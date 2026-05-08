@@ -20,14 +20,28 @@ import { jobRegistry } from "./helpers";
 
 const SUCCESS_RESULT: SubagentResult = {
   output: "All tests pass",
-  usage: { input: 10, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, turns: 1 },
+  usage: {
+    input: 10,
+    output: 50,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0.001,
+    turns: 1,
+  },
   model: "test/test-model",
   isError: false,
 };
 
 const ERROR_RESULT: SubagentResult = {
   output: "Something broke",
-  usage: { input: 5, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.0005, turns: 1 },
+  usage: {
+    input: 5,
+    output: 10,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0.0005,
+    turns: 1,
+  },
   model: undefined,
   isError: true,
   errorMessage: "API rate limit exceeded",
@@ -35,14 +49,28 @@ const ERROR_RESULT: SubagentResult = {
 
 const EMPTY_OUTPUT_RESULT: SubagentResult = {
   output: "",
-  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  usage: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    turns: 0,
+  },
   model: undefined,
   isError: false,
 };
 
 const ZERO_USAGE_RESULT: SubagentResult = {
   output: "Done",
-  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  usage: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    turns: 0,
+  },
   model: undefined,
   isError: false,
 };
@@ -50,7 +78,14 @@ const ZERO_USAGE_RESULT: SubagentResult = {
 /** Error result whose errorMessage contains an API key — triggers sanitizeOutput. */
 const SECRET_ERROR_RESULT: SubagentResult = {
   output: "Some output",
-  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  usage: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    turns: 0,
+  },
   model: undefined,
   isError: true,
   errorMessage: "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890",
@@ -96,9 +131,11 @@ function mockCtxWithHistory() {
   return {
     cwd: "/tmp",
     sessionManager: {
-      getBranch: vi.fn().mockReturnValue([
-        { type: "message", message: { role: "user", content: "test input" } },
-      ]),
+      getBranch: vi
+        .fn()
+        .mockReturnValue([
+          { type: "message", message: { role: "user", content: "test input" } },
+        ]),
     },
     model: { provider: "test", id: "test-model" },
     ui: { setStatus: vi.fn() },
@@ -114,7 +151,14 @@ function mockJobResult(jobId: string, jobPromise: Promise<SubagentResult>) {
     liveStatus: {
       turn: 0,
       output: "",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
     },
   });
 }
@@ -169,7 +213,11 @@ describe("notifyOnComplete", () => {
       ([t]: any[]) => t.name === "subagent_with_context",
     )?.[0];
 
-    return { api: _api, isolatedToolDef: isolatedDef, contextToolDef: contextDef };
+    return {
+      api: _api,
+      isolatedToolDef: isolatedDef,
+      contextToolDef: contextDef,
+    };
   }
 
   beforeEach(() => {
@@ -196,7 +244,11 @@ describe("notifyOnComplete", () => {
   describe("both tools deliver notifications", () => {
     const toolCases = [
       ["subagent_isolated", () => isolatedToolDef, () => mockCtx()] as const,
-      ["subagent_with_context", () => contextToolDef, () => mockCtxWithHistory()] as const,
+      [
+        "subagent_with_context",
+        () => contextToolDef,
+        () => mockCtxWithHistory(),
+      ] as const,
     ];
 
     for (const [label, getToolDef, getCtx] of toolCases) {
@@ -511,10 +563,13 @@ describe("notifyOnComplete", () => {
       control.resolve(SUCCESS_RESULT);
 
       // Let microtasks settle, then assert nothing was sent
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-        expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
 
     it("does NOT deliver notification when result was retrieved before completion", async () => {
@@ -540,10 +595,13 @@ describe("notifyOnComplete", () => {
       control.resolve(SUCCESS_RESULT);
 
       // The delivery guard checks !jobState.resultRetrieved and skips
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-        expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
 
     it("suppresses inject notification when result was retrieved before completion", async () => {
@@ -566,10 +624,13 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-        expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
   });
 
@@ -652,9 +713,12 @@ describe("notifyOnComplete", () => {
 
       control.reject(new Error("Timeout"));
 
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
   });
 
@@ -677,10 +741,13 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-        expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
   });
 
@@ -740,7 +807,9 @@ describe("notifyOnComplete", () => {
 
       const msg = sentMessageAt(api, 0);
       // The raw secret must NOT appear in the output
-      expect(msg.content).not.toContain("sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890");
+      expect(msg.content).not.toContain(
+        "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890",
+      );
       // sanitizeOutput replaces it with [REDACTED]
       expect(msg.content).toContain("[REDACTED]");
       expect(msg.content).toContain(jobId);
@@ -816,9 +885,12 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(0);
-      }, { timeout: 50 });
+      await vi.waitFor(
+        () => {
+          expect(api.sendMessage).toHaveBeenCalledTimes(0);
+        },
+        { timeout: 50 },
+      );
     });
 
     it("delivers notification even when ctx is stale (ui.setStatus throws)", async () => {
