@@ -143,7 +143,11 @@ function mockCtxWithHistory() {
 }
 
 /** Return a resolved value for the startSubagentJob mock. */
-function mockJobResult(jobId: string, jobPromise: Promise<SubagentResult>) {
+function mockJobResult(
+  jobId: string,
+  jobPromise: Promise<SubagentResult>,
+  modelLabel = "test/test-model",
+) {
   return Promise.resolve({
     jobId,
     jobPromise,
@@ -160,6 +164,7 @@ function mockJobResult(jobId: string, jobPromise: Promise<SubagentResult>) {
         turns: 0,
       },
     },
+    modelLabel,
   });
 }
 
@@ -192,6 +197,7 @@ describe("notifyOnComplete", () => {
   let api: ReturnType<typeof setupExtension>["api"];
   let isolatedToolDef: any;
   let contextToolDef: any;
+  let statusToolDef: any;
 
   /** Build the minimal ExtensionAPI mock and register the extension. */
   function setupExtension() {
@@ -213,10 +219,15 @@ describe("notifyOnComplete", () => {
       ([t]: any[]) => t.name === "subagent_with_context",
     )?.[0];
 
+    const statusDef = _api.registerTool.mock.calls.find(
+      ([t]: any[]) => t.name === "get_subagent_status",
+    )?.[0];
+
     return {
       api: _api,
       isolatedToolDef: isolatedDef,
       contextToolDef: contextDef,
+      statusToolDef: statusDef,
     };
   }
 
@@ -229,10 +240,12 @@ describe("notifyOnComplete", () => {
     api = setup.api;
     isolatedToolDef = setup.isolatedToolDef;
     contextToolDef = setup.contextToolDef;
+    statusToolDef = setup.statusToolDef;
 
-    // Guard: ensure both tools were captured
+    // Guard: ensure tools were captured
     expect(isolatedToolDef).toBeDefined();
     expect(contextToolDef).toBeDefined();
+    expect(statusToolDef).toBeDefined();
   });
 
   afterEach(() => {
@@ -509,6 +522,33 @@ describe("notifyOnComplete", () => {
       expect(msg.details).toMatchObject({ mode: "notify", jobId });
     });
 
+    it("allows more than five sequential inject completions because the cap is concurrent, not lifetime", async () => {
+      for (let i = 0; i < MAX_INJECT + 1; i++) {
+        const jobId = `inject-sequential-${i}`;
+        const control = createJobControl();
+        mockStartSubagentJob.mockImplementationOnce(() =>
+          mockJobResult(jobId, control.jobPromise),
+        );
+
+        await isolatedToolDef.execute(
+          `call-sequential-${i}`,
+          { async: true, task: "test", notifyOnComplete: "inject" },
+          undefined,
+          undefined,
+          mockCtx(),
+        );
+
+        control.resolve({ ...SUCCESS_RESULT, output: `done ${i}` });
+
+        await vi.waitFor(() => {
+          expect(api.sendUserMessage).toHaveBeenCalledTimes(i + 1);
+          expect(api.sendMessage).toHaveBeenCalledTimes(i + 1);
+        });
+      }
+
+      expect(getInjectCount()).toBe(0);
+    });
+
     it("uses fallback text when output is empty in inject mode", async () => {
       const jobId = "inject-empty";
       const control = createJobControl();
@@ -533,6 +573,42 @@ describe("notifyOnComplete", () => {
       // Fallback "(sub-agent produced no output)" is used instead of empty string
       const [userContent] = api.sendUserMessage.mock.calls[0];
       expect(userContent).toBe("(sub-agent produced no output)");
+    });
+  });
+
+  describe("async status", () => {
+    it("shows the resolved async job model instead of the parent model", async () => {
+      const jobId = "status-override-model";
+      const control = createJobControl();
+      mockStartSubagentJob.mockImplementationOnce(() =>
+        mockJobResult(
+          jobId,
+          control.jobPromise,
+          "override/provider-model",
+        ),
+      );
+
+      await isolatedToolDef.execute(
+        "call-status-model",
+        { async: true, task: "test", model: "override/provider-model" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      const result = await statusToolDef.execute(
+        "call-get-status",
+        { jobId },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      expect((result.details as Record<string, unknown>).model).toBe(
+        "override/provider-model",
+      );
+
+      control.resolve(SUCCESS_RESULT);
     });
   });
 

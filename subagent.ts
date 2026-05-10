@@ -310,6 +310,13 @@ function incrementInjectCount(): void {
   g2.__piSubagenturaInjectCount =
     ((g2.__piSubagenturaInjectCount ?? 0) as number) + 1;
 }
+function decrementInjectCount(): void {
+  const g2 = typeof global !== "undefined" ? global : globalThis;
+  g2.__piSubagenturaInjectCount = Math.max(
+    0,
+    ((g2.__piSubagenturaInjectCount ?? 0) as number) - 1,
+  );
+}
 
 /** Max concurrent inject-mode notifications before degrading to notify */
 export const MAX_INJECT = 5;
@@ -345,25 +352,29 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
         return;
       }
       incrementInjectCount();
-      // Inject full result as user message
-      (pi as any).sendUserMessage?.(
-        result.output || "(sub-agent produced no output)",
-        {
-          deliverAs: "followUp",
-        },
-      );
-      // Also send a summary notification
-      pi.sendMessage!(
-        [
+      try {
+        // Inject full result as user message
+        (pi as any).sendUserMessage?.(
+          result.output || "(sub-agent produced no output)",
           {
-            customType: "subagent-notify",
-            content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
-            display: true,
-            details: { jobId: jobState.id, result, mode: "inject" },
+            deliverAs: "followUp",
           },
-        ] as any,
-        { deliverAs: "followUp" } as any,
-      );
+        );
+        // Also send a summary notification
+        pi.sendMessage!(
+          [
+            {
+              customType: "subagent-notify",
+              content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
+              display: true,
+              details: { jobId: jobState.id, result, mode: "inject" },
+            },
+          ] as any,
+          { deliverAs: "followUp" } as any,
+        );
+      } finally {
+        decrementInjectCount();
+      }
     } else {
       // notify mode
       pi.sendMessage!(
@@ -502,7 +513,7 @@ export default function (pi: ExtensionAPI) {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus } =
+        const { jobId, jobPromise, session, liveStatus, modelLabel } =
           await startSubagentJob({
             task: params.task,
             persona: params.persona,
@@ -514,10 +525,6 @@ export default function (pi: ExtensionAPI) {
             defaultModel: ctx.model,
             maxAge: params.maxAge,
           });
-
-        const modelLabel = ctx.model
-          ? `${ctx.model.provider}/${ctx.model.id}`
-          : undefined;
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -704,7 +711,7 @@ export default function (pi: ExtensionAPI) {
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus } =
+        const { jobId, jobPromise, session, liveStatus, modelLabel } =
           await startSubagentJob({
             task: params.task,
             persona: params.persona,
@@ -716,10 +723,6 @@ export default function (pi: ExtensionAPI) {
             defaultModel: ctx.model,
             maxAge: params.maxAge,
           });
-
-        const modelLabel = ctx.model
-          ? `${ctx.model.provider}/${ctx.model.id}`
-          : undefined;
         const jobState: JobState = {
           id: jobId,
           status: "running",

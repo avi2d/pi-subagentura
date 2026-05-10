@@ -262,6 +262,7 @@ export interface StartSubagentJobResult {
   jobPromise: Promise<SubagentResult>;
   session: AgentSession;
   liveStatus: SubagentLiveStatus;
+  modelLabel?: string;
 }
 
 /**
@@ -504,5 +505,5 @@ export async function startSubagentJob(
     return result;
   })();
 
-  return { jobId, jobPromise, session, liveStatus };
+  return { jobId, jobPromise, session, liveStatus, modelLabel };
 }
