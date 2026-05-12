@@ -54,7 +54,7 @@ Check GitHub Actions: https://github.com/lmn451/pi-subagentura/actions
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| 404 on publish | Verify trusted publisher config on npmjs.com matches exactly |
-| Workflow didn't trigger | Ensure tag matches `v*` and was pushed to remote |
+| Issue                   | Solution                                                     |
+| ----------------------- | ------------------------------------------------------------ |
+| 404 on publish          | Verify trusted publisher config on npmjs.com matches exactly |
+| Workflow didn't trigger | Ensure tag matches `v*` and was pushed to remote             |

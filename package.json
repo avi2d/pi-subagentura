@@ -24,6 +24,7 @@
   },
   "files": [
     "subagent.ts",
+    "helpers.ts",
     "README.md",
     "LICENSE"
   ],
@@ -52,6 +53,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "prettier": "^3.8.3",
     "typescript": "^6.0.3",
     "vitest": "^3.0.0"
   }

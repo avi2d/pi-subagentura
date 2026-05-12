@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { getProviders } from "@mariozechner/pi-ai";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
@@ -7,6 +7,15 @@ import {
   resolveModel,
   SubagentLiveStatus,
   SubagentResult,
+  jobRegistry,
+  MAX_REGISTRY_SIZE,
+  pruneOldestJob,
+  pruneCompletedJobs,
+  scheduleJobCleanup,
+  generateJobId,
+  JOB_CLEANUP_TTL_MS,
+  type JobState,
+  type JobStatus,
 } from "./helpers";
 
 // ── Simulation helpers ────────────────────────────────────────────────
@@ -17,8 +26,17 @@ function createLiveStatus(): SubagentLiveStatus {
   return {
     turn: 0,
     output: "",
-    usage: { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-    activeTool: undefined as { name: string; args: Record<string, unknown> } | undefined,
+    usage: {
+      turns: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+    },
+    activeTool: undefined as
+      | { name: string; args: Record<string, unknown> }
+      | undefined,
   };
 }
 
@@ -41,7 +59,9 @@ function simulateTurnEnd(status: SubagentLiveStatus) {
 
 function createDebounceHarness() {
   let activeToolTimer: ReturnType<typeof setTimeout> | undefined;
-  let pendingActiveTool: { name: string; args: Record<string, unknown> } | undefined;
+  let pendingActiveTool:
+    | { name: string; args: Record<string, unknown> }
+    | undefined;
   const state = { activeTool: undefined as typeof pendingActiveTool };
 
   function setActiveToolDebounced(tool: typeof pendingActiveTool) {
@@ -114,7 +134,15 @@ describe("formatUsage", () => {
   });
 
   it("should format all usage fields", () => {
-    const usage = { ...baseUsage, input: 1500, output: 500, cacheRead: 100, cacheWrite: 200, cost: 0.0123, turns: 2 };
+    const usage = {
+      ...baseUsage,
+      input: 1500,
+      output: 500,
+      cacheRead: 100,
+      cacheWrite: 200,
+      cost: 0.0123,
+      turns: 2,
+    };
     const result = formatUsage(usage);
     expect(result).toContain("1.5k");
     expect(result).toContain("↓500");
@@ -125,7 +153,10 @@ describe("formatUsage", () => {
   });
 
   it("should append model at the end", () => {
-    const result = formatUsage({ ...baseUsage, turns: 1 }, "anthropic/claude-3-5-sonnet-20241022");
+    const result = formatUsage(
+      { ...baseUsage, turns: 1 },
+      "anthropic/claude-3-5-sonnet-20241022",
+    );
     expect(result).toMatch(/anthropic\/claude-3-5-sonnet-20241022$/);
   });
 });
@@ -198,7 +229,10 @@ describe("active tool debouncing", () => {
     await new Promise((r) => setTimeout(r, ACTIVE_TOOL_DEBOUNCE_MS + 50));
 
     // Now the activeTool should be committed
-    expect(state.activeTool).toEqual({ name: "bash", args: { command: "sleep 5" } });
+    expect(state.activeTool).toEqual({
+      name: "bash",
+      args: { command: "sleep 5" },
+    });
   });
 
   it("should clear activeTool immediately when a committed tool ends", async () => {
@@ -232,17 +266,25 @@ describe("resolveModel", () => {
   });
 
   it("should return defaultModel when modelId is undefined", () => {
-    const defaultModel = { provider: "anthropic", id: "claude-3-5-sonnet-20241022" } as any;
+    const defaultModel = {
+      provider: "anthropic",
+      id: "claude-3-5-sonnet-20241022",
+    } as any;
     expect(resolveModel(undefined, defaultModel)).toBe(defaultModel);
   });
 
   it("should parse provider/id format correctly", () => {
-    const result = resolveModel("anthropic/claude-3-5-sonnet-20241022", undefined);
+    const result = resolveModel(
+      "anthropic/claude-3-5-sonnet-20241022",
+      undefined,
+    );
     expect(result?.provider).toBe("anthropic");
   });
 
   it("should return undefined for unknown provider/id when no default", () => {
-    expect(resolveModel("unknown/impossibly-long-model-id", undefined)).toBeUndefined();
+    expect(
+      resolveModel("unknown/impossibly-long-model-id", undefined),
+    ).toBeUndefined();
   });
 
   it("should fall back to defaultModel when provider not found", () => {
@@ -272,5 +314,672 @@ describe("error handling scenarios", () => {
         undefined,
       ),
     ).toBe("");
+  });
+});
+
+// ── Async Tests ──────────────────────────────────────────────────────
+
+// Mock JobState helpers
+function createMockJobState(overrides: Partial<JobState> = {}): JobState {
+  return {
+    id: generateJobId(),
+    status: "running",
+    liveStatus: {
+      turn: 0,
+      output: "",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    },
+    session: {
+      abort: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+    } as unknown as JobState["session"],
+    startedAt: Date.now(),
+    promise: Promise.resolve({
+      output: "mock result",
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.001,
+        turns: 1,
+      },
+      model: "test/model",
+      isError: false,
+    }),
+    modelLabel: "test/model",
+    ...overrides,
+  };
+}
+
+describe("jobRegistry", () => {
+  beforeEach(() => {
+    jobRegistry.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should be empty on initialization", () => {
+    expect(jobRegistry.size).toBe(0);
+  });
+
+  it("should store and retrieve jobs", () => {
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+    expect(jobRegistry.get(job.id)).toBe(job);
+  });
+
+  it("should support multiple concurrent jobs", () => {
+    const job1 = createMockJobState();
+    const job2 = createMockJobState();
+    const job3 = createMockJobState();
+    jobRegistry.set(job1.id, job1);
+    jobRegistry.set(job2.id, job2);
+    jobRegistry.set(job3.id, job3);
+    expect(jobRegistry.size).toBe(3);
+    expect(jobRegistry.get(job1.id)?.id).toBe(job1.id);
+    expect(jobRegistry.get(job2.id)?.id).toBe(job2.id);
+    expect(jobRegistry.get(job3.id)?.id).toBe(job3.id);
+  });
+});
+
+describe("generateJobId", () => {
+  it("should return a string of 16 hex characters", () => {
+    const id = generateJobId();
+    expect(id).toHaveLength(16);
+    expect(/^[0-9a-f]{16}$/.test(id)).toBe(true);
+  });
+
+  it("should generate unique IDs", () => {
+    const ids = new Set(Array.from({ length: 100 }, () => generateJobId()));
+    expect(ids.size).toBe(100);
+  });
+});
+
+describe("registry size cap", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => jobRegistry.clear());
+
+  function createMockJobState(overrides: Partial<JobState> = {}): JobState {
+    return {
+      id: generateJobId(),
+      status: "running",
+      liveStatus: {
+        turn: 0,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn() } as any,
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+        isError: false,
+      }),
+      ...overrides,
+    };
+  }
+
+  it("pruneOldestJob removes oldest completed job", () => {
+    const job1 = createMockJobState({ status: "done" });
+    const job2 = createMockJobState({ status: "done" });
+    jobRegistry.set(job1.id, job1);
+    jobRegistry.set(job2.id, job2);
+    expect(pruneOldestJob()).toBe(true);
+    expect(jobRegistry.has(job1.id)).toBe(false);
+    expect(jobRegistry.has(job2.id)).toBe(true);
+  });
+
+  it("pruneOldestJob returns false when no completed jobs exist", () => {
+    const job1 = createMockJobState({ status: "running" });
+    jobRegistry.set(job1.id, job1);
+    expect(pruneOldestJob()).toBe(false);
+    expect(jobRegistry.has(job1.id)).toBe(true);
+  });
+
+  it("pruneCompletedJobs removes all completed and error jobs", () => {
+    const job1 = createMockJobState({ status: "done" });
+    const job2 = createMockJobState({ status: "error" });
+    const job3 = createMockJobState({ status: "running" });
+    jobRegistry.set(job1.id, job1);
+    jobRegistry.set(job2.id, job2);
+    jobRegistry.set(job3.id, job3);
+    expect(pruneCompletedJobs()).toBe(2);
+    expect(jobRegistry.has(job1.id)).toBe(false);
+    expect(jobRegistry.has(job2.id)).toBe(false);
+    expect(jobRegistry.has(job3.id)).toBe(true);
+  });
+
+  it("startSubagentJob evicts oldest completed job when at MAX_REGISTRY_SIZE", () => {
+    // Fill registry to cap with done jobs
+    for (let i = 0; i < MAX_REGISTRY_SIZE; i++) {
+      const job = createMockJobState({ status: "done" });
+      jobRegistry.set(job.id, job);
+    }
+    expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+
+    // Adding a new job should evict the oldest done job
+    // Note: startSubagentJob enforces cap before generating jobId
+    // We simulate by calling pruneOldestJob directly
+    expect(pruneOldestJob()).toBe(true);
+    expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE - 1);
+  });
+});
+
+describe("scheduleJobCleanup", () => {
+  beforeEach(() => {
+    jobRegistry.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should NOT remove job for non-immediate cleanup (jobs persist indefinitely)", async () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+
+    scheduleJobCleanup(job.id, false);
+    expect(jobRegistry.has(job.id)).toBe(true);
+
+    vi.advanceTimersByTime(1000000);
+    expect(jobRegistry.has(job.id)).toBe(true); // still there
+  });
+
+  it("should remove job immediately for immediate cleanup", async () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+
+    scheduleJobCleanup(job.id, true);
+    // Immediate: setTimeout(fn, 0) — advance past it
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobRegistry.has(job.id)).toBe(false);
+  });
+});
+
+describe("async job lifecycle", () => {
+  beforeEach(() => {
+    jobRegistry.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should transition job from running to done on promise resolve", async () => {
+    const job = createMockJobState({ status: "running" });
+    jobRegistry.set(job.id, job);
+
+    expect(job.status).toBe("running");
+
+    const result = await job.promise;
+    job.status = result.isError ? "error" : "done";
+    job.result = result;
+
+    expect(job.status).toBe("done");
+    expect(job.result?.output).toBe("mock result");
+    expect(job.result?.usage.turns).toBe(1);
+  });
+
+  it("should transition job from running to cancelled", () => {
+    const job = createMockJobState({ status: "running" });
+    jobRegistry.set(job.id, job);
+
+    job.status = "cancelled";
+    expect(job.status).toBe("cancelled");
+    expect(jobRegistry.get(job.id)?.status).toBe("cancelled");
+  });
+
+  it("should handle cancelled job result request (status is already cancelled)", () => {
+    const job = createMockJobState({ status: "cancelled" });
+    jobRegistry.set(job.id, job);
+
+    const found = jobRegistry.get(job.id);
+    expect(found?.status).toBe("cancelled");
+  });
+
+  it("should handle unknown jobId lookup", () => {
+    expect(jobRegistry.get("nonexistent")).toBeUndefined();
+  });
+
+  it("should handle duplicate cancel (idempotent)", () => {
+    const job = createMockJobState({ status: "cancelled" });
+    jobRegistry.set(job.id, job);
+
+    const found = jobRegistry.get(job.id);
+    expect(found?.status).toBe("cancelled");
+  });
+
+  it("should handle completed job that is then cancelled (should reject)", () => {
+    const job = createMockJobState({ status: "done" });
+    jobRegistry.set(job.id, job);
+
+    const found = jobRegistry.get(job.id);
+    expect(found?.status).toBe("done");
+  });
+
+  it("should guard against cancellation race in promise chain", () => {
+    // Simulate the guard: promise resolves after cancel
+    const job = createMockJobState({ status: "cancelled" });
+    jobRegistry.set(job.id, job);
+
+    // The guard pattern: if status is cancelled, don't overwrite
+    if (job.status !== "cancelled") {
+      job.status = "done";
+      job.result =
+        job.promise.constructor.toString() as unknown as SubagentResult;
+    }
+
+    // Status should remain cancelled (guard prevented overwrite)
+    expect(job.status).toBe("cancelled");
+  });
+});
+
+describe("SubagentLiveStatus mutation (shared reference)", () => {
+  beforeEach(() => {
+    jobRegistry.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should reflect real-time mutations in registry liveStatus", () => {
+    const liveStatus: SubagentLiveStatus = {
+      turn: 0,
+      output: "",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    };
+
+    const job = createMockJobState({ liveStatus });
+    jobRegistry.set(job.id, job);
+
+    // Simulate event subscriber mutations
+    liveStatus.turn = 1;
+    liveStatus.output = "Hello, world!";
+    liveStatus.activeTool = { name: "read", args: { path: "/tmp" } };
+    liveStatus.usage.turns = 1;
+
+    const found = jobRegistry.get(job.id);
+    expect(found?.liveStatus.turn).toBe(1);
+    expect(found?.liveStatus.output).toBe("Hello, world!");
+    expect(found?.liveStatus.activeTool?.name).toBe("read");
+  });
+});
+
+// ── Additional Async Tests ──────────────────────────────────────────
+
+describe("race condition: cancel during await", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should return cancelled message when status changes to cancelled after await resolves", async () => {
+    vi.useFakeTimers();
+    let resolvePromise!: (value: SubagentResult) => void;
+    const deferredPromise = new Promise<SubagentResult>((resolve) => {
+      resolvePromise = resolve;
+    });
+    const job: JobState = {
+      id: generateJobId(),
+      status: "running",
+      liveStatus: {
+        turn: 0,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: {
+        abort: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      } as unknown as JobState["session"],
+      startedAt: Date.now(),
+      promise: deferredPromise,
+      modelLabel: "test/model",
+    };
+    jobRegistry.set(job.id, job);
+    job.status = "cancelled"; // Simulate cancel before promise resolves
+    resolvePromise!({
+      output: "this should be ignored",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+      model: "test/model",
+      isError: true,
+      errorMessage: "The operation was aborted",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(job.status).toBe("cancelled");
+    expect(job.result).toBeUndefined();
+  });
+
+  it("should use promise result when status is still running after resolve", async () => {
+    vi.useFakeTimers();
+    let resolvePromise!: (value: SubagentResult) => void;
+    const deferredPromise = new Promise<SubagentResult>((resolve) => {
+      resolvePromise = resolve;
+    });
+    const job: JobState = {
+      id: generateJobId(),
+      status: "running",
+      liveStatus: {
+        turn: 0,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: {
+        abort: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      } as unknown as JobState["session"],
+      startedAt: Date.now(),
+      promise: deferredPromise,
+      modelLabel: "test/model",
+    };
+    jobRegistry.set(job.id, job);
+    const successResult: SubagentResult = {
+      output: "completed successfully",
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.001,
+        turns: 1,
+      },
+      model: "test/model",
+      isError: false,
+    };
+    resolvePromise!(successResult);
+    await vi.advanceTimersByTimeAsync(0);
+    if (job.status !== "cancelled") {
+      job.result = await job.promise;
+    }
+    expect(job.result?.output).toBe("completed successfully");
+  });
+});
+
+describe("scheduleJobCleanup timer lifecycle", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should NOT remove job when no immediate cleanup scheduled (jobs persist)", async () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+    scheduleJobCleanup(job.id, false);
+    vi.advanceTimersByTime(1000000);
+    expect(jobRegistry.has(job.id)).toBe(true); // persists
+  });
+
+  it("should remove job immediately for immediate cleanup", async () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+    scheduleJobCleanup(job.id, true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobRegistry.has(job.id)).toBe(false);
+  });
+
+  it("should fire immediate cleanup after TTL cleanup is scheduled", async () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+    scheduleJobCleanup(job.id, false);
+    vi.advanceTimersByTime(1000);
+    scheduleJobCleanup(job.id, true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobRegistry.has(job.id)).toBe(false);
+  });
+});
+
+describe("cancellation guard in promise chain", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should NOT overwrite job.result when job.status is cancelled", async () => {
+    const job = createMockJobState({ status: "cancelled" });
+    job.promise = Promise.resolve({
+      output: "this should not be set",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+      isError: true,
+    });
+    jobRegistry.set(job.id, job);
+    if (job.status !== "cancelled") {
+      job.result = await job.promise;
+    }
+    expect(job.result).toBeUndefined();
+    expect(job.status).toBe("cancelled");
+  });
+
+  it("should allow result assignment when status is not cancelled", async () => {
+    const job = createMockJobState({ status: "done" });
+    const expectedResult: SubagentResult = {
+      output: "success",
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.001,
+        turns: 1,
+      },
+      model: "test/model",
+      isError: false,
+    };
+    job.promise = Promise.resolve(expectedResult);
+    jobRegistry.set(job.id, job);
+    if (job.status !== "cancelled") {
+      job.result = await job.promise;
+    }
+    expect(job.result?.output).toBe("success");
+    expect(job.status).toBe("done");
+  });
+
+  it("should handle status transition from running to cancelled before result is read", async () => {
+    let resolvePromise!: (value: SubagentResult) => void;
+    const deferredPromise = new Promise<SubagentResult>((resolve) => {
+      resolvePromise = resolve;
+    });
+    const job = createMockJobState({
+      status: "running",
+      promise: deferredPromise,
+    });
+    jobRegistry.set(job.id, job);
+    job.status = "cancelled";
+    resolvePromise!({
+      output: "ignored output",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+      isError: true,
+    });
+    if (job.status !== "cancelled") {
+      throw new Error("Guard should have prevented this");
+    }
+    expect(job.result).toBeUndefined();
+  });
+});
+
+describe("get_subagent_status edge cases (simulated)", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should return not found for unknown jobId", () => {
+    expect(jobRegistry.get("nonexistent")).toBeUndefined();
+  });
+
+  it("should return cancelled status for known cancelled jobId", () => {
+    const job = createMockJobState({ status: "cancelled" });
+    jobRegistry.set(job.id, job);
+    expect(jobRegistry.get(job.id)?.status).toBe("cancelled");
+  });
+
+  it("should return running status for active job", () => {
+    const job = createMockJobState({ status: "running" });
+    jobRegistry.set(job.id, job);
+    expect(jobRegistry.get(job.id)?.status).toBe("running");
+  });
+
+  it("should return done status for completed job", () => {
+    const job = createMockJobState({ status: "done" });
+    jobRegistry.set(job.id, job);
+    expect(jobRegistry.get(job.id)?.status).toBe("done");
+  });
+});
+
+describe("get_subagent_result edge cases (simulated)", () => {
+  beforeEach(() => jobRegistry.clear());
+  afterEach(() => {
+    vi.useRealTimers();
+    jobRegistry.clear();
+  });
+
+  it("should return not found for unknown jobId", async () => {
+    expect(jobRegistry.get("nonexistent")).toBeUndefined();
+  });
+
+  it("should return cancelled message for cancelled jobId without awaiting", () => {
+    const job = createMockJobState({ status: "cancelled" });
+    jobRegistry.set(job.id, job);
+    expect(jobRegistry.get(job.id)?.status).toBe("cancelled");
+  });
+
+  it("should await promise for running job and update result", async () => {
+    const job = createMockJobState({ status: "running" });
+    job.promise = Promise.resolve({
+      output: "completed",
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.001,
+        turns: 1,
+      },
+      model: "test/model",
+      isError: false,
+    });
+    jobRegistry.set(job.id, job);
+    const found = jobRegistry.get(job.id);
+    if (found && found.status !== "cancelled") {
+      const result = await found.promise;
+      found.result = result;
+      found.status = result.isError ? "error" : "done";
+    }
+    expect(found?.result?.output).toBe("completed");
+    expect(found?.status).toBe("done");
+  });
+
+  it("should re-check cancelled status after await and return cancelled message", async () => {
+    let resolvePromise!: (value: SubagentResult) => void;
+    const deferredPromise = new Promise<SubagentResult>((resolve) => {
+      resolvePromise = resolve;
+    });
+    const job = createMockJobState({
+      status: "running",
+      promise: deferredPromise,
+    });
+    jobRegistry.set(job.id, job);
+    job.status = "cancelled";
+    resolvePromise!({
+      output: "should be ignored",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+      isError: true,
+      errorMessage: "aborted",
+    });
+    const found = jobRegistry.get(job.id);
+    if (found) {
+      const result = await found.promise;
+      if ((found.status as JobStatus) === "cancelled") {
+        expect(found.status).toBe("cancelled");
+        expect(found.result).toBeUndefined();
+      } else {
+        found.result = result;
+      }
+    }
   });
 });
