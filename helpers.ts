@@ -177,18 +177,69 @@ export function generateJobId(): string {
  * The caller (LLM agent) is responsible for providing the correct model id.
  * This function does NOT guess — it only does exact lookups:
  *   1. undefined → defaultModel
- *   2. "provider/id" format → exact getModel lookup
- *   3. Bare id → exact getModel scan across all providers
- *   4. Falls back to defaultModel when nothing matches
+ *   2. Use parent modelRegistry (has extension-added models like minimax)
+ *   3. "provider/id" format → exact getModel lookup (global static registry)
+ *   4. Bare id → exact getModel scan across all providers (global static registry)
+ *   5. Falls back to defaultModel when nothing matches
  */
 export function resolveModel(
   modelId: string | undefined,
-  // @ts-expect-error — Model<TApi> requires type arg; unknown is a safe placeholder here
+  // @ts-expect-error — Model<TApi> requires type arg; unknown is a safe placeholder
   defaultModel: Model | undefined,
+  parentModelRegistry?: ModelRegistry,
 ) {
   if (!modelId) return defaultModel;
 
-  // "provider/id" format — exact lookup only
+  // 1. Try parent modelRegistry first (has extension-added models like minimax)
+  if (parentModelRegistry) {
+    const allModels = parentModelRegistry.getAll();
+    const availableModels = parentModelRegistry.getAvailable();
+
+    if (modelId.includes("/")) {
+      const [provider, id] = modelId.split("/", 2);
+      // Exact match
+      const exact = parentModelRegistry.find(provider, id);
+      if (exact) return exact as any;
+      // Case-insensitive provider match
+      for (const m of allModels) {
+        if (m.provider.toLowerCase() === provider.toLowerCase() && m.id === id) {
+          return m as any;
+        }
+      }
+    } else {
+      const needle = modelId.toLowerCase();
+
+      // 1) Exact model ID match
+      for (const m of allModels) {
+        if (m.id.toLowerCase() === needle) return m as any;
+      }
+
+      // 2) Provider name match — pick best model from that provider (prefer available)
+      for (const m of allModels) {
+        if (m.provider.toLowerCase() === needle) {
+          // Found matching provider — check if any model from it is available
+          const providerAvailable = availableModels.find(
+            (a) => a.provider === m.provider,
+          );
+          if (providerAvailable) return providerAvailable as any;
+          // No available model — return any model from this provider
+          return m as any;
+        }
+      }
+
+      // 3) Model name match (case-insensitive substring)
+      for (const m of allModels) {
+        if (m.name?.toLowerCase().includes(needle)) return m as any;
+      }
+
+      // 4) Provider name substring match (e.g. "mini" matches "minimax")
+      for (const m of allModels) {
+        if (m.provider.toLowerCase().includes(needle)) return m as any;
+      }
+    }
+  }
+
+  // 2. Fall back to global static registry (built-in models only)
   if (modelId.includes("/")) {
     const [provider, id] = modelId.split("/", 2);
     // @ts-expect-error — getModel requires KnownProvider union; we trust the caller
@@ -255,6 +306,8 @@ export interface StartSubagentJobParams {
   // @ts-expect-error — Model<TApi> requires type arg
   defaultModel: Model | undefined;
   maxAge?: number;
+  /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
+  parentModelRegistry?: ModelRegistry;
 }
 
 export interface StartSubagentJobResult {
@@ -286,6 +339,7 @@ export async function startSubagentJob(
     signal,
     onUpdate,
     defaultModel,
+    parentModelRegistry,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -298,7 +352,8 @@ export async function startSubagentJob(
   const modelRegistry = ModelRegistry.create(authStorage);
 
   // Resolve model: exact match only, fallback to default
-  const targetModel = resolveModel(modelOverride, defaultModel);
+  // Uses parent's modelRegistry to find extension-added models (e.g. minimax)
+  const targetModel = resolveModel(modelOverride, defaultModel, parentModelRegistry);
   const modelLabel = targetModel
     ? `${targetModel.provider}/${targetModel.id}`
     : undefined;

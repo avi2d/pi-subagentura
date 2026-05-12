@@ -23,6 +23,7 @@ import {
   type Theme,
   convertToLlm,
   serializeConversation,
+  ModelRegistry,
 } from "@mariozechner/pi-coding-agent";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
@@ -64,6 +65,7 @@ async function runSubagent(
   onUpdate: ((partial: AgentToolResult) => void) | undefined,
   // @ts-expect-error — Model<TApi> requires type arg; unknown is a safe placeholder
   defaultModel: Model | undefined,
+  parentModelRegistry: ModelRegistry | undefined,
 ): Promise<SubagentResult> {
   try {
     const { jobPromise } = await startSubagentJob({
@@ -75,6 +77,7 @@ async function runSubagent(
       signal,
       onUpdate,
       defaultModel,
+      parentModelRegistry,
     });
     return await jobPromise;
   } catch (err) {
@@ -524,6 +527,7 @@ export default function (pi: ExtensionAPI) {
             onUpdate: undefined,
             defaultModel: ctx.model,
             maxAge: params.maxAge,
+            parentModelRegistry: ctx.modelRegistry,
           });
         const jobState: JobState = {
           id: jobId,
@@ -654,6 +658,7 @@ export default function (pi: ExtensionAPI) {
         signal,
         onUpdate,
         ctx.model,
+        ctx.modelRegistry,
       );
 
       const usageStr = formatUsage(result.usage, result.model);
@@ -722,6 +727,7 @@ export default function (pi: ExtensionAPI) {
             onUpdate: undefined,
             defaultModel: ctx.model,
             maxAge: params.maxAge,
+            parentModelRegistry: ctx.modelRegistry,
           });
         const jobState: JobState = {
           id: jobId,
@@ -840,6 +846,7 @@ export default function (pi: ExtensionAPI) {
         signal,
         onUpdate,
         ctx.model,
+        ctx.modelRegistry,
       );
 
       const usageStr = formatUsage(result.usage, result.model);
