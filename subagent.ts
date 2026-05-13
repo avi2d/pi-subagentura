@@ -484,7 +484,9 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Spawn an in-process sub-agent that inherits the full conversation history.",
       "The sub-agent sees everything discussed so far plus the new task.",
-      "Model is inherited by default. Streams output in real-time when sync.",
+      "Model is inherited by default. Use the model param to override (e.g. 'minimax/MiniMax-M2.7').",
+      "Use list_available_models to see which models have configured auth before setting model.",
+      "Streams output in real-time when sync.",
       "",
       "Examples:",
       '  - task: "Review this PR for security issues", persona: "You are a senior security auditor"',
@@ -705,7 +707,9 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Spawn an in-process sub-agent with a fresh, empty context window.",
       "Only receives the task and optional persona. No conversation history.",
-      "Model is inherited by default. Streams output in real-time when sync.",
+      "Model is inherited by default. Use the model param to override (e.g. 'minimax/MiniMax-M2.7').",
+      "Use list_available_models to see which models have configured auth before setting model.",
+      "Streams output in real-time when sync.",
       "",
       "Examples:",
       '  - task: "Propose a README outline for this repo", persona: "You are a technical writer"',
