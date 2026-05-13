@@ -316,6 +316,8 @@ export interface StartSubagentJobResult {
   session: AgentSession;
   liveStatus: SubagentLiveStatus;
   modelLabel?: string;
+  /** Warning when modelOverride was specified but not found — lists available models */
+  modelWarning?: string;
 }
 
 /**
@@ -357,6 +359,19 @@ export async function startSubagentJob(
   const modelLabel = targetModel
     ? `${targetModel.provider}/${targetModel.id}`
     : undefined;
+
+  // Build model warning when override was specified (helps AI discover valid models)
+  let modelWarning: string | undefined;
+  if (modelOverride && parentModelRegistry) {
+    const available = parentModelRegistry.getAvailable();
+    const modelList = available
+      .map((m) => `  ${m.provider}/${m.id}${m.name ? ` (${m.name})` : ""}`)
+      .join("\n");
+    modelWarning =
+      `Requested model "${modelOverride}" resolved to ${modelLabel ?? "none"}. ` +
+      `Available models:\n${modelList || "  (none)"}\n` +
+      `Use list_available_models to discover more.`;
+  }
 
   let handleAbort: (() => void) | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -560,5 +575,5 @@ export async function startSubagentJob(
     return result;
   })();
 
-  return { jobId, jobPromise, session, liveStatus, modelLabel };
+  return { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning };
 }

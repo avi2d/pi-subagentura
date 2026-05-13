@@ -68,7 +68,7 @@ async function runSubagent(
   parentModelRegistry: ModelRegistry | undefined,
 ): Promise<SubagentResult> {
   try {
-    const { jobPromise } = await startSubagentJob({
+    const { jobPromise, modelWarning } = await startSubagentJob({
       task,
       persona,
       modelOverride,
@@ -79,7 +79,12 @@ async function runSubagent(
       defaultModel,
       parentModelRegistry,
     });
-    return await jobPromise;
+    const result = await jobPromise;
+    // Surface model resolution info so the AI sees what model was used
+    if (modelWarning && !result.isError) {
+      result.output = `${modelWarning}\n---\n${result.output}`;
+    }
+    return result;
   } catch (err) {
     // Preserve original error formatting: if startSubagentJob throws
     // (e.g., createAgentSession auth failure), return clean SubagentResult
@@ -516,7 +521,7 @@ export default function (pi: ExtensionAPI) {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel } =
+        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
           await startSubagentJob({
             task: params.task,
             persona: params.persona,
@@ -624,7 +629,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.`,
+              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
           details: {
@@ -716,7 +722,7 @@ export default function (pi: ExtensionAPI) {
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel } =
+        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
           await startSubagentJob({
             task: params.task,
             persona: params.persona,
@@ -827,7 +833,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.`,
+              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
           details: { jobId, status: "started" },
