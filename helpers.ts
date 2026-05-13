@@ -190,56 +190,22 @@ export function resolveModel(
 ) {
   if (!modelId) return defaultModel;
 
-  // 1. Try parent modelRegistry first (has extension-added models like minimax)
+  // Only exact matching — no fuzzy/substring guessing.
+  // The AI should call list_available_models and pick from the list.
   if (parentModelRegistry) {
-    const allModels = parentModelRegistry.getAll();
-    const availableModels = parentModelRegistry.getAvailable();
-
     if (modelId.includes("/")) {
       const [provider, id] = modelId.split("/", 2);
-      // Exact match
       const exact = parentModelRegistry.find(provider, id);
       if (exact) return exact as any;
-      // Case-insensitive provider match
-      for (const m of allModels) {
-        if (m.provider.toLowerCase() === provider.toLowerCase() && m.id === id) {
-          return m as any;
-        }
-      }
     } else {
-      const needle = modelId.toLowerCase();
-
-      // 1) Exact model ID match
-      for (const m of allModels) {
-        if (m.id.toLowerCase() === needle) return m as any;
-      }
-
-      // 2) Provider name match — pick best model from that provider (prefer available)
-      for (const m of allModels) {
-        if (m.provider.toLowerCase() === needle) {
-          // Found matching provider — check if any model from it is available
-          const providerAvailable = availableModels.find(
-            (a) => a.provider === m.provider,
-          );
-          if (providerAvailable) return providerAvailable as any;
-          // No available model — return any model from this provider
-          return m as any;
-        }
-      }
-
-      // 3) Model name match (case-insensitive substring)
-      for (const m of allModels) {
-        if (m.name?.toLowerCase().includes(needle)) return m as any;
-      }
-
-      // 4) Provider name substring match (e.g. "mini" matches "minimax")
-      for (const m of allModels) {
-        if (m.provider.toLowerCase().includes(needle)) return m as any;
+      // Bare id — search all models in parent registry
+      for (const m of parentModelRegistry.getAll()) {
+        if (m.id === modelId) return m as any;
       }
     }
   }
 
-  // 2. Fall back to global static registry (built-in models only)
+  // Fall back to global static registry (built-in models only)
   if (modelId.includes("/")) {
     const [provider, id] = modelId.split("/", 2);
     // @ts-expect-error — getModel requires KnownProvider union; we trust the caller
