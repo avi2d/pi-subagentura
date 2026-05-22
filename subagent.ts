@@ -902,8 +902,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_subagent_status",
     label: "Get Subagent Status",
-    description:
-      "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
+    description: "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
     parameters: StatusParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -917,7 +916,7 @@ export default function (pi: ExtensionAPI) {
               text: `Job ${params.jobId} not found. It may have been cancelled.`,
             },
           ],
-          details: { jobId: params.jobId },
+           details: { jobId: params.jobId, status: "not_found" },
           isError: true,
         };
       }
