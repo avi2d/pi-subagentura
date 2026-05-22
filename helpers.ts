@@ -6,6 +6,8 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { getModel, getProviders } from "@mariozechner/pi-ai";
 import type { Model } from "@mariozechner/pi-ai";
 
@@ -20,6 +22,50 @@ import {
   SessionManager,
   type AgentSession,
 } from "@mariozechner/pi-coding-agent";
+
+// ── Debug Logging ─────────────────────────────────────────────────
+
+const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
+  ? resolve(process.env.SUBAGENT_DEBUG_LOG_DIR)
+  : undefined;
+
+export function debugLog(level: string, event: string, data: Record<string, unknown> = {}) {
+  if (!DEBUG_LOG_DIR) return;
+  try {
+    if (!existsSync(DEBUG_LOG_DIR)) {
+      mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+    }
+    const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      ...data,
+    }) + "\n";
+    const fileName = resolve(DEBUG_LOG_DIR, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    appendFileSync(fileName, entry);
+  } catch {
+    // Silently fail to avoid polluting output
+  }
+}
+
+export function extractTextFromContent(content: unknown): string {
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is { type: "text"; text: string } =>
+        typeof c === "object" && c !== null && c.type === "text" && typeof c.text === "string"
+      )
+      .map((c) => c.text)
+      .join("\n");
+  }
+  if (typeof content === "string") {
+    return content;
+  }
+  debugLog("warn", "unexpected_content_type", {
+    contentType: typeof content,
+    content: String(String(content).slice(0, 200)),
+  });
+  return "";
+}
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -431,6 +477,11 @@ export async function startSubagentJob(
   }
 
   // Create session
+  debugLog("info", "session_creating", {
+    jobId,
+    model: modelLabel ?? "default",
+    cwd,
+  });
   const session = (
     await createAgentSession({
       sessionManager: SessionManager.inMemory(),
@@ -440,10 +491,15 @@ export async function startSubagentJob(
       cwd,
     })
   ).session;
+  debugLog("info", "session_created", {
+    jobId,
+    sessionModel: session.model ? `${session.model.provider}/${session.model.id}` : null,
+  });
 
   // Wire abort signal
   if (signal) {
     handleAbort = () => {
+      debugLog("warn", "job_abort", { jobId });
       session.abort().catch(() => {});
     };
     if (signal.aborted) {
@@ -460,10 +516,16 @@ export async function startSubagentJob(
         liveStatus.turn++;
         liveStatus.usage.turns = liveStatus.turn;
         liveStatus.output = "";
+        debugLog("info", "turn_start", { jobId, turn: liveStatus.turn });
         onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));
         break;
       }
       case "tool_execution_start": {
+        debugLog("info", "tool_start", {
+          jobId,
+          toolName: event.toolName,
+          args: event.args as Record<string, unknown>,
+        });
         setActiveToolDebounced({
           name: event.toolName,
           args: event.args as Record<string, unknown>,
@@ -471,10 +533,17 @@ export async function startSubagentJob(
         break;
       }
       case "tool_execution_end": {
+        debugLog("info", "tool_end", { jobId, toolName: liveStatus.activeTool?.name });
         setActiveToolDebounced(undefined);
         break;
       }
       case "turn_end": {
+        debugLog("info", "turn_end", {
+          jobId,
+          turn: liveStatus.turn,
+          outputLength: liveStatus.output.length,
+          activeTool: liveStatus.activeTool?.name ?? null,
+        });
         if (activeToolTimer) {
           clearTimeout(activeToolTimer);
           activeToolTimer = undefined;
@@ -484,8 +553,20 @@ export async function startSubagentJob(
         break;
       }
       case "message_update": {
-        if (event.assistantMessageEvent.type === "text_delta") {
-          liveStatus.output += event.assistantMessageEvent.delta;
+        const evt = event.assistantMessageEvent;
+        debugLog("info", "message_update", {
+          jobId,
+          updateType: evt.type,
+          ...(evt.type === "text_delta" && {
+            delta: evt.delta.slice(0, 200),
+            outputLength: liveStatus.output.length,
+          }),
+          ...(evt.type === "thinking_delta" && { delta: evt.delta.slice(0, 200) }),
+          ...(evt.type === "toolcall_delta" && { partial: String(evt.partial).slice(0, 200) }),
+          ...(evt.type === "toolcall_end" && { toolCallId: evt.toolCall?.id }),
+        });
+        if (evt.type === "text_delta") {
+          liveStatus.output += evt.delta;
           onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));
         }
         break;
@@ -499,28 +580,46 @@ export async function startSubagentJob(
     ? `${personaPrefix}You are a SEPARATE background sub-agent. Your ONLY job is the task below.\nThe conversation history above is CONTEXT ONLY — do NOT comment on it, do NOT role-play as the main assistant, do NOT describe the spawning process. Execute ONLY the task and return ONLY the result.\n\n## Conversation History (context only — do not respond to this)\n${contextText}\n\n## Your Task (respond ONLY to this)\n${task}`
     : `${personaPrefix}Task: ${task}`;
 
+  debugLog("info", "prompt_built", {
+    jobId,
+    hasContext: !!contextText,
+    contextLength: contextText?.length ?? 0,
+    taskLength: task.length,
+    persona: persona ?? null,
+    promptPreview: finalPrompt.slice(0, 500),
+  });
+
   // Launch the prompt in a promise chain (NOT awaited — returns immediately).
   // The jobPromise represents the full lifecycle: prompt → extraction → cleanup.
   const jobPromise = (async (): Promise<SubagentResult> => {
     let result: SubagentResult;
     try {
+      debugLog("info", "prompt_start", { jobId });
       await session.prompt(finalPrompt);
+      debugLog("info", "prompt_complete", { jobId });
 
       // Extract final assistant output
       const messages = session.agent.state.messages;
+      debugLog("info", "messages_extracted", {
+        jobId,
+        messageCount: messages.length,
+        messageRoles: messages.map((m) => m.role),
+        lastMessageContentType: typeof (messages[messages.length - 1] as any)?.content,
+        lastMessageContentIsArray: Array.isArray((messages[messages.length - 1] as any)?.content),
+      });
+
       let finalOutput = liveStatus.output;
       for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i];
+        debugLog("info", "message_check", {
+          jobId,
+          index: i,
+          role: msg.role,
+          contentType: typeof (msg as any).content,
+          contentIsArray: Array.isArray((msg as any).content),
+        });
         if (msg.role === "assistant") {
-          const textParts = msg.content
-            ?.filter(
-              (c: {
-                type: string;
-                text?: string;
-              }): c is { type: "text"; text: string } => c.type === "text",
-            )
-            .map((c) => c.text)
-            .join("\n");
+          const textParts = extractTextFromContent(msg.content);
           if (textParts) {
             finalOutput = textParts;
             break;
@@ -558,6 +657,13 @@ export async function startSubagentJob(
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+      debugLog("error", "subagent_error", {
+        jobId,
+        error: msg,
+        stack: stack ?? null,
+        errorName: err instanceof Error ? err.name : typeof err,
+      });
       result = {
         output: `Sub-agent crashed: ${msg}`,
         usage: {
@@ -573,6 +679,14 @@ export async function startSubagentJob(
         errorMessage: msg,
       };
     } finally {
+      debugLog("info", "job_complete", {
+        jobId,
+        outputLength: result.output.length,
+        output: result.output.slice(0, 200),
+        isError: result.isError,
+        errorMessage: result.errorMessage ?? null,
+        usage: result.usage,
+      });
       if (activeToolTimer) {
         clearTimeout(activeToolTimer);
         activeToolTimer = undefined;
@@ -581,6 +695,7 @@ export async function startSubagentJob(
         signal.removeEventListener("abort", handleAbort);
       if (unsubscribe) unsubscribe();
       session?.dispose();
+      debugLog("info", "session_disposed", { jobId });
     }
     return result;
   })();
