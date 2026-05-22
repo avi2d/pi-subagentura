@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 /**
- * Tmux Agent - Socket bridge to pi RPC mode
+ * Tmux Agent - Spawns pi session in tmux window with session persistence
  * 
- * This runs in a tmux window and:
- * 1. Connects to the Unix socket (parent-side)
- * 2. Spawns `pi --mode rpc` as a child process
- * 3. Bridges socket <-> pi stdin/stdout for persistent sessions
+ * Usage:
+ *   node tmux-agent-cli.js --socket <path> --cwd <dir> --task "<task>"
+ *
+ * Architecture:
+ * 1. Creates a session directory
+ * 2. Runs pi with the task via --continue
+ * 3. pi processes task and saves session
+ * 4. User can continue session with: pi --session-dir <sessionDir> --continue "next task"
+ * 5. Main agent gets result via socket (if still connected)
  */
 
 import net from "node:net";
-import { spawn } from "node:child_process";
 import { writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { spawn } from "node:child_process";
 
 const DEBUG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR || "/tmp/pi-subagentura-logs";
 
@@ -37,16 +42,19 @@ const args = process.argv.slice(2).reduce((acc, val, idx, arr) => {
 }, { socket: "", cwd: process.cwd(), task: "" });
 
 if (!args.socket) {
-  console.error("Usage: node tmux-agent-cli.js --socket <path> [--cwd <dir>] --task <task>");
+  console.error("Usage: node tmux-agent-cli.js --socket <path> --cwd <dir> --task <task>");
   process.exit(1);
 }
 
-debugLog("Starting tmux-agent-cli", { socket: args.socket, cwd: args.cwd });
+// Generate session directory path from socket path
+const sessionDir = args.socket + "_sessions";
+const sessionId = Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+
+debugLog("Starting tmux-agent-cli", { socket: args.socket, cwd: args.cwd, sessionDir, taskLength: args.task.length });
 
 let client = null;
-let piProcess = null;
 let output = "";
-let sessionActive = false;
+let done = false;
 
 function send(msg) {
   if (client && client.writable) {
@@ -54,8 +62,8 @@ function send(msg) {
   }
 }
 
-function sendProgress(output, turn = 0) {
-  send({ method: "progress", params: { output: output.slice(-500), turn } });
+function sendProgress(output) {
+  send({ method: "progress", params: { output: output.slice(-500) } });
 }
 
 function sendResult(output, usage = {}) {
@@ -72,8 +80,8 @@ client = net.createConnection(args.socket, () => {
   debugLog("Connected to socket");
   send({ method: "progress", params: { output: "[ready]" } });
   
-  // Now spawn pi in RPC mode
-  spawnPi();
+  // Create session directory and spawn pi
+  initSession();
 });
 
 client.on("data", (chunk) => {
@@ -82,27 +90,11 @@ client.on("data", (chunk) => {
     if (!line.trim()) continue;
     try {
       const msg = JSON.parse(line);
-      debugLog("Received from parent:", msg.method || msg.type, msg.id || "");
+      debugLog("Received from parent:", msg.method || msg.type);
       
-      if (msg.method === "task" || msg.type === "prompt") {
-        // Forward to pi stdin as RPC prompt
-        if (piProcess && piProcess.stdin) {
-          const task = msg.params?.task || msg.message;
-          const id = String(msg.id || Date.now());
-          debugLog("Sending to pi:", task?.substring(0, 50));
-          piProcess.stdin.write(JSON.stringify({ 
-            type: "prompt", 
-            id: id,
-            message: task 
-          }) + "\n");
-        }
-      } else if (msg.method === "abort" || msg.type === "abort") {
+      if (msg.method === "abort") {
         debugLog("Abort received");
-        if (piProcess) {
-          piProcess.stdin.write(JSON.stringify({ type: "abort", id: "abort" }) + "\n");
-        }
-      } else if (msg.method === "ping") {
-        send({ method: "pong", id: msg.id });
+        sendError("Task aborted");
       }
     } catch (e) {
       debugLog("Parse error:", e.message);
@@ -112,166 +104,113 @@ client.on("data", (chunk) => {
 
 client.on("close", () => {
   debugLog("Parent disconnected");
-  if (piProcess) {
-    piProcess.kill("SIGTERM");
-  }
-  process.exit(0);
 });
 
 client.on("error", (err) => {
   debugLog("Socket error:", err.message);
-  process.exit(1);
 });
 
-function spawnPi() {
-  debugLog("Spawning pi --mode rpc in", args.cwd);
-  
-  piProcess = spawn("pi", ["--mode", "rpc"], {
-    cwd: args.cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, PI_OFFLINE: "0" }
-  });
-
-  // Wait a bit for pi to initialize before we start responding to events
-  setTimeout(() => {
-    debugLog("pi initialization delay passed");
-  }, 1000);
-
-  piProcess.stderr.on("data", (chunk) => {
-    const text = chunk.toString();
-    // Parse RPC events from pi
-    const lines = text.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-        handlePiEvent(event);
-      } catch {
-        // Not JSON, might be regular stderr
-        debugLog("pi stderr:", text.slice(0, 200));
-      }
-    }
-  });
-
-  piProcess.stdout.on("data", (chunk) => {
-    const text = chunk.toString();
-    const lines = text.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-        handlePiEvent(event);
-      } catch (e) {
-        debugLog("stdout parse error:", e.message);
-      }
-    }
-  });
-
-  piProcess.on("close", (code) => {
-    debugLog("pi exited with code", code);
-    send({ method: "closed", params: { code } });
-    process.exit(0);
-  });
-
-  piProcess.on("error", (err) => {
-    debugLog("pi spawn error:", err.message);
-    sendError("Failed to spawn pi: " + err.message);
-    process.exit(1);
-  });
-}
-
-function handlePiEvent(event) {
-  debugLog("pi event:", event.type || event.method, event.id || "");
-  
-  // Handle extension_ui_request - send back a dummy response so pi doesn't hang
-  if (event.type === "extension_ui_request") {
-    debugLog("Extension UI request:", event.method, event.id);
-    // Send a response to unblock pi
-    try {
-      if (piProcess && piProcess.stdin) {
-        const response = JSON.stringify({
-          type: "extension_ui_response",
-          id: event.id,
-          cancelled: false
-        }) + "\n";
-        debugLog("Writing response to pi stdin, length:", response.length);
-        const written = piProcess.stdin.write(response);
-        debugLog("Write result:", written);
-        // Also try flushing
-        if (piProcess.stdin.flush) {
-          piProcess.stdin.flush();
-        }
-      } else {
-        debugLog("piProcess or stdin is null");
-      }
-    } catch (e) {
-      debugLog("Error writing to stdin:", e.message);
-    }
+function initSession() {
+  // Create session directory
+  try {
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    debugLog("Created session dir:", sessionDir);
+  } catch (e) {
+    debugLog("Failed to create session dir:", e.message);
+    sendError("Failed to create session: " + e.message);
     return;
   }
   
-  // Forward relevant events to parent
-  if (event.type === "response" && event.success) {
-    // Extract final output from agent_end or messages
-    const resultText = extractResult(event);
-    if (resultText !== null) {
-      sendResult(resultText);
-    }
-  } else if (event.type === "response" && !event.success) {
-    sendError(event.error || "Unknown error");
-  } else if (event.type === "agent_end") {
-    // Get last assistant message as result
-    const messages = event.messages || [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "assistant") {
-        const content = messages[i].content;
-        if (Array.isArray(content)) {
-          const text = content.filter(c => c.type === "text").map(c => c.text).join("");
-          if (text) {
-            sendResult(text);
-            return;
-          }
-        }
-        break;
-      }
-    }
-  } else if (event.type === "extension_ui_request") {
-    // Acknowledge extension UI requests
-    debugLog("Extension UI:", event.method);
-  } else if (event.type === "message_update") {
-    // Streaming update - send progress
-    const content = event.message?.content;
-    if (Array.isArray(content)) {
-      const text = content.filter(c => c.type === "text").map(c => c.text).join("");
-      if (text) {
-        sendProgress(text, event.message.role === "assistant" ? 1 : 0);
-      }
-    }
+  // Write session info
+  const sessionInfo = {
+    sessionId,
+    sessionDir,
+    task: args.task,
+    startedAt: new Date().toISOString()
+  };
+  
+  try {
+    writeFileSync(sessionDir + "/session_info.json", JSON.stringify(sessionInfo, null, 2));
+    debugLog("Wrote session info");
+  } catch (e) {
+    debugLog("Failed to write session info:", e.message);
   }
+  
+  // Send session info to parent
+  send({ method: "session", params: { sessionId, sessionDir } });
+  
+  // Spawn pi with --continue to process the task
+  runPiSession();
 }
 
-function extractResult(event) {
-  // Try to get result from various event formats
-  if (event.data?.output) return event.data.output;
-  if (event.messages) {
-    for (let i = event.messages.length - 1; i >= 0; i--) {
-      const msg = event.messages[i];
-      if (msg.role === "assistant") {
-        const content = msg.content;
-        if (Array.isArray(content)) {
-          const text = content.filter(c => c.type === "text").map(c => c.text).join("");
-          if (text) return text;
-        }
-      }
+function runPiSession() {
+  debugLog("Spawning pi --session-dir", sessionDir, "--continue with task");
+  
+  console.error("\n╔══════════════════════════════════════════════════════════════╗");
+  console.error("║  Pi Session: " + sessionId.slice(0, 20).padEnd(44) + "║");
+  console.error("║  Session dir: " + sessionDir.slice(0, 50).padEnd(44) + "║");
+  console.error("╠══════════════════════════════════════════════════════════════╣");
+  console.error("║  User can continue with:                                    ║");
+  console.error("║    pi --session-dir " + sessionDir.slice(0, 40).padEnd(46) + "║");
+  console.error("║    pi --session-dir " + sessionDir.slice(0, 40) + " --continue \"task\"" + "║");
+  console.error("╚══════════════════════════════════════════════════════════════╝\n");
+  
+  // Spawn pi with --continue to process the task
+  const piProcess = spawn("pi", ["--session-dir", sessionDir, "--continue", args.task], {
+    cwd: args.cwd,
+    stdio: ["inherit", "pipe", "pipe"]
+  });
+  
+  let lastProgress = 0;
+  
+  piProcess.stdout.on("data", (chunk) => {
+    const text = chunk.toString();
+    output += text;
+    
+    // Send progress every 500 chars
+    if (output.length - lastProgress > 500) {
+      sendProgress(output);
+      lastProgress = output.length;
     }
-  }
-  return null;
+    
+    // Write to terminal so user sees it
+    process.stdout.write(text);
+  });
+  
+  piProcess.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    // Check for completion notification
+    if (text.includes("Done after")) {
+      debugLog("Pi completed task");
+    }
+    process.stderr.write(text);
+  });
+  
+  piProcess.on("close", (code) => {
+    debugLog("pi exited with code", code);
+    
+    if (done) return;
+    done = true;
+    
+    if (code === 0) {
+      sendResult(output);
+    } else {
+      sendError("pi exited with code " + code);
+    }
+    
+    console.error("\n╔══════════════════════════════════════════════════════════════╗");
+    console.error("║  Task completed. Session saved.                              ║");
+    console.error("║  Continue with: pi --session-dir " + sessionDir.slice(0, 33) + " --continue" + "   ║");
+    console.error("╚══════════════════════════════════════════════════════════════╝\n");
+  });
+  
+  piProcess.on("error", (err) => {
+    debugLog("pi spawn error:", err.message);
+    sendError("Failed to spawn pi: " + err.message);
+  });
 }
 
 process.on("SIGTERM", () => {
   debugLog("SIGTERM received");
-  if (piProcess) piProcess.kill("SIGTERM");
   process.exit(0);
 });
-
-debugLog("Ready, waiting for connection...");
