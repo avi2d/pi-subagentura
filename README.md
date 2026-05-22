@@ -101,7 +101,7 @@ Best for:
 
 ### `tmux_spawn`
 
-Spawns an interactive pi session in a dedicated tmux window with session persistence. The user can continue chatting with the subagent after the initial task completes.
+Spawns an interactive pi session in a dedicated tmux window with socket-based IPC for real-time progress and completion notification.
 
 **Parameters:**
 
@@ -112,11 +112,12 @@ Spawns an interactive pi session in a dedicated tmux window with session persist
 
 **How it works:**
 
-1. Creates a session directory for persistence
-2. Spawns `pi --session-dir <dir> --continue "<task>"`
+1. Creates a Unix socket server for IPC
+2. Spawns tmux window running `pi --session-dir <dir> --continue "<task>"`
 3. User sees the pi TUI processing the task in real-time
-4. After task completes, session is saved
-5. User can continue the session with another pi command
+4. Progress streams back to main agent via socket
+5. After task completes, main agent receives result notification
+6. Session persists — user can continue with another pi command
 
 **Best for:**
 
@@ -140,7 +141,7 @@ The session persists, so you can continue from any terminal.
 
 ### `wezterm_spawn`
 
-Spawns an interactive pi session in a new Wezterm pane with session persistence. Similar to `tmux_spawn` but uses Wezterm's native CLI instead of tmux.
+Spawns an interactive pi session in a new Wezterm pane with socket-based IPC for real-time progress and completion notification. Same architecture as `tmux_spawn` but uses Wezterm's native CLI.
 
 **Parameters:**
 
@@ -151,11 +152,12 @@ Spawns an interactive pi session in a new Wezterm pane with session persistence.
 
 **How it works:**
 
-1. Creates a session directory
-2. Opens a new pane in Wezterm running `pi --session-dir <dir> --continue "<task>"`
+1. Creates a Unix socket server for IPC
+2. Spawns new Wezterm pane running `pi --session-dir <dir> --continue "<task>"`
 3. User sees the pi TUI in the new pane
-4. After task completes, session is saved
-5. User can continue the session from any terminal
+4. Progress streams back to main agent via socket
+5. After task completes, main agent receives result notification
+6. Session persists — user can continue with another pi command
 
 **Best for:**
 
@@ -168,6 +170,7 @@ Spawns an interactive pi session in a new Wezterm pane with session persistence.
 ```bash
 pi --session-dir <session-dir> --continue "next task"
 ```
+
 
 ## Async Workflow Tools
 
