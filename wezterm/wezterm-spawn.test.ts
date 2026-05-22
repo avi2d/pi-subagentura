@@ -27,7 +27,7 @@ describe("wezterm_spawn", () => {
     expect(call.name).toBe("wezterm_spawn");
     expect(call.label).toBe("Wezterm Agent");
     expect(call.description).toContain("Wezterm pane");
-    expect(call.description).toContain("session persistence");
+    expect(call.description).toContain("socket-based IPC");
     
     // Check parameters
     expect(call.parameters).toBeDefined();
@@ -52,8 +52,8 @@ describe("wezterm_spawn", () => {
     registerWeztermSpawn(mockPi);
     
     const call = mockPi.registerTool.mock.calls[0][0];
-    expect(call.description).toContain("session persistence");
-    expect(call.description).toContain("continue chatting");
+    expect(call.description).toContain("socket-based IPC");
+    expect(call.description).toContain("Session persists");
   });
 });
 
