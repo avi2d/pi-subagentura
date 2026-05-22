@@ -180,14 +180,19 @@ function handlePiEvent(event) {
   
   // Handle extension_ui_request - send back a dummy response so pi doesn't hang
   if (event.type === "extension_ui_request") {
-    debugLog("Extension UI request:", event.method);
+    debugLog("Extension UI request:", event.method, event.id);
     // Send a response to unblock pi
-    if (piProcess && piProcess.stdin) {
-      piProcess.stdin.write(JSON.stringify({
+    if (piProcess && piProcess.stdin && piProcess.stdin.writable) {
+      const response = JSON.stringify({
         type: "extension_ui_response",
         id: event.id,
         cancelled: false
-      }) + "\n");
+      }) + "\n";
+      debugLog("Sending response, writable:", piProcess.stdin.writable);
+      piProcess.stdin.write(response);
+      debugLog("Response sent");
+    } else {
+      debugLog("Cannot send response - stdin not ready");
     }
     return;
   }
