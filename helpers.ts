@@ -105,43 +105,6 @@ export interface SubagentLiveStatus {
 }
 
 
-// ── RPC Types ────────────────────────────────────────────────────────
-
-/** Options for RPC agent_call */
-export interface RpcOptions {
-  /** Timeout in ms (default: 60000) */
-  timeout?: number;
-  /** Abort signal for cancellation */
-  signal?: AbortSignal;
-  /** Stream progress updates via onUpdate callback */
-  streamProgress?: boolean;
-  /** Tracks recursion depth for circular call detection (default: 3) */
-  callDepth?: number;
-}
-
-/** Result of an RPC agent_call */
-export interface RpcResult {
-  output: string;
-  usage: SubagentResult["usage"];
-  model?: string;
-  isError: boolean;
-  errorMessage?: string;
-  /** Duration of the RPC call in ms */
-  duration: number;
-}
-
-/** Parameters for agent_call tool */
-export interface RpcCallParams {
-  /** Name of the registered agent to call */
-  target: string;
-  /** Task to delegate to the agent */
-  task: string;
-  /** Optional: which capability to invoke (discovery metadata only - no routing) */
-  method?: string;
-  /** RPC options (timeout, signal, streamProgress, callDepth) */
-  options?: RpcOptions;
-}
-
 
 // ── Async Job Types ─────────────────────────────────────────────────
 
@@ -149,11 +112,8 @@ export type JobStatus = "running" | "done" | "error" | "cancelled";
 
 /** Notification delivery mode for async subagent completion */
 export type NotifyOnComplete = "notify" | "inject";
-
 export interface JobState {
   id: string;
-  /** Job type: 'subagent' | 'rpc'. Defaults to 'subagent' for backward compat. */
-  type?: "subagent" | "rpc";
   status: JobStatus;
   liveStatus: SubagentLiveStatus;
   result?: SubagentResult;
@@ -169,10 +129,6 @@ export interface JobState {
   resultRetrieved?: boolean;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
-  /** RPC-specific: options passed to agent_call */
-  rpcOptions?: RpcOptions;
-  /** RPC-specific: metadata about the RPC call */
-  rpcMeta?: { target: string; method?: string; callDepth: number };
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -202,55 +158,6 @@ declare global {
   var __piSubagenturaPiRef: unknown; // ExtensionAPI ref — set in subagent.ts factory
 }
 
-// Initialize the global pi ref
-if (!g.__piSubagenturaPiRef) {
-  g.__piSubagenturaPiRef = undefined;
-  }
-
-// ── Call Depth Tracking ─────────────────────────────────────────────────
-
-/** Maximum RPC nesting depth before rejecting (prevents circular calls) */
-export const MAX_CALL_DEPTH = 5;
-
-if (!(g as any).__piSubagenturaCallDepth) {
-  (g as any).__piSubagenturaCallDepth = 0;
-}
-
-/**
- * Get the current call depth for RPC calls.
- * Resets to 0 on session_shutdown.
- */
-export function getCallDepth(): number {
-  return (g as any).__piSubagenturaCallDepth as number;
-}
-
-/**
- * Increment call depth and return new value.
- * Throws if MAX_CALL_DEPTH exceeded.
- */
-export function incrementCallDepth(): number {
-  const current = (g as any).__piSubagenturaCallDepth as number;
-  if (current >= MAX_CALL_DEPTH) {
-    throw new Error(`RPC call depth limit exceeded (${MAX_CALL_DEPTH}). Circular RPC detected.`);
-  }
-  (g as any).__piSubagenturaCallDepth = current + 1;
-  return (g as any).__piSubagenturaCallDepth;
-}
-
-/**
- * Decrement call depth (call after RPC completes).
- */
-export function decrementCallDepth(): void {
-  const current = (g as any).__piSubagenturaCallDepth as number;
-  (g as any).__piSubagenturaCallDepth = Math.max(0, current - 1);
-}
-
-/**
- * Reset call depth to 0 (call on session_shutdown).
- */
-export function resetCallDepth(): void {
-  (g as any).__piSubagenturaCallDepth = 0;
-}
 
 /** Jobs persist indefinitely — no automatic expiration */
 export const JOB_CLEANUP_TTL_MS = 0;

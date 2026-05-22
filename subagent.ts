@@ -30,6 +30,7 @@ import type { Model } from "@mariozechner/pi-ai";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
   buildLiveUpdate,
+  debugLog,
   formatUsage,
   SubagentLiveStatus,
   SubagentResult,
@@ -39,20 +40,10 @@ import {
   pruneCompletedJobs,
   scheduleJobCleanup,
   startSubagentJob,
-  debugLog,
-  resetCallDepth,
   type JobState,
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
-import {
-  registerAgent,
-  getAgent,
-  listAgents,
-  unregisterAgent,
-  hasAgent,
-  type AgentRegistration,
-} from "./agent-registry";
 import { createSocketServer, type SocketServer } from "./tmux-agent";
 import { registerTmuxSpawn } from "./tmux-spawn";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
@@ -1371,8 +1362,6 @@ export default function (pi: ExtensionAPI) {
 
     jobRegistry.clear();
     g2.__piSubagenturaPiRef = undefined;
-    g2.__piSubagenturaInjectCount = 0;
-    resetCallDepth();
   });
 }
 
