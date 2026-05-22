@@ -132,6 +132,11 @@ function spawnPi() {
     env: { ...process.env, PI_OFFLINE: "0" }
   });
 
+  // Wait a bit for pi to initialize before we start responding to events
+  setTimeout(() => {
+    debugLog("pi initialization delay passed");
+  }, 1000);
+
   piProcess.stderr.on("data", (chunk) => {
     const text = chunk.toString();
     // Parse RPC events from pi
@@ -182,17 +187,25 @@ function handlePiEvent(event) {
   if (event.type === "extension_ui_request") {
     debugLog("Extension UI request:", event.method, event.id);
     // Send a response to unblock pi
-    if (piProcess && piProcess.stdin && piProcess.stdin.writable) {
-      const response = JSON.stringify({
-        type: "extension_ui_response",
-        id: event.id,
-        cancelled: false
-      }) + "\n";
-      debugLog("Sending response, writable:", piProcess.stdin.writable);
-      piProcess.stdin.write(response);
-      debugLog("Response sent");
-    } else {
-      debugLog("Cannot send response - stdin not ready");
+    try {
+      if (piProcess && piProcess.stdin) {
+        const response = JSON.stringify({
+          type: "extension_ui_response",
+          id: event.id,
+          cancelled: false
+        }) + "\n";
+        debugLog("Writing response to pi stdin, length:", response.length);
+        const written = piProcess.stdin.write(response);
+        debugLog("Write result:", written);
+        // Also try flushing
+        if (piProcess.stdin.flush) {
+          piProcess.stdin.flush();
+        }
+      } else {
+        debugLog("piProcess or stdin is null");
+      }
+    } catch (e) {
+      debugLog("Error writing to stdin:", e.message);
     }
     return;
   }
