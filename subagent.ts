@@ -39,6 +39,7 @@ import {
   pruneCompletedJobs,
   scheduleJobCleanup,
   startSubagentJob,
+  debugLog,
   type JobState,
   type JobStatus,
   type NotifyOnComplete,
@@ -508,6 +509,19 @@ export default function (pi: ExtensionAPI) {
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "subagent_with_context",
+        toolCallId: _toolCallId,
+        async: params.async ?? false,
+        taskLength: params.task?.length ?? 0,
+        persona: params.persona ?? null,
+        model: params.model ?? null,
+        cwd: params.cwd ?? ctx.cwd,
+        notifyOnComplete: params.notifyOnComplete ?? null,
+        maxAge: params.maxAge ?? null,
+      });
+
+
       // Gather conversation history
       const branch = ctx.sessionManager.getBranch();
       const messages = branch
@@ -730,6 +744,19 @@ export default function (pi: ExtensionAPI) {
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "subagent_isolated",
+        toolCallId: _toolCallId,
+        async: params.async ?? false,
+        taskLength: params.task?.length ?? 0,
+        persona: params.persona ?? null,
+        model: params.model ?? null,
+        cwd: params.cwd ?? ctx.cwd,
+        notifyOnComplete: params.notifyOnComplete ?? null,
+        maxAge: params.maxAge ?? null,
+      });
+
+
       // ── Async path ──
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
@@ -906,6 +933,13 @@ export default function (pi: ExtensionAPI) {
     parameters: StatusParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "get_subagent_status",
+        toolCallId: _toolCallId,
+        jobId: params.jobId,
+      });
+
+
       const job = jobRegistry.get(params.jobId);
 
       if (!job) {
@@ -983,6 +1017,13 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
       const job = jobRegistry.get(params.jobId);
+      debugLog("info", "tool_call", {
+        toolName: "get_subagent_result",
+        toolCallId: _toolCallId,
+        jobId: params.jobId,
+      });
+
+
 
       if (!job) {
         return {
@@ -1077,6 +1118,13 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const job = jobRegistry.get(params.jobId);
+      debugLog("info", "tool_call", {
+        toolName: "cancel_subagent",
+        toolCallId: _toolCallId,
+        jobId: params.jobId,
+      });
+
+
 
       if (!job) {
         return {
@@ -1199,6 +1247,14 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const modelRegistry = ctx.modelRegistry;
+      debugLog("info", "tool_call", {
+        toolName: "list_available_models",
+        toolCallId: _toolCallId,
+        authOnly: params.authOnly ?? true,
+        filter: params.filter ?? null,
+      });
+
+
       const models =
         params.authOnly !== false
           ? modelRegistry.getAvailable()
@@ -1262,6 +1318,11 @@ export default function (pi: ExtensionAPI) {
 
     async execute() {
       const before = jobRegistry.size;
+      debugLog("info", "tool_call", {
+        toolName: "prune_subagent_jobs",
+      });
+
+
       const removed = pruneCompletedJobs();
       const after = jobRegistry.size;
 
