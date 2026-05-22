@@ -10,7 +10,7 @@ import { writeFileSync, existsSync, mkdirSync } from "node:fs";
 const DEBUG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR || "/tmp/pi-subagentura-logs";
 
 function debugLog(...args) {
-  const msg = "[" + new Date().toISOString() + "] " + args.join(" ");
+  const msg = "[" + new Date().toISOString() + "] " + args.map(a => typeof a === "object" ? JSON.stringify(a) : a).join(" ");
   console.error("[debug] " + msg);
   try {
     if (!existsSync(DEBUG_DIR)) {
@@ -19,7 +19,7 @@ function debugLog(...args) {
     const logFile = DEBUG_DIR + "/tmux-agent-" + process.pid + ".log";
     writeFileSync(logFile, msg + "\n", { flag: "a" });
   } catch (e) {
-    console.error("[debug] File log error: " + e.message);
+    // ignore
   }
 }
 
@@ -35,7 +35,7 @@ if (!args.socket) {
   process.exit(1);
 }
 
-debugLog("Starting", { socket: args.socket, cwd: args.cwd, taskLength: args.task.length });
+debugLog("Starting", args.socket, args.cwd, args.task.substring(0, 20));
 
 let client = null;
 let piProcess = null;
@@ -61,7 +61,7 @@ function sendError(message) {
   send({ method: "error", params: { message }, id: currentId });
 }
 
-debugLog("Connecting to socket", args.socket);
+debugLog("Connecting to", args.socket);
 client = net.createConnection(args.socket, () => {
   debugLog("Connected");
   send({ method: "progress", params: { output: "[ready]" }, id: null });
@@ -73,9 +73,10 @@ client.on("data", (chunk) => {
     if (!line.trim()) continue;
     try {
       const msg = JSON.parse(line);
+      debugLog("Received", msg.method);
       if (msg.method === "task" && msg.params?.task) {
         currentId = msg.id;
-        debugLog("Got task", { taskLength: msg.params.task.length });
+        debugLog("Task:", typeof msg.params.task, String(msg.params.task).substring(0, 30));
         runTask(msg.params.task);
       } else if (msg.method === "abort") {
         aborted = true;
@@ -103,8 +104,9 @@ client.on("error", (err) => {
 });
 
 function runTask(task) {
+  debugLog("Running task:", task);
   const piArgs = ["-p", task];
-  debugLog("Spawning pi", piArgs);
+  debugLog("Spawning pi", piArgs.join(" "));
 
   piProcess = spawn("pi", piArgs, {
     cwd: args.cwd,
@@ -122,11 +124,11 @@ function runTask(task) {
   });
 
   piProcess.stderr.on("data", (chunk) => {
-    debugLog("pi stderr", chunk.toString().slice(0, 200));
+    debugLog("pi stderr", chunk.toString().slice(0, 100));
   });
 
   piProcess.on("close", (code) => {
-    debugLog("pi exited", { code, aborted });
+    debugLog("pi done", code);
     if (aborted) return;
     if (code === 0) {
       sendResult(output);
@@ -149,4 +151,4 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-debugLog("Ready, waiting for task...");
+debugLog("Ready");
