@@ -462,10 +462,16 @@ export async function startSubagentJob(
         liveStatus.turn++;
         liveStatus.usage.turns = liveStatus.turn;
         liveStatus.output = "";
+        debugLog("info", "turn_start", { jobId, turn: liveStatus.turn });
         onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));
         break;
       }
       case "tool_execution_start": {
+        debugLog("info", "tool_start", {
+          jobId,
+          toolName: event.toolName,
+          args: event.args as Record<string, unknown>,
+        });
         setActiveToolDebounced({
           name: event.toolName,
           args: event.args as Record<string, unknown>,
@@ -473,10 +479,12 @@ export async function startSubagentJob(
         break;
       }
       case "tool_execution_end": {
+        debugLog("info", "tool_end", { jobId, toolName: liveStatus.activeTool?.name });
         setActiveToolDebounced(undefined);
         break;
       }
       case "turn_end": {
+        debugLog("info", "turn_end", { jobId, turn: liveStatus.turn });
         if (activeToolTimer) {
           clearTimeout(activeToolTimer);
           activeToolTimer = undefined;
@@ -552,6 +560,7 @@ export async function startSubagentJob(
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      debugLog("error", "subagent_error", { jobId, error: msg });
       result = {
         output: `Sub-agent crashed: ${msg}`,
         usage: {
@@ -567,6 +576,13 @@ export async function startSubagentJob(
         errorMessage: msg,
       };
     } finally {
+      debugLog("info", "job_complete", {
+        jobId,
+        outputLength: result.output.length,
+        isError: result.isError,
+        errorMessage: result.errorMessage ?? null,
+        usage: result.usage,
+      });
       if (activeToolTimer) {
         clearTimeout(activeToolTimer);
         activeToolTimer = undefined;
