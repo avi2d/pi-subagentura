@@ -6,6 +6,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { getModel, getProviders } from "@mariozechner/pi-ai";
@@ -129,6 +130,8 @@ export interface JobState {
   resultRetrieved?: boolean;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
+  /** Session directory path for session persistence */
+  sessionDir?: string;
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -317,6 +320,8 @@ export interface StartSubagentJobParams {
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
+  /** Directory for session storage. If provided, pi will save the session here. */
+  sessionDir?: string;
 }
 
 export interface StartSubagentJobResult {
@@ -351,6 +356,7 @@ export async function startSubagentJob(
     onUpdate,
     defaultModel,
     parentModelRegistry,
+    sessionDir,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -362,8 +368,7 @@ export async function startSubagentJob(
   const authStorage = AuthStorage.create();
   const modelRegistry = ModelRegistry.create(authStorage);
 
-  // Resolve model: exact match only, fallback to default
-  // Uses parent's modelRegistry to find extension-added models (e.g. minimax)
+  // Resolve model early (needed for sessionDir case too)
   const targetModel = resolveModel(modelOverride, defaultModel, parentModelRegistry);
   const modelLabel = targetModel
     ? `${targetModel.provider}/${targetModel.id}`
@@ -380,6 +385,124 @@ export async function startSubagentJob(
       `Requested model "${modelOverride}" resolved to ${modelLabel ?? "none"}. ` +
       `Available models:\n${modelList || "  (none)"}\n` +
       `Use list_available_models to discover more.`;
+  }
+
+  // ── Session Directory Path: spawn pi subprocess ─────────────────────
+  if (sessionDir) {
+    // Ensure session directory exists
+    if (!existsSync(sessionDir)) {
+      mkdirSync(sessionDir, { recursive: true });
+    }
+
+    // Build the prompt
+    const personaPrefix = persona ? `${persona}\n\n` : "";
+    const finalPrompt = contextText
+      ? `${personaPrefix}You are a SEPARATE background sub-agent. Your ONLY job is the task below.\nThe conversation history above is CONTEXT ONLY — do NOT comment on it, do NOT role-play as the main assistant, do NOT describe the spawning process. Execute ONLY the task and return ONLY the result.\n\n## Conversation History (context only — do not respond to this)\n${contextText}\n\n## Your Task (respond ONLY to this)\n${task}`
+      : `${personaPrefix}Task: ${task}`;
+
+    // Build the pi command
+    const piCmd = ["pi", `--session-dir`, sessionDir, "--continue", finalPrompt];
+
+    debugLog("info", "session_spawning", {
+      jobId,
+      sessionDir,
+      command: piCmd.join(" "),
+    });
+
+    // Spawn pi subprocess
+    let proc: ReturnType<typeof spawn>;
+    let procClosed = false;
+    let stdoutData = "";
+    let stderrData = "";
+
+    const procPromise = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+      proc = spawn(piCmd[0], piCmd.slice(1), {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      proc.stdout?.on("data", (data: Buffer) => {
+        stdoutData += data.toString();
+      });
+
+      proc.stderr?.on("data", (data: Buffer) => {
+        stderrData += data.toString();
+      });
+
+      proc.on("close", (code, sig) => {
+        procClosed = true;
+        resolve({ code, signal: sig });
+      });
+
+      proc.on("error", (err) => {
+        debugLog("error", "session_spawn_error", { jobId, error: err.message });
+        if (!procClosed) {
+          procClosed = true;
+          resolve({ code: 1, signal: null });
+        }
+      });
+    });
+
+    // Abort handler for sessionDir case
+    let handleAbort: (() => void) | undefined;
+    if (signal) {
+      handleAbort = () => {
+        debugLog("warn", "job_abort", { jobId });
+        if (proc && !procClosed) {
+          proc.kill("SIGTERM");
+        }
+      };
+      if (signal.aborted) {
+        handleAbort();
+      } else {
+        signal.addEventListener("abort", handleAbort);
+      }
+    }
+
+    // Build jobPromise for sessionDir case
+    const jobPromise = (async (): Promise<SubagentResult> => {
+      let result: SubagentResult;
+      try {
+        const { code, signal: sig } = await procPromise;
+        debugLog("info", "session_complete", { jobId, code, signal: sig });
+
+        if (code === 0 || sig === null) {
+          result = {
+            output: stdoutData || "(no output)",
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+            model: modelLabel,
+            isError: false,
+          };
+        } else {
+          result = {
+            output: `Sub-agent exited with code ${code}: ${stderrData || stdoutData}`,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+            model: modelLabel,
+            isError: true,
+            errorMessage: `Exited with code ${code}`,
+          };
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        result = {
+          output: `Sub-agent crashed: ${msg}`,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          model: modelLabel,
+          isError: true,
+          errorMessage: msg,
+        };
+      } finally {
+        if (signal && handleAbort) {
+          signal.removeEventListener("abort", handleAbort);
+        }
+        debugLog("info", "session_dir_job_complete", { jobId });
+      }
+      return result;
+    })();
+
+    // Return early with sessionDir case
+    // @ts-expect-error — session is AgentSession | null for sessionDir case
+    return { jobId, jobPromise, session: null, liveStatus, modelLabel, modelWarning };
   }
 
   let handleAbort: (() => void) | undefined;

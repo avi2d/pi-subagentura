@@ -287,6 +287,12 @@ const BaseParams = Type.Object({
         "Optional TTL in milliseconds for completed job retention. Jobs persist indefinitely if omitted.",
     }),
   ),
+  sessionDir: Type.Optional(
+    Type.String({
+      description:
+        "Directory for session storage. If provided, pi will save the session here and you can later continue it with: pi --session-dir <dir> --continue",
+    }),
+  ),
 });
 
 const StatusParams = Type.Object({
@@ -561,6 +567,7 @@ export default function (pi: ExtensionAPI) {
             defaultModel: ctx.model,
             maxAge: params.maxAge,
             parentModelRegistry: ctx.modelRegistry,
+            sessionDir: params.sessionDir,
           });
         const jobState: JobState = {
           id: jobId,
@@ -578,6 +585,7 @@ export default function (pi: ExtensionAPI) {
                 : undefined,
           notificationDelivered: false,
           maxAge: params.maxAge,
+          sessionDir: params.sessionDir,
         };
 
         jobRegistry.set(jobId, jobState);
