@@ -43,6 +43,14 @@ import {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
+import {
+  registerAgent,
+  getAgent,
+  listAgents,
+  unregisterAgent,
+  hasAgent,
+  type AgentRegistration,
+} from "./agent-registry";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
