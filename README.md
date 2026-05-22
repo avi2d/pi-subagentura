@@ -13,6 +13,7 @@ A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
 - `tmux_spawn` — spawn an agent in a dedicated tmux window with socket-based IPC
+- `wezterm_spawn` — spawn an agent in a new Wezterm pane with session persistence
 
 The sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready.
 
@@ -136,6 +137,37 @@ pi --session-dir /tmp/pi-<uid>/agent-<uuid>.sock_sessions --continue "next task"
 The session persists, so you can continue from any terminal.
 
 ![Tmux demo](tmux-demo.png)
+
+### `wezterm_spawn`
+
+Spawns an interactive pi session in a new Wezterm pane with session persistence. Similar to `tmux_spawn` but uses Wezterm's native CLI instead of tmux.
+
+**Parameters:**
+
+- `task` — required task for the wezterm agent
+- `name` — optional pane label hint
+- `cwd` — optional working directory
+- `timeout` — timeout in ms (default 60000)
+
+**How it works:**
+
+1. Creates a session directory
+2. Opens a new pane in Wezterm running `pi --session-dir <dir> --continue "<task>"`
+3. User sees the pi TUI in the new pane
+4. After task completes, session is saved
+5. User can continue the session from any terminal
+
+**Best for:**
+
+- Wezterm users who want native terminal integration
+- visible execution with session persistence
+- spawning a subagent you want to continue chatting with later
+
+**Continuing the session:**
+
+```bash
+pi --session-dir <session-dir> --continue "next task"
+```
 
 ## Async Workflow Tools
 
