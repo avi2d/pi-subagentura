@@ -51,8 +51,10 @@ import {
   hasAgent,
   type AgentRegistration,
 } from "./agent-registry";
+import { createSocketServer, type SocketServer } from "./tmux-agent";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
+import { randomBytes as randomBytesImport } from "node:crypto";
 
 // ── Footer Status Key ───────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
