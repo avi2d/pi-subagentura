@@ -47,7 +47,8 @@ import {
 import { createSocketServer, type SocketServer } from "./tmux/tmux-agent";
 import { registerTmuxSpawn } from "./tmux/tmux-spawn";
 import { registerWeztermSpawn } from "./wezterm/wezterm-spawn";
-import { Text, truncateToWidth, SelectList, Container } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { showSessionPicker, renderSessionPickerResult, SessionPickerParams } from "./session-picker";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
 
@@ -1357,18 +1358,12 @@ export default function (pi: ExtensionAPI) {
     label: "List Sessions",
     description: [
       "Scan session directories for saved pi sessions and pick one to continue.",
-      "Shows a picker UI to select a session, then returns the session path.",
-      "You can continue the session with: pi --session <path> --continue",
+      "Shows a picker UI with saved sessions and running subagent jobs.",
+      "Press ↓ at the bottom to switch to running jobs section.",
       "",
       "sessionDirs: Array of directories to scan. Defaults to common locations.",
     ].join("\n"),
-    parameters: Type.Object({
-      sessionDirs: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Directories to scan for session files. Defaults to common pi session locations.",
-        }),
-      ),
-    }),
+    parameters: SessionPickerParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       debugLog("info", "tool_call", {
@@ -1376,133 +1371,41 @@ export default function (pi: ExtensionAPI) {
         sessionDirs: params.sessionDirs ?? ["default"],
       });
 
-      // Default session directories to scan
-      const dirsToScan = params.sessionDirs ?? [
-        process.env.PI_CODING_AGENT_SESSION_DIR ?? "",
-        `${process.env.HOME}/.pi/agent/sessions`,
-      ].filter(Boolean);
+      const result = await showSessionPicker(ctx, params.sessionDirs);
 
-      interface SessionInfo {
-        path: string;
-        timestamp: string;
-        taskPreview: string;
-      }
-
-      // Scan for session files
-      const sessions: SessionInfo[] = [];
-      const { readdirSync, readFileSync, existsSync } = await import("node:fs");
-      const { resolve } = await import("node:path");
-
-      for (const dir of dirsToScan) {
-        if (!existsSync(dir)) continue;
-        try {
-          const files = readdirSync(dir);
-          for (const file of files) {
-            if (!file.endsWith(".jsonl")) continue;
-            const fullPath = resolve(dir, file);
-            try {
-              const content = readFileSync(fullPath, "utf-8");
-              const firstLine = content.split("\n")[0];
-              const meta = JSON.parse(firstLine);
-              // Extract timestamp from filename or metadata
-              const timestamp = meta.timestamp
-                ? new Date(meta.timestamp).toLocaleString()
-                : file.replace(/\.jsonl$/, "").slice(0, 16);
-              // Try to get first user message as task preview
-              let taskPreview = "Unknown task";
-              try {
-                const lines = content.split("\n");
-                for (const line of lines) {
-                  if (line.includes('"role":"user"')) {
-                    const msgMatch = line.match(/"text":"([^"]+)"/);
-                    if (msgMatch) {
-                      taskPreview = msgMatch[1].slice(0, 60);
-                      break;
-                    }
-                  }
-                }
-              } catch { /* ignore */ }
-
-              sessions.push({
-                path: fullPath,
-                timestamp,
-                taskPreview,
-              });
-            } catch { /* skip invalid files */ }
-          }
-        } catch { /* skip inaccessible dirs */ }
-      }
-
-      // Sort by timestamp (newest first)
-      sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-
-      if (sessions.length === 0) {
+      if (!result) {
         return {
-          content: [{ type: "text", text: "No sessions found in the specified directories." }],
-          details: { sessions: [] },
+          content: [{ type: "text", text: "No sessions found and no running jobs." }],
+          details: { sessions: [], runningJobs: [] },
         };
       }
 
-      // Build SelectList items
-      const items = sessions.map((s) => ({
-        value: s.path,
-        label: `${s.timestamp} — ${s.taskPreview}`,
-        description: s.path,
-      }));
-
-      // Show picker using ctx.ui.custom
-      const selected = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-        const container = new Container();
-
-        // Title
-        container.addChild(
-          new Text(theme.fg("accent", theme.bold("Select a Session to Continue")), 1, 0),
-        );
-        container.addChild(new Text(theme.fg("dim", `${sessions.length} session${sessions.length === 1 ? "" : "s"} found`), 1, 0));
-
-        // SelectList
-        const selectList = new SelectList(items, Math.min(items.length, 10), {
-          selectedPrefix: (t) => theme.fg("accent", t),
-          selectedText: (t) => theme.fg("accent", t),
-          description: (t) => theme.fg("muted", t),
-          scrollInfo: (t) => theme.fg("dim", t),
-          noMatch: (t) => theme.fg("warning", t),
-        });
-        selectList.onSelect = (item) => done(item.value);
-        selectList.onCancel = () => done(null);
-        container.addChild(selectList);
-
-        // Help text
-        container.addChild(
-          new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel"), 1, 0),
-        );
-
-        return {
-          render: (w: number) => container.render(w),
-          invalidate: () => container.invalidate(),
-          handleInput: (data: string) => {
-            selectList.handleInput(data);
-            tui.requestRender();
-          },
-        };
-      }, { overlay: true });
-
-      if (selected) {
+      if (result.type === "session") {
         return {
           content: [
             {
               type: "text",
-              text: `Selected session: ${selected}\n\nContinue with: pi --session "${selected}" --continue`,
+              text: `Selected session: ${result.path}\n\nContinue with: pi --session "${result.path}" --continue`,
             },
           ],
-          details: { selectedPath: selected },
+          details: { selectedPath: result.path, type: "session" },
         };
-      } else {
+      } else if (result.type === "job") {
         return {
-          content: [{ type: "text", text: "No session selected." }],
-          details: { cancelled: true },
+          content: [
+            {
+              type: "text",
+              text: `Running job: ${result.jobId}\n\nUse get_subagent_status({ jobId: "${result.jobId}" }) to check progress.\nUse get_subagent_result({ jobId: "${result.jobId}" }) to get output when done.`,
+            },
+          ],
+          details: { jobId: result.jobId, status: result.status, type: "job" },
         };
       }
+
+      return {
+        content: [{ type: "text", text: "No selection." }],
+        details: { cancelled: true },
+      };
     },
 
     renderCall(_args, theme) {
@@ -1510,18 +1413,15 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme, _context) {
-      const details = result.details as Record<string, unknown> | undefined;
+      const details = result.details as any;
       if (details?.cancelled) {
-        return new Text(theme.fg("dim", "No session selected"), 0, 0);
+        return new Text(theme.fg("dim", "No selection"), 0, 0);
       }
-      const path = details?.selectedPath as string | undefined;
-      if (path) {
-        const truncated = truncateToWidth(path, 50);
-        return new Text(
-          theme.fg("success", `✓ Selected: ${truncated}`),
-          0,
-          0,
-        );
+      if (details?.type === "session") {
+        return new Text(theme.fg("success", `✓ Session: ${truncateToWidth(details.selectedPath, 50)}`), 0, 0);
+      }
+      if (details?.type === "job") {
+        return new Text(theme.fg("warning", `⚡ Job: ${(details.jobId as string).slice(0, 8)}`), 0, 0);
       }
       return new Text(theme.fg("dim", "No sessions found"), 0, 0);
     },
