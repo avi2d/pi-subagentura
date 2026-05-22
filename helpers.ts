@@ -6,6 +6,8 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { getModel, getProviders } from "@mariozechner/pi-ai";
 import type { Model } from "@mariozechner/pi-ai";
 
@@ -20,6 +22,49 @@ import {
   SessionManager,
   type AgentSession,
 } from "@mariozechner/pi-coding-agent";
+
+// ── Debug Logging ─────────────────────────────────────────────────
+
+const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
+  ? resolve(process.env.SUBAGENT_DEBUG_LOG_DIR)
+  : resolve(process.cwd(), ".pi/subagent-logs");
+
+export function debugLog(level: string, event: string, data: Record<string, unknown> = {}) {
+  try {
+    if (!existsSync(DEBUG_LOG_DIR)) {
+      mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+    }
+    const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      ...data,
+    }) + "\n";
+    const fileName = resolve(DEBUG_LOG_DIR, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    appendFileSync(fileName, entry);
+  } catch {
+    // Silently fail to avoid polluting output
+  }
+}
+
+export function extractTextFromContent(content: unknown): string {
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is { type: "text"; text: string } =>
+        typeof c === "object" && c !== null && c.type === "text" && typeof c.text === "string"
+      )
+      .map((c) => c.text)
+      .join("\n");
+  }
+  if (typeof content === "string") {
+    return content;
+  }
+  debugLog("warn", "unexpected_content_type", {
+    contentType: typeof content,
+    content: String(String(content).slice(0, 200)),
+  });
+  return "";
+}
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -468,15 +513,7 @@ export async function startSubagentJob(
       for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i];
         if (msg.role === "assistant") {
-          const textParts = msg.content
-            ?.filter(
-              (c: {
-                type: string;
-                text?: string;
-              }): c is { type: "text"; text: string } => c.type === "text",
-            )
-            .map((c) => c.text)
-            .join("\n");
+          const textParts = extractTextFromContent(msg.content);
           if (textParts) {
             finalOutput = textParts;
             break;
