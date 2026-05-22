@@ -211,7 +211,9 @@ export function registerTmuxSpawn(pi: ExtensionAPI): void {
         }
 
         // Send task to the tmux agent
+        console.error("[tmux-spawn] Calling sendTask with:", params.task);
         socketServer.sendTask(params.task);
+        console.error("[tmux-spawn] sendTask called");
 
         // Wait for result
         const result = await new Promise<{
