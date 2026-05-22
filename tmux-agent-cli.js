@@ -178,6 +178,20 @@ function spawnPi() {
 function handlePiEvent(event) {
   debugLog("pi event:", event.type || event.method, event.id || "");
   
+  // Handle extension_ui_request - send back a dummy response so pi doesn't hang
+  if (event.type === "extension_ui_request") {
+    debugLog("Extension UI request:", event.method);
+    // Send a response to unblock pi
+    if (piProcess && piProcess.stdin) {
+      piProcess.stdin.write(JSON.stringify({
+        type: "extension_ui_response",
+        id: event.id,
+        cancelled: false
+      }) + "\n");
+    }
+    return;
+  }
+  
   // Forward relevant events to parent
   if (event.type === "response" && event.success) {
     // Extract final output from agent_end or messages
