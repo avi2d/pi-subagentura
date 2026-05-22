@@ -1,6 +1,6 @@
 {
   "name": "pi-subagentura",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Public Pi package that adds in-process sub-agents via the SDK",
   "main": "subagent.ts",
   "type": "module",
