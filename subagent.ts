@@ -52,6 +52,7 @@ import {
   type AgentRegistration,
 } from "./agent-registry";
 import { createSocketServer, type SocketServer } from "./tmux-agent";
+import { registerTmuxSpawn } from "./tmux-spawn";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
@@ -1307,6 +1308,9 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
   });
+
+  // ── Tmux spawn tool ──────────────────────────────────────────────
+  registerTmuxSpawn(pi);
 
   // ── Session shutdown: abort all jobs and clear registry ──────────
   (pi as any).on?.("session_shutdown", () => {

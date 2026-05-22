@@ -127,6 +127,11 @@ export interface SocketServer {
 	sendError(message: string, id: number | string | null): void;
 
 	/**
+	 * Register a handler for incoming messages from the subagent.
+	 */
+	onMessage: MessageHandler | null;
+
+	/**
 	 * Close the server, socket, and cleanup resources.
 	 * Removes the socket file and readiness marker.
 	 */
@@ -302,6 +307,8 @@ export async function createSocketServer(
 		get readyFilePath() {
 			return readyFilePath;
 		},
+
+		onMessage: messageHandler as MessageHandler | null,
 
 		sendProgress(output: string, tool?: string, turn: number = 1): void {
 			sendMessage({
