@@ -58,6 +58,44 @@ export interface SubagentLiveStatus {
   usage: SubagentResult["usage"];
 }
 
+
+// ── RPC Types ────────────────────────────────────────────────────────
+
+/** Options for RPC agent_call */
+export interface RpcOptions {
+  /** Timeout in ms (default: 60000) */
+  timeout?: number;
+  /** Abort signal for cancellation */
+  signal?: AbortSignal;
+  /** Stream progress updates via onUpdate callback */
+  streamProgress?: boolean;
+  /** Tracks recursion depth for circular call detection (default: 3) */
+  callDepth?: number;
+}
+
+/** Result of an RPC agent_call */
+export interface RpcResult {
+  output: string;
+  usage: SubagentResult["usage"];
+  model?: string;
+  isError: boolean;
+  errorMessage?: string;
+  /** Duration of the RPC call in ms */
+  duration: number;
+}
+
+/** Parameters for agent_call tool */
+export interface RpcCallParams {
+  /** Name of the registered agent to call */
+  target: string;
+  /** Task to delegate to the agent */
+  task: string;
+  /** Optional: which capability to invoke (discovery metadata only - no routing) */
+  method?: string;
+  /** RPC options (timeout, signal, streamProgress, callDepth) */
+  options?: RpcOptions;
+}
+
 // ── Async Job Types ─────────────────────────────────────────────────
 
 export type JobStatus = "running" | "done" | "error" | "cancelled";
@@ -67,6 +105,8 @@ export type NotifyOnComplete = "notify" | "inject";
 
 export interface JobState {
   id: string;
+  /** Job type: 'subagent' | 'rpc'. Defaults to 'subagent' for backward compat. */
+  type?: "subagent" | "rpc";
   status: JobStatus;
   liveStatus: SubagentLiveStatus;
   result?: SubagentResult;
@@ -82,6 +122,10 @@ export interface JobState {
   resultRetrieved?: boolean;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
+  /** RPC-specific: options passed to agent_call */
+  rpcOptions?: RpcOptions;
+  /** RPC-specific: metadata about the RPC call */
+  rpcMeta?: { target: string; method?: string; callDepth: number };
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
