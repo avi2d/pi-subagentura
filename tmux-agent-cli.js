@@ -1,21 +1,28 @@
 #!/usr/bin/env node
 /**
  * Tmux Agent - Simple socket client for pi subprocess communication
- *
- * Usage:
- *   node tmux-agent-cli.js --socket <path> [--cwd <dir>] --task "<task>"
- *
- * This runs in a tmux window and:
- * 1. Connects to the Unix socket (parent-side)
- * 2. Waits for task message
- * 3. Spawns `pi "<task>"` as child process
- * 4. Streams output via socket messages
  */
 
 import net from "node:net";
 import { spawn } from "node:child_process";
+import { writeFileSync, existsSync, mkdirSync } from "node:fs";
 
-// Simple argument parsing
+const DEBUG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR || "/tmp/pi-subagentura-logs";
+
+function debugLog(...args) {
+  const msg = "[" + new Date().toISOString() + "] " + args.join(" ");
+  console.error("[debug] " + msg);
+  try {
+    if (!existsSync(DEBUG_DIR)) {
+      mkdirSync(DEBUG_DIR, { recursive: true, mode: 0o700 });
+    }
+    const logFile = DEBUG_DIR + "/tmux-agent-" + process.pid + ".log";
+    writeFileSync(logFile, msg + "\n", { flag: "a" });
+  } catch (e) {
+    console.error("[debug] File log error: " + e.message);
+  }
+}
+
 const args = process.argv.slice(2).reduce((acc, val, idx, arr) => {
   if (val === "--socket" && idx + 1 < arr.length) acc.socket = arr[++idx];
   else if (val === "--cwd" && idx + 1 < arr.length) acc.cwd = arr[++idx];
@@ -27,6 +34,8 @@ if (!args.socket) {
   console.error("Usage: node tmux-agent.js --socket <path> [--cwd <dir>] --task \"<task>\"");
   process.exit(1);
 }
+
+debugLog("Starting", { socket: args.socket, cwd: args.cwd, taskLength: args.task.length });
 
 let client = null;
 let piProcess = null;
@@ -52,10 +61,9 @@ function sendError(message) {
   send({ method: "error", params: { message }, id: currentId });
 }
 
-// Connect to parent socket
-console.error(`[tmux-agent] Connecting to ${args.socket}`);
+debugLog("Connecting to socket", args.socket);
 client = net.createConnection(args.socket, () => {
-  console.error("[tmux-agent] Connected");
+  debugLog("Connected");
   send({ method: "progress", params: { output: "[ready]" }, id: null });
 });
 
@@ -67,83 +75,78 @@ client.on("data", (chunk) => {
       const msg = JSON.parse(line);
       if (msg.method === "task" && msg.params?.task) {
         currentId = msg.id;
-        const task = msg.params.task;
-        console.error(`[tmux-agent] Got task: ${task.slice(0, 50)}...`);
-        runTask(task);
+        debugLog("Got task", { taskLength: msg.params.task.length });
+        runTask(msg.params.task);
       } else if (msg.method === "abort") {
-        console.error("[tmux-agent] Abort received");
         aborted = true;
-        if (piProcess) {
-          piProcess.kill("SIGTERM");
-          setTimeout(() => piProcess && piProcess.kill("SIGKILL"), 3000);
-        }
+        if (piProcess) piProcess.kill("SIGTERM");
         sendError("Task aborted");
         process.exit(0);
       } else if (msg.method === "ping") {
         send({ method: "pong", id: msg.id });
       }
     } catch (e) {
-      console.error("[tmux-agent] Parse error:", e.message);
+      debugLog("Parse error", e.message);
     }
   }
 });
 
 client.on("close", () => {
-  console.error("[tmux-agent] Parent disconnected");
+  debugLog("Parent disconnected");
   if (piProcess) piProcess.kill("SIGTERM");
   process.exit(0);
 });
 
 client.on("error", (err) => {
-  console.error("[tmux-agent] Socket error:", err.message);
+  debugLog("Socket error", err.message);
   process.exit(1);
 });
 
 function runTask(task) {
-  const piArgs = ["--no-input", task];
-  console.error(`[tmux-agent] Spawning: pi ${piArgs.join(" ")}`);
+  const piArgs = ["-p", task];
+  debugLog("Spawning pi", piArgs);
 
   piProcess = spawn("pi", piArgs, {
     cwd: args.cwd,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  let turnCount = 0;
   let lastProgress = 0;
 
   piProcess.stdout.on("data", (chunk) => {
-    const text = chunk.toString();
-    output += text;
-    // Send progress every 500 chars
+    output += chunk.toString();
     if (output.length - lastProgress > 500) {
-      sendProgress(output, turnCount);
+      sendProgress(output);
       lastProgress = output.length;
     }
   });
 
   piProcess.stderr.on("data", (chunk) => {
-    // Could pipe to parent, but tmux window already shows it
-    console.error("[pi] " + chunk.toString().slice(0, 200));
+    debugLog("pi stderr", chunk.toString().slice(0, 200));
   });
 
   piProcess.on("close", (code) => {
+    debugLog("pi exited", { code, aborted });
     if (aborted) return;
     if (code === 0) {
       sendResult(output);
     } else {
-      sendError(`pi exited with code ${code}`);
+      sendError("pi exited with code " + code);
     }
     process.exit(0);
   });
 
   piProcess.on("error", (err) => {
-    sendError(`Failed to spawn pi: ${err.message}`);
+    debugLog("Spawn error", err.message);
+    sendError("Failed to spawn pi: " + err.message);
     process.exit(1);
   });
 }
 
-// Keep alive for signals
 process.on("SIGTERM", () => {
+  debugLog("SIGTERM");
   if (piProcess) piProcess.kill("SIGTERM");
   process.exit(0);
 });
+
+debugLog("Ready, waiting for task...");
