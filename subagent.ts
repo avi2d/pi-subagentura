@@ -44,8 +44,8 @@ import {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
-import { createSocketServer, type SocketServer } from "./tmux-agent";
-import { registerTmuxSpawn } from "./tmux-spawn";
+import { createSocketServer, type SocketServer } from "./tmux/tmux-agent";
+import { registerTmuxSpawn } from "./tmux/tmux-spawn";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
