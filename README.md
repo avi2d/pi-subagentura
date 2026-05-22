@@ -12,6 +12,8 @@ A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
+- `tmux_spawn` — spawn an agent in a dedicated tmux window with socket-based IPC
+
 The sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready.
 
 ## Why use it?
@@ -22,6 +24,7 @@ The sub-agents run inside the current Pi process, stream live progress back to t
 - Run sub-agents in the background while continuing the main conversation
 - Poll, collect, or cancel background jobs on demand
 - Get live previews of running sub-agents (current turn, active tool, usage)
+- Spawn agents in visible tmux windows for full transparency into execution
 
 ![Sub-agent demo](working.png)
 
@@ -95,7 +98,29 @@ Best for:
 - avoiding context contamination from the parent session
 - background analysis without polluting the main conversation
 
-### Async Workflow Tools
+### `tmux_spawn`
+
+Spawns a sub-agent in a dedicated tmux window with Unix domain socket IPC for parent↔subagent communication. Provides full visibility into agent execution via terminal.
+
+Parameters:
+
+- `task` — required task for the tmux agent
+- `name` — optional tmux window name hint
+- `cwd` — optional working directory
+- `timeout` — timeout in ms (default 60000)
+
+Best for:
+
+- when you need to see exactly what the agent is doing in real-time
+- long-running tasks where you want visibility
+- debugging agent behavior
+- transparency into tool calls and output
+
+The agent runs in a separate tmux window — you can switch to it and watch the execution live. Socket IPC streams progress back to the parent tool call.
+
+![Tmux demo](tmux-demo.png)
+
+## Async Workflow Tools
 
 When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Use these tools to manage async jobs:
 
@@ -125,7 +150,7 @@ Parameters:
 
 #### `prune_subagent_jobs`
 
-Remove all completed and failed subagent jobs from the registry. Running and cancelled jobs are preserved.
+Remove all completed and failed jobs from the registry. Running and cancelled jobs are preserved.
 
 ### `list_available_models`
 
@@ -135,13 +160,46 @@ Parameters:
 
 - `filter` — optional substring filter for provider or model name
 - `authOnly` — if true (default), only return models with configured auth
+
+## Debug Logging
+
+Enable structured debug logging by setting the `SUBAGENT_DEBUG_LOG_DIR` environment variable:
+
+```bash
+SUBAGENT_DEBUG_LOG_DIR=/tmp/subagent-logs pi "run some task"
+```
+
+Logs are written to `debug-YYYY-MM-DD.jsonl` files in the specified directory. Each entry contains:
+
+- `timestamp` — ISO timestamp
+- `level` — info/warn/error
+- `event` — event type (e.g., `tool_call`, `session_created`, `prompt_start`)
+- Additional event-specific fields (jobId, model, cwd, etc.)
+
+Events logged:
+
+| Event | Description |
+|-------|-------------|
+| `tool_call` | A subagent tool was called |
+| `session_creating` | About to create an agent session |
+| `session_created` | Session created successfully |
+| `prompt_start` | Prompt execution started |
+| `prompt_complete` | Prompt execution completed |
+| `turn_start` | New turn started |
+| `turn_end` | Turn ended |
+| `tool_start` | Tool execution started |
+| `tool_end` | Tool execution completed |
+| `job_complete` | Job finished (success or error) |
+| `job_abort` | Job was aborted |
+
 ## Example prompts
 
-- “Use a sub-agent to review this change and list risks.”
-- “Use an isolated sub-agent to propose a README outline for this repo.”
-- “Spawn a context-aware sub-agent to continue debugging while we keep planning here.”
-- “Run a sub-agent in the background to run the test suite, then notify me when done.”
-- “Spawn two isolated async sub-agents to review this code from different angles, then collect both results.”
+- "Use a sub-agent to review this change and list risks."
+- "Use an isolated sub-agent to propose a README outline for this repo."
+- "Spawn a context-aware sub-agent to continue debugging while we keep planning here."
+- "Run a sub-agent in the background to run the test suite, then notify me when done."
+- "Spawn two isolated async sub-agents to review this code from different angles, then collect both results."
+- "Use tmux_spawn to refactor this module — I want to watch what it does."
 
 ## Development
 
