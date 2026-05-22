@@ -127,6 +127,13 @@ export interface SocketServer {
 	sendError(message: string, id: number | string | null): void;
 
 	/**
+	 * Send a task request to the subagent.
+	 * @param task - The task description
+	 * @param id - Request ID
+	 */
+	sendTask(task: string, id?: number | string | null): void;
+
+	/**
 	 * Register a handler for incoming messages from the subagent.
 	 */
 	onMessage: MessageHandler | null;
@@ -338,6 +345,15 @@ export async function createSocketServer(
 					code: -32000,
 					message,
 				},
+				id,
+			});
+		},
+
+		sendTask(task: string, id: number | string | null = null): void {
+			sendMessage({
+				jsonrpc: "2.0",
+				method: "task",
+				params: { task } as unknown as Record<string, unknown>,
 				id,
 			});
 		},

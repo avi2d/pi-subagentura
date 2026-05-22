@@ -210,6 +210,9 @@ export function registerTmuxSpawn(pi: ExtensionAPI): void {
           };
         }
 
+        // Send task to the tmux agent
+        socketServer.sendTask(params.task);
+
         // Wait for result
         const result = await new Promise<{
           output: string;
