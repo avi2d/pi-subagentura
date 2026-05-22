@@ -27,9 +27,10 @@ import {
 
 const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
   ? resolve(process.env.SUBAGENT_DEBUG_LOG_DIR)
-  : resolve(process.cwd(), ".pi/subagent-logs");
+  : undefined;
 
 export function debugLog(level: string, event: string, data: Record<string, unknown> = {}) {
+  if (!DEBUG_LOG_DIR) return;
   try {
     if (!existsSync(DEBUG_LOG_DIR)) {
       mkdirSync(DEBUG_LOG_DIR, { recursive: true });
