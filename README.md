@@ -100,23 +100,40 @@ Best for:
 
 ### `tmux_spawn`
 
-Spawns a sub-agent in a dedicated tmux window with Unix domain socket IPC for parent↔subagent communication. Provides full visibility into agent execution via terminal.
+Spawns an interactive pi session in a dedicated tmux window with session persistence. The user can continue chatting with the subagent after the initial task completes.
 
-Parameters:
+**Parameters:**
 
 - `task` — required task for the tmux agent
 - `name` — optional tmux window name hint
 - `cwd` — optional working directory
 - `timeout` — timeout in ms (default 60000)
 
-Best for:
+**How it works:**
+
+1. Creates a session directory for persistence
+2. Spawns `pi --session-dir <dir> --continue "<task>"`
+3. User sees the pi TUI processing the task in real-time
+4. After task completes, session is saved
+5. User can continue the session with another pi command
+
+**Best for:**
 
 - when you need to see exactly what the agent is doing in real-time
 - long-running tasks where you want visibility
 - debugging agent behavior
-- transparency into tool calls and output
+- transparent execution in a dedicated window
+- spawning a subagent you want to continue chatting with later
 
-The agent runs in a separate tmux window — you can switch to it and watch the execution live. Socket IPC streams progress back to the parent tool call.
+**Continuing the session:**
+
+After the initial task completes, the tmux window shows instructions for continuing:
+
+```bash
+pi --session-dir /tmp/pi-<uid>/agent-<uuid>.sock_sessions --continue "next task"
+```
+
+The session persists, so you can continue from any terminal.
 
 ![Tmux demo](tmux-demo.png)
 
