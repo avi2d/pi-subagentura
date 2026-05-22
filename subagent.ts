@@ -40,6 +40,7 @@ import {
   scheduleJobCleanup,
   startSubagentJob,
   debugLog,
+  resetCallDepth,
   type JobState,
   type JobStatus,
   type NotifyOnComplete,
@@ -637,27 +638,7 @@ export default function (pi: ExtensionAPI) {
                 /* ctx stale */
               }
             }
-          },
-          (error) => {
-            // Promise rejection handler — deliver failure notification
-            if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
-              deliverNotification(jobState, {
-                output: `Sub-agent crashed: ${error instanceof Error ? error.message : String(error)}`,
-                usage: {
-                  input: 0,
-                  output: 0,
-                  cacheRead: 0,
-                  cacheWrite: 0,
-                  cost: 0,
-                  turns: 0,
-                },
-                model: undefined,
-                isError: true,
-                errorMessage:
-                  error instanceof Error ? error.message : String(error),
-              });
-            }
-          },
+          }
         );
 
         return {
@@ -1391,6 +1372,7 @@ export default function (pi: ExtensionAPI) {
     jobRegistry.clear();
     g2.__piSubagenturaPiRef = undefined;
     g2.__piSubagenturaInjectCount = 0;
+    resetCallDepth();
   });
 }
 

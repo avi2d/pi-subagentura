@@ -142,6 +142,7 @@ export interface RpcCallParams {
   options?: RpcOptions;
 }
 
+
 // ── Async Job Types ─────────────────────────────────────────────────
 
 export type JobStatus = "running" | "done" | "error" | "cancelled";
@@ -204,6 +205,51 @@ declare global {
 // Initialize the global pi ref
 if (!g.__piSubagenturaPiRef) {
   g.__piSubagenturaPiRef = undefined;
+  }
+
+// ── Call Depth Tracking ─────────────────────────────────────────────────
+
+/** Maximum RPC nesting depth before rejecting (prevents circular calls) */
+export const MAX_CALL_DEPTH = 5;
+
+if (!(g as any).__piSubagenturaCallDepth) {
+  (g as any).__piSubagenturaCallDepth = 0;
+}
+
+/**
+ * Get the current call depth for RPC calls.
+ * Resets to 0 on session_shutdown.
+ */
+export function getCallDepth(): number {
+  return (g as any).__piSubagenturaCallDepth as number;
+}
+
+/**
+ * Increment call depth and return new value.
+ * Throws if MAX_CALL_DEPTH exceeded.
+ */
+export function incrementCallDepth(): number {
+  const current = (g as any).__piSubagenturaCallDepth as number;
+  if (current >= MAX_CALL_DEPTH) {
+    throw new Error(`RPC call depth limit exceeded (${MAX_CALL_DEPTH}). Circular RPC detected.`);
+  }
+  (g as any).__piSubagenturaCallDepth = current + 1;
+  return (g as any).__piSubagenturaCallDepth;
+}
+
+/**
+ * Decrement call depth (call after RPC completes).
+ */
+export function decrementCallDepth(): void {
+  const current = (g as any).__piSubagenturaCallDepth as number;
+  (g as any).__piSubagenturaCallDepth = Math.max(0, current - 1);
+}
+
+/**
+ * Reset call depth to 0 (call on session_shutdown).
+ */
+export function resetCallDepth(): void {
+  (g as any).__piSubagenturaCallDepth = 0;
 }
 
 /** Jobs persist indefinitely — no automatic expiration */

@@ -12,6 +12,82 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { SocketServer } from "./tmux-agent";
 import { createSocketServer } from "./tmux-agent";
 
+// ── Process Exit Cleanup ─────────────────────────────────────────────────
+
+/** Track active tmux windows and sockets for cleanup on abnormal exit */
+const activeWindows = new Set<string>();
+const activeSockets = new Set<string>();
+
+/**
+ * Register a tmux window name and socket path for cleanup.
+ * Called when a spawn successfully starts.
+ */
+function trackWindow(socketPath: string, windowName: string): void {
+  activeSockets.add(socketPath);
+  activeWindows.add(windowName);
+}
+
+/**
+ * Unregister a tmux window and socket after successful cleanup.
+ * Called when a spawn completes normally.
+ */
+function untrackWindow(socketPath: string, windowName: string): void {
+  activeSockets.delete(socketPath);
+  activeWindows.delete(windowName);
+}
+
+// ── Process exit handlers ────────────────────────────────────────────────
+
+// Only register exit handlers once per process
+let exitHandlersRegistered = false;
+
+function registerExitHandlers(): void {
+  if (exitHandlersRegistered) return;
+  exitHandlersRegistered = true;
+
+  const cleanup = async () => {
+    // Kill all tracked tmux windows
+    for (const win of activeWindows) {
+      try {
+        await new Promise<void>((resolve) => {
+          execFile("tmux", ["kill-window", "-t", win], (err) => resolve());
+        });
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+    activeWindows.clear();
+
+    // Close all tracked sockets
+    for (const path of activeSockets) {
+      try {
+        // Import dynamically to avoid circular deps at module load
+        const { rm } = await import("node:fs/promises");
+        await rm(path, { force: true });
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+    activeSockets.clear();
+  };
+
+  // Clean up on abnormal process exit
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
+  process.on("SIGHUP", cleanup);
+
+  // Also clean up on uncaught exceptions
+  process.on("uncaughtException", (err) => {
+    console.error("[tmux-spawn] uncaught exception:", err.message);
+    cleanup().finally(() => process.exit(1));
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    console.error("[tmux-spawn] unhandled rejection:", reason);
+    cleanup().finally(() => process.exit(1));
+  });
+}
+
 const TmuxSpawnParams = Type.Object({
   task: Type.String({ description: "Task for the tmux agent" }),
   name: Type.Optional(Type.String({ description: "tmux window name hint" })),
@@ -25,8 +101,15 @@ function isTmuxAvailable(): Promise<boolean> {
   });
 }
 
-function killTmuxWindow(windowName: string): void {
-  execFile("tmux", ["kill-window", "-t", windowName], () => {});
+function killTmuxWindow(windowName: string): Promise<void> {
+  return new Promise((resolve) => {
+    execFile("tmux", ["kill-window", "-t", windowName], (err) => {
+      if (err) {
+        console.error(`[tmux-spawn] failed to kill window ${windowName}: ${err.message}`);
+      }
+      resolve();
+    });
+  });
 }
 
 async function waitForReady(readyPath: string, timeoutMs = 10000): Promise<boolean> {
@@ -71,10 +154,16 @@ export function registerTmuxSpawn(pi: ExtensionAPI): void {
         try {
           await socketServer?.close();
         } catch {}
-        killTmuxWindow(windowName);
+        await killTmuxWindow(windowName);
+        if (socketServer) {
+          untrackWindow(socketServer.socketPath, windowName);
+        }
       };
 
       try {
+        // Register exit handlers once
+        registerExitHandlers();
+
         // Create socket server (parent-side listener)
         socketServer = await createSocketServer(windowName, targetCwd, async (msg) => {
           if (msg.method === "progress" && msg.params?.output) {
@@ -84,6 +173,9 @@ export function registerTmuxSpawn(pi: ExtensionAPI): void {
             });
           }
         });
+
+        // Track for cleanup on abnormal exit
+        trackWindow(socketServer.socketPath, windowName);
 
         // Build command to run in tmux window
         // The tmux-agent-cli.js is a CommonJS script that:

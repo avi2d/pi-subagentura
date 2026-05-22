@@ -340,9 +340,9 @@ describe("notifyOnComplete", () => {
           expect(msgOpts).toMatchObject({ deliverAs: "followUp" });
         });
 
-        it("delivers notification when job promise rejects", async () => {
+        it("delivers notification when job completes with error result", async () => {
           const toolDef = getToolDef();
-          const jobId = `both-reject-${label}`;
+          const jobId = `both-error-${label}`;
           const control = createJobControl();
           mockStartSubagentJob.mockImplementationOnce(() =>
             mockJobResult(jobId, control.jobPromise),
@@ -356,7 +356,8 @@ describe("notifyOnComplete", () => {
             getCtx(),
           );
 
-          control.reject(new Error("Connection timeout"));
+          // In production, jobPromise never rejects - it resolves with an error result
+          control.resolve(ERROR_RESULT);
 
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
@@ -364,7 +365,7 @@ describe("notifyOnComplete", () => {
 
           const msg = sentMessageAt(api, 0);
           expect(msg.content).toContain("❌");
-          expect(msg.content).toContain("Connection timeout");
+          expect(msg.content).toContain(ERROR_RESULT.errorMessage!);
           expect(msg.details).toMatchObject({ jobId, mode: "notify" });
         });
       });
