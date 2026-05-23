@@ -153,8 +153,8 @@ export function registerWeztermSpawn(pi: ExtensionAPI): void {
             [
               "cli",
               "spawn",
-              "--class",
-              paneId,
+              "--cwd",
+              targetCwd,
               "--",
               "bash",
               "-c",
