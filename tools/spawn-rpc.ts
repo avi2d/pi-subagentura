@@ -136,6 +136,13 @@ export async function spawnRpcSubagent(params: {
 
    rpcRegistry.register(entry);
 
+   // 7. Set up ready timeout BEFORE waiting for socket (ready is sent immediately on startup)
+   const readyTimeout = setTimeout(() => {
+      console.warn(`Subagent ${jobId} did not send ready notification within 5s`);
+      pendingReadyTimeouts.delete(jobId);
+   }, 5000);
+   pendingReadyTimeouts.set(jobId, readyTimeout);
+
 
    // Wait for socket to be ready (max 5 seconds)
    const waitForSocket = async (path: string, timeout = 5000): Promise<void> => {
@@ -197,13 +204,6 @@ export async function spawnRpcSubagent(params: {
 
    // 9. Start heartbeat monitoring
    rpcRouter.startHeartbeat(jobId);
-
-   // 10. Set ready timeout - will be cleared by the onReady callback above
-   const readyTimeout = setTimeout(() => {
-      console.warn(`Subagent ${jobId} did not send ready notification within 5s`);
-      pendingReadyTimeouts.delete(jobId);
-   }, 5000);
-   pendingReadyTimeouts.set(jobId, readyTimeout);
 
    // Register in jobRegistry for notification delivery
    const jobState: JobState = {
