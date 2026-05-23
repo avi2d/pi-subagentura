@@ -525,6 +525,13 @@ describe("startSubagentJob with sessionDir", () => {
     await expect(
       startSubagentJob({
         task: "test task",
+        persona: undefined,
+        modelOverride: undefined,
+        cwd: process.cwd(),
+        contextText: null,
+        signal: undefined,
+        onUpdate: undefined,
+        defaultModel: undefined,
         sessionDir: testSessionDir,
       }),
     ).resolves.toBeDefined();

@@ -42,6 +42,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint --fix .",
     "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
@@ -52,9 +54,12 @@
     "typebox": "*"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
+    "eslint": "^10.4.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.4",
     "vitest": "^3.0.0"
   }
 }
