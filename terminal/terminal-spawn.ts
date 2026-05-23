@@ -111,10 +111,11 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
 
       const jobId = generateJobId();
 
-      // Create job state (session will be null for terminal spawns)
+      // For terminal spawns, we don't accumulate terminal output in liveStatus
+      // since the user is watching the terminal directly. We just track minimal status.
       const liveStatus: SubagentLiveStatus = {
         turn: 0,
-        output: "",
+        output: "(watch terminal for real-time output)",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
       };
 
@@ -140,12 +141,8 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
 
       try {
         // Create socket server for IPC
-        socketServer = await createSocketServer(windowId, targetCwd, async (msg) => {
-          if (msg.method === "progress" && msg.params?.output) {
-            // Update liveStatus with progress
-            liveStatus.output += msg.params.output as string;
-          }
-        });
+        // Note: For terminal spawns, we don't accumulate output in liveStatus
+        // since user watches terminal directly. Progress messages are ignored.
 
         // Build the pi command
         const helperPath = require.resolve(`../${backend}/${backend}-agent-cli.js`);
@@ -216,8 +213,9 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
                 isError: true,
                 errorMessage: msg.params?.message,
               });
-            } else if (msg.method === "progress" && msg.params?.output) {
-              liveStatus.output += msg.params.output as string;
+            } else if (msg.method === "progress" && msg.params?.turn !== undefined) {
+              // Track turn count from progress if available
+              liveStatus.turn = msg.params.turn as number;
             }
           };
         });
