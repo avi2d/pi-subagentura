@@ -1539,11 +1539,13 @@ export default function (pi: ExtensionAPI) {
                   content: [
                     {
                       type: "text",
-                      text: `No session file (.jsonl) found in: ${sessionPath}\n\nThis may mean:\n` +
-                        `1. The async agent is still starting up (wait a few seconds)\n` +
-                        `2. The session hasn't been saved yet (pi saves periodically)\n` +
-                        `3. The job completed but session wasn't persisted\n\n` +
-                        `Use get_subagent_status to check if the job is still running.`,
+                      text: `No session file (.jsonl) found in: ${sessionPath}\n\n` +
+                        `Note: pi only saves the session file when the session ends or periodically.\n` +
+                        `For running async agents, the file won't exist until completion.\n\n` +
+                        `connect_to_session works for:\n` +
+                        `  - Completed sessions\n` +
+                        `  - Sessions started manually with a specific --session path\n\n` +
+                        `For running async agents, use get_subagent_status to monitor progress.`,
                     },
                   ],
                   details: { error: "no session file found", path: sessionPath },
