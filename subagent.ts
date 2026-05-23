@@ -1533,11 +1533,14 @@ export default function (pi: ExtensionAPI) {
           }
         }
         // Open wezterm new window with pi session
-        // Use wezterm start to launch a new wezterm instance with pi
-        // This is more reliable than 'cli spawn' which can have PATH issues
+        // Using cli spawn --new-window with direct pi path
         const piFullPath = "/Users/applesucks/Library/pnpm/pi";
         const args = [
-          "start",
+          "cli",
+          "spawn",
+          "--new-window",
+          "--cwd",
+          dirname(actualSessionPath) || process.cwd(),
           "--",
           piFullPath,
           "--session",
