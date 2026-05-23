@@ -73,7 +73,7 @@ export class TmuxBridge {
          throw new Error(`Invalid jobId: contains unsafe characters`);
       }
 
-      const sessionName = `pi-subagentura:${safeJobId}`;
+      const sessionName = `pi-subagentura-${safeJobId}`;
       const entryScript = config.entryScriptPath;
       const socketPath = path.join(this.socketDir, `${safeJobId}.sock`);
 
@@ -151,7 +151,7 @@ export class TmuxBridge {
       try {
          const { stdout } = await execAsync('tmux list-sessions -F \'#{session_name}\'');
          const allSessions = stdout.trim().split('\n').filter(Boolean);
-         return allSessions.filter(name => name.startsWith('pi-subagentura:'));
+         return allSessions.filter(name => name.startsWith('pi-subagentura-'));
       } catch {
          return [];
       }
@@ -163,7 +163,7 @@ export class TmuxBridge {
       const zombies: string[] = [];
 
       for (const session of tmuxSessions) {
-         const jobId = session.replace('pi-subagentura:', '');
+         const jobId = session.replace('pi-subagentura-', '');
          if (!registryJobIds.has(jobId)) {
             zombies.push(session);
          }
@@ -235,7 +235,7 @@ export class TmuxBridge {
       const detached: string[] = [];
 
       for (const jobId of registryJobIds) {
-         const sessionName = `pi-subagentura:${jobId}`;
+         const sessionName = `pi-subagentura-${jobId}`;
          if (!tmuxSessions.includes(sessionName)) {
             detached.push(jobId);
          }
