@@ -72,6 +72,7 @@ export async function spawnRpcSubagent(params: {
    }
 
    // 2. Generate jobId
+   console.error(`[spawn-rpc] Starting with task: ${params.task?.slice(0, 50)}...`);
    const jobId = generateId();
 
    // 3. Ensure socket directory exists atomically with 0700 permissions
@@ -117,6 +118,7 @@ export async function spawnRpcSubagent(params: {
       task: params.task,
       persona: params.persona
    });
+   console.error(`[spawn-rpc] Tmux session created: ${sessionId}, socket: ${socketPath}`);
 
    // 7. Register service
    const exposedTools = params.expose || ['agent.prompt', 'agent.status', 'tools.list', 'tools.execute'];

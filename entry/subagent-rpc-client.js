@@ -21,6 +21,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 var net = __toESM(require("net"), 1);
+var import_child_process = require("child_process");
+const ENV_TASK = process.env.PI_TASK || "";
+const ENV_PERSONA = process.env.PI_PERSONA || "";
 function parseArgs() {
   const args = process.argv.slice(2);
   let socket = "";
@@ -159,7 +162,7 @@ class RpcClient {
     }
   }
   async sendNotification(method, params) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const id = Math.random().toString(36).substring(7);
       const request = {
         jsonrpc: "2.0",
@@ -169,7 +172,8 @@ class RpcClient {
       };
       this.pendingRequests.set(id, {
         resolve: () => resolve(),
-        reject
+        reject: () => resolve()
+        // Don't fail notifications
       });
       this.send(request);
       setTimeout(() => {
@@ -189,6 +193,44 @@ class RpcClient {
       this.socket = null;
     }
   }
+}
+async function executePiTask(task, persona, cwd) {
+  return new Promise((resolve) => {
+    const args = [];
+    if (persona) {
+      const escapedPersona = persona.replace(/'/g, "'\\''");
+      args.push(`--persona='${escapedPersona}'`);
+    }
+    const escapedTask = task.replace(/'/g, "'\\''");
+    args.push(`'${escapedTask}'`);
+    log("info", "spawning-pi", { cwd, args: args.join(" ") });
+    const pi = (0, import_child_process.spawn)("pi", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TERM: "xterm" }
+    });
+    let stdout = "";
+    let stderr = "";
+    pi.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+    pi.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+    pi.on("close", (code) => {
+      const output = stdout || (stderr ? `Errors:
+${stderr}` : "(no output)");
+      const isError = code !== 0;
+      if (isError && stderr) {
+        log("warn", "pi-exited-with-error", { exitCode: code, stderr: stderr.slice(0, 500) });
+      }
+      resolve({ output, isError });
+    });
+    pi.on("error", (err) => {
+      log("error", "pi-process-error", { error: err.message });
+      resolve({ output: `Failed to spawn pi: ${err.message}`, isError: true });
+    });
+  });
 }
 async function main() {
   const args = parseArgs();
@@ -230,38 +272,68 @@ async function main() {
   client.registerHandler("session.heartbeat", async (params) => {
     return { seq: params?.seq, correlationId: params?.correlationId };
   });
-  setupSignalHandlers(client);
+  client.registerHandler("session.execute", async (params) => {
+    log("info", "session.execute called", { jobId: currentJobId });
+    const task = params?.task || "";
+    const persona = params?.persona;
+    const cwd = params?.cwd || process.cwd();
+    try {
+      const result = await executePiTask(task, persona, cwd);
+      await client.sendNotification("session.output", {
+        jobId: currentJobId,
+        output: result.output,
+        isError: result.isError
+      });
+      await client.sendNotification("session.done", {
+        jobId: currentJobId,
+        output: result.output,
+        isError: result.isError
+      });
+      return result;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log("error", "Task execution failed", { error: errorMessage });
+      await client.sendNotification("session.output", {
+        jobId: currentJobId,
+        output: errorMessage,
+        isError: true
+      });
+      return { output: errorMessage, isError: true };
+    }
+  });
   try {
     await client.sendNotification("session.ready", { jobId: currentJobId });
     log("info", "Ready notification sent");
   } catch (err) {
     log("warn", "Failed to send ready notification", { error: err.message });
   }
-  log("info", "RPC client running, waiting for requests...");
-  await new Promise((resolve) => {
-    const checkConnection = setInterval(() => {
-      if (!client) {
-        clearInterval(checkConnection);
-        resolve();
-      }
-    }, 1e3);
-  });
-}
-function setupSignalHandlers(client) {
-  const shutdown = async (signal) => {
-    log("info", `Received ${signal}, initiating graceful shutdown`, { jobId: currentJobId });
-    try {
-      await client.sendNotification("session.shutdown.starting", { jobId: currentJobId, signal });
-    } catch {
-    }
-    await client.disconnect();
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGHUP", () => shutdown("SIGHUP"));
+  if (ENV_TASK) {
+    log("info", "Auto-executing task from environment", { taskLength: ENV_TASK.length });
+    const result = await executePiTask(ENV_TASK, ENV_PERSONA || void 0, process.cwd());
+    await client.sendNotification("session.output", {
+      jobId: currentJobId,
+      output: result.output,
+      isError: result.isError
+    });
+    await client.sendNotification("session.done", {
+      jobId: currentJobId,
+      output: result.output,
+      isError: result.isError
+    });
+    log("info", "Auto-execution complete", { isError: result.isError });
+  } else {
+    log("info", "RPC client running, waiting for requests...");
+    await new Promise((resolve) => {
+      const checkConnection = setInterval(() => {
+        if (!client) {
+          clearInterval(checkConnection);
+          resolve();
+        }
+      }, 1e3);
+    });
+  }
 }
 main().catch((err) => {
-  log("error", "Fatal error", { error: err.message });
+  log("error", "Fatal error", { error: err.message, stack: err.stack });
   process.exit(1);
 });

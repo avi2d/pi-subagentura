@@ -85,6 +85,8 @@ export class TmuxBridge {
       const envVars = [taskEnv, personaEnv].filter(Boolean).join(' ');
       const fullEnv = envVars ? `${envVars} ` : '';
       const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent "env TERM=xterm ${fullEnv}node ${entryScript} --socket=${socketPath} --jobId=${safeJobId}"`;
+      console.error(`[tmux-bridge] Creating session: ${sessionName}`);
+      console.error(`[tmux-bridge] Command: ${tmuxCmd}`);
       try {
          await execAsync(tmuxCmd);
       } catch (err) {
