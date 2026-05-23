@@ -74,6 +74,8 @@ export async function spawnRpcSubagent(params: {
    // 2. Generate jobId
    console.error(`[spawn-rpc] Starting with task: ${params.task?.slice(0, 50)}...`);
    const jobId = generateId();
+   // Default to "notify" mode for RPC subagents so notifications work by default
+   const notifyMode = params.notifyOnComplete || "notify";
 
    // 3. Ensure socket directory exists atomically with 0700 permissions
    try {
@@ -134,12 +136,17 @@ export async function spawnRpcSubagent(params: {
 
    rpcRegistry.register(entry);
 
+
    // 8. Connect explicitly with ready notification handler
    // This ensures we capture the session.ready even if it arrives before heartbeat starts
-   await rpcRouter.connect(jobId, socketPath, () => {
-      clearPendingReadyTimeout(jobId);
-   });
-
+   try {
+      await rpcRouter.connect(jobId, socketPath, () => {
+         clearPendingReadyTimeout(jobId);
+      });
+      console.error(`[spawn-rpc] Connected to RPC socket`);
+   } catch (err) {
+      console.error(`[spawn-rpc] Failed to connect to RPC socket: ${(err as Error).message}`);
+   }
    // 9. Start heartbeat monitoring
    rpcRouter.startHeartbeat(jobId);
 
@@ -150,29 +157,27 @@ export async function spawnRpcSubagent(params: {
    }, 5000);
    pendingReadyTimeouts.set(jobId, readyTimeout);
 
-   // 11. Register in jobRegistry for notification delivery
-   if (params.notifyOnComplete) {
-      const jobState: JobState = {
-         id: jobId,
-         status: 'running',
-         liveStatus: {
-            turn: 0,
-            output: '',
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }
-         },
-         startedAt: Date.now(),
-         promise: Promise.resolve({
-            output: '',
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-            model: undefined,
-            isError: false
-         }),
-         notifyOnComplete: params.notifyOnComplete,
-         notificationDelivered: false,
-         maxAge: undefined
-      };
-      jobRegistry.set(jobId, jobState);
-   }
+   // Register in jobRegistry for notification delivery
+   const jobState: JobState = {
+      id: jobId,
+      status: 'running',
+      liveStatus: {
+         turn: 0,
+         output: '',
+         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }
+      },
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+         output: '',
+         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+         model: undefined,
+         isError: false
+      }),
+      notifyOnComplete: notifyMode,
+      notificationDelivered: false,
+      maxAge: undefined
+   };
+   jobRegistry.set(jobId, jobState);
 
    const attachCommand = `tmux attach -t "${sessionId}"`;
    const weztermCommand = `wezterm cli split-pane --domain-id=TMUX -- tmux attach -t "${sessionId}"`;
