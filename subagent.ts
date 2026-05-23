@@ -516,7 +516,10 @@ export default function (pi: ExtensionAPI) {
       "",
       "For async (background) execution, the main agent continues immediately.",
       "Use async only if user asked to do so or is willing to continue the conversation.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "",
+      "⚠️  IMPORTANT: DO NOT CALL get_subagent_result UNTIL USER EXPLICITLY ASKS FOR IT.",
+      "Only call get_subagent_status if you need to check progress for decisions.",
+      "The user will tell you when they want the results.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -738,7 +741,10 @@ export default function (pi: ExtensionAPI) {
       '  - task: "Analyze this code without context contamination", async: true, notifyOnComplete: "inject"',
       "",
       "For async (background) execution, the main agent continues immediately.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "",
+      "⚠️  IMPORTANT: DO NOT CALL get_subagent_result UNTIL USER EXPLICITLY ASKS FOR IT.",
+      "Only call get_subagent_status if you need to check progress for decisions.",
+      "The user will tell you when they want the results.",
     ].join("\n"),
     parameters: BaseParams,
 
