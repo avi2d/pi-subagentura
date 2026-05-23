@@ -51,6 +51,7 @@ import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { showSessionPicker, renderSessionPickerResult, SessionPickerParams } from "./session-picker";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
+import { execFile } from "node:child_process";
 
 // ── Footer Status Key ───────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
@@ -556,6 +557,10 @@ export default function (pi: ExtensionAPI) {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
+        // Auto-generate sessionDir for async agents if not provided
+        // This enables later attachment via tmux/wezterm
+        const sessionDir = params.sessionDir ?? `/tmp/pi-async-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
         const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
           await startSubagentJob({
             task: params.task,
@@ -568,7 +573,7 @@ export default function (pi: ExtensionAPI) {
             defaultModel: ctx.model,
             maxAge: params.maxAge,
             parentModelRegistry: ctx.modelRegistry,
-            sessionDir: params.sessionDir,
+            sessionDir,
           });
         const jobState: JobState = {
           id: jobId,
@@ -586,7 +591,7 @@ export default function (pi: ExtensionAPI) {
                 : undefined,
           notificationDelivered: false,
           maxAge: params.maxAge,
-          sessionDir: params.sessionDir,
+          sessionDir,
         };
 
         jobRegistry.set(jobId, jobState);
@@ -646,7 +651,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse connect_to_session({ sessionPath: "${sessionDir}", backend: "tmux" }) to attach a terminal.\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -654,6 +659,7 @@ export default function (pi: ExtensionAPI) {
             jobId,
             status: "started",
             contextMessages: messages.length,
+            sessionDir,
           },
         };
       }
@@ -1424,6 +1430,137 @@ export default function (pi: ExtensionAPI) {
         return new Text(theme.fg("warning", `⚡ Job: ${(details.jobId as string).slice(0, 8)}`), 0, 0);
       }
       return new Text(theme.fg("dim", "No sessions found"), 0, 0);
+    },
+  });
+
+  // ── Tool 8: connect to session ──────────────────────────────────
+  pi.registerTool({
+    name: "connect_to_session",
+    label: "Connect to Session",
+    description: [
+      "Open a tmux or wezterm window attached to an existing session.",
+      "This lets you view and interact with a running or completed session.",
+      "",
+      "Usage:",
+      "- Use list_sessions to pick a session",
+      "- Or provide sessionPath directly (from async agent's sessionDir)",
+      "",
+      'Example: connect_to_session({ sessionPath: "/tmp/pi-xxx/sessions/uuid.jsonl", backend: "tmux" })',
+    ].join("\n"),
+    parameters: Type.Object({
+      sessionPath: Type.String({
+        description: "Path to the session file (.jsonl)",
+      }),
+      backend: Type.Union([
+        Type.Literal("tmux", { description: "Open in tmux window" }),
+        Type.Literal("wezterm", { description: "Open in wezterm tab" }),
+      ], {
+        description: "Terminal backend to use",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "connect_to_session",
+        sessionPath: params.sessionPath,
+        backend: params.backend,
+      });
+
+      const { sessionPath, backend } = params;
+
+      if (backend === "tmux") {
+        // Generate a unique window name
+        const windowName = `pi-session-${Date.now()}`;
+        
+        // Open tmux window with pi session attached
+        // Using 'display-popup' for a cleaner overlay, or 'new-window' for a separate window
+        const args = [
+          "new-window",
+          "-n", windowName,
+          `pi --session "${sessionPath}" --continue`,
+        ];
+
+        return new Promise((resolve) => {
+          execFile("tmux", args, (error, stdout, stderr) => {
+            if (error) {
+              resolve({
+                content: [
+                  {
+                    type: "text",
+                    text: `Failed to open tmux window: ${error.message}\n\nIs tmux installed and running?`,
+                  },
+                ],
+                details: { error: error.message },
+              });
+              return;
+            }
+            resolve({
+              content: [
+                {
+                  type: "text",
+                  text: `Opened tmux window: ${windowName}\n\nUse \`tmux attach -t ${windowName}\` to reattach, or switch to the new window in your terminal.`,
+                },
+              ],
+              details: { windowName, sessionPath, backend },
+            });
+          });
+        });
+      } else if (backend === "wezterm") {
+        // Open wezterm tab with pi session
+        const args = [
+          "cli",
+          "split-pane",
+          "--",
+          "pi", "--session", sessionPath, "--continue",
+        ];
+
+        return new Promise((resolve) => {
+          execFile("wezterm", args, (error, stdout, stderr) => {
+            if (error) {
+              resolve({
+                content: [
+                  {
+                    type: "text",
+                    text: `Failed to open wezterm tab: ${error.message}\n\nIs wezterm installed?`,
+                  },
+                ],
+                details: { error: error.message },
+              });
+              return;
+            }
+            resolve({
+              content: [
+                {
+                  type: "text",
+                  text: `Opened wezterm tab with session: ${sessionPath}`,
+                },
+              ],
+              details: { sessionPath, backend },
+            });
+          });
+        });
+      }
+
+      return {
+        content: [{ type: "text", text: "Unknown backend. Use 'tmux' or 'wezterm'." }],
+        details: { error: "unknown backend" },
+      };
+    },
+
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("connect_to_session")), 0, 0);
+    },
+
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as Record<string, unknown> | undefined;
+      if (details?.error) {
+        return new Text(theme.fg("error", `✗ ${details.error}`), 0, 0);
+      }
+      const backend = details?.backend as string;
+      if (backend === "tmux") {
+        return new Text(theme.fg("success", `✓ Opened tmux: ${details?.windowName}`), 0, 0);
+      }
+      return new Text(theme.fg("success", `✓ Opened ${backend}`), 0, 0);
     },
   });
 
