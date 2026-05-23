@@ -32,7 +32,6 @@ const TerminalSpawnParams = Type.Object({
   ], {
     description: "Terminal backend to use",
   }),
-  timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default 600000 = 10 minutes)" })),
   maxAge: Type.Optional(Type.Number({ description: "TTL in ms for completed job retention" })),
   notifyOnComplete: Type.Optional(Type.Union([
     Type.Literal("notify", { description: "Send notification when complete" }),
@@ -193,9 +192,8 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
         socketServer.sendTask(params.task);
 
         // Create the result promise - this will resolve when the agent completes
+        // No timeout - terminal spawn is for real-time viewing, user controls when done
         const resultPromise = new Promise<SubagentResult>((resolve) => {
-          const timeoutMs = params.timeout ?? 600000; // 10 min default timeout
-          const startTime = Date.now();
           let done = false;
 
           socketServer!.onMessage = (msg: any) => {
@@ -222,19 +220,6 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
               liveStatus.output += msg.params.output as string;
             }
           };
-
-          // Timeout handler
-          setTimeout(() => {
-            if (done) return;
-            done = true;
-            resolve({
-              output: `Timeout after ${timeoutMs}ms`,
-              usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-              model: params.model ?? "unknown",
-              isError: true,
-              errorMessage: "Timeout",
-            });
-          }, timeoutMs);
         });
 
         // Register job in registry
