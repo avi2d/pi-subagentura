@@ -490,6 +490,47 @@ describe("registry size cap", () => {
   });
 });
 
+describe("startSubagentJob with sessionDir", () => {
+  beforeEach(() => {
+    jobRegistry.clear();
+  });
+
+  afterEach(() => {
+    jobRegistry.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("should not throw TDZ error when sessionDir is provided", async () => {
+    // This test catches TDZ errors where liveStatus is accessed before declaration.
+    // Previously, liveStatus was declared AFTER the if (sessionDir) block that returns early,
+    // causing "Cannot access 'liveStatus' before initialization" at runtime.
+
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    // Mock spawn to prevent actual subprocess spawning
+    vi.mock("node:child_process", () => ({
+      spawn: vi.fn(() => ({
+        on: vi.fn(),
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        kill: vi.fn(),
+      })),
+    }));
+
+    const { startSubagentJob } = await import("./helpers");
+    const testSessionDir = join(tmpdir(), `tdz-test-${Date.now()}`);
+
+    // This should NOT throw "Cannot access 'liveStatus' before initialization"
+    await expect(
+      startSubagentJob({
+        task: "test task",
+        sessionDir: testSessionDir,
+      }),
+    ).resolves.toBeDefined();
+  });
+});
+
 describe("scheduleJobCleanup", () => {
   beforeEach(() => {
     jobRegistry.clear();

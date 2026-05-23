@@ -387,6 +387,20 @@ export async function startSubagentJob(
       `Use list_available_models to discover more.`;
   }
 
+  // liveStatus must be declared before the sessionDir branch returns early
+  const liveStatus: SubagentLiveStatus = {
+    turn: 0,
+    output: "",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 0,
+    },
+  };
+
   // ── Session Directory Path: spawn pi subprocess ─────────────────────
   if (sessionDir) {
     // Ensure session directory exists
@@ -501,26 +515,15 @@ export async function startSubagentJob(
     })();
 
     // Return early with sessionDir case
-    // @ts-expect-error — session is AgentSession | null for sessionDir case
+    return { jobId, jobPromise, session: null, liveStatus, modelLabel, modelWarning };
     return { jobId, jobPromise, session: null, liveStatus, modelLabel, modelWarning };
   }
 
   let handleAbort: (() => void) | undefined;
   let unsubscribe: (() => void) | undefined;
 
-  const liveStatus: SubagentLiveStatus = {
-    turn: 0,
-    output: "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      turns: 0,
-    },
-  };
-
+  // Debounce activeTool updates to prevent flickering on fast tool calls.
+  // When onUpdate is undefined (async path), skip the debounce entirely —
   // Debounce activeTool updates to prevent flickering on fast tool calls.
   // When onUpdate is undefined (async path), skip the debounce entirely —
   // no rendering to flicker, and the timer overhead is wasted.
