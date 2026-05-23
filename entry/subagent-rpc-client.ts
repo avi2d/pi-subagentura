@@ -212,6 +212,162 @@ class RpcClient {
    }
 }
 
+// RPC Server that listens for connections from parent
+class RpcServer {
+   private server: net.Server | null = null;
+   private socketPath: string;
+   private jobId: string;
+   private clientSocket: net.Socket | null = null;
+   private handlers: Map<string, (params?: Record<string, unknown>) => Promise<unknown>> = new Map();
+   private buffer = '';
+   private running = true;
+
+   constructor(socketPath: string, jobId: string) {
+      this.socketPath = socketPath;
+      this.jobId = jobId;
+   }
+
+   async listen(): Promise<void> {
+      return new Promise((resolve, reject) => {
+         // Ensure socket directory exists
+         const dir = path.dirname(this.socketPath);
+         fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+
+         this.server = net.createServer((socket) => {
+            this.handleConnection(socket);
+         });
+
+         this.server.on('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+               // Socket exists - try to unlink and retry
+               fs.unlink(this.socketPath, () => {
+                  this.server!.listen(this.socketPath, () => {
+                     log('info', 'Server listening after retry', { socketPath: this.socketPath });
+                     resolve();
+                  });
+               });
+            } else {
+               log('error', 'Server error', { error: err.message });
+               reject(err);
+            }
+         });
+
+         this.server.listen(this.socketPath, () => {
+            log('info', 'Server listening', { socketPath: this.socketPath });
+            resolve();
+         });
+      });
+   }
+
+   private handleConnection(socket: net.Socket): void {
+      this.clientSocket = socket;
+      log('info', 'Client connected');
+
+      socket.on('data', (data: Buffer) => {
+         this.buffer += data.toString();
+         const messages = this.buffer.split('\n');
+         this.buffer = messages.pop() || '';
+
+         for (const msg of messages) {
+            if (msg.trim()) {
+               try {
+                  const parsed = JSON.parse(msg);
+                  this.handleMessage(parsed, socket);
+               } catch {
+                  // Invalid JSON - send parse error
+                  socket.write(JSON.stringify({
+                     jsonrpc: "2.0",
+                     id: null,
+                     error: { code: -32700, message: "Parse error" }
+                  }) + '\n');
+               }
+            }
+         }
+      });
+
+      socket.on('close', () => {
+         log('info', 'Client disconnected');
+         this.clientSocket = null;
+      });
+
+      socket.on('error', (err) => {
+         log('error', 'Socket error', { error: err.message });
+      });
+   }
+
+   private handleMessage(message: Record<string, unknown>, socket: net.Socket): void {
+      // Request from parent
+      if ('method' in message) {
+         const method = message.method as string;
+         const id = message.id;
+         const params = message.params as Record<string, unknown> | undefined;
+         const handler = this.handlers.get(method);
+
+         if (handler) {
+            handler(params).then((result) => {
+               if (id !== undefined) {
+                  socket.write(JSON.stringify({
+                     jsonrpc: "2.0",
+                     id,
+                     result
+                  }) + '\n');
+               }
+            }).catch((err) => {
+               if (id !== undefined) {
+                  socket.write(JSON.stringify({
+                     jsonrpc: "2.0",
+                     id,
+                     error: { code: -32603, message: err.message }
+                  }) + '\n');
+               }
+            });
+         } else {
+            if (id !== undefined) {
+               socket.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id,
+                  error: { code: -32601, message: `Method not found: ${method}` }
+               }) + '\n');
+            }
+         }
+      }
+   }
+
+   registerHandler(method: string, handler: (params?: Record<string, unknown>) => Promise<unknown>): void {
+      this.handlers.set(method, handler);
+   }
+
+   send(message: Record<string, unknown>): void {
+      if (this.clientSocket) {
+         this.clientSocket.write(JSON.stringify(message) + '\n');
+      }
+   }
+
+   async sendNotification(method: string, params?: Record<string, unknown>): Promise<void> {
+      this.send({
+         jsonrpc: "2.0",
+         method,
+         params
+      });
+   }
+
+   async disconnect(): Promise<void> {
+      this.running = false;
+      if (this.clientSocket) {
+         this.clientSocket.destroy();
+         this.clientSocket = null;
+      }
+      if (this.server) {
+         this.server.close();
+         this.server = null;
+      }
+   }
+
+   isRunning(): boolean {
+      return this.running;
+   }
+}
+
 // Execute task using pi command
 async function executePiTask(task: string, persona: string | undefined, cwd: string): Promise<{ output: string; isError: boolean }> {
    return new Promise((resolve) => {
@@ -268,42 +424,42 @@ async function main(): Promise<void> {
    currentJobId = args.jobId;
    correlationId = currentJobId;
 
-   log('info', 'Starting RPC client', { jobId: currentJobId, socket: args.socket });
+   log('info', 'Starting RPC server', { jobId: currentJobId, socket: args.socket });
 
-   const client = new RpcClient(args.socket, args.jobId);
+   const server = new RpcServer(args.socket, args.jobId);
 
    try {
-      await client.connect();
+      await server.listen();
    } catch (err) {
-      log('error', 'Failed to connect to parent', { error: (err as Error).message });
+      log('error', 'Failed to start server', { error: (err as Error).message });
       process.exit(1);
    }
 
    // Register default handlers
-   client.registerHandler('agent.prompt', async (params) => {
+   server.registerHandler('agent.prompt', async (params) => {
       log('debug', 'agent.prompt', { prompt: params?.prompt });
       return { success: true, prompt: params?.prompt, executed: true };
    });
 
-   client.registerHandler('agent.status', async () => {
+   server.registerHandler('agent.status', async () => {
       return { status: 'running', jobId: currentJobId };
    });
 
-   client.registerHandler('tools.list', async () => {
+   server.registerHandler('tools.list', async () => {
       return { tools: ['agent.prompt', 'agent.status', 'tools.list', 'tools.execute'] };
    });
 
-   client.registerHandler('tools.execute', async (params) => {
+   server.registerHandler('tools.execute', async (params) => {
       log('debug', 'tools.execute', { name: params?.name });
       return { success: true, tool: params?.name };
    });
 
    // CRITICAL: Handle session.shutdown notification (C-1)
-   client.registerHandler('session.shutdown', async (params) => {
+   server.registerHandler('session.shutdown', async (params) => {
       log('info', 'Shutdown requested', { correlationId: params?.correlationId });
 
       try {
-         await client.sendNotification('session.shutdown.ack', {
+         await server.sendNotification('session.shutdown.ack', {
             jobId: currentJobId,
             correlationId: params?.correlationId
          });
@@ -315,12 +471,12 @@ async function main(): Promise<void> {
    });
 
    // CRITICAL: Handle session.heartbeat ping (C-4)
-   client.registerHandler('session.heartbeat', async (params) => {
+   server.registerHandler('session.heartbeat', async (params) => {
       return { seq: params?.seq, correlationId: params?.correlationId };
    });
 
    // Handle session.execute - parent requests us to execute our task
-   client.registerHandler('session.execute', async (params) => {
+   server.registerHandler('session.execute', async (params) => {
       log('info', 'session.execute called', { jobId: currentJobId });
 
       const task = (params?.task as string) || '';
@@ -332,14 +488,14 @@ async function main(): Promise<void> {
          const result = await executePiTask(task, persona, cwd);
 
          // Send output notification
-         await client.sendNotification('session.output', {
+         await server.sendNotification('session.output', {
             jobId: currentJobId,
             output: result.output,
             isError: result.isError
          });
 
          // Send done notification
-         await client.sendNotification('session.done', {
+         await server.sendNotification('session.done', {
             jobId: currentJobId,
             output: result.output,
             isError: result.isError
@@ -351,7 +507,7 @@ async function main(): Promise<void> {
          log('error', 'Task execution failed', { error: errorMessage });
 
          // Send error notification
-         await client.sendNotification('session.output', {
+         await server.sendNotification('session.output', {
             jobId: currentJobId,
             output: errorMessage,
             isError: true
@@ -363,7 +519,7 @@ async function main(): Promise<void> {
 
    // Notify parent we're ready
    try {
-      await client.sendNotification('session.ready', { jobId: currentJobId });
+      await server.sendNotification('session.ready', { jobId: currentJobId });
       log('info', 'Ready notification sent');
    } catch (err) {
       log('warn', 'Failed to send ready notification', { error: (err as Error).message });
@@ -376,14 +532,14 @@ async function main(): Promise<void> {
       const result = await executePiTask(ENV_TASK, ENV_PERSONA || undefined, process.cwd());
 
       // Send output notification
-      await client.sendNotification('session.output', {
+      await server.sendNotification('session.output', {
          jobId: currentJobId,
          output: result.output,
          isError: result.isError
       });
 
       // Send done notification
-      await client.sendNotification('session.done', {
+      await server.sendNotification('session.done', {
          jobId: currentJobId,
          output: result.output,
          isError: result.isError
@@ -396,7 +552,7 @@ async function main(): Promise<void> {
       // Keep alive until disconnected
       await new Promise<void>((resolve) => {
          const checkConnection = setInterval(() => {
-            if (!client) {
+            if (!server.isRunning()) {
                clearInterval(checkConnection);
                resolve();
             }
