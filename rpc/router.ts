@@ -8,6 +8,7 @@ import {
   STREAM_CONSTANTS 
 } from './types.js';
 import { RpcServiceRegistry, rpcRegistry } from './registry.js';
+import { jobRegistry } from '../helpers.js';
 
 interface HeartbeatMonitor {
   jobId: string;
@@ -224,6 +225,12 @@ export class RpcRouter {
       }, HEARTBEAT_CONSTANTS.INTERVAL_MS),
       onDead: (jobId) => {
         this.registry.updateStatus(jobId, 'dead');
+        // Also update jobRegistry so it gets cleaned up
+        const job = jobRegistry.get(jobId);
+        if (job) {
+          job.status = 'dead';
+          jobRegistry.set(jobId, job);
+        }
       }
     };
 
