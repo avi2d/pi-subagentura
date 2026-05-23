@@ -47,6 +47,7 @@ import {
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { spawnNotifySubagent, SpawnNotifyParams, type SpawnNotifyResult } from "./tools/spawn-notify.js";
+import { rpcRouter } from "./rpc/mod.js";
 
 // ── Footer Status Key ───────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
@@ -478,6 +479,58 @@ export default function(pi: ExtensionAPI) {
          return renderSubagentNotify(message, options, theme);
       },
    );
+
+   // ── RPC Notification Bridge ───────────────────────────────────
+   // Subscribe to session.output notifications from RPC-spawned subagents
+   // This bridges RPC notifications → deliverNotification for unified UX
+   const rpcUnsubscribe = rpcRouter.subscribe("session.output", (notification) => {
+      const { jobId, output, isError } = notification.params as {
+         jobId: string;
+         output: string;
+         isError: boolean;
+      };
+
+      const jobState = jobRegistry.get(jobId);
+      if (!jobState) {
+         debugLog("warn", "rpc_notification_no_job", { jobId });
+         return;
+      }
+
+      if (jobState.notificationDelivered || jobState.resultRetrieved) {
+         debugLog("info", "rpc_notification_skipped", {
+            jobId,
+            delivered: jobState.notificationDelivered,
+            retrieved: jobState.resultRetrieved,
+         });
+         return;
+      }
+
+      const result: SubagentResult = {
+         output: output || "(no output)",
+         usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+         },
+         model: undefined,
+         isError: isError ?? false,
+         errorMessage: isError ? output : undefined,
+      };
+
+      jobState.result = result;
+      jobState.status = isError ? "error" : "done";
+
+      debugLog("info", "rpc_notification_delivering", { jobId, isError });
+
+      if (jobState.notifyOnComplete) {
+         deliverNotification(jobState, result);
+      }
+
+      scheduleJobCleanup(jobId, false, jobState.maxAge);
+   });
 
    // ── Tool 1: inherits conversation history ────────────────────────
    pi.registerTool({
@@ -1360,7 +1413,7 @@ export default function(pi: ExtensionAPI) {
       },
    });
 
-      // ── Tool 8: spawn tmux subagent with notification ────────────────────
+   // ── Tool 8: spawn tmux subagent with notification ────────────────────
    pi.registerTool({
       name: "spawn_notify_subagent",
       label: "Spawn Subagent (TMUX + Notify)",
@@ -1446,25 +1499,25 @@ export default function(pi: ExtensionAPI) {
       },
    });
 
-// ── Session shutdown: abort all jobs and clear registry ──────────
-(pi as any).on?.("session_shutdown", () => {
-   const g2 = typeof global !== "undefined" ? global : globalThis;
+   // ── Session shutdown: abort all jobs and clear registry ──────────
+   (pi as any).on?.("session_shutdown", () => {
+      const g2 = typeof global !== "undefined" ? global : globalThis;
 
-   // Abort all running subagent sessions before clearing
-   for (const job of jobRegistry.values()) {
-      if (job.status === "running") {
-         try {
-            job.session.abort().catch(() => { });
-         } catch {
-            /* session may already be disposed */
+      // Abort all running subagent sessions before clearing
+      for (const job of jobRegistry.values()) {
+         if (job.status === "running") {
+            try {
+               job.session.abort().catch(() => { });
+            } catch {
+               /* session may already be disposed */
+            }
          }
       }
-   }
 
-   jobRegistry.clear();
-   g2.__piSubagenturaPiRef = undefined;
-   g2.__piSubagenturaInjectCount = 0;
-});
+      jobRegistry.clear();
+      g2.__piSubagenturaPiRef = undefined;
+      g2.__piSubagenturaInjectCount = 0;
+   });
 }
 
 // ── Re-exports ───────────────────────────────────────────────────────
