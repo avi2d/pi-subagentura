@@ -316,8 +316,8 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
 		label: "Complete Terminal Job",
 		description:
 			"Signal a terminal_spawn job to complete. " +
-			"Sends SIGTERM to pi, captures final output, and fires notification. " +
-			"Use when done watching but want to keep the session available.",
+			"Captures current output, exits bridge process, but keeps pi running in terminal. " +
+			"Use when done watching but want to continue chatting with pi directly.",
 		parameters: Type.Object({
 			jobId: Type.String({ description: "Job ID returned by terminal_spawn" }),
 		}),
@@ -356,13 +356,15 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
 				content: [{
 					type: "text" as const,
 					text: `Complete signal sent to job ${params.jobId}.\n\n` +
-						`Pi will shut down gracefully and save its session.\n` +
-						`You can continue later with: pi --session-dir <session_dir> --continue\n\n` +
-						`You'll receive a notification when the job completes.`,
+						`Pi is still running in the ${job.backend} window!\n` +
+						`Continue chatting with pi directly in that terminal.\n` +
+						`Session is saved for later if needed.\n\n` +
+						`You'll receive a notification with the current output.`,
 				}],
 				details: {
 					jobId: params.jobId,
 					status: "completing",
+					backend: job.backend,
 				},
 			};
 		},

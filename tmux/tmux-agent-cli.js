@@ -98,10 +98,13 @@ client.on("data", (chunk) => {
       }
 
       if (msg.method === "complete") {
-        debugLog("Complete requested - sending SIGTERM to pi");
-        if (piProcess) {
-          piProcess.kill("SIGTERM");
-        }
+        debugLog("Complete requested - sending final result and exiting");
+        // Send current accumulated output as final result
+        sendResult(output);
+        // Close the socket to signal completion
+        client.end();
+        // Exit without killing pi - it keeps running in the tmux window
+        process.exit(0);
       }
     } catch (e) {
       debugLog("Parse error:", e.message);
