@@ -347,7 +347,7 @@ export const MAX_INJECT = 5;
  * Deliver async subagent completion notification.
  * Reads pi from globalThis to survive module reloads.
  */
-function deliverNotification(jobState: JobState, result: SubagentResult): void {
+export function deliverNotification(jobState: JobState, result: SubagentResult): void {
   const g2 = typeof global !== "undefined" ? global : globalThis;
   const pi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return; // extension not loaded yet

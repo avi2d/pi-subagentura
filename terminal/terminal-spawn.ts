@@ -15,6 +15,7 @@ import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { jobRegistry, type JobState, type SubagentResult, type SubagentLiveStatus, generateJobId } from "../helpers";
+import { deliverNotification } from "../subagent";
 import type { SocketServer } from "../tmux/tmux-agent";
 import { createSocketServer } from "../tmux/tmux-agent";
 
@@ -31,6 +32,7 @@ const TerminalSpawnParams = Type.Object({
   ], {
     description: "Terminal backend to use",
   }),
+  timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default 600000 = 10 minutes)" })),
   maxAge: Type.Optional(Type.Number({ description: "TTL in ms for completed job retention" })),
   notifyOnComplete: Type.Optional(Type.Union([
     Type.Literal("notify", { description: "Send notification when complete" }),
@@ -192,7 +194,7 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
 
         // Create the result promise - this will resolve when the agent completes
         const resultPromise = new Promise<SubagentResult>((resolve) => {
-          const timeoutMs = 60000; // 60s default timeout
+          const timeoutMs = params.timeout ?? 600000; // 10 min default timeout
           const startTime = Date.now();
           let done = false;
 
@@ -271,7 +273,7 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
           // Deliver notification if requested
           if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
             jobState.notificationDelivered = true;
-            // Notification would be delivered via the same mechanism as async subagents
+            deliverNotification(jobState, result);
           }
         });
 
