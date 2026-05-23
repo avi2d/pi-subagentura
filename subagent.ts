@@ -1533,20 +1533,16 @@ export default function (pi: ExtensionAPI) {
           }
         }
         // Open wezterm new window with pi session
-        // Use full path to pi and bash -l to ensure PATH and shell config are loaded
+        // Use wezterm start to launch a new wezterm instance with pi
+        // This is more reliable than 'cli spawn' which can have PATH issues
         const piFullPath = "/Users/applesucks/Library/pnpm/pi";
-        const shellCmd = `"${piFullPath}" --session "${actualSessionPath}" --continue`;
         const args = [
-          "cli",
-          "spawn",
-          "--new-window",
-          "--cwd",
-          dirname(actualSessionPath) || process.cwd(),
+          "start",
           "--",
-          "bash",
-          "-l",
-          "-c",
-          shellCmd,
+          piFullPath,
+          "--session",
+          actualSessionPath,
+          "--continue",
         ];
 
         return new Promise((resolve) => {
@@ -1556,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
                 content: [
                   {
                     type: "text",
-                    text: `Failed to open wezterm tab: ${error.message}\n\nIs wezterm installed?`,
+                    text: `Failed to open wezterm window: ${error.message}\n\nIs wezterm installed?`,
                   },
                 ],
                 details: { error: error.message },
