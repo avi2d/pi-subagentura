@@ -48,7 +48,6 @@ import { createSocketServer, type SocketServer } from "./tmux/tmux-agent";
 import { registerTmuxSpawn } from "./tmux/tmux-spawn";
 import { registerWeztermSpawn } from "./wezterm/wezterm-spawn";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
-import { showSessionPicker, renderSessionPickerResult, SessionPickerParams } from "./session-picker";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -652,11 +651,11 @@ export default function (pi: ExtensionAPI) {
 
         return {
           content: [
-            {
-              type: "text",
-              text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse connect_to_session({ sessionPath: "${sessionDir}", backend: "tmux" }) to attach a terminal.\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
-                (modelWarning ? `\n\n${modelWarning}` : ""),
-            },
+              {
+                type: "text" as const,
+                text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                  (modelWarning ? `\n\n${modelWarning}` : ""),
+              },
           ],
           details: {
             jobId,
@@ -880,8 +879,8 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [
             {
-              type: "text",
-              text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse connect_to_session({ sessionPath: "${sessionDir}", backend: "tmux" }) to attach a terminal.\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              type: "text" as const,
+              text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -1368,278 +1367,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Tool 7: list sessions ─────────────────────────────────────────
-  pi.registerTool({
-    name: "list_sessions",
-    label: "List Sessions",
-    description: [
-      "Scan session directories for saved pi sessions and pick one to continue.",
-      "Shows a picker UI with saved sessions and running subagent jobs.",
-      "Press ↓ at the bottom to switch to running jobs section.",
-      "",
-      "sessionDirs: Array of directories to scan. Defaults to common locations.",
-    ].join("\n"),
-    parameters: SessionPickerParams,
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      debugLog("info", "tool_call", {
-        toolName: "list_sessions",
-        sessionDirs: params.sessionDirs ?? ["default"],
-      });
-
-      const result = await showSessionPicker(ctx, params.sessionDirs);
-
-      if (!result) {
-        return {
-          content: [{ type: "text", text: "No sessions found and no running jobs." }],
-          details: { sessions: [], runningJobs: [] },
-        };
-      }
-
-      if (result.type === "session") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Selected session: ${result.path}\n\nContinue with: pi --session "${result.path}" --continue`,
-            },
-          ],
-          details: { selectedPath: result.path, type: "session" },
-        };
-      } else if (result.type === "job") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Running job: ${result.jobId}\n\nUse get_subagent_status({ jobId: "${result.jobId}" }) to check progress.\nUse get_subagent_result({ jobId: "${result.jobId}" }) to get output when done.`,
-            },
-          ],
-          details: { jobId: result.jobId, status: result.status, type: "job" },
-        };
-      } else if (result.type === "cancelled" && result.path) {
-        // Fallback text output when UI picker wasn't available
-        return {
-          content: [{ type: "text", text: result.path }],
-          details: { textOutput: true },
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: "No selection." }],
-        details: { cancelled: true },
-      };
-    },
-
-    renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("list_sessions")), 0, 0);
-    },
-
-    renderResult(result, _options, theme, _context) {
-      const details = result.details as any;
-      if (details?.cancelled) {
-        return new Text(theme.fg("dim", "No selection"), 0, 0);
-      }
-      if (details?.type === "session") {
-        return new Text(theme.fg("success", `✓ Session: ${truncateToWidth(details.selectedPath, 50)}`), 0, 0);
-      }
-      if (details?.type === "job") {
-        return new Text(theme.fg("warning", `⚡ Job: ${(details.jobId as string).slice(0, 8)}`), 0, 0);
-      }
-      return new Text(theme.fg("dim", "No sessions found"), 0, 0);
-    },
-  });
-
-  // ── Tool 8: connect to session ──────────────────────────────────
-  pi.registerTool({
-    name: "connect_to_session",
-    label: "Connect to Session",
-    description: [
-      "Open a tmux or wezterm window attached to an existing session.",
-      "This lets you view and interact with a running or completed session.",
-      "",
-      "Usage:",
-      "- Use list_sessions to pick a session",
-      "- Or provide sessionPath directly (from async agent's sessionDir)",
-      "",
-      'Example: connect_to_session({ sessionPath: "/tmp/pi-xxx/sessions/uuid.jsonl", backend: "tmux" })',
-    ].join("\n"),
-    parameters: Type.Object({
-      sessionPath: Type.String({
-        description: "Path to the session file (.jsonl)",
-      }),
-      backend: Type.Union([
-        Type.Literal("tmux", { description: "Open in tmux window" }),
-        Type.Literal("wezterm", { description: "Open in wezterm tab" }),
-      ], {
-        description: "Terminal backend to use",
-      }),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      debugLog("info", "tool_call", {
-        toolName: "connect_to_session",
-        sessionPath: params.sessionPath,
-        backend: params.backend,
-      });
-
-      const { sessionPath, backend } = params;
-
-      if (backend === "tmux") {
-        // Generate a unique window name
-        const windowName = `pi-session-${Date.now()}`;
-        
-        // Open tmux window with pi session attached
-        // Using 'display-popup' for a cleaner overlay, or 'new-window' for a separate window
-        const args = [
-          "new-window",
-          "-n", windowName,
-          `pi --session "${sessionPath}" --continue`,
-        ];
-
-        return new Promise((resolve) => {
-          execFile("tmux", args, (error, stdout, stderr) => {
-            if (error) {
-              resolve({
-                content: [
-                  {
-                    type: "text",
-                    text: `Failed to open tmux window: ${error.message}\n\nIs tmux installed and running?`,
-                  },
-                ],
-                details: { error: error.message },
-              });
-              return;
-            }
-            resolve({
-              content: [
-                {
-                  type: "text",
-                  text: `Opened tmux window: ${windowName}\n\nUse \`tmux attach -t ${windowName}\` to reattach, or switch to the new window in your terminal.`,
-                },
-              ],
-              details: { windowName, sessionPath, backend },
-            });
-          });
-        });
-      } else if (backend === "wezterm") {
-        // Find the session file in the directory
-        const { readdirSync, existsSync } = await import("node:fs");
-        const { join, dirname } = await import("node:path");
-        let actualSessionPath = sessionPath;
-        // If sessionPath is a directory, find the .jsonl file
-        if (!sessionPath.endsWith(".jsonl")) {
-          try {
-            if (existsSync(sessionPath)) {
-              const files = readdirSync(sessionPath);
-              const sessionFile = files.find((f: string) => f.endsWith(".jsonl"));
-              if (sessionFile) {
-                actualSessionPath = join(sessionPath, sessionFile);
-              } else {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `No session file (.jsonl) found in: ${sessionPath}\n\n` +
-                        `Note: pi only saves the session file when the session ends or periodically.\n` +
-                        `For running async agents, the file won't exist until completion.\n\n` +
-                        `connect_to_session works for:\n` +
-                        `  - Completed sessions\n` +
-                        `  - Sessions started manually with a specific --session path\n\n` +
-                        `For running async agents, use get_subagent_status to monitor progress.`,
-                    },
-                  ],
-                  details: { error: "no session file found", path: sessionPath },
-                };
-              }
-            } else {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Session directory not found: ${sessionPath}`,
-                  },
-                ],
-                details: { error: "directory not found", path: sessionPath },
-              };
-            }
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Failed to read session directory: ${sessionPath}\nError: ${err instanceof Error ? err.message : String(err)}`,
-                },
-              ],
-              details: { error: "read failed" },
-            };
-          }
-        }
-        // Open wezterm new window with pi session
-        // Run pi inside bash -l -c so that after pi exits, bash keeps the window alive
-        const piFullPath = "/Users/applesucks/Library/pnpm/pi";
-        const piCmd = `"${piFullPath}" --session "${actualSessionPath}" --continue`;
-        const args = [
-          "cli",
-          "spawn",
-          "--new-window",
-          "--cwd",
-          dirname(actualSessionPath) || process.cwd(),
-          "--",
-          "bash",
-          "-l",
-          "-c",
-          `${piCmd}; exec bash`,
-        ];
-
-        return new Promise((resolve) => {
-          execFile("wezterm", args, (error, stdout, stderr) => {
-            if (error) {
-              resolve({
-                content: [
-                  {
-                    type: "text",
-                    text: `Failed to open wezterm window: ${error.message}\n\nIs wezterm installed?`,
-                  },
-                ],
-                details: { error: error.message },
-              });
-              return;
-            }
-            resolve({
-              content: [
-                {
-                  type: "text",
-                  text: `Opened wezterm tab with session: ${sessionPath}`,
-                },
-              ],
-              details: { sessionPath, backend },
-            });
-          });
-        });
-      }
-
-      return {
-        content: [{ type: "text", text: "Unknown backend. Use 'tmux' or 'wezterm'." }],
-        details: { error: "unknown backend" },
-      };
-    },
-
-    renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("connect_to_session")), 0, 0);
-    },
-
-    renderResult(result, _options, theme, _context) {
-      const details = result.details as Record<string, unknown> | undefined;
-      if (details?.error) {
-        return new Text(theme.fg("error", `✗ ${details.error}`), 0, 0);
-      }
-      const backend = details?.backend as string;
-      if (backend === "tmux") {
-        return new Text(theme.fg("success", `✓ Opened tmux: ${details?.windowName}`), 0, 0);
-      }
-      return new Text(theme.fg("success", `✓ Opened ${backend}`), 0, 0);
-    },
-  });
 
   // ── Tmux spawn tool ──────────────────────────────────────────────
   registerTmuxSpawn(pi);

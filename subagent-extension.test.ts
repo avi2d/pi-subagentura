@@ -8,6 +8,6 @@ describe("extension registration", () => {
     };
 
     expect(() => registerExtension(api as any)).not.toThrow();
-    expect(api.registerTool).toHaveBeenCalledTimes(11);
+    expect(api.registerTool).toHaveBeenCalledTimes(9);
   });
 });
