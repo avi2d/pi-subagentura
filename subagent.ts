@@ -1523,19 +1523,49 @@ export default function (pi: ExtensionAPI) {
         });
       } else if (backend === "wezterm") {
         // Find the session file in the directory
-        const { readdirSync } = await import("node:fs");
+        const { readdirSync, existsSync } = await import("node:fs");
         const { join, dirname } = await import("node:path");
         let actualSessionPath = sessionPath;
         // If sessionPath is a directory, find the .jsonl file
         if (!sessionPath.endsWith(".jsonl")) {
           try {
-            const files = readdirSync(sessionPath);
-            const sessionFile = files.find((f: string) => f.endsWith(".jsonl"));
-            if (sessionFile) {
-              actualSessionPath = join(sessionPath, sessionFile);
+            if (existsSync(sessionPath)) {
+              const files = readdirSync(sessionPath);
+              const sessionFile = files.find((f: string) => f.endsWith(".jsonl"));
+              if (sessionFile) {
+                actualSessionPath = join(sessionPath, sessionFile);
+              } else {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `No session file (.jsonl) found in directory: ${sessionPath}`,
+                    },
+                  ],
+                  details: { error: "no session file found", path: sessionPath },
+                };
+              }
+            } else {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Session directory not found: ${sessionPath}`,
+                  },
+                ],
+                details: { error: "directory not found", path: sessionPath },
+              };
             }
-          } catch {
-            // Use as-is if directory read fails
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to read session directory: ${sessionPath}\nError: ${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              details: { error: "read failed" },
+            };
           }
         }
         // Open wezterm new window with pi session
