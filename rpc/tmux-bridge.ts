@@ -84,7 +84,10 @@ export class TmuxBridge {
       const personaEnv = config.persona ? `PI_PERSONA='${config.persona.replace(/'/g, "'\\''")}'` : '';
       const envVars = [taskEnv, personaEnv].filter(Boolean).join(' ');
       const fullEnv = envVars ? `${envVars} ` : '';
-      const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent "env TERM=xterm ${fullEnv}node ${entryScript} --socket=${socketPath} --jobId=${safeJobId}"`;
+      // Use nvm node v20 as a stable path (fnm paths are temporary)
+      // Use bash -c with background sleep to keep session alive after command finishes
+      const nodePath = '/Users/applesucks/.nvm/versions/node/v20.15.1/bin/node';
+      const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent 'bash -c "env TERM=xterm ${fullEnv}${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999"'`;
       console.error(`[tmux-bridge] Creating session: ${sessionName}`);
       console.error(`[tmux-bridge] Command: ${tmuxCmd}`);
       try {

@@ -93,7 +93,7 @@ export async function spawnRpcSubagent(params: {
       const build = spawn('npx', [
          'esbuild',
          'entry/subagent-rpc-client.ts',
-         '--outfile=entry/subagent-rpc-client.js',
+         '--outfile=entry/subagent-rpc-client.cjs',
          '--platform=node',
          '--target=node18',
          '--format=cjs'
@@ -108,7 +108,7 @@ export async function spawnRpcSubagent(params: {
    });
 
    // 6. Create tmux session
-   const entryScriptPath = path.resolve(process.cwd(), 'entry/subagent-rpc-client.js');
+   const entryScriptPath = path.resolve(process.cwd(), 'entry/subagent-rpc-client.cjs');
    const socketPath = path.join(SOCKET_DIR, `${jobId}.sock`);
 
    const { sessionId, processId } = await tmuxBridge.createSession({
