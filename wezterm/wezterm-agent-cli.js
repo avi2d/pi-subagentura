@@ -104,6 +104,15 @@ client.on("data", (chunk) => {
         sendError("Task aborted");
         process.exit(0);
       }
+
+      if (msg.method === "complete") {
+        debugLog("Complete requested - sending SIGTERM to pi");
+        if (piProcess) {
+          // Send SIGTERM to pi for graceful shutdown
+          // pi will exit, close handler will send result, then we exit
+          piProcess.kill("SIGTERM");
+        }
+      }
     } catch (e) {
       // ignore parse errors
     }

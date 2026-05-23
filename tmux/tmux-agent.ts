@@ -134,6 +134,13 @@ export interface SocketServer {
 	sendTask(task: string, id?: number | string | null): void;
 
 	/**
+	 * Send a completion request to the subagent.
+	 * Tells the agent to finalize and send its result, but keep running.
+	 * @param id - Request ID
+	 */
+	sendComplete(id?: number | string | null): void;
+
+	/**
 	 * Register a handler for incoming messages from the subagent.
 	 */
 	onMessage: MessageHandler | null;
@@ -354,6 +361,15 @@ export async function createSocketServer(
 				jsonrpc: "2.0",
 				method: "task",
 				params: { task } as unknown as Record<string, unknown>,
+				id,
+			});
+		},
+
+		sendComplete(id: number | string | null = null): void {
+			sendMessage({
+				jsonrpc: "2.0",
+				method: "complete",
+				params: undefined,
 				id,
 			});
 		},

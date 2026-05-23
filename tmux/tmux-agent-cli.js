@@ -96,6 +96,13 @@ client.on("data", (chunk) => {
         debugLog("Abort received");
         sendError("Task aborted");
       }
+
+      if (msg.method === "complete") {
+        debugLog("Complete requested - sending SIGTERM to pi");
+        if (piProcess) {
+          piProcess.kill("SIGTERM");
+        }
+      }
     } catch (e) {
       debugLog("Parse error:", e.message);
     }
