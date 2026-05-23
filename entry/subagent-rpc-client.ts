@@ -1,6 +1,11 @@
 import * as net from 'net';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+
+// Read task/persona from environment for auto-execution
+const ENV_TASK = process.env.PI_TASK || '';
+const ENV_PERSONA = process.env.PI_PERSONA || '';
 
 // Parse CLI arguments
 function parseArgs(): { socket: string; jobId: string } {
@@ -169,7 +174,7 @@ class RpcClient {
    }
 
    async sendNotification(method: string, params?: Record<string, unknown>): Promise<void> {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
          const id = Math.random().toString(36).substring(7);
          const request = {
             jsonrpc: "2.0",
@@ -180,7 +185,7 @@ class RpcClient {
 
          this.pendingRequests.set(id, {
             resolve: () => resolve(),
-            reject
+            reject: () => resolve() // Don't fail notifications
          });
 
          this.send(request);
@@ -189,7 +194,7 @@ class RpcClient {
          setTimeout(() => {
             if (this.pendingRequests.has(id)) {
                this.pendingRequests.delete(id);
-               resolve(); // Don't fail notifications
+               resolve();
             }
          }, 5000);
       });
@@ -205,6 +210,56 @@ class RpcClient {
          this.socket = null;
       }
    }
+}
+
+// Execute task using pi command
+async function executePiTask(task: string, persona: string | undefined, cwd: string): Promise<{ output: string; isError: boolean }> {
+   return new Promise((resolve) => {
+      const args: string[] = [];
+
+      if (persona) {
+         const escapedPersona = persona.replace(/'/g, "'\\''");
+         args.push(`--persona='${escapedPersona}'`);
+      }
+
+      const escapedTask = task.replace(/'/g, "'\\''");
+      args.push(`'${escapedTask}'`);
+
+      log('info', 'spawning-pi', { cwd, args: args.join(' ') });
+
+      const pi = spawn('pi', args, {
+         cwd,
+         stdio: ['ignore', 'pipe', 'pipe'],
+         env: { ...process.env, TERM: 'xterm' }
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      pi.stdout?.on('data', (data: Buffer) => {
+         stdout += data.toString();
+      });
+
+      pi.stderr?.on('data', (data: Buffer) => {
+         stderr += data.toString();
+      });
+
+      pi.on('close', (code) => {
+         const output = stdout || (stderr ? `Errors:\n${stderr}` : '(no output)');
+         const isError = code !== 0;
+
+         if (isError && stderr) {
+            log('warn', 'pi-exited-with-error', { exitCode: code, stderr: stderr.slice(0, 500) });
+         }
+
+         resolve({ output, isError });
+      });
+
+      pi.on('error', (err) => {
+         log('error', 'pi-process-error', { error: err.message });
+         resolve({ output: `Failed to spawn pi: ${err.message}`, isError: true });
+      });
+   });
 }
 
 // Main function
@@ -270,29 +325,27 @@ async function main(): Promise<void> {
 
       const task = (params?.task as string) || '';
       const persona = params?.persona as string | undefined;
+      const cwd = (params?.cwd as string) || process.cwd();
 
-      // Execute task and send output notification
+      // Execute task using pi command
       try {
-         // TODO: Integrate with pi-agent for actual execution
-         // For now, return a placeholder
-         const output = `[Subagent ${currentJobId}] Task executed: ${task.slice(0, 100)}...\n` +
-            `Persona: ${persona || 'default'}`;
+         const result = await executePiTask(task, persona, cwd);
 
          // Send output notification
          await client.sendNotification('session.output', {
             jobId: currentJobId,
-            output,
-            isError: false
+            output: result.output,
+            isError: result.isError
          });
 
          // Send done notification
          await client.sendNotification('session.done', {
             jobId: currentJobId,
-            output,
-            isError: false
+            output: result.output,
+            isError: result.isError
          });
 
-         return { output, isError: false };
+         return result;
       } catch (err) {
          const errorMessage = err instanceof Error ? err.message : String(err);
          log('error', 'Task execution failed', { error: errorMessage });
@@ -308,8 +361,6 @@ async function main(): Promise<void> {
       }
    });
 
-   setupSignalHandlers(client);
-
    // Notify parent we're ready
    try {
       await client.sendNotification('session.ready', { jobId: currentJobId });
@@ -318,42 +369,44 @@ async function main(): Promise<void> {
       log('warn', 'Failed to send ready notification', { error: (err as Error).message });
    }
 
-   // Message loop - the client handles incoming messages via event emitter
-   // We just need to keep the process alive
-   log('info', 'RPC client running, waiting for requests...');
+   // Auto-execute if task was provided via environment
+   if (ENV_TASK) {
+      log('info', 'Auto-executing task from environment', { taskLength: ENV_TASK.length });
 
-   // Keep alive until disconnected
-   await new Promise<void>((resolve) => {
-      const checkConnection = setInterval(() => {
-         if (!client) {
-            clearInterval(checkConnection);
-            resolve();
-         }
-      }, 1000);
-   });
-}
+      const result = await executePiTask(ENV_TASK, ENV_PERSONA || undefined, process.cwd());
 
-function setupSignalHandlers(client: RpcClient): void {
-   const shutdown = async (signal: string): Promise<void> => {
-      log('info', `Received ${signal}, initiating graceful shutdown`, { jobId: currentJobId });
+      // Send output notification
+      await client.sendNotification('session.output', {
+         jobId: currentJobId,
+         output: result.output,
+         isError: result.isError
+      });
 
-      try {
-         await client.sendNotification('session.shutdown.starting', { jobId: currentJobId, signal });
-      } catch {
-         // Best effort
-      }
+      // Send done notification
+      await client.sendNotification('session.done', {
+         jobId: currentJobId,
+         output: result.output,
+         isError: result.isError
+      });
 
-      await client.disconnect();
-      process.exit(0);
-   };
+      log('info', 'Auto-execution complete', { isError: result.isError });
+   } else {
+      log('info', 'RPC client running, waiting for requests...');
 
-   process.on('SIGTERM', () => shutdown('SIGTERM'));
-   process.on('SIGINT', () => shutdown('SIGINT'));
-   process.on('SIGHUP', () => shutdown('SIGHUP'));
+      // Keep alive until disconnected
+      await new Promise<void>((resolve) => {
+         const checkConnection = setInterval(() => {
+            if (!client) {
+               clearInterval(checkConnection);
+               resolve();
+            }
+         }, 1000);
+      });
+   }
 }
 
 // Run
 main().catch((err) => {
-   log('error', 'Fatal error', { error: (err as Error).message });
+   log('error', 'Fatal error', { error: err.message, stack: err.stack });
    process.exit(1);
 });

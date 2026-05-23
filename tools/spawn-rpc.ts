@@ -114,7 +114,8 @@ export async function spawnRpcSubagent(params: {
       entryScriptPath,
       cwd: params.cwd,
       timeout: params.timeout,
-      correlationId
+      task: params.task,
+      persona: params.persona
    });
 
    // 7. Register service
