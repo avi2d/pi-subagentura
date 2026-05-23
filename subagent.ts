@@ -1539,7 +1539,11 @@ export default function (pi: ExtensionAPI) {
                   content: [
                     {
                       type: "text",
-                      text: `No session file (.jsonl) found in directory: ${sessionPath}`,
+                      text: `No session file (.jsonl) found in: ${sessionPath}\n\nThis may mean:\n` +
+                        `1. The async agent is still starting up (wait a few seconds)\n` +
+                        `2. The session hasn't been saved yet (pi saves periodically)\n` +
+                        `3. The job completed but session wasn't persisted\n\n` +
+                        `Use get_subagent_status to check if the job is still running.`,
                     },
                   ],
                   details: { error: "no session file found", path: sessionPath },
