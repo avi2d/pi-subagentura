@@ -1533,6 +1533,9 @@ export default function (pi: ExtensionAPI) {
           }
         }
         // Open wezterm new window with pi session
+        // Use full path to pi and bash -l to ensure PATH and shell config are loaded
+        const piFullPath = "/Users/applesucks/Library/pnpm/pi";
+        const shellCmd = `"${piFullPath}" --session "${actualSessionPath}" --continue`;
         const args = [
           "cli",
           "spawn",
@@ -1540,7 +1543,10 @@ export default function (pi: ExtensionAPI) {
           "--cwd",
           dirname(actualSessionPath) || process.cwd(),
           "--",
-          "pi", "--session", actualSessionPath, "--continue",
+          "bash",
+          "-l",
+          "-c",
+          shellCmd,
         ];
 
         return new Promise((resolve) => {
