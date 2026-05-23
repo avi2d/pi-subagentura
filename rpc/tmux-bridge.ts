@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { TmuxSessionConfig, TmuxExitEvent, SOCKET_DIR } from './types.js';
+import { debugLog } from '../helpers.js';
 
 const execAsync = promisify(exec);
 
@@ -28,7 +29,6 @@ export class TmuxBridge {
       this.socketDir = socketDir;
    }
 
-   // System check - verify tmux is available
    async isTmuxAvailable(): Promise<boolean> {
       try {
          await execAsync('tmux -V');
@@ -38,7 +38,6 @@ export class TmuxBridge {
       }
    }
 
-   // Ensure tmux is available or throw
    async ensureTmuxAvailable(): Promise<void> {
       const available = await this.isTmuxAvailable();
       if (!available) {
@@ -46,28 +45,21 @@ export class TmuxBridge {
       }
    }
 
-   // Setup tmux hooks for session exit detection (C-2 - MANDATORY)
    async setupTmuxHooks(): Promise<void> {
       await this.ensureTmuxAvailable();
-
-      // Set global hook for session close - this is CRITICAL for crash detection
       const hookCmd = `tmux set-hook -g session-closed 'if -F "#{session_name}" != "" { display-message "SESSION_CLOSED #{session_name} #{session_pid}" }'`;
 
       try {
          await execAsync(hookCmd);
          this.tmuxHooksEnabled = true;
       } catch (err) {
-         console.warn('Failed to setup tmux hooks:', err);
-         // Hooks failed but we can still use polling fallback
+         debugLog("warn", "tmux_hooks_setup_failed", { error: String(err) });
       }
    }
 
-   // Create a new tmux session
    async createSession(config: TmuxSessionConfig): Promise<{ sessionId: string; processId: number }> {
       await this.ensureTmuxAvailable();
 
-      // CRITICAL: Sanitize jobId to prevent command injection
-      // jobId comes from internal UUID generation, but we validate anyway
       const safeJobId = config.jobId.replace(/[^a-zA-Z0-9_-]/g, '');
       if (!safeJobId || safeJobId.length !== config.jobId.length) {
          throw new Error(`Invalid jobId: contains unsafe characters`);
@@ -77,16 +69,12 @@ export class TmuxBridge {
       const entryScript = config.entryScriptPath;
       const socketPath = path.join(this.socketDir, `${safeJobId}.sock`);
 
-      // Use JSON encoding for task/persona to avoid shell quoting issues entirely
       const taskJson = config.task ? Buffer.from(JSON.stringify(config.task)).toString('base64') : '';
       const personaJson = config.persona ? Buffer.from(JSON.stringify(config.persona)).toString('base64') : '';
-      // Use nvm node v20 as a stable path (fnm paths are temporary)
       const nodePath = '/Users/applesucks/.nvm/versions/node/v20.15.1/bin/node';
-      // Use spawn instead of execAsync to avoid shell quoting issues
       const bashCmd = `env TERM=xterm PI_TASK_B64=${taskJson} PI_PERSONA_B64=${personaJson} ${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999`;
       const tmuxArgs = ['new-session', '-d', '-s', sessionName, '-n', 'pi-subagent', 'bash', '-c', bashCmd];
-      console.error(`[tmux-bridge] Creating session: ${sessionName}`);
-      console.error(`[tmux-bridge] Args: ${tmuxArgs.join(' ')}`);
+
       try {
          const proc = spawn('tmux', tmuxArgs);
          await new Promise<void>((resolve, reject) => {
@@ -97,36 +85,29 @@ export class TmuxBridge {
             proc.on('error', reject);
          });
       } catch (err) {
+         debugLog("error", "create_session_failed", { sessionName, error: String(err) });
          throw new Error(`Failed to create tmux session ${sessionName}: ${err}`);
       }
 
-      // Get the pane PID
       const pid = await this.getSessionPid(sessionName);
-
       return { sessionId: sessionName, processId: pid };
    }
 
-   // Kill a tmux session
    async killSession(sessionId: string): Promise<void> {
       await this.ensureTmuxAvailable();
 
       try {
          await execAsync(`tmux kill-session -t "${sessionId}"`);
       } catch (err) {
-         // Session might already be dead, which is fine
-         console.warn(`Failed to kill session ${sessionId}:`, err);
+         debugLog("warn", "kill_session_failed", { sessionId, error: String(err) });
       }
    }
 
-   // Attach to a tmux session (for debugging)
    async attachToSession(sessionId: string): Promise<void> {
       await this.ensureTmuxAvailable();
-
-      // This would need to be run interactively
-      console.log(`To attach to session ${sessionId}, run: tmux attach -t ${sessionId}`);
+      debugLog("info", "attach_session", { sessionId });
    }
 
-   // Get the pane PID for a session
    async getSessionPid(sessionName: string): Promise<number> {
       try {
          const { stdout } = await execAsync(
@@ -138,7 +119,6 @@ export class TmuxBridge {
       }
    }
 
-   // Check if a session exists
    async sessionExists(sessionName: string): Promise<boolean> {
       try {
          await execAsync(`tmux list-sessions -F '#{session_name}' | grep -q "${sessionName}"`);
@@ -148,7 +128,6 @@ export class TmuxBridge {
       }
    }
 
-   // List all our sessions
    async listSessions(): Promise<string[]> {
       await this.ensureTmuxAvailable();
 
@@ -161,7 +140,6 @@ export class TmuxBridge {
       }
    }
 
-   // Detect zombie sessions (sessions in tmux but not in our registry)
    async detectZombieSessions(registryJobIds: Set<string>): Promise<string[]> {
       const tmuxSessions = await this.listSessions();
       const zombies: string[] = [];
@@ -176,7 +154,6 @@ export class TmuxBridge {
       return zombies;
    }
 
-   // Cleanup orphaned sessions (NFR-2.3, O-2)
    async cleanupOrphans(registryJobIds: Set<string>): Promise<number> {
       const zombies = await this.detectZombieSessions(registryJobIds);
       let cleaned = 0;
@@ -185,21 +162,18 @@ export class TmuxBridge {
          try {
             await this.killSession(session);
             cleaned++;
-            console.log(`Cleaned up orphan session: ${session}`);
+            debugLog("info", "orphan_cleaned", { session });
          } catch (err) {
-            console.warn(`Failed to cleanup orphan ${session}:`, err);
+            debugLog("warn", "orphan_cleanup_failed", { session, error: String(err) });
          }
       }
 
       return cleaned;
    }
 
-   // Start periodic orphan cleanup (runs on startup and every 5 minutes)
    startOrphanCleanup(registryJobIdsFn: () => Set<string>): void {
-      // Initial cleanup on startup
-      this.cleanupOrphans(registryJobIdsFn()).catch(console.error);
+      this.cleanupOrphans(registryJobIdsFn()).catch((err) => debugLog("error", "orphan_cleanup_err", { error: String(err) }));
 
-      // Periodic cleanup every 5 minutes
       this.orphanCleanupInterval = setInterval(async () => {
          await this.cleanupOrphans(registryJobIdsFn());
       }, 5 * 60 * 1000);
@@ -212,12 +186,10 @@ export class TmuxBridge {
       }
    }
 
-   // Register session exit handler
    onSessionExit(sessionId: string, handler: (event: TmuxExitEvent) => void): void {
       this.sessionExitHandlers.set(sessionId, handler);
    }
 
-   // Handle session exit (called when we detect session closed)
    async handleSessionExit(sessionId: string, jobId: string, exitCode: number, reason: 'normal' | 'crash' | 'signal' | 'timeout'): Promise<void> {
       const handler = this.sessionExitHandlers.get(sessionId);
       if (handler) {
@@ -231,9 +203,6 @@ export class TmuxBridge {
       }
    }
 
-   // tmux server crash behavior (E-1)
-   // When tmux server crashes, sessions become detached and hooks don't fire
-   // Fallback: poll tmux list-sessions to detect missing sessions
    async detectDetachedSessions(registryJobIds: Set<string>): Promise<string[]> {
       const tmuxSessions = await this.listSessions();
       const detached: string[] = [];
@@ -249,5 +218,4 @@ export class TmuxBridge {
    }
 }
 
-// Singleton instance
 export const tmuxBridge = new TmuxBridge();

@@ -11,6 +11,7 @@ import { rpcRegistry } from '../rpc/registry.js';
 import { rpcRouter } from '../rpc/router.js';
 import { tmuxBridge } from '../rpc/tmux-bridge.js';
 import {
+   debugLog,
    jobRegistry,
    type JobState,
    type NotifyOnComplete
@@ -62,7 +63,6 @@ export async function spawnRpcSubagent(params: {
    weztermCommand: string;
    zellijCommand: string;
 }> {
-   // 1. Validate tmux availability
    const tmuxAvailable = await tmuxBridge.isTmuxAvailable();
    if (!tmuxAvailable) {
       throw new Error(
@@ -71,24 +71,21 @@ export async function spawnRpcSubagent(params: {
       );
    }
 
-   // 2. Generate jobId
-   console.error(`[spawn-rpc] Starting with task: ${params.task?.slice(0, 50)}...`);
    const jobId = generateId();
-   // Default to "notify" mode for RPC subagents so notifications work by default
+   debugLog("info", "spawn_rpc_start", { jobId, taskLength: params.task?.length ?? 0 });
+
    const notifyMode = params.notifyOnComplete || "notify";
 
-   // 3. Ensure socket directory exists atomically with 0700 permissions
    try {
       await fs.promises.mkdir(SOCKET_DIR, { mode: SOCKET_DIR_MODE, recursive: true });
    } catch (err) {
-      console.error(`[spawn-rpc] Failed to create socket directory ${SOCKET_DIR}:`, err);
+      debugLog("error", "socket_dir_create_failed", { jobId, error: String(err) });
       throw err;
    }
 
-   // 4. Generate correlationId
    const correlationId = generateId();
 
-   // 5. Build entry script
+   // Build entry script
    await new Promise<void>((resolve, reject) => {
       const build = spawn('npx', [
          'esbuild',
@@ -107,7 +104,6 @@ export async function spawnRpcSubagent(params: {
       });
    });
 
-   // 6. Create tmux session
    const entryScriptPath = path.resolve(process.cwd(), 'entry/subagent-rpc-client.cjs');
    const socketPath = path.join(SOCKET_DIR, `${jobId}.sock`);
 
@@ -120,9 +116,7 @@ export async function spawnRpcSubagent(params: {
       task: params.task,
       persona: params.persona
    });
-   console.error(`[spawn-rpc] Tmux session created: ${sessionId}, socket: ${socketPath}`);
 
-   // 7. Register service
    const exposedTools = params.expose || ['agent.prompt', 'agent.status', 'tools.list', 'tools.execute'];
 
    const entry: RpcServiceEntry = {
@@ -136,76 +130,68 @@ export async function spawnRpcSubagent(params: {
 
    rpcRegistry.register(entry);
 
-   // 7. Set up ready timeout BEFORE waiting for socket (ready is sent immediately on startup)
+   // Set up ready timeout BEFORE waiting for socket
    const readyTimeout = setTimeout(() => {
-      console.warn(`Subagent ${jobId} did not send ready notification within 5s`);
+      debugLog("warn", "ready_timeout", { jobId });
       pendingReadyTimeouts.delete(jobId);
    }, 5000);
    pendingReadyTimeouts.set(jobId, readyTimeout);
 
-
-   // Wait for socket to be ready (max 5 seconds)
-   const waitForSocket = async (path: string, timeout = 5000): Promise<void> => {
+   // Wait for socket to be ready
+   const waitForSocket = async (sockPath: string, timeout = 5000): Promise<void> => {
       const start = Date.now();
       while (Date.now() - start < timeout) {
          try {
-            await fs.promises.access(path);
+            await fs.promises.access(sockPath);
             return;
          } catch {
             await new Promise(r => setTimeout(r, 50));
          }
       }
-      throw new Error(`Socket ${path} not ready after ${timeout}ms`);
+      throw new Error(`Socket ${sockPath} not ready after ${timeout}ms`);
    };
 
-   // 8. Wait for socket to exist, then connect
    try {
-      console.error(`[spawn-rpc] Waiting for socket: ${socketPath}`);
       await waitForSocket(socketPath, 5000);
       await rpcRouter.connect(jobId, socketPath, () => {
          clearPendingReadyTimeout(jobId);
       });
-      console.error(`[spawn-rpc] Connected to RPC socket`);
    } catch (err) {
-      console.error(`[spawn-rpc] Failed to connect to RPC socket: ${(err as Error).message}`);
+      debugLog("error", "connect_failed", { jobId, error: String(err) });
    }
 
-   // 8b. Subscribe to notifications from subagent
-   const unsubscribeOutput = rpcRouter.subscribe('session.output', (notification) => {
-      const params = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
-      if (params?.jobId) {
-         const job = jobRegistry.get(params.jobId);
+   // Subscribe to notifications from subagent
+   rpcRouter.subscribe('session.output', (notification) => {
+      const p = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
+      if (p?.jobId) {
+         const job = jobRegistry.get(p.jobId);
          if (job) {
-            job.liveStatus.output += params.output || '';
-            jobRegistry.set(params.jobId, job);
-            console.error(`[spawn-rpc] Received output for ${params.jobId}: ${(params.output || '').slice(0, 50)}...`);
+            job.liveStatus.output += p.output || '';
+            jobRegistry.set(p.jobId, job);
          }
       }
    });
 
-   const unsubscribeDone = rpcRouter.subscribe('session.done', (notification) => {
-      const params = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
-      if (params?.jobId) {
-         const job = jobRegistry.get(params.jobId);
+   rpcRouter.subscribe('session.done', (notification) => {
+      const p = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
+      if (p?.jobId) {
+         const job = jobRegistry.get(p.jobId);
          if (job) {
-            job.status = params.isError ? 'error' : 'done';
-            job.liveStatus.output = params.output || '';
+            job.status = p.isError ? 'error' : 'done';
+            job.liveStatus.output = p.output || '';
             job.promise = Promise.resolve({
-               output: params.output || '',
+               output: p.output || '',
                usage: job.liveStatus.usage,
                model: undefined,
-               isError: params.isError || false
+               isError: p.isError || false
             });
-            jobRegistry.set(params.jobId, job);
-            console.error(`[spawn-rpc] Subagent ${params.jobId} completed: ${params.isError ? 'error' : 'done'}`);
+            jobRegistry.set(p.jobId, job);
          }
       }
    });
 
-   // 9. Start heartbeat monitoring
    rpcRouter.startHeartbeat(jobId);
 
-   // Register in jobRegistry for notification delivery
    const jobState: JobState = {
       id: jobId,
       status: 'running',
