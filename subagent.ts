@@ -1510,12 +1510,31 @@ export default function (pi: ExtensionAPI) {
           });
         });
       } else if (backend === "wezterm") {
-        // Open wezterm tab with pi session
+        // Find the session file in the directory
+        const { readdirSync } = await import("node:fs");
+        const { join, dirname } = await import("node:path");
+        let actualSessionPath = sessionPath;
+        // If sessionPath is a directory, find the .jsonl file
+        if (!sessionPath.endsWith(".jsonl")) {
+          try {
+            const files = readdirSync(sessionPath);
+            const sessionFile = files.find((f: string) => f.endsWith(".jsonl"));
+            if (sessionFile) {
+              actualSessionPath = join(sessionPath, sessionFile);
+            }
+          } catch {
+            // Use as-is if directory read fails
+          }
+        }
+        // Open wezterm new window with pi session
         const args = [
           "cli",
-          "split-pane",
+          "spawn",
+          "--new-window",
+          "--cwd",
+          dirname(actualSessionPath) || process.cwd(),
           "--",
-          "pi", "--session", sessionPath, "--continue",
+          "pi", "--session", actualSessionPath, "--continue",
         ];
 
         return new Promise((resolve) => {
