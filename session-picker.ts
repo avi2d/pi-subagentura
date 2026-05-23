@@ -122,6 +122,29 @@ export async function showSessionPicker(
     return null;
   }
 
+  // Check if ctx.ui.custom is available (non-interactive mode may not have it)
+  if (!ctx.ui?.custom) {
+    // Fallback: return session info as text when UI picker isn't available
+    const lines: string[] = [];
+    if (sessionItems.length > 0) {
+      lines.push(`Found ${sessionItems.length} session(s):`);
+      for (const s of sessions) {
+        lines.push(`  - ${s.timestamp}: ${s.taskPreview}`);
+        lines.push(`    Path: ${s.path}`);
+      }
+    }
+    if (jobItems.length > 0) {
+      lines.push(`\nRunning jobs (${jobItems.length}):`);
+      for (const j of runningJobs) {
+        lines.push(`  - ${j.status}: ${j.id}`);
+        if (j.modelLabel) lines.push(`    Model: ${j.modelLabel}`);
+      }
+    }
+    // Return a special result that indicates text output
+    return { type: "cancelled" as const, path: lines.join("\n") };
+  }
+
+
   // Track state
   let activeSection: "sessions" | "jobs" = "sessions";
   const hasSessions = sessionItems.length > 0;

@@ -1410,6 +1410,12 @@ export default function (pi: ExtensionAPI) {
           ],
           details: { jobId: result.jobId, status: result.status, type: "job" },
         };
+      } else if (result.type === "cancelled" && result.path) {
+        // Fallback text output when UI picker wasn't available
+        return {
+          content: [{ type: "text", text: result.path }],
+          details: { textOutput: true },
+        };
       }
 
       return {
