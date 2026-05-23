@@ -147,6 +147,39 @@ export async function spawnRpcSubagent(params: {
    } catch (err) {
       console.error(`[spawn-rpc] Failed to connect to RPC socket: ${(err as Error).message}`);
    }
+
+   // 8b. Subscribe to notifications from subagent
+   const unsubscribeOutput = rpcRouter.subscribe('session.output', (notification) => {
+      const params = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
+      if (params?.jobId) {
+         const job = jobRegistry.get(params.jobId);
+         if (job) {
+            job.liveStatus.output += params.output || '';
+            jobRegistry.set(params.jobId, job);
+            console.error(`[spawn-rpc] Received output for ${params.jobId}: ${(params.output || '').slice(0, 50)}...`);
+         }
+      }
+   });
+
+   const unsubscribeDone = rpcRouter.subscribe('session.done', (notification) => {
+      const params = notification.params as { jobId?: string; output?: string; isError?: boolean } | undefined;
+      if (params?.jobId) {
+         const job = jobRegistry.get(params.jobId);
+         if (job) {
+            job.status = params.isError ? 'error' : 'done';
+            job.liveStatus.output = params.output || '';
+            job.promise = Promise.resolve({
+               output: params.output || '',
+               usage: job.liveStatus.usage,
+               model: undefined,
+               isError: params.isError || false
+            });
+            jobRegistry.set(params.jobId, job);
+            console.error(`[spawn-rpc] Subagent ${params.jobId} completed: ${params.isError ? 'error' : 'done'}`);
+         }
+      }
+   });
+
    // 9. Start heartbeat monitoring
    rpcRouter.startHeartbeat(jobId);
 
