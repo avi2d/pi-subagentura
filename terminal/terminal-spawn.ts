@@ -265,9 +265,11 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
           content: [{
             type: "text" as const,
             text: `Job ${jobId} started in ${backend} window: ${windowId}\n\n` +
-              `Use get_subagent_status({ jobId: "${jobId}" }) to check progress.\n` +
-              `Use get_subagent_result({ jobId: "${jobId}" }) to collect output when done.\n\n` +
-              `The terminal window is active - you can watch the agent work in real-time.`,
+              `Watch the agent work in real-time in the ${backend} window.\n` +
+              `When done, close the window to trigger completion.\n` +
+              `You'll receive a ${params.notifyOnComplete ?? "notification"} when the job completes.\n\n` +
+              `Use get_subagent_status({ jobId: "${jobId}" }) to check status.\n` +
+              `Use get_subagent_result({ jobId: "${jobId}" }) to get final output.`,
           }],
           details: {
             jobId,
