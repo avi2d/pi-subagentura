@@ -147,7 +147,7 @@ export function registerTerminalSpawn(pi: ExtensionAPI): void {
         });
 
         // Build the pi command
-        const helperPath = require.resolve(`./${backend}/${backend}-agent-cli.js`);
+        const helperPath = require.resolve(`../${backend}/${backend}-agent-cli.js`);
         const taskEscaped = params.task.replace(/"/g, '\\"');
         const personaArg = params.persona ? `--persona "${params.persona.replace(/"/g, '\\"')}"` : "";
         const modelArg = params.model ? `--model ${params.model}` : "";
