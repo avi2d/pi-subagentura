@@ -137,9 +137,24 @@ export async function spawnRpcSubagent(params: {
    rpcRegistry.register(entry);
 
 
-   // 8. Connect explicitly with ready notification handler
-   // This ensures we capture the session.ready even if it arrives before heartbeat starts
+   // Wait for socket to be ready (max 5 seconds)
+   const waitForSocket = async (path: string, timeout = 5000): Promise<void> => {
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+         try {
+            await fs.promises.access(path);
+            return;
+         } catch {
+            await new Promise(r => setTimeout(r, 50));
+         }
+      }
+      throw new Error(`Socket ${path} not ready after ${timeout}ms`);
+   };
+
+   // 8. Wait for socket to exist, then connect
    try {
+      console.error(`[spawn-rpc] Waiting for socket: ${socketPath}`);
+      await waitForSocket(socketPath, 5000);
       await rpcRouter.connect(jobId, socketPath, () => {
          clearPendingReadyTimeout(jobId);
       });
