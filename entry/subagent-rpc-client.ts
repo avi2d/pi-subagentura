@@ -3,9 +3,18 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Read task/persona from environment for auto-execution
-const ENV_TASK = process.env.PI_TASK || '';
-const ENV_PERSONA = process.env.PI_PERSONA || '';
+// Read task/persona from environment for auto-execution (base64-encoded JSON to avoid shell quoting issues)
+function decodeBase64Env(key: string): string {
+   const val = process.env[key];
+   if (!val) return '';
+   try {
+      return JSON.parse(Buffer.from(val, 'base64').toString('utf8'));
+   } catch {
+      return '';
+   }
+}
+const ENV_TASK = decodeBase64Env('PI_TASK_B64');
+const ENV_PERSONA = decodeBase64Env('PI_PERSONA_B64');
 
 // Parse CLI arguments
 function parseArgs(): { socket: string; jobId: string } {

@@ -24,8 +24,17 @@ var net = __toESM(require("net"), 1);
 var import_child_process = require("child_process");
 var fs = __toESM(require("fs"), 1);
 var path = __toESM(require("path"), 1);
-const ENV_TASK = process.env.PI_TASK || "";
-const ENV_PERSONA = process.env.PI_PERSONA || "";
+function decodeBase64Env(key) {
+  const val = process.env[key];
+  if (!val) return "";
+  try {
+    return JSON.parse(Buffer.from(val, "base64").toString("utf8"));
+  } catch {
+    return "";
+  }
+}
+const ENV_TASK = decodeBase64Env("PI_TASK_B64");
+const ENV_PERSONA = decodeBase64Env("PI_PERSONA_B64");
 function parseArgs() {
   const args = process.argv.slice(2);
   let socket = "";

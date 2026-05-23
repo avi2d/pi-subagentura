@@ -77,17 +77,13 @@ export class TmuxBridge {
       const entryScript = config.entryScriptPath;
       const socketPath = path.join(this.socketDir, `${safeJobId}.sock`);
 
-      // Build the tmux command - entryScript is internal path, no user input
-      // TERM=xterm is needed when spawning from non-interactive contexts
-      // Pass task/persona via env vars for auto-execution
-      const taskEnv = config.task ? `PI_TASK='${config.task.replace(/'/g, "'\\''")}'` : '';
-      const personaEnv = config.persona ? `PI_PERSONA='${config.persona.replace(/'/g, "'\\''")}'` : '';
-      const envVars = [taskEnv, personaEnv].filter(Boolean).join(' ');
-      const fullEnv = envVars ? `${envVars} ` : '';
+      // Use JSON encoding for task/persona to avoid shell quoting issues entirely
+      const taskJson = config.task ? Buffer.from(JSON.stringify(config.task)).toString('base64') : '';
+      const personaJson = config.persona ? Buffer.from(JSON.stringify(config.persona)).toString('base64') : '';
       // Use nvm node v20 as a stable path (fnm paths are temporary)
-      // Use bash -c with background sleep to keep session alive after command finishes
       const nodePath = '/Users/applesucks/.nvm/versions/node/v20.15.1/bin/node';
-      const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent 'bash -c "env TERM=xterm ${fullEnv.replace(/'/g, "'\\\\'\\\\''")}${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999"'`;
+      // Simple command - no complex quoting needed, just double quotes around bash -c
+      const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent "bash -c 'env TERM=xterm PI_TASK_B64=${taskJson} PI_PERSONA_B64=${personaJson} ${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999'"`;
       console.error(`[tmux-bridge] Creating session: ${sessionName}`);
       console.error(`[tmux-bridge] Command: ${tmuxCmd}`);
       try {
