@@ -760,6 +760,9 @@ export default function (pi: ExtensionAPI) {
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
 
+        // Auto-generate sessionDir for async agents if not provided
+        const sessionDir = params.sessionDir ?? `/tmp/pi-async-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
         const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
           await startSubagentJob({
             task: params.task,
@@ -772,6 +775,7 @@ export default function (pi: ExtensionAPI) {
             defaultModel: ctx.model,
             maxAge: params.maxAge,
             parentModelRegistry: ctx.modelRegistry,
+            sessionDir,
           });
         const jobState: JobState = {
           id: jobId,
@@ -871,11 +875,11 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text: `Job ${jobId} started. Session saved to: ${sessionDir}\n\nUse connect_to_session({ sessionPath: "${sessionDir}", backend: "tmux" }) to attach a terminal.\n\nUse get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
-          details: { jobId, status: "started" },
+          details: { jobId, status: "started", sessionDir },
         };
       }
 
