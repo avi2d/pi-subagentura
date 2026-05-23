@@ -116,7 +116,8 @@ export interface JobState {
   status: JobStatus;
   liveStatus: SubagentLiveStatus;
   result?: SubagentResult;
-  session: AgentSession;
+  /** AgentSession for in-process subagents; undefined for RPC/tmux subagents */
+  session?: AgentSession;
   startedAt: number;
   promise: Promise<SubagentResult>;
   modelLabel?: string;
@@ -325,7 +326,8 @@ export interface StartSubagentJobParams {
 export interface StartSubagentJobResult {
   jobId: string;
   jobPromise: Promise<SubagentResult>;
-  session: AgentSession;
+  /** AgentSession for in-process subagents; undefined for RPC/tmux subagents */
+  session?: AgentSession;
   liveStatus: SubagentLiveStatus;
   modelLabel?: string;
   /** Warning when modelOverride was specified but not found — lists available models */

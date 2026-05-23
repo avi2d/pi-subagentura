@@ -47,6 +47,9 @@ import {
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { spawnNotifySubagent, SpawnNotifyParams, type SpawnNotifyResult } from "./tools/spawn-notify.js";
+import { spawnRpcSubagent, SpawnRpcParams } from "./tools/spawn-rpc.js";
+import { callSubagentRpc, CallRpcParams, listRpcSubagents, ListRpcParams } from "./tools/mod.js";
+import { killRpcSubagent, KillRpcParams } from "./tools/mod.js";
 import { rpcRouter } from "./rpc/mod.js";
 
 // ── Footer Status Key ───────────────────────────────────────────────
@@ -1496,6 +1499,209 @@ export default function(pi: ExtensionAPI) {
          ];
 
          return new Text(lines.join("\n"), 0, 0);
+      },
+   });
+
+   // ── Tool: spawn RPC subagent in tmux with notification ────────────────────
+   pi.registerTool({
+      name: "spawn_rpc_subagent",
+      label: "Spawn RPC Subagent",
+      description: [
+         "Spawn a subagent in an isolated tmux session with RPC communication.",
+         "The subagent runs in tmux and can receive commands via RPC.",
+         "When complete, it sends a notification with results.",
+         "Attach with: tmux attach -t pi-subagentura:<jobId>",
+      ].join("\n"),
+      parameters: SpawnRpcParams,
+
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+         debugLog("info", "tool_call", {
+            toolName: "spawn_rpc_subagent",
+            toolCallId: _toolCallId,
+         });
+
+         try {
+            const result = await spawnRpcSubagent({
+               task: params.task,
+               persona: params.persona,
+               cwd: params.cwd,
+               model: params.model,
+               expose: params.expose,
+               timeout: params.timeout,
+               notifyOnComplete: params.notifyOnComplete,
+            });
+
+            return {
+               content: [
+                  {
+                     type: "text",
+                     text: result.message,
+                  },
+               ],
+               details: {
+                  jobId: result.jobId,
+                  socketPath: result.socketPath,
+                  sessionId: result.sessionId,
+                  attachCommand: result.attachCommand,
+                  weztermCommand: result.weztermCommand,
+                  zellijCommand: result.zellijCommand,
+               },
+            };
+         } catch (err) {
+            return {
+               content: [
+                  {
+                     type: "text",
+                     text: `Failed to spawn RPC subagent: ${(err as Error).message}`,
+                  },
+               ],
+               isError: true,
+               details: { error: (err as Error).message },
+            };
+         }
+      },
+
+      renderCall(args, theme) {
+         const task = String(args.task ?? "").slice(0, 50);
+         const text =
+            theme.fg("toolTitle", theme.bold("spawn_rpc_subagent ")) +
+            theme.fg("dim", `"${task}..."`);
+         return new Text(text, 0, 0);
+      },
+
+      renderResult(result, _options, theme, _context) {
+         const details = result.details as Record<string, unknown> | undefined;
+         if (!details) {
+            return new Text(theme.fg("error", "Spawn failed"), 0, 0);
+         }
+
+         const lines = [
+            theme.fg("success", "✓ RPC Subagent spawned"),
+            theme.fg("accent", `  Job ID: ${details.jobId}`),
+            theme.fg("accent", `  Session: ${details.sessionId}`),
+            "",
+            theme.fg("toolTitle", "Attach commands:"),
+            `  tmux:   ${details.attachCommand}`,
+            `  wezterm: ${details.weztermCommand}`,
+            `  zellij:  ${details.zellijCommand}`,
+         ];
+
+         return new Text(lines.join("\n"), 0, 0);
+      },
+   });
+
+   // ── Tool: call RPC subagent ──────────────────────────────────────────────
+   pi.registerTool({
+      name: "call_subagent_rpc",
+      label: "Call RPC Subagent",
+      description: "Call a method on an RPC subagent.",
+      parameters: CallRpcParams,
+
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+         debugLog("info", "tool_call", {
+            toolName: "call_subagent_rpc",
+            toolCallId: _toolCallId,
+         });
+
+         try {
+            const result = await callSubagentRpc({
+               jobId: params.jobId,
+               method: params.method,
+               params: params.params,
+               timeout: params.timeout,
+            });
+
+            return {
+               content: [{ type: "text", text: JSON.stringify(result) }],
+               details: result,
+            };
+         } catch (err) {
+            return {
+               content: [{ type: "text", text: `RPC call failed: ${(err as Error).message}` }],
+               isError: true,
+               details: { error: (err as Error).message },
+            };
+         }
+      },
+
+      renderCall(args, theme) {
+         const method = String(args.method ?? "");
+         const text =
+            theme.fg("toolTitle", theme.bold("call_subagent_rpc ")) +
+            theme.fg("dim", method);
+         return new Text(text, 0, 0);
+      },
+   });
+
+   // ── Tool: list RPC subagents ──────────────────────────────────────────────
+   pi.registerTool({
+      name: "list_rpc_subagents",
+      label: "List RPC Subagents",
+      description: "List all running RPC subagents.",
+      parameters: ListRpcParams,
+
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+         debugLog("info", "tool_call", {
+            toolName: "list_rpc_subagents",
+            toolCallId: _toolCallId,
+         });
+
+
+         try {
+            const result = await listRpcSubagents({});
+            return {
+               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+               details: result,
+            };
+         } catch (err) {
+            return {
+               content: [{ type: "text", text: `Failed to list subagents: ${(err as Error).message}` }],
+               isError: true,
+               details: { error: (err as Error).message },
+            };
+         }
+      },
+
+      renderCall(_args, theme) {
+         return new Text(theme.fg("toolTitle", theme.bold("list_rpc_subagents")), 0, 0);
+      },
+   });
+
+   // ── Tool: kill RPC subagent ───────────────────────────────────────────────
+   pi.registerTool({
+      name: "kill_rpc_subagent",
+      label: "Kill RPC Subagent",
+      description: "Kill a running RPC subagent session.",
+      parameters: KillRpcParams,
+
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+         debugLog("info", "tool_call", {
+            toolName: "kill_rpc_subagent",
+            toolCallId: _toolCallId,
+         });
+
+         try {
+            await killRpcSubagent({ jobId: params.jobId });
+
+            return {
+               content: [{ type: "text", text: `Subagent ${params.jobId} killed` }],
+               details: { jobId: params.jobId },
+            };
+         } catch (err) {
+            return {
+               content: [{ type: "text", text: `Failed to kill subagent: ${(err as Error).message}` }],
+               isError: true,
+               details: { error: (err as Error).message },
+            };
+         }
+      },
+
+      renderCall(args, theme) {
+         const jobId = String(args.jobId ?? "");
+         return new Text(
+            theme.fg("toolTitle", theme.bold("kill_rpc_subagent ")) +
+            theme.fg("dim", jobId)
+         );
       },
    });
 
