@@ -10,7 +10,7 @@
  * 5. Sends result when done
  */
 
-import { connect as netConnect, type Socket as NetSocket } from "node:net";
+import { connect as netConnect } from "node:net";
 import { spawn } from "node:child_process";
 import { writeFileSync, existsSync, mkdirSync } from "node:fs";
 
@@ -45,26 +45,26 @@ if (!args.socket) {
 
 debugLog("Starting wezterm-agent-cli", { socket: args.socket, cwd: args.cwd, taskLength: args.task.length });
 
-let client: NetSocket | null = null;
-let piProcess: ReturnType<typeof spawn> | null = null;
+let client = null;
+let piProcess = null;
 let output = "";
 let done = false;
 
-function send(msg: Record<string, unknown>) {
+function send(msg) {
   if (client && client.writable) {
     client.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\n");
   }
 }
 
-function sendProgress(output: string, turn = 0) {
+function sendProgress(output, turn = 0) {
   send({ method: "progress", params: { output: output.slice(-500), turn }, id: null });
 }
 
-function sendResult(output: string, usage: Record<string, unknown> = {}) {
+function sendResult(output, usage = {}) {
   send({ method: "result", params: { output, usage }, id: 1 });
 }
 
-function sendError(message: string) {
+function sendError(message) {
   send({ method: "error", params: { message }, id: 1 });
 }
 
@@ -76,7 +76,7 @@ const sessionId = Date.now() + "_" + Math.random().toString(36).slice(2, 8);
 try {
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   debugLog("Created session dir:", sessionDir);
-} catch (e: any) {
+} catch (e) {
   debugLog("Failed to create session dir:", e.message);
 }
 
@@ -138,7 +138,7 @@ function runPiSession() {
   let lastProgress = 0;
   let turnCount = 0;
   
-  piProcess.stdout?.on("data", (chunk: Buffer) => {
+  piProcess.stdout?.on("data", (chunk) => {
     const text = chunk.toString();
     output += text;
     
@@ -152,7 +152,7 @@ function runPiSession() {
     process.stdout.write(text);
   });
   
-  piProcess.stderr?.on("data", (chunk: Buffer) => {
+  piProcess.stderr?.on("data", (chunk) => {
     const text = chunk.toString();
     // Check for turn completion to track turns
     if (text.includes("Done after")) {
