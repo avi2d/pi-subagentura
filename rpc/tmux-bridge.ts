@@ -82,12 +82,20 @@ export class TmuxBridge {
       const personaJson = config.persona ? Buffer.from(JSON.stringify(config.persona)).toString('base64') : '';
       // Use nvm node v20 as a stable path (fnm paths are temporary)
       const nodePath = '/Users/applesucks/.nvm/versions/node/v20.15.1/bin/node';
-      // Simple command - no complex quoting needed, just double quotes around bash -c
-      const tmuxCmd = `tmux new-session -d -s "${sessionName}" -n pi-subagent "bash -c 'env TERM=xterm PI_TASK_B64=${taskJson} PI_PERSONA_B64=${personaJson} ${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999'"`;
+      // Use spawn instead of execAsync to avoid shell quoting issues
+      const bashCmd = `env TERM=xterm PI_TASK_B64=${taskJson} PI_PERSONA_B64=${personaJson} ${nodePath} ${entryScript} --socket=${socketPath} --jobId=${safeJobId}; sleep 9999`;
+      const tmuxArgs = ['new-session', '-d', '-s', sessionName, '-n', 'pi-subagent', 'bash', '-c', bashCmd];
       console.error(`[tmux-bridge] Creating session: ${sessionName}`);
-      console.error(`[tmux-bridge] Command: ${tmuxCmd}`);
+      console.error(`[tmux-bridge] Args: ${tmuxArgs.join(' ')}`);
       try {
-         await execAsync(tmuxCmd);
+         const proc = spawn('tmux', tmuxArgs);
+         await new Promise<void>((resolve, reject) => {
+            proc.on('close', (code) => {
+               if (code === 0) resolve();
+               else reject(new Error(`tmux exited with code ${code}`));
+            });
+            proc.on('error', reject);
+         });
       } catch (err) {
          throw new Error(`Failed to create tmux session ${sessionName}: ${err}`);
       }
