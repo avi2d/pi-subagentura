@@ -1533,8 +1533,9 @@ export default function (pi: ExtensionAPI) {
           }
         }
         // Open wezterm new window with pi session
-        // Using cli spawn --new-window with direct pi path
+        // Run pi inside bash -l -c so that after pi exits, bash keeps the window alive
         const piFullPath = "/Users/applesucks/Library/pnpm/pi";
+        const piCmd = `"${piFullPath}" --session "${actualSessionPath}" --continue`;
         const args = [
           "cli",
           "spawn",
@@ -1542,10 +1543,10 @@ export default function (pi: ExtensionAPI) {
           "--cwd",
           dirname(actualSessionPath) || process.cwd(),
           "--",
-          piFullPath,
-          "--session",
-          actualSessionPath,
-          "--continue",
+          "bash",
+          "-l",
+          "-c",
+          `${piCmd}; exec bash`,
         ];
 
         return new Promise((resolve) => {
