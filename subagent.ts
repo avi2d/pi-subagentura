@@ -47,6 +47,7 @@ import {
 import { createSocketServer, type SocketServer } from "./tmux/tmux-agent";
 import { registerTmuxSpawn } from "./tmux/tmux-spawn";
 import { registerWeztermSpawn } from "./wezterm/wezterm-spawn";
+import { registerTerminalSpawn } from "./terminal/terminal-spawn";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { randomBytes as randomBytesImport } from "node:crypto";
@@ -1373,6 +1374,9 @@ export default function (pi: ExtensionAPI) {
 
   // ── Wezterm spawn tool ─────────────────────────────────────────────
   registerWeztermSpawn(pi);
+
+  // ── Terminal spawn tool ─────────────────────────────────────────────
+  registerTerminalSpawn(pi);
 
   // ── Session shutdown: abort all jobs and clear registry ──────────
   (pi as any).on?.("session_shutdown", () => {
