@@ -128,6 +128,8 @@ export interface JobState {
   resultRetrieved?: boolean;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
+  /** Execution backend: 'in-process' (default) or 'tmux' (attachable) */
+  backend?: 'in-process' | 'tmux';
 }
 
 // ── Job Registry ────────────────────────────────────────────────────

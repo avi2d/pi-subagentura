@@ -47,6 +47,21 @@ import {
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
+// Tmux backend imports
+import {
+  spawnTmuxSubagent,
+  getTmuxActivityStatus,
+  getTmuxJob,
+  listTmuxJobs,
+  getTmuxAttachInstructions,
+  killTmuxJob,
+  checkTmux,
+  TMUX_BASE_DIR,
+} from "./tmux-spawner";
+import { registerTmuxCommands } from "./tmux-commands";
+import { isTmuxChildMode, activateTmuxChildMode } from "./tmux-child";
+import * as fs from "node:fs";
+
 // ── Footer Status Key ───────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
 
@@ -283,6 +298,18 @@ const BaseParams = Type.Object({
         "Optional TTL in milliseconds for completed job retention. Jobs persist indefinitely if omitted.",
     }),
   ),
+  backend: Type.Optional(
+    Type.Union([
+      Type.Literal("in-process", {
+        description: "Run in the same process (default, faster but shares memory)",
+      }),
+      Type.Literal("tmux", {
+        description: "Run in a tmux session (slower but allows attach and true isolation)",
+      }),
+    ], {
+      description: "Execution backend: 'in-process' (default) or 'tmux' (attachable)",
+    }),
+  ),
 });
 
 const StatusParams = Type.Object({
@@ -330,12 +357,26 @@ function decrementInjectCount(): void {
 /** Max concurrent inject-mode notifications before degrading to notify */
 export const MAX_INJECT = 5;
 
+// ── Shutdown Guard ──────────────────────────────────────────────
+const SHUTDOWN_KEY = Symbol.for("pi-subagentura/shutdown");
+
+function isShuttingDown(): boolean {
+  return (globalThis as any)[SHUTDOWN_KEY] === true;
+}
+
+function setShuttingDown(): void {
+  (globalThis as any)[SHUTDOWN_KEY] = true;
+}
+
 // ── Notification Delivery ───────────────────────────────────────
 /**
  * Deliver async subagent completion notification.
  * Reads pi from globalThis to survive module reloads.
  */
 function deliverNotification(jobState: JobState, result: SubagentResult): void {
+  // Don't deliver during shutdown
+  if (isShuttingDown()) return;
+
   const g2 = typeof global !== "undefined" ? global : globalThis;
   const pi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return; // extension not loaded yet
@@ -465,10 +506,174 @@ function renderSubagentNotify(
 }
 
 export default function (pi: ExtensionAPI) {
+  // If running as a tmux subagent (PI_SUBAGENT=1), activate child mode
+  if (isTmuxChildMode()) {
+    console.log("[subagent] Running in tmux child mode");
+    activateTmuxChildMode(pi);
+    return;
+  }
+
+  // ============================================================================
+  // Signal Handlers - Graceful cleanup of orphan tmux sessions
+  // ============================================================================
+
+  let cleanupDone = false;
+
+  function cleanupAllSessions(): void {
+    const sessions = jobRegistry.values();
+    let killed = 0;
+    for (const job of sessions) {
+      if (job.status === "running" && job.backend === "tmux") {
+        try {
+          killTmuxJob(job.id);
+          killed++;
+        } catch {
+          // Ignore - session may already be dead
+        }
+      }
+    }
+    if (killed > 0) {
+      console.log(`[subagent] Cleaned up ${killed} orphan tmux session(s)`);
+    }
+  }
+
+  function doCleanup(signal: string): void {
+    if (cleanupDone) return;
+    cleanupDone = true;
+    isShuttingDown = true;
+    console.log(`[subagent] Received ${signal}, cleaning up...`);
+    cleanupAllSessions();
+  }
+
+  // Register signal handlers
+  process.on("SIGINT", () => {
+    doCleanup("SIGINT");
+    process.exit(0);
+  });
+
+  process.on("SIGTERM", () => {
+    doCleanup("SIGTERM");
+    process.exit(0);
+  });
+
+  process.on("exit", () => {
+    cleanupAllSessions();
+  });
+
+  // Guard flag to prevent operations during shutdown
+  let isShuttingDown = false;
+
   // Persist pi ref for async notification delivery (survives module reload)
   const g2 = typeof global !== "undefined" ? global : globalThis;
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaInjectCount = 0;
+
+  // Ensure base directory exists for tmux backend
+  fs.mkdirSync(TMUX_BASE_DIR, { recursive: true });
+
+  // Register tmux commands
+  registerTmuxCommands(pi);
+
+  // ── TUI Widget ──────────────────────────────────────────────────────
+  let latestCtx: any = null;
+  let widgetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function formatElapsed(startTime: Date): string {
+    const seconds = Math.floor((Date.now() - startTime.getTime()) / 1000);
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
+  function truncateWidget(s: string | undefined, maxWidth: number): string {
+    if (!s) return "".padEnd(maxWidth);
+    if (s.length <= maxWidth) return s;
+    return s.slice(0, Math.max(0, maxWidth - 1)) + "...";
+  }
+
+  function updateWidget(): void {
+    if (!latestCtx?.hasUI || isShuttingDown) return;
+
+    // Get both in-process and tmux jobs
+    const inProcessJobs = [...jobRegistry.values()].filter((j) => j.status === "running");
+    const tmuxJobs = listTmuxJobs().filter((j) => j.state === "running");
+    const all = [...inProcessJobs, ...tmuxJobs];
+
+    if (all.length === 0) {
+      latestCtx.ui.setWidget("subagent-status", undefined);
+      if (widgetTimer) {
+        clearTimeout(widgetTimer);
+        widgetTimer = null;
+      }
+      return;
+    }
+
+    latestCtx.ui.setWidget(
+      "subagent-status",
+      (_tui: any, _theme: any) => {
+        return {
+          invalidate() {},
+          render(width: number) {
+            const w = Math.max(20, width);
+            const inner = w - 2;
+            const lines: string[] = [];
+
+            // Top line
+            const top = "\u250c" + "\u2500".repeat(inner) + "\u2510";
+            lines.push(top.slice(0, w));
+
+            // Subagent lines
+            for (const job of all) {
+              const isTmux = job.hasOwnProperty("sessionDir");
+              const startedAt = (job as any).startedAt ?? (job as any).createdAt;
+              const elapsed = formatElapsed(new Date(startedAt));
+              const taskLen = Math.max(5, inner - 20);
+              const task = truncateWidget((job as any).task, taskLen);
+              const backend = isTmux ? "tmux" : "proc";
+              const status = isTmux ? "running" : "running";
+              const padding =
+                inner - elapsed.length - 2 - task.length - 2 - backend.length - 2 - status.length;
+              const line =
+                "\u2502 " +
+                elapsed +
+                "  " +
+                task +
+                " ".repeat(Math.max(1, padding)) +
+                backend +
+                " " +
+                status +
+                " \u2502";
+              lines.push(line.slice(0, w));
+            }
+
+            // Bottom line
+            const bottom = "\u2514" + "\u2500".repeat(inner) + "\u2518";
+            lines.push(bottom.slice(0, w));
+
+            return lines;
+          },
+        };
+      },
+      { placement: "aboveEditor" }
+    );
+  }
+
+  function scheduleWidgetUpdate(): void {
+    if (!latestCtx?.hasUI) return;
+    updateWidget();
+    widgetTimer = setTimeout(scheduleWidgetUpdate, 1000);
+  }
+
+  function startWidgetRefresh(): void {
+    if (widgetTimer) return;
+    scheduleWidgetUpdate();
+  }
+
+  // Capture UI context for widget updates
+  pi.on("session_start", (_event: any, ctx: any) => {
+    latestCtx = ctx;
+    startWidgetRefresh();
+  });
 
   // Register notification renderer before any tools
   (pi as any).registerMessageRenderer?.(
@@ -529,6 +734,101 @@ export default function (pi: ExtensionAPI) {
           (e): e is typeof e & { type: "message" } => e.type === "message",
         )
         .map((e) => e.message);
+
+      // ── Tmux backend path ──
+      if (params.backend === "tmux") {
+        const tmuxAvailable = await checkTmux();
+        if (!tmuxAvailable) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: tmux is required for tmux backend. Install with: brew install tmux",
+              },
+            ],
+            isError: true,
+            details: {},
+          };
+        }
+
+        const targetCwd = params.cwd ?? ctx.cwd;
+        const contextMode: "isolated" | "with_context" = "with_context";
+
+        const jobId = await spawnTmuxSubagent(
+          params.task,
+          contextMode,
+          targetCwd,
+          (exitData) => {
+            // Handle completion callback
+            const job = getTmuxJob(jobId);
+            if (!job) return;
+
+            const result: SubagentResult = {
+              output: exitData.output || "(no output)",
+              usage: exitData.usage || {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                turns: 0,
+              },
+              model: exitData.model,
+              isError: exitData.type === "error" || exitData.type === "cancelled",
+              errorMessage: exitData.errorMessage,
+            };
+
+            // Deliver notification if requested
+            const jobState = jobRegistry.get(jobId);
+            if (jobState?.notifyOnComplete && !jobState.notificationDelivered) {
+              deliverNotification(jobState, result);
+            }
+
+            // Update widget to remove completed job
+            updateWidget();
+          }
+        );
+
+        // Add to in-process registry for tracking
+        const jobState: JobState = {
+          id: jobId,
+          status: "running",
+          liveStatus: {
+            turn: 0,
+            output: "",
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          },
+          session: null as any,
+          startedAt: Date.now(),
+          promise: new Promise(() => {}),
+          notifyOnComplete:
+            params.notifyOnComplete === "inject"
+              ? "inject"
+              : params.notifyOnComplete === "notify"
+                ? "notify"
+                : undefined,
+          notificationDelivered: false,
+          maxAge: params.maxAge,
+          backend: "tmux",
+        };
+        jobRegistry.set(jobId, jobState);
+
+        // Update widget
+        updateWidget();
+
+        const attachInstructions = getTmuxAttachInstructions(jobId);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Tmux subagent spawned: ${jobId}` +
+                (attachInstructions ? `\n\n${attachInstructions}` : ""),
+            },
+          ],
+          details: { jobId, backend: "tmux", status: "started" },
+        };
+      }
 
       // ── Async path ──
       if (params.async === true) {
@@ -606,6 +906,9 @@ export default function (pi: ExtensionAPI) {
             ) {
               deliverNotification(jobState, result);
             }
+
+            // Update widget to reflect completion
+            updateWidget();
 
             const remaining = [...jobRegistry.values()].filter(
               (j) => j.status === "running",
@@ -754,8 +1057,99 @@ export default function (pi: ExtensionAPI) {
         cwd: params.cwd ?? ctx.cwd,
         notifyOnComplete: params.notifyOnComplete ?? null,
         maxAge: params.maxAge ?? null,
+        backend: params.backend ?? null,
       });
 
+      // ── Tmux backend path ──
+      if (params.backend === "tmux") {
+        const tmuxAvailable = await checkTmux();
+        if (!tmuxAvailable) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: tmux is required for tmux backend. Install with: brew install tmux",
+              },
+            ],
+            isError: true,
+            details: {},
+          };
+        }
+
+        const targetCwd = params.cwd ?? ctx.cwd;
+        const contextMode: "isolated" | "with_context" = "isolated";
+
+        const jobId = await spawnTmuxSubagent(
+          params.task,
+          contextMode,
+          targetCwd,
+          (exitData) => {
+            const job = getTmuxJob(jobId);
+            if (!job) return;
+
+            const result: SubagentResult = {
+              output: exitData.output || "(no output)",
+              usage: exitData.usage || {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                turns: 0,
+              },
+              model: exitData.model,
+              isError: exitData.type === "error" || exitData.type === "cancelled",
+              errorMessage: exitData.errorMessage,
+            };
+
+            const jobState = jobRegistry.get(jobId);
+            if (jobState?.notifyOnComplete && !jobState.notificationDelivered) {
+              deliverNotification(jobState, result);
+            }
+
+            // Update widget to remove completed job
+            updateWidget();
+          }
+        );
+
+        const jobState: JobState = {
+          id: jobId,
+          status: "running",
+          liveStatus: {
+            turn: 0,
+            output: "",
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          },
+          session: null as any,
+          startedAt: Date.now(),
+          promise: new Promise(() => {}),
+          notifyOnComplete:
+            params.notifyOnComplete === "inject"
+              ? "inject"
+              : params.notifyOnComplete === "notify"
+                ? "notify"
+                : undefined,
+          notificationDelivered: false,
+          maxAge: params.maxAge,
+          backend: "tmux",
+        };
+        jobRegistry.set(jobId, jobState);
+
+        updateWidget();
+
+        const attachInstructions = getTmuxAttachInstructions(jobId);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Tmux subagent spawned: ${jobId}` +
+                (attachInstructions ? `\n\n${attachInstructions}` : ""),
+            },
+          ],
+          details: { jobId, backend: "tmux", status: "started" },
+        };
+      }
 
       // ── Async path ──
       if (params.async === true) {
@@ -824,6 +1218,9 @@ export default function (pi: ExtensionAPI) {
             ) {
               deliverNotification(jobState, result);
             }
+
+            // Update widget to reflect completion
+            updateWidget();
 
             // Update or clear footer status
             const remaining = [...jobRegistry.values()].filter(
@@ -955,6 +1352,86 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Handle tmux jobs
+      if (job.backend === "tmux") {
+        const tmuxJob = getTmuxJob(params.jobId);
+        if (!tmuxJob) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Job ${params.jobId} not found. Tmux session may have ended.`,
+              },
+            ],
+            details: { jobId: params.jobId, status: "not_found" },
+            isError: true,
+          };
+        }
+
+        if (tmuxJob.state === "completed" || tmuxJob.state === "killed") {
+          const exitData = tmuxJob.exitData;
+          const result = {
+            output: exitData?.output || "(no output)",
+            usage: exitData?.usage || {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              turns: 0,
+            },
+            model: exitData?.model,
+            isError: tmuxJob.state === "killed",
+            errorMessage: exitData?.errorMessage,
+          };
+          const usageStr = formatUsage(result.usage, result.model);
+          return {
+            content: [{ type: "text", text: result.output }],
+            details: {
+              status: tmuxJob.state,
+              usage: result.usage,
+              model: result.model,
+              usageSummary: usageStr,
+              backend: "tmux",
+            },
+            isError: result.isError,
+          };
+        }
+
+        if (tmuxJob.state === "attached") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Job ${params.jobId} is attached to tmux. You can interact with it via tmux attach -t ${params.jobId}`,
+              },
+            ],
+            details: { jobId: params.jobId, status: "attached", backend: "tmux" },
+          };
+        }
+
+        // Running - get activity status
+        const activity = getTmuxActivityStatus(params.jobId);
+        if (activity) {
+          const output = `Phase: ${activity.phase}, Scope: ${activity.scope}, Event: ${activity.event}`;
+          return {
+            content: [{ type: "text", text: output }],
+            details: {
+              status: "running",
+              phase: activity.phase,
+              scope: activity.scope,
+              event: activity.event,
+              backend: "tmux",
+            },
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: `Job ${params.jobId} is running (tmux)` }],
+          details: { jobId: params.jobId, status: "running", backend: "tmux" },
+        };
+      }
+
       if (job.status === "done" || job.status === "error") {
         const result = job.result!;
         const usageStr = formatUsage(result.usage, result.model);
@@ -1012,7 +1489,7 @@ export default function (pi: ExtensionAPI) {
     name: "get_subagent_result",
     label: "Get Subagent Result",
     description:
-      "Block until an async subagent job completes, then return the final output and usage summary.",
+      "Block until an async subagent job completes, then return the final output and usage summary. For tmux backend, returns immediately with current status if the job hasn't completed yet.",
     parameters: ResultParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -1035,6 +1512,76 @@ export default function (pi: ExtensionAPI) {
           ],
           details: { jobId: params.jobId },
           isError: true,
+        };
+      }
+
+      // Handle tmux jobs
+      if (job.backend === "tmux") {
+        const tmuxJob = getTmuxJob(params.jobId);
+        if (!tmuxJob) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Job ${params.jobId} not found. Tmux session may have ended.`,
+              },
+            ],
+            details: { jobId: params.jobId, status: "not_found" },
+            isError: true,
+          };
+        }
+
+        if (tmuxJob.state === "completed") {
+          const exitData = tmuxJob.exitData;
+          const result: SubagentResult = {
+            output: exitData?.output || "(no output)",
+            usage: exitData?.usage || {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              turns: 0,
+            },
+            model: exitData?.model,
+            isError: false,
+            errorMessage: exitData?.errorMessage,
+          };
+          const usageStr = formatUsage(result.usage, result.model);
+          return {
+            content: [{ type: "text", text: result.output }],
+            details: {
+              usage: result.usage,
+              model: result.model,
+              usageSummary: usageStr,
+              backend: "tmux",
+            },
+            isError: result.isError,
+          };
+        }
+
+        if (tmuxJob.state === "killed") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Job ${params.jobId} was cancelled.`,
+              },
+            ],
+            details: { jobId: params.jobId, status: "cancelled", backend: "tmux" },
+            isError: true,
+          };
+        }
+
+        // Still running - for tmux we can't block, so return current status
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Job ${params.jobId} is still running. Use get_subagent_status to check progress, or attach via: tmux attach -t ${params.jobId}`,
+            },
+          ],
+          details: { jobId: params.jobId, status: "running", backend: "tmux" },
         };
       }
 
@@ -1157,6 +1704,26 @@ export default function (pi: ExtensionAPI) {
           details: { jobId: params.jobId, status: job.status },
           isError: true,
         };
+      }
+
+      // Handle tmux jobs
+      if (job.backend === "tmux") {
+        const success = killTmuxJob(params.jobId);
+        if (success) {
+          job.status = "cancelled";
+          scheduleJobCleanup(params.jobId, true);
+          updateWidget();
+          return {
+            content: [{ type: "text", text: `Job ${params.jobId} cancelled (tmux).` }],
+            details: { jobId: params.jobId, status: "cancelled" },
+          };
+        } else {
+          return {
+            content: [{ type: "text", text: `Failed to cancel job ${params.jobId}.` }],
+            details: { jobId: params.jobId, status: job.status },
+            isError: true,
+          };
+        }
       }
 
       // Abort the session
@@ -1361,13 +1928,18 @@ export default function (pi: ExtensionAPI) {
 
   // ── Session shutdown: abort all jobs and clear registry ──────────
   (pi as any).on?.("session_shutdown", () => {
+    isShuttingDown = true;
     const g2 = typeof global !== "undefined" ? global : globalThis;
 
     // Abort all running subagent sessions before clearing
     for (const job of jobRegistry.values()) {
       if (job.status === "running") {
         try {
-          job.session.abort().catch(() => {});
+          if (job.backend === "tmux") {
+            killTmuxJob(job.id);
+          } else {
+            job.session.abort().catch(() => {});
+          }
         } catch {
           /* session may already be disposed */
         }
