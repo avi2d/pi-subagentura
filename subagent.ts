@@ -299,16 +299,22 @@ const BaseParams = Type.Object({
     }),
   ),
   backend: Type.Optional(
-    Type.Union([
-      Type.Literal("in-process", {
-        description: "Run in the same process (default, faster but shares memory)",
-      }),
-      Type.Literal("tmux", {
-        description: "Run in a tmux session (slower but allows attach and true isolation)",
-      }),
-    ], {
-      description: "Execution backend: 'in-process' (default) or 'tmux' (attachable)",
-    }),
+    Type.Union(
+      [
+        Type.Literal("in-process", {
+          description:
+            "Run in the same process (default, faster but shares memory)",
+        }),
+        Type.Literal("tmux", {
+          description:
+            "Run in a tmux session (slower but allows attach and true isolation)",
+        }),
+      ],
+      {
+        description:
+          "Execution backend: 'in-process' (default) or 'tmux' (attachable)",
+      },
+    ),
   ),
 });
 
@@ -595,7 +601,9 @@ export default function (pi: ExtensionAPI) {
     if (!latestCtx?.hasUI || isShuttingDown) return;
 
     // Get both in-process and tmux jobs
-    const inProcessJobs = [...jobRegistry.values()].filter((j) => j.status === "running");
+    const inProcessJobs = [...jobRegistry.values()].filter(
+      (j) => j.status === "running",
+    );
     const tmuxJobs = listTmuxJobs().filter((j) => j.state === "running");
     const all = [...inProcessJobs, ...tmuxJobs];
 
@@ -625,14 +633,22 @@ export default function (pi: ExtensionAPI) {
             // Subagent lines
             for (const job of all) {
               const isTmux = job.hasOwnProperty("sessionDir");
-              const startedAt = (job as any).startedAt ?? (job as any).createdAt;
+              const startedAt =
+                (job as any).startedAt ?? (job as any).createdAt;
               const elapsed = formatElapsed(new Date(startedAt));
               const taskLen = Math.max(5, inner - 20);
               const task = truncateWidget((job as any).task, taskLen);
               const backend = isTmux ? "tmux" : "proc";
               const status = isTmux ? "running" : "running";
               const padding =
-                inner - elapsed.length - 2 - task.length - 2 - backend.length - 2 - status.length;
+                inner -
+                elapsed.length -
+                2 -
+                task.length -
+                2 -
+                backend.length -
+                2 -
+                status.length;
               const line =
                 "\u2502 " +
                 elapsed +
@@ -654,7 +670,7 @@ export default function (pi: ExtensionAPI) {
           },
         };
       },
-      { placement: "aboveEditor" }
+      { placement: "aboveEditor" },
     );
   }
 
@@ -726,7 +742,6 @@ export default function (pi: ExtensionAPI) {
         maxAge: params.maxAge ?? null,
       });
 
-
       // Gather conversation history
       const branch = ctx.sessionManager.getBranch();
       const messages = branch
@@ -774,7 +789,8 @@ export default function (pi: ExtensionAPI) {
                 turns: 0,
               },
               model: exitData.model,
-              isError: exitData.type === "error" || exitData.type === "cancelled",
+              isError:
+                exitData.type === "error" || exitData.type === "cancelled",
               errorMessage: exitData.errorMessage,
             };
 
@@ -786,7 +802,7 @@ export default function (pi: ExtensionAPI) {
 
             // Update widget to remove completed job
             updateWidget();
-          }
+          },
         );
 
         // Add to in-process registry for tracking
@@ -796,7 +812,14 @@ export default function (pi: ExtensionAPI) {
           liveStatus: {
             turn: 0,
             output: "",
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              turns: 0,
+            },
           },
           session: null as any,
           startedAt: Date.now(),
@@ -845,19 +868,25 @@ export default function (pi: ExtensionAPI) {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
-          await startSubagentJob({
-            task: params.task,
-            persona: params.persona,
-            modelOverride: params.model,
-            cwd: targetCwd,
-            contextText: conversationText,
-            signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
-            onUpdate: undefined,
-            defaultModel: ctx.model,
-            maxAge: params.maxAge,
-            parentModelRegistry: ctx.modelRegistry,
-          });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+        } = await startSubagentJob({
+          task: params.task,
+          persona: params.persona,
+          modelOverride: params.model,
+          cwd: targetCwd,
+          contextText: conversationText,
+          signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
+          onUpdate: undefined,
+          defaultModel: ctx.model,
+          maxAge: params.maxAge,
+          parentModelRegistry: ctx.modelRegistry,
+        });
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -956,7 +985,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text:
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -1098,7 +1128,8 @@ export default function (pi: ExtensionAPI) {
                 turns: 0,
               },
               model: exitData.model,
-              isError: exitData.type === "error" || exitData.type === "cancelled",
+              isError:
+                exitData.type === "error" || exitData.type === "cancelled",
               errorMessage: exitData.errorMessage,
             };
 
@@ -1109,7 +1140,7 @@ export default function (pi: ExtensionAPI) {
 
             // Update widget to remove completed job
             updateWidget();
-          }
+          },
         );
 
         const jobState: JobState = {
@@ -1118,7 +1149,14 @@ export default function (pi: ExtensionAPI) {
           liveStatus: {
             turn: 0,
             output: "",
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              turns: 0,
+            },
           },
           session: null as any,
           startedAt: Date.now(),
@@ -1155,19 +1193,25 @@ export default function (pi: ExtensionAPI) {
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
-          await startSubagentJob({
-            task: params.task,
-            persona: params.persona,
-            modelOverride: params.model,
-            cwd: targetCwd,
-            contextText: null, // isolated — no context
-            signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
-            onUpdate: undefined,
-            defaultModel: ctx.model,
-            maxAge: params.maxAge,
-            parentModelRegistry: ctx.modelRegistry,
-          });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+        } = await startSubagentJob({
+          task: params.task,
+          persona: params.persona,
+          modelOverride: params.model,
+          cwd: targetCwd,
+          contextText: null, // isolated — no context
+          signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
+          onUpdate: undefined,
+          defaultModel: ctx.model,
+          maxAge: params.maxAge,
+          parentModelRegistry: ctx.modelRegistry,
+        });
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -1269,7 +1313,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text:
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -1326,7 +1371,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_subagent_status",
     label: "Get Subagent Status",
-    description: "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
+    description:
+      "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
     parameters: StatusParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -1335,7 +1381,6 @@ export default function (pi: ExtensionAPI) {
         toolCallId: _toolCallId,
         jobId: params.jobId,
       });
-
 
       const job = jobRegistry.get(params.jobId);
 
@@ -1347,7 +1392,7 @@ export default function (pi: ExtensionAPI) {
               text: `Job ${params.jobId} not found. It may have been cancelled.`,
             },
           ],
-           details: { jobId: params.jobId, status: "not_found" },
+          details: { jobId: params.jobId, status: "not_found" },
           isError: true,
         };
       }
@@ -1406,7 +1451,11 @@ export default function (pi: ExtensionAPI) {
                 text: `Job ${params.jobId} is attached to tmux. You can interact with it via tmux attach -t ${params.jobId}`,
               },
             ],
-            details: { jobId: params.jobId, status: "attached", backend: "tmux" },
+            details: {
+              jobId: params.jobId,
+              status: "attached",
+              backend: "tmux",
+            },
           };
         }
 
@@ -1427,7 +1476,9 @@ export default function (pi: ExtensionAPI) {
         }
 
         return {
-          content: [{ type: "text", text: `Job ${params.jobId} is running (tmux)` }],
+          content: [
+            { type: "text", text: `Job ${params.jobId} is running (tmux)` },
+          ],
           details: { jobId: params.jobId, status: "running", backend: "tmux" },
         };
       }
@@ -1489,7 +1540,7 @@ export default function (pi: ExtensionAPI) {
     name: "get_subagent_result",
     label: "Get Subagent Result",
     description:
-      "Block until an async subagent job completes, then return the final output and usage summary. For tmux backend, returns immediately with current status if the job hasn't completed yet.",
+      "USE ONLY IF USER ASKED TO;Block until an async subagent job completes, then return the final output and usage summary. For tmux backend, returns immediately with current status if the job hasn't completed yet.",
     parameters: ResultParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -1499,8 +1550,6 @@ export default function (pi: ExtensionAPI) {
         toolCallId: _toolCallId,
         jobId: params.jobId,
       });
-
-
 
       if (!job) {
         return {
@@ -1568,7 +1617,11 @@ export default function (pi: ExtensionAPI) {
                 text: `Job ${params.jobId} was cancelled.`,
               },
             ],
-            details: { jobId: params.jobId, status: "cancelled", backend: "tmux" },
+            details: {
+              jobId: params.jobId,
+              status: "cancelled",
+              backend: "tmux",
+            },
             isError: true,
           };
         }
@@ -1671,8 +1724,6 @@ export default function (pi: ExtensionAPI) {
         jobId: params.jobId,
       });
 
-
-
       if (!job) {
         return {
           content: [{ type: "text", text: `Job ${params.jobId} not found.` }],
@@ -1714,12 +1765,16 @@ export default function (pi: ExtensionAPI) {
           scheduleJobCleanup(params.jobId, true);
           updateWidget();
           return {
-            content: [{ type: "text", text: `Job ${params.jobId} cancelled (tmux).` }],
+            content: [
+              { type: "text", text: `Job ${params.jobId} cancelled (tmux).` },
+            ],
             details: { jobId: params.jobId, status: "cancelled" },
           };
         } else {
           return {
-            content: [{ type: "text", text: `Failed to cancel job ${params.jobId}.` }],
+            content: [
+              { type: "text", text: `Failed to cancel job ${params.jobId}.` },
+            ],
             details: { jobId: params.jobId, status: job.status },
             isError: true,
           };
@@ -1821,7 +1876,6 @@ export default function (pi: ExtensionAPI) {
         filter: params.filter ?? null,
       });
 
-
       const models =
         params.authOnly !== false
           ? modelRegistry.getAvailable()
@@ -1888,7 +1942,6 @@ export default function (pi: ExtensionAPI) {
       debugLog("info", "tool_call", {
         toolName: "prune_subagent_jobs",
       });
-
 
       const removed = pruneCompletedJobs();
       const after = jobRegistry.size;
