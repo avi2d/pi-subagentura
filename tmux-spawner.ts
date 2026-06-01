@@ -19,6 +19,7 @@ import {
   peekExitSidecar,
   consumeExitSidecar,
   cleanupTmuxSession,
+  writeExitSidecar,
   type TmuxSessionInfo,
   type TmuxExitData,
   type TmuxActivityData,
@@ -43,9 +44,19 @@ interface TmuxJobState {
   completedAt?: Date;
   exitData?: TmuxExitData;
   onComplete?: (exitData: TmuxExitData) => void;
+  // Epoch ms of the last observed fs.watch event for this job. Used by the
+  // watchdog to detect orphaned children that crash before writing the exit sidecar.
+  lastActivity: number;
 }
 
 const tmuxJobRegistry = new Map<string, TmuxJobState>();
+
+// Watchdog: poll running jobs for orphans that crashed before writing the
+// exit sidecar. fs.watch only fires on file changes, so a stuck child
+// produces no events and would otherwise stay 'running' forever.
+const WATCHDOG_CHECK_MS = 30_000;
+const WATCHDOG_TIMEOUT_MS = 5 * 60_000; // 5 minutes with no activity = orphan
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
 function startCentralWatcher(): void {
   if (centralWatcher) return;
@@ -71,6 +82,12 @@ function startCentralWatcher(): void {
   centralWatcher.on('error', (err) => {
     console.error('[tmux-spawner] Central watcher error:', err.message);
   });
+
+  if (!watchdogTimer) {
+    watchdogTimer = setInterval(checkWatchdog, WATCHDOG_CHECK_MS);
+    // Don't keep the event loop alive just for the watchdog.
+    watchdogTimer.unref?.();
+  }
 }
 
 function stopCentralWatcher(): void {
@@ -82,12 +99,62 @@ function stopCentralWatcher(): void {
     centralWatcher.close();
     centralWatcher = null;
   }
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+}
+
+function checkWatchdog(): void {
+  const now = Date.now();
+  for (const [, job] of tmuxJobRegistry) {
+    // Skip 'attached' jobs - a human is supervising; the child is likely idle
+    // waiting for input and not writing activity, but the user can still kill
+    // manually if needed. Only orphaned 'running' jobs should be reaped.
+    if (job.state === 'attached') continue;
+    if (job.state !== 'running') continue;
+    if (now - job.lastActivity < WATCHDOG_TIMEOUT_MS) continue;
+
+    // Orphaned: no watcher event for too long. Mark killed so the job doesn't
+    // stay 'running' forever. Best-effort sidecar so any concurrent reader
+    // sees the result.
+    console.warn(
+      `[tmux-spawner] Watchdog: job ${job.id} inactive for ${Math.round(
+        (now - job.lastActivity) / 1000
+      )}s, marking as killed`
+    );
+    if (job.sessionDir) {
+      writeExitSidecar(job.sessionDir, 'cancelled', {
+        errorMessage: 'watchdog timeout: no activity',
+      });
+    }
+    job.state = 'killed';
+    job.completedAt = new Date();
+    job.exitData = {
+      type: 'cancelled',
+      timestamp: new Date().toISOString(),
+      errorMessage: 'watchdog timeout: no activity',
+    };
+    job.onComplete?.(job.exitData);
+  }
+
+  // If watchdog has nothing to watch, stop the interval to avoid burning CPU.
+  const hasActive = [...tmuxJobRegistry.values()].some(
+    (j) => j.state === 'running' || j.state === 'attached'
+  );
+  if (!hasActive && watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
 }
 
 function checkAllSessionsForExit(): void {
   for (const [jobId, job] of tmuxJobRegistry) {
     if (job.state !== 'running' && job.state !== 'attached') continue;
     if (!job.sessionDir) continue;
+
+    // The watcher fired for a file in this job's session dir - the child is alive.
+    job.lastActivity = Date.now();
 
     const exitData = peekExitSidecar(job.sessionDir);
     if (exitData) {
@@ -137,6 +204,12 @@ function generateId(): string {
   return crypto.randomBytes(8).toString('hex');
 }
 
+/**
+ * Single-quote escape for embedding a string inside `'...'` in a shell command.
+ * Correct for that context (closing quote, escaped quote, reopening quote), but
+ * does NOT sanitize unquoted metacharacters. Callers must wrap the result in
+ * single quotes.
+ */
 function shellEscape(str: string): string {
   return str.replace(/'/g, "'\\''");
 }
@@ -163,6 +236,7 @@ export async function spawnTmuxSubagent(
     sessionDir: session.sessionDir,
     createdAt: new Date(),
     onComplete,
+    lastActivity: Date.now(),
   });
 
   // Start central watcher
@@ -188,37 +262,49 @@ async function spawnInTmux(
 ): Promise<void> {
   const { id } = session;
 
+  // Strip TMUX from the child's env so it doesn't see itself as nested.
+  // Setting `TMUX: undefined` is not contractually filtered by child_process
+  // across all versions; explicitly omit the key.
+  const { TMUX: _stripped, ...envWithoutTmux } = process.env;
+  void _stripped;
+  const env: NodeJS.ProcessEnv = {
+    ...envWithoutTmux,
+    PI_SUBAGENT: '1',
+    PI_SUBAGENT_ID: id,
+    PI_SUBAGENT_SESSION_DIR: session.sessionDir,
+    PI_SUBAGENT_CONTEXT_MODE: contextMode,
+  };
+
   return new Promise((resolve, reject) => {
-    const env = {
-      ...process.env,
-      TMUX: undefined,
-      // Child mode env vars
-      PI_SUBAGENT: '1',
-      PI_SUBAGENT_ID: id,
-      PI_SUBAGENT_SESSION_DIR: session.sessionDir,
-      PI_SUBAGENT_CONTEXT_MODE: contextMode,
-    };
-
     // Step 1: Create empty tmux session
-    execFile('tmux', ['new-session', '-d', '-s', id, '-c', cwd], { env },
-      (error: Error | null) => {
-        if (error) {
-          console.error(`[tmux-spawner] tmux new-session failed: ${error.message}`);
-          reject(error);
-          return;
-        }
+    execFile('tmux', ['new-session', '-d', '-s', id, '-c', cwd], { env }, (err: Error | null) => {
+      if (err) {
+        console.error(`[tmux-spawner] tmux new-session failed: ${err.message}`);
+        return reject(err);
+      }
 
-        // Step 2: Wait for session to initialize, then send command
-        setTimeout(() => {
+      // Step 2: Wait until the session is actually queryable. Polling is more
+      // robust than a fixed 500ms sleep on slow systems / under load. 100ms
+      // keeps worst-case child process count at ~50 (5s / 100ms), low enough
+      // not to spike CPU on slow spawns.
+      waitForTmuxSession(id, { timeoutMs: 5_000, intervalMs: 100 })
+        .then(() => {
           const escapedTask = shellEscape(task);
-          // Export env vars and run pi - env vars must be set in the tmux session
+          // Env vars must be exported inside the tmux session because tmux
+          // new-session -e (env-flag) is not portable across all tmux versions.
           const cmd = `export PI_SUBAGENT='1' PI_SUBAGENT_ID='${id}' PI_SUBAGENT_SESSION_DIR='${session.sessionDir}' PI_SUBAGENT_CONTEXT_MODE='${contextMode}' && pi '${escapedTask}'`;
           const sendProc = spawn('tmux', ['send-keys', '-t', id, cmd], { env });
 
           sendProc.on('close', () => {
-            // Step 3: Send Enter to execute
-            spawn('tmux', ['send-keys', '-t', id, 'Enter'], { env });
+            // Step 3: Send Enter to execute. Fire-and-forget but with an
+            // error handler so a failed send (tmux gone, pipe broken) is
+            // visible instead of an unhandled error.
+            const enterProc = spawn('tmux', ['send-keys', '-t', id, 'Enter'], { env });
+            enterProc.on('error', (enterErr: Error) => {
+              console.error(`[tmux-spawner] Enter send failed for ${id}:`, enterErr.message);
+            });
             console.log(`[tmux-spawner] Command sent to session ${id}`);
+
 
             // Update activity to active
             writeTmuxActivity(session.sessionDir, {
@@ -231,13 +317,40 @@ async function spawnInTmux(
             resolve();
           });
 
-          sendProc.on('error', (err: Error) => {
-            console.error(`[tmux-spawner] send-keys failed: ${err.message}`);
-            reject(err);
+          sendProc.on('error', (sendErr: Error) => {
+            console.error(`[tmux-spawner] send-keys failed: ${sendErr.message}`);
+            reject(sendErr);
           });
-        }, 500);
-      }
-    );
+        })
+        .catch((pollErr: Error) => {
+          console.error(`[tmux-spawner] session ${id} did not become ready: ${pollErr.message}`);
+          reject(pollErr);
+        });
+    });
+  });
+}
+
+
+/**
+ * Poll `tmux has-session` until the session is queryable, with a hard timeout.
+ * Replaces the previous fixed 500ms setTimeout which was flaky on slow systems.
+ */
+function waitForTmuxSession(
+  id: string,
+  opts: { timeoutMs: number; intervalMs: number }
+): Promise<void> {
+  const deadline = Date.now() + opts.timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      execFile('tmux', ['has-session', '-t', id], (err) => {
+        if (!err) return resolve();
+        if (Date.now() >= deadline) {
+          return reject(new Error(`tmux session ${id} not ready after ${opts.timeoutMs}ms`));
+        }
+        setTimeout(tick, opts.intervalMs);
+      });
+    };
+    tick();
   });
 }
 
@@ -262,8 +375,8 @@ export function getTmuxActivityStatus(
         event: activity.latestEvent,
       };
     }
-  } catch {
-    // Ignore
+  } catch (e) {
+    console.error('[tmux-spawner] getTmuxActivityStatus failed:', (e as Error).message);
   }
   return null;
 }
@@ -316,16 +429,20 @@ export function killTmuxJob(jobId: string): boolean {
   if (!job) return false;
 
   try {
-    // Kill tmux session
-    spawn('tmux', ['kill-session', '-t', jobId]);
+    // Kill tmux session. spawn() is async, so we attach an error handler -
+    // any failure (tmux not found, session already dead, etc.) would otherwise
+    // be a silent unhandled error.
+    const killProc = spawn('tmux', ['kill-session', '-t', jobId]);
+    killProc.on('error', (err) => {
+      console.error(`[tmux-spawner] kill-session failed for ${jobId}:`, err.message);
+    });
 
     // Update registry
     job.state = 'killed';
     job.completedAt = new Date();
 
-    // Write cancelled exit
+    // Write cancelled exit so any concurrent reader sees the kill.
     if (job.sessionDir) {
-      const { writeExitSidecar } = require('./tmux-session');
       writeExitSidecar(job.sessionDir, 'cancelled');
     }
 

@@ -44,21 +44,10 @@ export function getTmuxChildConfig(): TmuxChildConfig | null {
   };
 }
 
+// Accumulated assistant text for the final exit sidecar. We deliberately do NOT
+// persist this to a file on every text_delta (would be sync I/O on the TUI hot path);
+// the value is small and only read once at session_shutdown.
 let sessionOutput = '';
-
-/**
- * Record output for final extraction
- */
-function recordOutput(text: string): void {
-  sessionOutput += text;
-  // Also write to output file for legacy support
-  try {
-    const outputFile = `${SESSION_DIR}/output.txt`;
-    require('node:fs').writeFileSync(outputFile, sessionOutput);
-  } catch {
-    // Ignore
-  }
-}
 
 /**
  * Activate tmux child mode - registers event handlers
@@ -155,7 +144,7 @@ export function activateTmuxChildMode(pi: ExtensionAPI): void {
   pi.on('message_update', (event: any) => {
     const msgEvent = event?.assistantMessageEvent;
     if (msgEvent?.type === 'text_delta') {
-      recordOutput(msgEvent.delta || '');
+      sessionOutput += msgEvent.delta || '';
       writeTmuxActivity(SESSION_DIR, {
         phase: 'active',
         activeScope: 'output',

@@ -11,94 +11,98 @@ import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { listTmuxJobs, getTmuxAttachInstructions, killTmuxJob } from './tmux-spawner';
 
 export function registerTmuxCommands(pi: ExtensionAPI): void {
-  // list-subagents command
-  pi.registerCommand('list-subagents', {
-    description: 'List all active subagent sessions',
-    // @ts-expect-error - command handler signature differs from type definition
-    async handler() {
-      const jobs = listTmuxJobs();
+	// Defensive: some test mocks and minimal ExtensionAPI implementations don't
+	// provide registerCommand. Skip gracefully so the extension still loads.
+	if (typeof (pi as any).registerCommand !== 'function') return;
 
-      if (jobs.length === 0) {
-        return { content: [{ type: 'text', text: 'No active tmux subagents' }] };
-      }
+	// list-subagents command
+	pi.registerCommand('list-subagents', {
+		description: 'List all active subagent sessions',
+		// @ts-expect-error - command handler signature differs from type definition
+		async handler() {
+			const jobs = listTmuxJobs();
 
-      const lines = ['Active Subagents:', ''];
-      for (const job of jobs) {
-        const status =
-          job.state === 'running'
-            ? '🟢 running'
-            : job.state === 'attached'
-              ? '🔵 attached'
-              : job.state === 'completed'
-                ? '✅ completed'
-                : job.state === 'killed'
-                  ? '❌ killed'
-                  : '⚪ unknown';
+			if (jobs.length === 0) {
+				return { content: [{ type: 'text', text: 'No active tmux subagents' }] };
+			}
 
-        lines.push(`${status} ${job.id}`);
-        lines.push(`   Task: ${job.task.substring(0, 60)}${job.task.length > 60 ? '...' : ''}`);
-        lines.push(`   Attach: tmux attach -t ${job.id}`);
-        lines.push('');
-      }
+			const lines = ['Active Subagents:', ''];
+			for (const job of jobs) {
+				const status =
+					job.state === 'running'
+						? '🟢 running'
+						: job.state === 'attached'
+							? '🔵 attached'
+							: job.state === 'completed'
+								? '✅ completed'
+								: job.state === 'killed'
+									? '❌ killed'
+									: '⚪ unknown';
 
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    },
-  });
+				lines.push(`${status} ${job.id}`);
+				lines.push(`   Task: ${job.task.substring(0, 60)}${job.task.length > 60 ? '...' : ''}`);
+				lines.push(`   Attach: tmux attach -t ${job.id}`);
+				lines.push('');
+			}
 
-  // attach command
-  pi.registerCommand('attach', {
-    description: 'Attach to a tmux subagent session',
-    parameters: [
-      {
-        name: 'id',
-        description: 'Subagent session ID to attach to',
-        required: true,
-      },
-    ],
-    // @ts-expect-error - command handler signature differs from type definition
-    async handler(params: { id: string }) {
-      const instructions = getTmuxAttachInstructions(params.id);
-      if (!instructions) {
-        return {
-          content: [{ type: 'text', text: `Subagent ${params.id} not found` }],
-          isError: true,
-        };
-      }
+			return { content: [{ type: 'text', text: lines.join('\n') }] };
+		},
+	});
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: instructions,
-          },
-        ],
-      };
-    },
-  });
+	// attach command
+	pi.registerCommand('attach', {
+		description: 'Attach to a tmux subagent session',
+		parameters: [
+			{
+				name: 'id',
+				description: 'Subagent session ID to attach to',
+				required: true,
+			},
+		],
+		// @ts-expect-error - command handler signature differs from type definition
+		async handler(params: { id: string }) {
+			const instructions = getTmuxAttachInstructions(params.id);
+			if (!instructions) {
+				return {
+					content: [{ type: 'text', text: `Subagent ${params.id} not found` }],
+					isError: true,
+				};
+			}
 
-  // kill-subagent command
-  pi.registerCommand('kill-subagent', {
-    description: 'Kill a tmux subagent session',
-    parameters: [
-      {
-        name: 'id',
-        description: 'Subagent session ID to kill',
-        required: true,
-      },
-    ],
-    // @ts-expect-error - command handler signature differs from type definition
-    async handler(params: { id: string }) {
-      const success = killTmuxJob(params.id);
-      if (!success) {
-        return {
-          content: [{ type: 'text', text: `Subagent ${params.id} not found` }],
-          isError: true,
-        };
-      }
+			return {
+				content: [
+					{
+						type: 'text',
+						text: instructions,
+					},
+				],
+			};
+		},
+	});
 
-      return {
-        content: [{ type: 'text', text: `Subagent ${params.id} killed` }],
-      };
-    },
-  });
+	// kill-subagent command
+	pi.registerCommand('kill-subagent', {
+		description: 'Kill a tmux subagent session',
+		parameters: [
+			{
+				name: 'id',
+				description: 'Subagent session ID to kill',
+				required: true,
+			},
+		],
+		// @ts-expect-error - command handler signature differs from type definition
+		async handler(params: { id: string }) {
+			const success = killTmuxJob(params.id);
+			if (!success) {
+				return {
+					content: [{ type: 'text', text: `Subagent ${params.id} not found` }],
+					isError: true,
+				};
+			}
+
+			return {
+				content: [{ type: 'text', text: `Subagent ${params.id} killed` }],
+			};
+		},
+	});
 }
