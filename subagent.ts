@@ -674,9 +674,29 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  function stopWidgetRefresh(): void {
+    if (widgetTimer) {
+      clearTimeout(widgetTimer);
+      widgetTimer = null;
+    }
+    // Drop the captured ctx so any in-flight scheduled callback that already
+    // passed the hasUI guard cannot reach a stale ctx after session replacement.
+    latestCtx = null;
+  }
+
   function scheduleWidgetUpdate(): void {
-    if (!latestCtx?.hasUI) return;
-    updateWidget();
+    if (isShuttingDown) return;
+    try {
+      if (!latestCtx?.hasUI) return;
+      updateWidget();
+    } catch (err) {
+      // Captured ctx may have been invalidated by a session replacement/reload
+      // that happened after this callback was scheduled. Stop refreshing so we
+      // don't crash pi with an uncaughtException on the next tick.
+      stopWidgetRefresh();
+      return;
+    }
+    if (isShuttingDown) return;
     widgetTimer = setTimeout(scheduleWidgetUpdate, 1000);
   }
 
@@ -1982,6 +2002,10 @@ export default function (pi: ExtensionAPI) {
   // ── Session shutdown: abort all jobs and clear registry ──────────
   (pi as any).on?.("session_shutdown", () => {
     isShuttingDown = true;
+    // Stop the recurring widget refresh and drop the captured ctx BEFORE
+    // the runtime invalidates the ctx, so the next scheduled tick of
+    // scheduleWidgetUpdate cannot reach a stale ctx and crash pi.
+    stopWidgetRefresh();
     const g2 = typeof global !== "undefined" ? global : globalThis;
 
     // Abort all running subagent sessions before clearing
