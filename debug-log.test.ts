@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 // Use dynamic import after setting env var
 const testDir = join(process.env.TEMP_DIR || "/tmp", `debug-log-test-${Date.now()}`);
+const today = new Date().toISOString().slice(0, 10);
+const logFileName = `debug-${today}.jsonl`;
 
 describe("debugLog", () => {
   beforeEach(() => {
@@ -12,7 +14,7 @@ describe("debugLog", () => {
 
   afterEach(() => {
     try {
-      const logFile = join(testDir, "debug-2026-05-22.jsonl");
+      const logFile = join(testDir, logFileName);
       if (existsSync(logFile)) unlinkSync(logFile);
       rmdirSync(testDir);
     } catch {}
@@ -27,7 +29,7 @@ describe("debugLog", () => {
 
     debugLog("info", "test_event", { foo: "bar", num: 42 });
 
-    const logFile = join(testDir, "debug-2026-05-22.jsonl");
+    const logFile = join(testDir, logFileName);
     expect(existsSync(logFile)).toBe(true);
 
     const content = readFileSync(logFile, "utf-8");
@@ -60,7 +62,7 @@ describe("debugLog", () => {
 
     debugLog("error", "subagent_error", { jobId: "test-job", error: "something broke" });
 
-    const logFile = join(testDir, "debug-2026-05-22.jsonl");
+    const logFile = join(testDir, logFileName);
     const content = readFileSync(logFile, "utf-8");
     const entry = JSON.parse(content.trim());
 

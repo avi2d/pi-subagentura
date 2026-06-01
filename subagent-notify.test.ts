@@ -207,6 +207,7 @@ describe("notifyOnComplete", () => {
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
+      registerCommand: vi.fn(),
     };
 
     registerExtension(_api as any);

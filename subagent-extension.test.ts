@@ -5,6 +5,8 @@ describe("extension registration", () => {
   it("registers all tools without throwing", () => {
     const api = {
       registerTool: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
     };
 
     expect(() => registerExtension(api as any)).not.toThrow();
