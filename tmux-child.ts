@@ -17,7 +17,6 @@ interface TmuxChildConfig {
   sessionDir: string;
   jobId: string;
   contextMode: 'isolated' | 'with_context';
-  autoExit: boolean;
 }
 
 // Environment variables (set by parent spawner)
@@ -25,7 +24,6 @@ const IS_CHILD = process.env.PI_SUBAGENT === '1';
 const SESSION_DIR = process.env.PI_SUBAGENT_SESSION_DIR || '/tmp/pi-subagents';
 const JOB_ID = process.env.PI_SUBAGENT_ID || 'unknown';
 const CONTEXT_MODE = (process.env.PI_SUBAGENT_CONTEXT_MODE || 'isolated') as 'isolated' | 'with_context';
-const AUTO_EXIT = process.env.PI_SUBAGENT_AUTO_EXIT !== '0'; // Default true
 
 /**
  * Check if we're running in tmux child mode
@@ -43,7 +41,6 @@ export function getTmuxChildConfig(): TmuxChildConfig | null {
     sessionDir: SESSION_DIR,
     jobId: JOB_ID,
     contextMode: CONTEXT_MODE,
-    autoExit: AUTO_EXIT,
   };
 }
 
@@ -115,77 +112,67 @@ export function activateTmuxChildMode(pi: ExtensionAPI): void {
   pi.on('agent_end', (event: any, ctx: ExtensionContext) => {
     const messages = event?.messages as any[] | undefined;
 
-    if (AUTO_EXIT) {
-      // Check if this was an error
-      let isError = false;
+    // Check if this was an error
+    let isError = false;
+    if (messages) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg?.role === 'assistant') {
+          isError = msg?.stopReason === 'error';
+          break;
+        }
+      }
+    }
+
+    if (isError) {
+      let errorMessage = 'Agent ended with error';
+      if (messages) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg?.role === 'assistant' && msg?.errorMessage) {
+            errorMessage = msg.errorMessage;
+            break;
+          }
+        }
+      }
+      writeTmuxActivity(SESSION_DIR, {
+        phase: 'error',
+        activeScope: 'idle',
+        latestEvent: `error: ${errorMessage}`,
+      });
+      writeExitSidecar(SESSION_DIR, 'error', { errorMessage });
+    } else {
+      // Clean completion - extract last assistant message as output
+      let finalOutput = sessionOutput || '(no output)';
       if (messages) {
         for (let i = messages.length - 1; i >= 0; i--) {
           const msg = messages[i];
           if (msg?.role === 'assistant') {
-            isError = msg?.stopReason === 'error';
+            const content = msg?.content;
+            if (typeof content === 'string' && content) {
+              finalOutput = content;
+            } else if (Array.isArray(content)) {
+              const textPart = content.find((c: any) => c?.type === 'text');
+              if (textPart?.text) {
+                finalOutput = textPart.text;
+              }
+            }
             break;
           }
         }
       }
 
-      if (isError) {
-        let errorMessage = 'Agent ended with error';
-        if (messages) {
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (msg?.role === 'assistant' && msg?.errorMessage) {
-              errorMessage = msg.errorMessage;
-              break;
-            }
-          }
-        }
-        writeTmuxActivity(SESSION_DIR, {
-          phase: 'error',
-          activeScope: 'idle',
-          latestEvent: `error: ${errorMessage}`,
-        });
-        writeExitSidecar(SESSION_DIR, 'error', { errorMessage });
-      } else {
-        // Clean completion - extract last assistant message as output
-        let finalOutput = sessionOutput || '(no output)';
-        if (messages) {
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (msg?.role === 'assistant') {
-              const content = msg?.content;
-              if (typeof content === 'string' && content) {
-                finalOutput = content;
-              } else if (Array.isArray(content)) {
-                const textPart = content.find((c: any) => c?.type === 'text');
-                if (textPart?.text) {
-                  finalOutput = textPart.text;
-                }
-              }
-              break;
-            }
-          }
-        }
-
-        writeTmuxActivity(SESSION_DIR, {
-          phase: 'done',
-          activeScope: 'idle',
-          latestEvent: 'agent_end',
-          outputLength: finalOutput.length,
-        });
-        writeExitSidecar(SESSION_DIR, 'done', { output: finalOutput });
-      }
-
-      // Shutdown the session
-      ctx.shutdown();
-      return;
+      writeTmuxActivity(SESSION_DIR, {
+        phase: 'done',
+        activeScope: 'idle',
+        latestEvent: 'agent_end',
+        outputLength: finalOutput.length,
+      });
+      writeExitSidecar(SESSION_DIR, 'done', { output: finalOutput });
     }
 
-    // Not auto-exiting - just mark as waiting
-    writeTmuxActivity(SESSION_DIR, {
-      phase: 'waiting',
-      activeScope: 'idle',
-      latestEvent: 'agent_end_waiting',
-    });
+    // Shutdown the session
+    ctx.shutdown();
   });
 
   pi.on('turn_start', (event: any) => {
