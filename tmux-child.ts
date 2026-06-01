@@ -3,7 +3,7 @@
  *
  * When PI_SUBAGENT=1 is set, this module activates child-mode behavior:
  * - Writes activity updates to shared file (throttled)
- * - Writes exit sidecar on agent_end
+ * - Writes exit sidecar on session_shutdown (not agent_end)
  * - Auto-exits when agent ends
  *
  * This is integrated into the main extension and activates based on
@@ -109,69 +109,28 @@ export function activateTmuxChildMode(pi: ExtensionAPI): void {
     });
   });
 
+  /**
+   * Option 2: Write exit file at session_shutdown, NOT at agent_end
+   * 
+   * agent_end fires after each turn (toolUse, stop, error, etc.)
+   * session_shutdown fires when ctx.shutdown() is called - the true end
+   * 
+   * This handles the edge case:
+   * - Subagent aborted (ctx.abort()) → agent_end fires (stopReason = "aborted")
+   * - Parent injects continue message
+   * - Subagent continues...
+   * - Eventually natural completion → ctx.shutdown() called
+   * - session_shutdown fires → exit file written with final result ✓
+   */
   pi.on('agent_end', (event: any, ctx: ExtensionContext) => {
-    const messages = event?.messages as any[] | undefined;
+    // Track activity only - DO NOT write exit file here
+    writeTmuxActivity(SESSION_DIR, {
+      phase: 'active',
+      activeScope: 'idle',
+      latestEvent: 'agent_end',
+    });
 
-    // Check if this was an error
-    let isError = false;
-    if (messages) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg?.role === 'assistant') {
-          isError = msg?.stopReason === 'error';
-          break;
-        }
-      }
-    }
-
-    if (isError) {
-      let errorMessage = 'Agent ended with error';
-      if (messages) {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (msg?.role === 'assistant' && msg?.errorMessage) {
-            errorMessage = msg.errorMessage;
-            break;
-          }
-        }
-      }
-      writeTmuxActivity(SESSION_DIR, {
-        phase: 'error',
-        activeScope: 'idle',
-        latestEvent: `error: ${errorMessage}`,
-      });
-      writeExitSidecar(SESSION_DIR, 'error', { errorMessage });
-    } else {
-      // Clean completion - extract last assistant message as output
-      let finalOutput = sessionOutput || '(no output)';
-      if (messages) {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (msg?.role === 'assistant') {
-            const content = msg?.content;
-            if (typeof content === 'string' && content) {
-              finalOutput = content;
-            } else if (Array.isArray(content)) {
-              const textPart = content.find((c: any) => c?.type === 'text');
-              if (textPart?.text) {
-                finalOutput = textPart.text;
-              }
-            }
-            break;
-          }
-        }
-      }
-
-      writeTmuxActivity(SESSION_DIR, {
-        phase: 'done',
-        activeScope: 'idle',
-        latestEvent: 'agent_end',
-        outputLength: finalOutput.length,
-      });
-      writeExitSidecar(SESSION_DIR, 'done', { output: finalOutput });
-    }
-
-    // Shutdown the session
+    // Shutdown the session - this triggers session_shutdown where exit file is written
     ctx.shutdown();
   });
 
@@ -228,8 +187,20 @@ export function activateTmuxChildMode(pi: ExtensionAPI): void {
     });
   });
 
-  // Session shutdown handler
+  /**
+   * Session shutdown handler - THIS is where we write the exit file
+   * 
+   * This is the TRUE end of the session, called after ctx.shutdown()
+   * Exit file is written here, not at agent_end
+   */
   pi.on('session_shutdown', () => {
+    // Extract final output from sessionOutput
+    const finalOutput = sessionOutput || '(no output)';
+
+    // Write exit sidecar with final result
+    writeExitSidecar(SESSION_DIR, 'done', { output: finalOutput });
+
+    // Flush pending activity
     flushPendingActivity(SESSION_DIR);
     writeTmuxActivity(SESSION_DIR, {
       phase: 'done',
