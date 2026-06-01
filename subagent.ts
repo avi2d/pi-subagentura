@@ -44,8 +44,6 @@ import {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
-import { Text, truncateToWidth } from "@mariozechner/pi-tui";
-import { Type } from "typebox";
 
 // Tmux backend imports
 import {
@@ -58,9 +56,32 @@ import {
   checkTmux,
   TMUX_BASE_DIR,
 } from "./tmux-spawner";
-import { registerTmuxCommands } from "./tmux-commands";
-import { isTmuxChildMode, activateTmuxChildMode } from "./tmux-child";
+import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Type } from "typebox";
+import {
+  readSubagentActivityFile,
+  type SubagentActivityState,
+} from "./activity";
+import {
+  advanceStatusState,
+  capStatusLines,
+  classifyStatus,
+  createStatusState,
+  DEFAULT_STATUS_LINE_LIMIT,
+  formatStatusLine,
+  formatTransitionLine,
+  formatWidgetRightLabel,
+  observeStatus,
+  type StatusSnapshot,
+  type SubagentStatusKind,
+  type SubagentStatusState,
+} from "./status";
+
+
 import * as fs from "node:fs";
+import { isTmuxChildMode, activateTmuxChildMode } from "./tmux-child";
+import { registerTmuxCommands } from "./tmux-commands";
+
 
 // ── Footer Status Key ───────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
@@ -591,23 +612,285 @@ export default function (pi: ExtensionAPI) {
     return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
 
-  function truncateWidget(s: string | undefined, maxWidth: number): string {
-    if (!s) return "".padEnd(maxWidth);
-    if (s.length <= maxWidth) return s;
-    return s.slice(0, Math.max(0, maxWidth - 1)) + "...";
+  // ── Widget line builders ──────────────────────────────────────────
+  // Based on pi-interactive-subagents' approach (HazAT). The old version did a
+  // manual `padding` calculation that was off by one, which made the closing `│`
+  // border disappear and sliced `running` to `runni` when content overflowed.
+  // Build lines that are *exactly* `width` visible chars using `visibleWidth` and
+  // `truncateToWidth` so borders and content always align regardless of width.
+
+  /**
+   * Build a single bordered content line: `│<left padded to fill><right>│`.
+   * Output is guaranteed to be exactly `width` visible characters.
+   */
+  function borderLine(left: string, right: string, width: number): string {
+    if (width <= 0) return "";
+    if (width === 1) return "\u2502";
+    const contentWidth = Math.max(0, width - 2);
+    const rightVis = visibleWidth(right);
+    if (rightVis >= contentWidth) {
+      // Right side alone is too wide: preserve it (truncated) and fill the rest
+      // with the right chunk only — avoid overflowing the terminal.
+      const truncRight = truncateToWidth(right, contentWidth);
+      const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
+      return "\u2502" + truncRight + " ".repeat(rightPad) + "\u2502";
+    }
+    const maxLeft = Math.max(0, contentWidth - rightVis);
+    const truncLeft = truncateToWidth(left, maxLeft);
+    const leftVis = visibleWidth(truncLeft);
+    const pad = Math.max(0, contentWidth - leftVis - rightVis);
+    return "\u2502" + truncLeft + " ".repeat(pad) + right + "\u2502";
   }
+
+  /**
+   * Build the bordered top line: `┌─ Title ──── info ─┐`.
+   * All characters are accounted for within `width`.
+   */
+  function borderTop(title: string, info: string, width: number): string {
+    if (width <= 0) return "";
+    if (width === 1) return "\u250c";
+    const inner = Math.max(0, width - 2);
+    const titlePart = `\u2500 ${title} `;
+    const infoPart = ` ${info} \u2500`;
+    const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
+    const fill = "\u2500".repeat(fillLen);
+    const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "\u2500");
+    return "\u250c" + content + "\u2510";
+  }
+
+  /** Build the bordered bottom line: `└──────────────────┘`. */
+  function borderBottom(width: number): string {
+    if (width <= 0) return "";
+    if (width === 1) return "\u2514";
+    const inner = Math.max(0, width - 2);
+    return "\u2514" + "\u2500".repeat(inner) + "\u2518";
+  }
+
+
+  // ── Rich status state per job ────────────────────────────────────────
+  // Mirrors pi-interactive-subagents: each running job has a
+  // SubagentStatusState (starting | active | waiting | stalled | running)
+  // derived either from a tmux activity file or synthesized from the
+  // in-process liveStatus (turn, activeTool). The widget reads this state
+  // to show " active · read 2m " / " waiting 2m " / " stalled 4m " labels.
+
+  interface WidgetJob {
+    id: string;
+    name: string;
+    task: string;
+    startedAtMs: number;
+    isTmux: boolean;
+    /** For tmux jobs: path to the child's activity file. */
+    activityFile?: string;
+    /**
+     * For in-process jobs: a virtual SubagentActivityState synthesized from
+     * liveStatus. Tmux jobs read this from disk on every poll.
+     */
+    virtualActivity?: SubagentActivityState;
+    statusState: SubagentStatusState;
+    /** Latest cached snapshot — populated by `tickAllJobs` and used by the widget. */
+    snapshot: StatusSnapshot;
+    /**
+     * When true, `stalled` and `recovered` transitions do NOT fire a steer
+     * message back to the parent agent. Matches the reference's `interactive`
+     * behavior: long-running user-driven agents (planner, iterate) stay quiet.
+     * Autonomous agents (scout, worker) ping the parent on stall.
+     */
+    interactive: boolean;
+  }
+
+  const widgetJobs = new Map<string, WidgetJob>();
+
+  // Status refresh interval — fires stalled/recovered transitions on a
+  // steady cadence (1s, matching the reference repo), decoupled from the
+  // widget render loop so transitions fire even when the widget isn't
+  // being painted (e.g. before session_start sets hasUI=true).
+  let statusInterval: ReturnType<typeof setInterval> | null = null;
+
+  // ── Per-job activity observation ─────────────────────────────────────
+
+  function observeWidgetJob(job: WidgetJob, now: number): void {
+    let activity: SubagentActivityState | null = null;
+
+    if (job.activityFile) {
+      const read = readSubagentActivityFile(job.activityFile, job.id);
+      if (read.ok) {
+        activity = read.activity;
+      } else {
+        // missing / invalid / wrong-id — record as a problem observation so
+        // the watchdog can mark it stalled after SNAPSHOT_STALLED_AFTER_MS
+        const problemRead = read as { ok: false; reason: "missing" | "invalid" | "wrong-id"; error?: string };
+        job.statusState = observeStatus(
+          job.statusState,
+          { snapshot: problemRead.reason, snapshotError: problemRead.error },
+          now,
+        );
+        return;
+      }
+    } else if (job.virtualActivity) {
+      activity = job.virtualActivity;
+    }
+
+    if (!activity) return;
+
+    const scopeToLabel = (scope?: string): string | undefined => {
+      if (!scope) return undefined;
+      if (scope === "tool") return activity?.toolName;
+      return scope;
+    };
+
+    job.statusState = observeStatus(
+      job.statusState,
+      {
+        snapshot: "present",
+        updatedAt: activity.updatedAt,
+        sequence: activity.sequence,
+        // Map our richer phase set onto status.ts's StatusActivityPhase.
+        // "done" maps to "waiting" + statusLabel="done" via classifyStatus.
+        phase: activity.phase === "done" ? "waiting" : activity.phase,
+        active: activity.phase === "active",
+        activeScope: activity.activeScope,
+        activeSince: activity.activeSince,
+        waitingSince: activity.waitingSince,
+        latestEvent: activity.latestEvent,
+        activityLabel: scopeToLabel(activity.activeScope),
+      },
+      now,
+    );
+  }
+
+  function advanceWidgetJob(job: WidgetJob, now: number): void {
+    const { nextState, snapshot, transition } = advanceStatusState(job.statusState, now);
+    job.statusState = nextState;
+    job.snapshot = snapshot;
+
+    // Fire a steer message on stalled/recovered transitions, but only for
+    // autonomous (non-interactive) jobs. Interactive jobs (user-driven) stay
+    // quiet on purpose — the user is working in the child's pane and a steer
+    // would just burn an orchestrator turn on a no-op ping.
+    if (transition && !job.interactive) {
+      try {
+        pi.sendMessage!(
+          [
+            {
+              customType: "subagent-notify",
+              content: formatTransitionLine(job.name, snapshot, transition),
+              display: true,
+              details: { jobId: job.id, snapshot, transition },
+            },
+          ] as any,
+          { deliverAs: "followUp" } as any,
+        );
+      } catch {
+        // pi ref may be stale after session replacement
+      }
+    }
+  }
+
+  /**
+   * Single pass: read activity for every tracked job and tick the state
+   * machine forward. Called by `statusInterval` (separate from widget refresh
+   * so transitions fire on a steady cadence even when the widget isn't visible).
+   */
+  function tickAllJobs(now: number): void {
+    for (const job of widgetJobs.values()) {
+      observeWidgetJob(job, now);
+      advanceWidgetJob(job, now);
+    }
+  }
+
+  // ── Widget render ────────────────────────────────────────────────────
 
   function updateWidget(): void {
     if (!latestCtx?.hasUI || isShuttingDown) return;
 
-    // Get both in-process and tmux jobs
+    // Sync widgetJobs to the union of currently-running jobs.
+    //
+    // Tmux jobs are tracked in two places: `jobRegistry` (for the unified
+    // widget view, with `backend: "tmux"`) and `tmuxJobRegistry` inside
+    // tmux-spawner (for the spawner's lifecycle). Prefer the jobRegistry
+    // entry so the widget has the `task` + `liveStatus` available; fall
+    // back to the tmux registry for jobs that were started outside the
+    // normal spawn path.
     const inProcessJobs = [...jobRegistry.values()].filter(
-      (j) => j.status === "running",
+      (j) => j.status === "running" && j.backend !== "tmux",
     );
-    const tmuxJobs = listTmuxJobs().filter((j) => j.state === "running");
-    const all = [...inProcessJobs, ...tmuxJobs];
+    const tmuxFromRegistry = [...jobRegistry.values()].filter(
+      (j) => j.status === "running" && j.backend === "tmux",
+    );
+    const tmuxOnly = listTmuxJobs()
+      .filter((j) => j.state === "running")
+      .filter((j) => !tmuxFromRegistry.some((r) => r.id === j.id));
+    const live = new Map<string, { kind: "in-process" | "tmux"; job: any }>();
+    for (const j of inProcessJobs) live.set(j.id, { kind: "in-process", job: j });
+    for (const j of tmuxFromRegistry) live.set(j.id, { kind: "tmux", job: j });
+    for (const j of tmuxOnly) live.set(j.id, { kind: "tmux", job: j });
 
-    if (all.length === 0) {
+    // Drop stale entries (job finished)
+    for (const id of [...widgetJobs.keys()]) {
+      if (!live.has(id)) widgetJobs.delete(id);
+    }
+
+    // Add new entries or update existing ones
+    for (const [id, entry] of live) {
+      let wj = widgetJobs.get(id);
+      const isTmux = entry.kind === "tmux";
+      const startedAtMs = entry.job.startedAt ?? entry.job.createdAt?.getTime?.() ?? Date.now();
+      const task = entry.job.task ?? "";
+      const name = isTmux ? `tmux ${id.slice(0, 8)}` : id.slice(0, 8);
+
+      if (!wj) {
+        wj = {
+          id,
+          name,
+          task,
+          startedAtMs,
+          isTmux,
+          statusState: createStatusState({ source: "pi", startTimeMs: startedAtMs }),
+          snapshot: classifyStatus(
+            createStatusState({ source: "pi", startTimeMs: startedAtMs }),
+            Date.now(),
+          ),
+          interactive: false,
+        };
+        widgetJobs.set(id, wj);
+      }
+
+      wj.task = task;
+      wj.startedAtMs = startedAtMs;
+      if (isTmux) {
+        wj.activityFile = `${entry.job.sessionDir}/subagent-activity/${id}.json`;
+        delete wj.virtualActivity;
+      } else {
+        // In-process: synthesize an activity state from liveStatus.
+        const liveStatus = entry.job.liveStatus;
+        const now = Date.now();
+        const turns = liveStatus?.usage?.turns ?? 0;
+        const activeTool = liveStatus?.activeTool;
+        const isActive = !!activeTool;
+        wj.virtualActivity = {
+          version: 1,
+          runningChildId: id,
+          createdAt: startedAtMs,
+          updatedAt: now,
+          sequence: turns,
+          latestEvent: isActive ? "tool_execution_start" : "turn_end",
+          phase: isActive ? "active" : turns > 0 ? "waiting" : "starting",
+          agentActive: turns > 0,
+          turnActive: false,
+          providerActive: false,
+          toolActive: isActive,
+          activeScope: isActive ? "tool" : undefined,
+          activeSince: isActive ? now : undefined,
+          waitingSince: !isActive && turns > 0 ? now : undefined,
+          turnIndex: liveStatus?.turn,
+          toolName: activeTool?.name,
+        };
+        delete wj.activityFile;
+      }
+    }
+
+    if (widgetJobs.size === 0) {
       latestCtx.ui.setWidget("subagent-status", undefined);
       if (widgetTimer) {
         clearTimeout(widgetTimer);
@@ -616,6 +899,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Build widget lines. The first DEFAULT_STATUS_LINE_LIMIT (4) jobs get
+    // a line each; the rest collapse into a single "+N more running" line.
+    const allWidgetJobs = [...widgetJobs.values()];
+    const { visibleLines, overflow } = capStatusLines(
+      allWidgetJobs.map((j) => formatStatusLine(j.name, j.snapshot)),
+      DEFAULT_STATUS_LINE_LIMIT,
+    );
+
     latestCtx.ui.setWidget(
       "subagent-status",
       (_tui: any, _theme: any) => {
@@ -623,49 +914,33 @@ export default function (pi: ExtensionAPI) {
           invalidate() {},
           render(width: number) {
             const w = Math.max(20, width);
-            const inner = w - 2;
             const lines: string[] = [];
 
-            // Top line
-            const top = "\u250c" + "\u2500".repeat(inner) + "\u2510";
-            lines.push(top.slice(0, w));
+            // Top line with title. Show "X of Y running (+N more)" when capped.
+            const count = widgetJobs.size;
+            const info =
+              overflow > 0
+                ? `${visibleLines.length} of ${count} running (+${overflow} more)`
+                : `${count} running`;
+            lines.push(borderTop("Subagents", info, w));
 
-            // Subagent lines
-            for (const job of all) {
-              const isTmux = job.hasOwnProperty("sessionDir");
-              const startedAt =
-                (job as any).startedAt ?? (job as any).createdAt;
-              const elapsed = formatElapsed(new Date(startedAt));
-              const taskLen = Math.max(5, inner - 20);
-              const task = truncateWidget((job as any).task, taskLen);
-              const backend = isTmux ? "tmux" : "proc";
-              const status = isTmux ? "running" : "running";
-              const padding =
-                inner -
-                elapsed.length -
-                2 -
-                task.length -
-                2 -
-                backend.length -
-                2 -
-                status.length;
-              const line =
-                "\u2502 " +
-                elapsed +
-                "  " +
-                task +
-                " ".repeat(Math.max(1, padding)) +
-                backend +
-                " " +
-                status +
-                " \u2502";
-              lines.push(line.slice(0, w));
+            // Per-job lines: right label is the rich status snapshot, left is task+elapsed
+            for (const j of allWidgetJobs.slice(0, visibleLines.length)) {
+              const elapsed = formatElapsed(new Date(j.startedAtMs));
+              const backend = j.isTmux ? "tmux" : "proc";
+              const left = ` ${elapsed}  ${j.task} `;
+              const right = ` ${backend} · ${formatWidgetRightLabel(j.snapshot).trim()} `;
+              lines.push(borderLine(left, right, w));
             }
 
-            // Bottom line
-            const bottom = "\u2514" + "\u2500".repeat(inner) + "\u2518";
-            lines.push(bottom.slice(0, w));
+            // Overflow line
+            if (overflow > 0) {
+              const left = ` +${overflow} more running `;
+              const right = "";
+              lines.push(borderLine(left, right, w));
+            }
 
+            lines.push(borderBottom(w));
             return lines;
           },
         };
@@ -678,6 +953,10 @@ export default function (pi: ExtensionAPI) {
     if (widgetTimer) {
       clearTimeout(widgetTimer);
       widgetTimer = null;
+    }
+    if (statusInterval) {
+      clearInterval(statusInterval);
+      statusInterval = null;
     }
     // Drop the captured ctx so any in-flight scheduled callback that already
     // passed the hasUI guard cannot reach a stale ctx after session replacement.
@@ -703,6 +982,19 @@ export default function (pi: ExtensionAPI) {
   function startWidgetRefresh(): void {
     if (widgetTimer) return;
     scheduleWidgetUpdate();
+    if (!statusInterval) {
+      // Steady cadence for stalled/recovered transitions, decoupled from
+      // widget rendering. 1s matches the reference repo.
+      statusInterval = setInterval(() => {
+        if (isShuttingDown || !latestCtx?.hasUI) return;
+        try {
+          tickAllJobs(Date.now());
+        } catch {
+          // Captured ctx may be stale; let the next tick recover
+        }
+      }, 1000);
+      statusInterval.unref?.();
+    }
   }
 
   // Capture UI context for widget updates

@@ -238,3 +238,14 @@ export function cleanupTmuxSession(session: TmuxSessionInfo): void {
 		console.error('[tmux-session] cleanupTmuxSession failed:', (e as Error).message);
 	}
 }
+
+/**
+ * Path to a job's per-job activity file (newer format, status.ts-driven).
+ * Sits next to the legacy `activity.json` and `exit.json` files written by
+ * `writeTmuxActivity` / `writeExitSidecar`. Children write here via
+ * `createSubagentActivityRecorder`; the parent polls it via
+ * `readSubagentActivityFile`.
+ */
+export function getSubagentActivityFilePath(sessionDir: string, runningChildId: string): string {
+	return path.join(sessionDir, 'subagent-activity', `${runningChildId}.json`);
+}
