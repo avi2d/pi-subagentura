@@ -1066,6 +1066,9 @@ export default function (pi: ExtensionAPI) {
   // Catches the "Cannot read properties of undefined (reading 'map')" class
   // of errors by logging the request shape before the SDK throws.
   // The `context` event fires after the agent's transformContext hook.
+  // When malformed messages are detected, return a fixed array so the
+  // `emitContext` chain (runner.js:639-667) hands the SDK a clean array,
+  // preventing downstream `.map()` / `.flatMap()` crashes in pi-ai.
   pi.on("context", (event: any) => {
     const msgs: any[] = event.messages ?? [];
     const last = msgs[msgs.length - 1];
@@ -1099,6 +1102,37 @@ export default function (pi: ExtensionAPI) {
       // Non-string, non-array, non-undefined content.
       badIndices.push({ index: i, id: m.id, role: m.role, issue: `content is ${c === null ? "null" : typeof c}` });
     }
+    if (badIndices.length > 0) {
+      // Defensively fix malformed messages so the chain doesn't hand the SDK
+      // something that will trip a `.map()` crash. Shape rules:
+      //   - content: null | number | object -> []  (loses the bad content; it was unusable)
+      //   - content: Array with a bad block     -> array with bad block(s) filtered out,
+      //                                          good blocks preserved
+      //   - content: string | undefined | good array -> unchanged
+      // `[]` is safe: convertMessages at anthropic.js:791-792 short-circuits on empty filteredBlocks.
+      const fixed = msgs.map((m, i) => {
+        if (!badIndices.some((b) => b.index === i)) return m;
+        // Message itself is not an object (null, undefined, primitive).
+        // Replace with a safe placeholder so reading `.content` below is safe.
+        if (!m || typeof m !== "object") {
+          return { role: "user", content: [] };
+        }
+        const c = m.content;
+        if (Array.isArray(c)) {
+          return {
+            ...m,
+            content: c.filter((b: any) => b && typeof b === "object" && typeof b.type === "string"),
+          };
+        }
+        return { ...m, content: [] };
+      });
+      debugLog("warn", "llm_context_defensively_fixed", {
+        messageCount: msgs.length,
+        badMessageCount: badIndices.length,
+        badMessages: badIndices.slice(0, 10),
+      });
+      return { messages: fixed };
+    }
     debugLog("debug", "llm_context", {
       messageCount: msgs.length,
       lastRole: last?.role,
@@ -1107,6 +1141,7 @@ export default function (pi: ExtensionAPI) {
       // Pinpoint: index, id (if present), role, and what's wrong with each.
       badMessages: badIndices.slice(0, 10),
     });
+    return undefined;
   });
 
   // Log the LLM request payload (model, message count, tool count) and
