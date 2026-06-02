@@ -710,7 +710,35 @@ export default function (pi: ExtensionAPI) {
   // ── Per-job activity observation ─────────────────────────────────────
 
   function observeWidgetJob(job: WidgetJob, now: number): void {
+    // For tmux jobs, consult the spawner's authoritative state FIRST. Once the
+    // child finishes, the activity recorder is disabled (see activity.ts markDone)
+    // and the file goes stale — without this check, the snapshot would flip to
+    // "stalled" 60s after completion even though the job is legitimately done.
+    if (job.isTmux) {
+      const tmuxJob = getTmuxJob(job.id);
+      if (tmuxJob?.state === "completed" || tmuxJob?.state === "killed") {
+        // Synthesize a "done" observation with a fresh updatedAt so it survives
+        // observeStatus's olderThanLastActivity replay guard. We use a high
+        // sequence number so any leftover observation from before the
+        // completion is treated as older and ignored.
+        job.statusState = observeStatus(
+          job.statusState,
+          {
+            snapshot: "present",
+            updatedAt: now,
+            sequence: Number.MAX_SAFE_INTEGER,
+            phase: "done",
+            latestEvent: "subagent_done",
+            activityLabel: tmuxJob.state === "killed" ? "killed" : "done",
+          },
+          now,
+        );
+        return;
+      }
+    }
+
     let activity: SubagentActivityState | null = null;
+
 
     if (job.activityFile) {
       const read = readSubagentActivityFile(job.activityFile, job.id);
@@ -745,9 +773,12 @@ export default function (pi: ExtensionAPI) {
         snapshot: "present",
         updatedAt: activity.updatedAt,
         sequence: activity.sequence,
-        // Map our richer phase set onto status.ts's StatusActivityPhase.
-        // "done" maps to "waiting" + statusLabel="done" via classifyStatus.
-        phase: activity.phase === "done" ? "waiting" : activity.phase,
+        // Pass phase through unchanged. The activity file's "done" phase is
+        // distinct from "waiting" in classifyStatus (status.ts:316-318) which
+        // sets statusLabel="done" for the "done" phase. Earlier code translated
+        // "done" → "waiting" here, which caused finished jobs to render as
+        // "(waiting)" with no done indicator.
+        phase: activity.phase,
         active: activity.phase === "active",
         activeScope: activity.activeScope,
         activeSince: activity.activeSince,
@@ -1136,12 +1167,14 @@ export default function (pi: ExtensionAPI) {
           session: null as any,
           startedAt: Date.now(),
           promise: new Promise(() => {}),
+          // Default to "notify" for tmux backend: the child runs in a separate
+          // tmux pane invisible to the parent TUI, so a brief completion
+          // notification is the user's only signal. "inject" is preserved
+          // when explicitly requested; unspecified → "notify" (was: undefined).
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+              : "notify",
           notificationDelivered: false,
           maxAge: params.maxAge,
           backend: "tmux",
@@ -1473,12 +1506,14 @@ export default function (pi: ExtensionAPI) {
           session: null as any,
           startedAt: Date.now(),
           promise: new Promise(() => {}),
+          // Default to "notify" for tmux backend: the child runs in a separate
+          // tmux pane invisible to the parent TUI, so a brief completion
+          // notification is the user's only signal. "inject" is preserved
+          // when explicitly requested; unspecified → "notify" (was: undefined).
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+              : "notify",
           notificationDelivered: false,
           maxAge: params.maxAge,
           backend: "tmux",
