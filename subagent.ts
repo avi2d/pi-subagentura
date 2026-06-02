@@ -79,6 +79,7 @@ import {
 
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { isTmuxChildMode, activateTmuxChildMode } from "./tmux-child";
 import { registerTmuxCommands } from "./tmux-commands";
 
@@ -890,7 +891,14 @@ export default function (pi: ExtensionAPI) {
       wj.task = task;
       wj.startedAtMs = startedAtMs;
       if (isTmux) {
-        wj.activityFile = `${entry.job.sessionDir}/subagent-activity/${id}.json`;
+        // Guard against undefined sessionDir: TmuxJobState.sessionDir is optional,
+        // and any future code path that registers a tmux job without one would
+        // produce a literal "undefined/subagent-activity/<id>.json" path.
+        if (entry.job.sessionDir) {
+          wj.activityFile = path.join(entry.job.sessionDir, "subagent-activity", `${id}.json`);
+        } else {
+          wj.activityFile = undefined;
+        }
         delete wj.virtualActivity;
       } else {
         // In-process: synthesize an activity state from liveStatus.
