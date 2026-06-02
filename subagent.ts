@@ -431,13 +431,26 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
       }
       incrementInjectCount();
       try {
-        // Inject full result as user message
-        (pi as any).sendUserMessage?.(
-          result.output || "(sub-agent produced no output)",
-          {
+        // Inject full result as user message. Log before/after so a downstream LLM
+        // error can be correlated with the injected payload.
+        const output = result.output || "(sub-agent produced no output)";
+        debugLog("info", "inject_user_message", {
+          jobId: jobState.id,
+          outputLength: output.length,
+          outputPreview: output.slice(0, 200),
+        });
+        try {
+          (pi as any).sendUserMessage?.(output, {
             deliverAs: "followUp",
-          },
-        );
+          });
+          debugLog("info", "inject_user_message_ok", { jobId: jobState.id });
+        } catch (err) {
+          debugLog("error", "inject_user_message_failed", {
+            jobId: jobState.id,
+            error: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+          });
+        }
         // Also send a summary notification
         pi.sendMessage!(
           [
@@ -467,8 +480,15 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
         { deliverAs: "followUp" } as any,
       );
     }
-  } catch {
-    // pi may be stale after session replacement
+  } catch (err) {
+    // pi may be stale after session replacement, but log it so we can tell
+    // whether the failure was the silent "stale pi" case or a real error.
+    debugLog("error", "notify_delivery_failed", {
+      jobId: jobState.id,
+      mode: jobState.notifyOnComplete,
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
   }
 
   jobState.notificationDelivered = true;
@@ -1040,6 +1060,69 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event: any, ctx: any) => {
     latestCtx = ctx;
     startWidgetRefresh();
+  });
+
+  // Trace what the agent sends to the LLM, and how the LLM responds.
+  // Catches the "Cannot read properties of undefined (reading 'map')" class
+  // of errors by logging the request shape before the SDK throws.
+  // The `context` event fires after the agent's transformContext hook.
+  pi.on("context", (event: any) => {
+    const msgs: any[] = event.messages ?? [];
+    const last = msgs[msgs.length - 1];
+    const lastContentShape = Array.isArray(last?.content)
+      ? `array(${last.content.length})[${last.content.map((c: any) => c?.type ?? "?").join(",")}]`
+      : typeof last?.content;
+    // Identify the EXACT message that will trip the `.map()` calls in
+    // pi-ai's convertMessages / convertContentBlocks. The only safe shapes
+    // are: string, Array<ContentBlock>, or undefined (which is treated as
+    // a no-op by convertMessages at line 758-797). Anything else (null,
+    // number, object without proper structure) crashes the request build.
+    const badIndices: Array<{ index: number; id?: string; role?: string; issue: string }> = [];
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      if (!m || typeof m !== "object") {
+        badIndices.push({ index: i, issue: `not an object: ${typeof m}` });
+        continue;
+      }
+      const c = m.content;
+      if (c === undefined) continue; // safe — convertMessages treats this as a no-op
+      if (typeof c === "string") continue;
+      // For arrays: check each block has a string `type`, since downstream
+      // code (convertContentBlocks, transformMessages) branches on it.
+      if (Array.isArray(c)) {
+        const badBlock = c.find((b: any) => !b || typeof b !== "object" || typeof b.type !== "string");
+        if (badBlock !== undefined) {
+          badIndices.push({ index: i, id: m.id, role: m.role, issue: `block[${c.indexOf(badBlock)}] missing string \`type\`` });
+        }
+        continue;
+      }
+      // Non-string, non-array, non-undefined content.
+      badIndices.push({ index: i, id: m.id, role: m.role, issue: `content is ${c === null ? "null" : typeof c}` });
+    }
+    debugLog("debug", "llm_context", {
+      messageCount: msgs.length,
+      lastRole: last?.role,
+      lastContentShape,
+      badMessageCount: badIndices.length,
+      // Pinpoint: index, id (if present), role, and what's wrong with each.
+      badMessages: badIndices.slice(0, 10),
+    });
+  });
+
+  // Log the LLM request payload (model, message count, tool count) and
+  // response status. Together with `llm_context`, this gives a full trail
+  // leading up to any errorMessage in the assistant entry.
+  pi.on("before_provider_request", (event: any) => {
+    const p = event.payload ?? {};
+    debugLog("debug", "llm_request", {
+      model: p.model,
+      messageCount: p.messages?.length,
+      toolCount: p.tools?.length,
+    });
+  });
+
+  pi.on("after_provider_response", (event: any) => {
+    debugLog("debug", "llm_response", { status: event.status });
   });
 
   // Register notification renderer before any tools
