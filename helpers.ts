@@ -8,12 +8,12 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { getModel, getProviders } from "@mariozechner/pi-ai";
-import type { Model } from "@mariozechner/pi-ai";
+import { getModel, getProviders } from "@earendil-works/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 
 // Note: Model<TApi> and AgentToolResult<T> are SDK generics. We use `unknown` as
 // the type argument to avoid strict generic instantiation issues with tsc.
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import {
   AuthStorage,
@@ -21,7 +21,7 @@ import {
   ModelRegistry,
   SessionManager,
   type AgentSession,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -77,7 +77,7 @@ export function extractTextFromContent(content: unknown): string {
  */
 export const ACTIVE_TOOL_DEBOUNCE_MS = 150;
 
-// Note: If Pi adds new providers, getProviders() from @mariozechner/pi-ai will
+// Note: If Pi adds new providers, getProviders() from @earendil-works/pi-ai will
 // return them automatically. We no longer maintain a hardcoded list.
 
 // ── Types ───────────────────────────────────────────────────────────

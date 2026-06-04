@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { SubagentResult } from "./helpers";
 
 // ── Hoisted mock: startSubagentJob must be mocked before any imports ──────
