@@ -25,6 +25,8 @@
   "files": [
     "subagent.ts",
     "interactive-tmux.ts",
+    "artifact.ts",
+    "subagent-artifact-cli.ts",
     "README.md",
     "LICENSE"
   ],

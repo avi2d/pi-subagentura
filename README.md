@@ -12,10 +12,12 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-- `subagent_interactive` — spawn an attachable tmux-backed Pi session
-- `get_interactive_subagent_status` — list attachable sessions with pane/session metadata
+- `subagent_interactive` — spawn an attachable tmux-backed Pi session with artifact-based progress
+- `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
 - `cancel_interactive_subagent` — kill an attachable sub-agent tmux pane
-The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there.
+- `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
+- `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
+The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 ## Why use it?
 
@@ -134,17 +136,19 @@ Remove all completed and failed subagent jobs from the registry. Running and can
 
 ### Interactive tmux Tools
 
-Use these when observability and manual follow-up matter more than in-process execution. They require running Pi inside tmux.
+Use these when observability and manual follow-up matter more than in-process execution. They require running Pi inside tmux. Interactive sub-agents write their progress to a per-sub-agent artifact directory on disk; the pane is for live monitoring, the artifact is the source of truth.
 
 #### `subagent_interactive`
 
-Starts a separate interactive `pi` process in a new tmux pane and returns immediately with:
+Starts a separate interactive `pi` process in a tmux window and returns immediately with:
 
 - sub-agent id
 - tmux pane id
-- `tmux attach ...` command
-- `tmux select-pane ...` command for use inside the same tmux session
+- `tmux attach ...` command (works from outside tmux)
+- `tmux select-pane ...` or `tmux select-window ...` command for use inside the same tmux session
 - child Pi session file path
+- artifact directory (events.ndjson + output.md)
+- the tmux window name (in background mode) so you can find it in your window list
 
 Parameters:
 
@@ -154,14 +158,42 @@ Parameters:
 - `model` — optional model override
 - `cwd` — optional working directory
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
+- `background` — spawn in a detached named window (invisible) instead of a visible horizontal split. Default `true` — your tmux layout is undisturbed and you can attach later with the returned `select-window` command. Pass `background: false` for a side-by-side split you can watch in real time.
+- `notifyOnUpdate` — controls how the parent agent learns about the sub-agent's progress:
+  - `"off"` (default if omitted) — never notify. Use `list_subagent_artifacts` / `read_subagent_artifact` to inspect manually.
+  - `"milestones"` (recommended) — pointer notification on `started` / `done` / `error` / `cancelled` events. The main agent reads the artifact via `read_subagent_artifact` to get the content.
+  - `"all"` — notify on every event including `wip` and `output_updated`. Use for live progress.
+
+The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle/WIP log) and `output.md` (clean prose the child writes when it has substantive content). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
+
+If you want the child pi to report progress, tell it (via the system prompt / persona) to use the inline CLI:
+
+```bash
+$ARTIFACT_DIR/cli.mjs wip "step 1 done"           # append a wip event
+$ARTIFACT_DIR/cli.mjs wip "step 2" --progress 2/5  # with optional progress
+cat output.md | $ARTIFACT_DIR/cli.mjs output       # write/rewrite output.md atomically
+```
 
 #### `get_interactive_subagent_status`
 
 Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
 
 #### `cancel_interactive_subagent`
+Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
 
-Kills the tmux pane for an interactive sub-agent by id.
+#### `list_subagent_artifacts`
+
+Lists all known interactive sub-agents: id, name, status, and last-update timestamp. Use this to discover sub-agents that finished while the parent was away.
+
+#### `read_subagent_artifact`
+
+Reads a sub-agent's artifact by id. Returns the lifecycle/WIP event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content. This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+
+Parameters:
+- `id` — required sub-agent id
+- `since` — optional unix-ms timestamp; only return events with `ts >= since`
+- `includeOutput` — include `output.md` (default `true`)
+
 ### `list_available_models`
 
 List all available AI models with auth status. Use this to validate model identifiers before passing them to subagent tools — prevents silent fallback to the parent session model.
