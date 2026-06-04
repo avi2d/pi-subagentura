@@ -22,6 +22,8 @@
 
 import {
   type ExtensionAPI,
+  type ExtensionContext,
+  type ExtensionUIContext,
   type Theme,
   convertToLlm,
   serializeConversation,
@@ -56,15 +58,16 @@ import {
 	type InteractiveSubagentState,
 	type NotifyOnUpdate,
 } from "./interactive-tmux";
-import { artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
-import { readdirSync, statSync } from "node:fs";
+import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
+import { openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-// ── Footer Status Key ───────────────────────────────────────────────
+// ── Footer Status Key ─────────────────────────────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
+const WIDGET_KEY = "subagentura-activity";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 // Shared helpers are imported from ./helpers (SubagentResult, SubagentLiveStatus,
@@ -474,14 +477,20 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
 /** True when the event should trigger a notification under the given cadence. */
 function shouldNotify(event: SubagentEvent, mode: NotifyOnUpdate): boolean {
 	if (mode === "off") return false;
-	if (mode === "all") return true;
-	// "milestones": only lifecycle events, not wip/output_updated.
-	return (
-		event.type === "started" ||
-		event.type === "done" ||
-		event.type === "error" ||
-		event.type === "cancelled"
-	);
+	// tool_activity is always silent — the TUI widget surfaces it, the LLM never sees it.
+	if (event.type === "tool_activity") return false;
+	// "started" is silent too — the TUI widget row appearing IS the started signal.
+	if (event.type === "started") return false;
+	// output_updated is no longer in any mode — the LLM sees the final result on done.
+	if (mode === "milestones") {
+		return (
+			event.type === "done" ||
+			event.type === "error" ||
+			event.type === "cancelled"
+		);
+	}
+	// "all": lifecycle + wip (legacy opt-in for live progress). started/tool_activity/output_updated still skipped.
+	return true;
 }
 
 /**
@@ -496,6 +505,10 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 	const g2 = typeof global !== "undefined" ? global : globalThis;
 	const interactivePi = (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
 	if (!interactivePi) return;
+
+	let runningCount = 0;
+	const widgetRows: string[] = [];
+	const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
 	for (const state of interactiveSubagentRegistry.values()) {
 		if (state.status === "cancelled" || state.status === "exited" || state.status === "unknown") continue;
@@ -515,34 +528,189 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 			if (last.exitCode !== undefined) state.exitCode = last.exitCode;
 		}
 
-		if (mode === "off") continue;
+		// Tail-read the child's session log and synthesize tool_activity events.
+		// Runs in every mode including 'off' — the artifact must reflect activity.
+		tailReadSessionLog(state, art);
 
 		// Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
 		// so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
 		const cursor = state.lastDeliveredEventTs ?? 0;
 		const events = readEvents(art, cursor + 1);
-		if (events.length === 0) continue;
 
-		let maxTs = cursor;
-		for (const ev of events) {
-			if (ev.ts > maxTs) maxTs = ev.ts;
-			if (!shouldNotify(ev, mode)) continue;
-			deliverArtifactNotification(interactivePi, state, ev);
+		if (events.length > 0 && mode !== "off") {
+			let maxTs = cursor;
+			for (const ev of events) {
+				if (ev.ts > maxTs) maxTs = ev.ts;
+				if (!shouldNotify(ev, mode)) continue;
+				deliverArtifactNotification(interactivePi, state, ev);
+			}
+			state.lastDeliveredEventTs = maxTs;
 		}
-		state.lastDeliveredEventTs = maxTs;
+
+		// TUI widget row: every iteration of the loop is a running sub-agent at this point.
+		runningCount++;
+		widgetRows.push(formatActivityRow(state));
 	}
+
+	// Paint footer + widget. Both are TUI-only — never reach the LLM.
+	if (ui) {
+		try {
+			ui.setStatus(
+				FOOTER_KEY,
+				runningCount > 0 ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running` : undefined,
+			);
+		} catch {
+			/* ui stale */
+		}
+		try {
+			ui.setWidget(WIDGET_KEY, widgetRows.length > 0 ? widgetRows : undefined, { placement: "belowEditor" });
+		} catch {
+			/* ui stale */
+		}
+	}
+}
+
+/** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
+ *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
+function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifact): void {
+	const sessionFile = state.sessionFile;
+	if (!sessionFile) return;
+
+	let size: number;
+	try {
+		size = statSync(sessionFile).size;
+	} catch {
+		return; // file not yet created by the child
+	}
+
+	const cursor = state.lastDeliveredSessionByte ?? 0;
+	if (size <= cursor) return;
+
+	let fd: number;
+	try {
+		fd = openSync(sessionFile, "r");
+	} catch {
+		return;
+	}
+	try {
+		const len = size - cursor;
+		const buf = Buffer.alloc(len);
+		let bytesRead = 0;
+		while (bytesRead < len) {
+			const n = readSync(fd, buf, bytesRead, len - bytesRead, cursor + bytesRead);
+			if (n <= 0) break;
+			bytesRead += n;
+		}
+		const chunk = buf.subarray(0, bytesRead).toString("utf8");
+		processSessionLogChunk(state, art, chunk);
+		state.lastDeliveredSessionByte = cursor + bytesRead;
+	} finally {
+		try { require("node:fs").closeSync(fd); } catch {}
+	}
+}
+
+/** Parse a chunk of session JSONL, append a tool_activity event per tool call. */
+function processSessionLogChunk(state: InteractiveSubagentState, art: SubagentArtifact, chunk: string): void {
+	const lines = chunk.split("\n");
+	// Last entry may be a partial line (the child hasn't finished writing it yet).
+	// We still process complete lines; the partial line will be re-read on the next tick.
+	const completeLines = chunk.endsWith("\n") ? lines : lines.slice(0, -1);
+	for (const line of completeLines) {
+		if (!line.trim()) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			// Skip malformed/partial — safer to drop than crash.
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		const msg = entry.message;
+		if (!msg) continue;
+
+		// Assistant message: extract toolCall blocks.
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type !== "toolCall") continue;
+				const summary = summarizeToolCall(block.name, block.arguments);
+				if (!summary) continue;
+				const ev: SubagentEvent = {
+					ts: msg.timestamp ?? Date.now(),
+					type: "tool_activity",
+					status: "running",
+					tool: block.name,
+					summary,
+				};
+				appendEvent(art, ev);
+				state.lastToolName = block.name;
+				state.lastToolSummary = summary;
+				state.lastActivityAt = ev.ts;
+			}
+		}
+	}
+}
+
+/** Short, human-readable summary of a tool call. Returns null for uninteresting tools. */
+function summarizeToolCall(name: string, args: any): string | null {
+	if (!args || typeof args !== "object") return null;
+	switch (name) {
+		case "bash": {
+			const cmd = typeof args.command === "string" ? args.command : null;
+			if (!cmd) return null;
+			return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
+		}
+		case "write":
+		case "edit":
+		case "read": {
+			const p = typeof args.path === "string" ? args.path : null;
+			if (!p) return null;
+			return p;
+		}
+		default:
+			return null; // skip grep/find/ls etc. — too noisy for the widget
+	}
+}
+
+/** Format a single TUI widget row for a running sub-agent. */
+function formatActivityRow(state: InteractiveSubagentState): string {
+	const ago = state.lastActivityAt ? ` (${agoStr(Date.now() - state.lastActivityAt)})` : "";
+	const summary = state.lastToolSummary ?? "starting…";
+	return `▶ ${state.name}: ${summary}${ago}`;
+}
+
+function agoStr(ms: number): string {
+	if (ms < 0) ms = 0;
+	if (ms < 1000) return "just now";
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s ago`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ago`;
+	return `${Math.floor(m / 60)}h ago`;
+}
+
+/** Build the LLM-facing notification content. Pointer paths always; error or wip body inlined. */
+function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEvent): string {
+	const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
+	const outputPath = join(state.artifactDir, "output.md");
+	const logPath = join(state.artifactDir, "events.ndjson");
+	const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;
+	let body = "";
+	if (event.type === "error") {
+		body = `\n${(event.message ?? "unknown error").slice(0, 500)}`;
+	} else if (event.type === "wip" && event.message) {
+		// wip events carry an agent-curated progress string; surface it for the LLM.
+		body = `\n${event.message}`;
+	}
+	return `${header}${body}${pointer}`;
 }
 
 /** Send a single pointer-only notification for one artifact event. */
 function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagentState, event: SubagentEvent): void {
-	const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
-	const body = event.message ? `\n${event.message}` : "";
-	const pointer = `\nArtifact: ${state.artifactDir}\nRead with: read_subagent_artifact({"id":"${state.id}"})`;
 	try {
 		pi.sendMessage!(
 			{
 				customType: "subagent-notify",
-				content: `${header}${body}${pointer}`,
+				content: buildArtifactMessage(state, event),
 				display: true,
 				details: { subagentId: state.id, event, mode: state.notifyOnUpdate ?? "milestones" },
 			},
@@ -558,6 +726,7 @@ function iconFor(event: SubagentEvent): string {
 		case "started":
 		case "wip":
 		case "output_updated":
+		case "tool_activity":
 			return "▶";
 		case "done":
 			return event.exitCode === 0 ? "✅" : "❌";
@@ -570,18 +739,22 @@ function iconFor(event: SubagentEvent): string {
 
 function labelFor(event: SubagentEvent): string {
 	switch (event.type) {
-		case "started":
-			return "started";
 		case "wip":
 			return "wip";
 		case "output_updated":
 			return "output updated";
+		case "tool_activity":
+			return "activity";
 		case "done":
 			return `done (exit ${event.exitCode ?? "?"})`;
 		case "error":
 			return "error";
 		case "cancelled":
 			return "cancelled";
+		// "started" is intentionally dropped — it would only fire on the very first poll
+		// and the widget row is a better signal than a one-shot message.
+		case "started":
+			return "started";
 	}
 }
 /**
@@ -670,15 +843,18 @@ export default function (pi: ExtensionAPI) {
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaInjectCount = 0;
 
-  // Register notification renderer before any tools
-  (pi as any).registerMessageRenderer?.(
-    "subagent-notify",
-    (message: any, options: any, theme: Theme) => {
-      return renderSubagentNotify(message, options, theme);
-    },
-  );
+  // Capture ctx.ui for the artifact poller (it runs from a setInterval and has no ctx).
+  // The handler is registered on every default-export invocation; the last one wins,
+  // which is the same pi the poller uses via __piSubagenturaPiRef.
+  pi.on("session_start", (_event, ctx) => {
+    g2.__piSubagenturaUi = ctx.ui;
+  });
+  pi.on("session_shutdown", () => {
+    // Don't null the ui ref here — the poller may still fire one last tick on shutdown,
+    // and stale ctx errors are already caught at the call sites.
+  });
 
-	// ── Interactive sub-agent artifact poller ────────────────────────
+  // Register notification renderer before any tools
 	// One global interval for the whole session. Each tick walks the artifact dir of
 	// every running interactive sub-agent and fires pointer notifications for new events.
 	// The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).

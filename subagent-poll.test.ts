@@ -76,7 +76,7 @@ describe("pollArtifactChanges", () => {
 		expect(state.lastDeliveredEventTs).toBeUndefined();
 	});
 
-	it("fires a pointer notification on a milestone event (mode: milestones)", async () => {
+	it("fires a pointer notification on done (mode: milestones). Started is silent.", async () => {
 		const mod = await importFresh();
 		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
 		mod.interactiveSubagentRegistry.set(state.id, state);
@@ -87,18 +87,20 @@ describe("pollArtifactChanges", () => {
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 
-		expect(sendMessage).toHaveBeenCalledTimes(2); // started + done
-		const calls = sendMessage.mock.calls;
-		expect(calls[0][0].customType).toBe("subagent-notify");
-		expect(calls[0][0].content).toContain("started");
-		expect(calls[1][0].content).toContain("done");
-		expect(calls[1][0].content).toContain("Artifact:");
-		expect(calls[1][0].content).toContain(`read_subagent_artifact`);
-		// cursor advanced
+		// Only done fires. started is silent (widget shows it).
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+		const call = sendMessage.mock.calls[0][0];
+		expect(call.customType).toBe("subagent-notify");
+		expect(call.content).toContain("done");
+		// New pointer format: paths, not a tool-call hint.
+		expect(call.content).toContain("Output:");
+		expect(call.content).toContain("Activity log:");
+		expect(call.content).not.toContain("read_subagent_artifact");
+		// cursor still advances to 2 even though only 1 was delivered
 		expect(state.lastDeliveredEventTs).toBe(2);
 	});
 
-	it("does NOT fire on wip/output_updated under milestones mode", async () => {
+	it("does NOT fire on wip/output_updated/tool_activity/started under milestones mode", async () => {
 		const mod = await importFresh();
 		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
 		mod.interactiveSubagentRegistry.set(state.id, state);
@@ -106,30 +108,33 @@ describe("pollArtifactChanges", () => {
 		appendEvent(art, { ts: 1, type: "started", status: "running" });
 		appendEvent(art, { ts: 2, type: "wip", status: "wip", message: "thinking" });
 		appendEvent(art, { ts: 3, type: "output_updated", status: "running" });
+		appendEvent(art, { ts: 4, type: "tool_activity", status: "running", tool: "bash", summary: "rg TODO src/" });
 
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 
-		// Only the started event should fire (wip + output_updated are skipped in milestones)
-		expect(sendMessage).toHaveBeenCalledTimes(1);
-		// But the cursor still advances past wip/output_updated so they aren't re-delivered
-		expect(state.lastDeliveredEventTs).toBe(3);
+		// All four are silent in milestones mode.
+		expect(sendMessage).not.toHaveBeenCalled();
+		// But the cursor still advances past them so they aren't re-delivered.
+		expect(state.lastDeliveredEventTs).toBe(4);
 	});
 
-	it("fires on wip under 'all' mode", async () => {
+	it("fires on wip under 'all' mode, but still skips started and tool_activity", async () => {
 		const mod = await importFresh();
 		const { state, artifactDir } = makeState({ notifyOnUpdate: "all" });
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
 		appendEvent(art, { ts: 1, type: "started", status: "running" });
 		appendEvent(art, { ts: 2, type: "wip", status: "wip", message: "step 1" });
+		appendEvent(art, { ts: 3, type: "tool_activity", status: "running", tool: "bash", summary: "rg TODO" });
 
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 
-		expect(sendMessage).toHaveBeenCalledTimes(2);
-		expect(sendMessage.mock.calls[1][0].content).toContain("wip");
-		expect(sendMessage.mock.calls[1][0].content).toContain("step 1");
+		// Only the wip fires. started + tool_activity are silent even in 'all' mode.
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+		expect(sendMessage.mock.calls[0][0].content).toContain("wip");
+		expect(sendMessage.mock.calls[0][0].content).toContain("step 1");
 	});
 
 	it("is at-most-once per event (cursor advances)", async () => {
@@ -142,7 +147,8 @@ describe("pollArtifactChanges", () => {
 
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
-		expect(sendMessage).toHaveBeenCalledTimes(2);
+		// Only done fires (started is silent).
+		expect(sendMessage).toHaveBeenCalledTimes(1);
 
 		// Second poll: no new events, no new notifications.
 		sendMessage.mockClear();

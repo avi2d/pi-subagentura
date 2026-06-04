@@ -25,9 +25,12 @@ export type SubagentStatus = "running" | "wip" | "done" | "error" | "cancelled";
 export interface SubagentEvent {
 	/** Unix epoch milliseconds */
 	ts: number;
-	type: "started" | "wip" | "output_updated" | "done" | "error" | "cancelled";
+	type: "started" | "wip" | "output_updated" | "tool_activity" | "done" | "error" | "cancelled";
 	status: SubagentStatus;
 	message?: string;
+	/** For tool_activity: which tool was called and a short arg summary. */
+	tool?: string;
+	summary?: string;
 	progress?: { current: number; total?: number };
 	exitCode?: number;
 }

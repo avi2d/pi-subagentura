@@ -1,0 +1,418 @@
+/**
+ * Tests for the session-log tail-read that synthesizes `tool_activity` events.
+ *
+ * The interactive sub-agent poller in the parent process tail-reads the child's
+ * session JSONL (which the child pi runtime writes automatically) and appends a
+ * `tool_activity` event to `events.ndjson` for each toolCall block in the log.
+ * This means sub-agents that don't call the `subagent-artifact wip` helper are
+ * still observable in the artifact and the TUI widget.
+ *
+ * Strategy: write a fake session JSONL to a temp file, point a registry state
+ * at it, then call `pollArtifactChanges` and assert the appended events.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { appendEvent, artifactPath, readEvents } from "./artifact";
+import type { InteractiveSubagentState } from "./interactive-tmux";
+
+function makeTmp(): string {
+	return mkdtempSync(join(tmpdir(), "pi-subagentura-session-log-"));
+}
+
+function makeState(overrides: {
+	sessionFile?: string;
+	notifyOnUpdate?: "off" | "milestones" | "all";
+}): { id: string; artifactDir: string; state: InteractiveSubagentState } {
+	const id = "id-" + Math.random().toString(36).slice(2, 8);
+	const root = makeTmp();
+	const artifactDir = join(root, id);
+	mkdirSync(artifactDir, { recursive: true });
+	const state: InteractiveSubagentState = {
+		id,
+		name: "Test",
+		task: "t",
+		paneId: "%99",
+		sessionFile: overrides.sessionFile ?? join(artifactDir, "session.jsonl"),
+		cwd: "/tmp",
+		startedAt: Date.now(),
+		status: "running",
+		attachCommand: "tmux attach -t sess",
+		selectPaneCommand: "tmux select-pane -t '%99'",
+		launchScriptFile: "/tmp/launch.sh",
+		artifactDir,
+		notifyOnUpdate: overrides.notifyOnUpdate,
+	};
+	return { id, artifactDir, state };
+}
+
+async function importFresh() {
+	vi.resetModules();
+	return import("./subagent");
+}
+
+describe("session-log tail-read", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = makeTmp();
+		const g = globalThis as any;
+		g.__piSubagenturaInteractiveRegistry?.clear?.();
+		g.__piSubagenturaPiRef = undefined;
+		g.__piSubagenturaUi = undefined;
+	});
+
+	afterEach(() => {
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("appends a tool_activity event for a bash tool call", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		// Write a fake session log with one assistant message containing a toolCall.
+		const sessionFile = state.sessionFile;
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "I'll search the codebase." },
+					{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "rg TODO src/" } },
+				],
+				api: "openai",
+				provider: "openai",
+				model: "gpt-4",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "toolUse",
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(sessionFile, JSON.stringify(entry) + "\n");
+
+		const sendMessage = vi.fn();
+		mod.pollArtifactChanges({ sendMessage } as any);
+
+		// Should not have notified the LLM (tool_activity is silent).
+		expect(sendMessage).not.toHaveBeenCalled();
+
+		// Should have appended a tool_activity event to events.ndjson.
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		expect(events).toHaveLength(1);
+		expect(events[0].type).toBe("tool_activity");
+		expect(events[0].tool).toBe("bash");
+		expect(events[0].summary).toBe("rg TODO src/");
+		expect(events[0].status).toBe("running");
+		// Cursor advanced.
+		expect(state.lastDeliveredSessionByte).toBeGreaterThan(0);
+	});
+
+	it("appends tool_activity for write, edit, read with file paths", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "t1", name: "write", arguments: { path: "/tmp/review-1.md", content: "..." } },
+					{ type: "toolCall", id: "t2", name: "edit", arguments: { path: "/src/foo.ts", oldText: "a", newText: "b" } },
+					{ type: "toolCall", id: "t3", name: "read", arguments: { path: "/src/bar.ts" } },
+				],
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		const tools = events.filter((e) => e.type === "tool_activity");
+		expect(tools).toHaveLength(3);
+		expect(tools[0]).toMatchObject({ tool: "write", summary: "/tmp/review-1.md" });
+		expect(tools[1]).toMatchObject({ tool: "edit", summary: "/src/foo.ts" });
+		expect(tools[2]).toMatchObject({ tool: "read", summary: "/src/bar.ts" });
+	});
+
+	it("skips tools with no summary (grep, find, ls, custom)", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "t1", name: "grep", arguments: { pattern: "TODO", path: "/src" } },
+					{ type: "toolCall", id: "t2", name: "find", arguments: { pattern: "*.ts" } },
+					{ type: "toolCall", id: "t3", name: "ls", arguments: { path: "/src" } },
+				],
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(0);
+	});
+
+	it("truncates long bash commands to 80 chars", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const longCmd = "echo " + "x".repeat(200);
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: longCmd } }],
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		const activity = events.find((e) => e.type === "tool_activity");
+		expect(activity?.summary).toBeDefined();
+		expect(activity!.summary!.length).toBeLessThanOrEqual(80);
+		expect(activity!.summary!.endsWith("…")).toBe(true);
+	});
+
+	it("cursor advances — second poll with no new lines does not duplicate", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "echo hi" } }],
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+		const after1 = state.lastDeliveredSessionByte;
+		expect(after1).toBeGreaterThan(0);
+
+		mod.pollArtifactChanges({} as any);
+		expect(state.lastDeliveredSessionByte).toBe(after1); // unchanged
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(1);
+	});
+
+	it("picks up new lines written between polls", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const e1 = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "echo 1" } }],
+				timestamp: 1700000000000,
+			},
+		};
+		const e2 = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t2", name: "write", arguments: { path: "/tmp/foo.md" } }],
+				timestamp: 1700000001000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(e1) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		// Append second line.
+		const { appendFileSync } = await import("node:fs");
+		appendFileSync(state.sessionFile, JSON.stringify(e2) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		const activity = events.filter((e) => e.type === "tool_activity");
+		expect(activity).toHaveLength(2);
+		expect(activity[0].tool).toBe("bash");
+		expect(activity[1].tool).toBe("write");
+	});
+
+	it("tolerates a partial trailing line without crashing", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "echo hi" } }],
+				timestamp: 1700000000000,
+			},
+		};
+		// Write a complete line + a truncated second line.
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n{ \"type\": \"mess");
+
+		mod.pollArtifactChanges({} as any);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		// Only the complete line was processed.
+		expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(1);
+		// Cursor advanced past the partial too (next poll re-reads it).
+		const size = state.lastDeliveredSessionByte ?? 0;
+		expect(size).toBeGreaterThan(0);
+	});
+
+	it("does nothing when the session file does not exist yet", async () => {
+		const mod = await importFresh();
+		const { state } = makeState({
+			sessionFile: "/tmp/does-not-exist-" + Math.random() + ".jsonl",
+		});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		expect(() => mod.pollArtifactChanges({} as any)).not.toThrow();
+		expect(state.lastDeliveredSessionByte).toBeUndefined();
+	});
+
+	it("updates state.lastToolSummary and lastActivityAt for the widget", async () => {
+		const mod = await importFresh();
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "rg TODO src/" } }],
+				timestamp: 1700000000000,
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+
+		expect(state.lastToolName).toBe("bash");
+		expect(state.lastToolSummary).toBe("rg TODO src/");
+		expect(state.lastActivityAt).toBe(1700000000000);
+	});
+
+	it("paints the TUI widget when ui ref is set", async () => {
+		const mod = await importFresh();
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "rg TODO src/" } }],
+				timestamp: Date.now(),
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+
+		const setStatus = vi.fn();
+		const setWidget = vi.fn();
+		(globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+		mod.pollArtifactChanges({} as any);
+
+		// Footer status shows count.
+		expect(setStatus).toHaveBeenCalledWith("subagentura-running", "⚡ 1 sub-agent running");
+		// Widget shows the activity row.
+		expect(setWidget).toHaveBeenCalledTimes(1);
+		const [key, lines, opts] = setWidget.mock.calls[0];
+		expect(key).toBe("subagentura-activity");
+		expect(opts).toEqual({ placement: "belowEditor" });
+		expect(lines[0]).toContain("Test:");
+		expect(lines[0]).toContain("rg TODO src/");
+	});
+
+	it("clears the widget and footer when no sub-agents are running", async () => {
+		const mod = await importFresh();
+		// Empty registry.
+		const setStatus = vi.fn();
+		const setWidget = vi.fn();
+		(globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+		mod.pollArtifactChanges({} as any);
+
+		expect(setStatus).toHaveBeenCalledWith("subagentura-running", undefined);
+		expect(setWidget).toHaveBeenCalledWith("subagentura-activity", undefined, { placement: "belowEditor" });
+	});
+
+	it("inlines the error message in the LLM notification but uses pointers on success", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		appendEvent(art, { ts: 1, type: "done", status: "done", exitCode: 0 });
+		appendEvent(art, {
+			ts: 2,
+			type: "error",
+			status: "error",
+			message: "bash exited with code 1: rg foo missing",
+		});
+
+		const sendMessage = vi.fn();
+		mod.pollArtifactChanges({ sendMessage } as any);
+
+		expect(sendMessage).toHaveBeenCalledTimes(2);
+
+		// done: pointer only, no body.
+		const doneCall = sendMessage.mock.calls[0][0];
+		expect(doneCall.content).toContain("done");
+		expect(doneCall.content).toContain("Output:");
+		expect(doneCall.content).toContain("Activity log:");
+		expect(doneCall.content).not.toContain("exited with code");
+
+		// error: inline message + pointers.
+		const errCall = sendMessage.mock.calls[1][0];
+		expect(errCall.content).toContain("error");
+		expect(errCall.content).toContain("bash exited with code 1");
+		expect(errCall.content).toContain("Output:");
+		expect(errCall.content).toContain("Activity log:");
+	});
+
+	it("truncates the inline error message to 500 chars", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const longMsg = "x".repeat(2000);
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		appendEvent(art, { ts: 1, type: "error", status: "error", message: longMsg });
+
+		const sendMessage = vi.fn();
+		mod.pollArtifactChanges({ sendMessage } as any);
+
+		const content = sendMessage.mock.calls[0][0].content as string;
+		// The "x".repeat(2000) portion must be capped.
+		const match = content.match(/x+/);
+		expect(match).not.toBeNull();
+		expect(match![0].length).toBeLessThanOrEqual(500);
+	});
+});

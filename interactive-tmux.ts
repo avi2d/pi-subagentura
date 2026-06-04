@@ -46,6 +46,17 @@ export interface InteractiveSubagentState {
 	 * to 0 to ensure the first event is always delivered.
 	 */
 	lastDeliveredEventTs?: number;
+	/**
+	 * Byte offset into the child's session JSONL that we have already processed.
+	 * The poller tail-reads the session file from this offset each tick and synthesizes
+	 * `tool_activity` events for any new tool calls. Same at-most-once guarantee as
+	 * `lastDeliveredEventTs`, but byte-granular for append-only JSONL efficiency.
+	 */
+	lastDeliveredSessionByte?: number;
+	/** Most recent tool_activity summary, for the TUI widget. */
+	lastToolSummary?: string;
+	lastToolName?: string;
+	lastActivityAt?: number;
 }
 
 const g = typeof global !== "undefined" ? global : globalThis;
