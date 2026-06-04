@@ -67,52 +67,8 @@ describe("subagent-artifact CLI", () => {
 		});
 	});
 
-	describe("wip", () => {
-		it("writes a wip event with message", () => {
-			const r = runCli(tmp, ["wip", "running tests"]);
-			expect(r.status).toBe(0);
-			const ev = JSON.parse(readFileSync(join(tmp, "events.ndjson"), "utf8").trim());
-			expect(ev.type).toBe("wip");
-			expect(ev.status).toBe("wip");
-			expect(ev.message).toBe("running tests");
-		});
-
-		it("supports --progress N/M", () => {
-			runCli(tmp, ["wip", "step", "--progress", "3/10"]);
-			const ev = JSON.parse(readFileSync(join(tmp, "events.ndjson"), "utf8").trim());
-			expect(ev.progress).toEqual({ current: 3, total: 10 });
-		});
-
-		it("supports --progress N (no total)", () => {
-			runCli(tmp, ["wip", "step", "--progress", "7"]);
-			const ev = JSON.parse(readFileSync(join(tmp, "events.ndjson"), "utf8").trim());
-			expect(ev.progress).toEqual({ current: 7 });
-		});
-	});
-
-	describe("output", () => {
-		it("reads stdin and writes output.md atomically", () => {
-			const r = runCli(tmp, ["output"], "the result text");
-			expect(r.status).toBe(0);
-			expect(readFileSync(join(tmp, "output.md"), "utf8")).toBe("the result text");
-			// No .tmp file left behind
-			expect(existsSync(join(tmp, "output.md.tmp"))).toBe(false);
-		});
-
-		it("appends an output_updated event", () => {
-			runCli(tmp, ["output"], "content");
-			const lines = readFileSync(join(tmp, "events.ndjson"), "utf8").trim().split("\n");
-			const ev = JSON.parse(lines[lines.length - 1]);
-			expect(ev.type).toBe("output_updated");
-		});
-
-		it("creates output.md with 0o600 perms", () => {
-			runCli(tmp, ["output"], "x");
-			expect(statSync(join(tmp, "output.md")).mode & 0o777).toBe(0o600);
-		});
-	});
-
 	describe("done", () => {
+
 		it("writes a done event with exit code 0 → status done", () => {
 			runCli(tmp, ["done", "0"]);
 			const ev = JSON.parse(readFileSync(join(tmp, "events.ndjson"), "utf8").trim());

@@ -7,7 +7,6 @@ import {
 	artifactPath,
 	ensureArtifactDir,
 	lastEvent,
-	lastUpdate,
 	listArtifacts,
 	readEvents,
 	readOutput,
@@ -68,14 +67,12 @@ describe("artifact", () => {
 		it("appends multiple events in order", () => {
 			const art = artifactPath(root, "a");
 			appendEvent(art, { ts: 1, type: "started", status: "running" });
-			appendEvent(art, { ts: 2, type: "wip", status: "wip", message: "thinking" });
 			appendEvent(art, { ts: 3, type: "done", status: "done", exitCode: 0 });
 			const content = readFileSync(art.statusFile, "utf8");
 			const lines = content.trim().split("\n");
-			expect(lines).toHaveLength(3);
+			expect(lines).toHaveLength(2);
 			expect(JSON.parse(lines[0]).type).toBe("started");
-			expect(JSON.parse(lines[1]).message).toBe("thinking");
-			expect(JSON.parse(lines[2]).exitCode).toBe(0);
+			expect(JSON.parse(lines[1]).exitCode).toBe(0);
 		});
 
 		it("creates the status file with 0o600 perms", () => {
@@ -117,7 +114,7 @@ describe("artifact", () => {
 		it("parses all events in order", () => {
 			const art = artifactPath(root, "a");
 			appendEvent(art, { ts: 100, type: "started", status: "running" });
-			appendEvent(art, { ts: 200, type: "wip", status: "wip", message: "m" });
+			appendEvent(art, { ts: 200, type: "error", status: "error", message: "m" });
 			const events = readEvents(art);
 			expect(events).toHaveLength(2);
 			expect(events[0].ts).toBe(100);
@@ -127,10 +124,9 @@ describe("artifact", () => {
 		it("filters by `since` (inclusive)", () => {
 			const art = artifactPath(root, "a");
 			appendEvent(art, { ts: 100, type: "started", status: "running" });
-			appendEvent(art, { ts: 200, type: "wip", status: "wip" });
 			appendEvent(art, { ts: 300, type: "done", status: "done", exitCode: 0 });
 			const events = readEvents(art, 200);
-			expect(events.map((e) => e.ts)).toEqual([200, 300]);
+			expect(events.map((e) => e.ts)).toEqual([300]);
 		});
 
 		it("silently skips malformed lines", () => {
@@ -190,40 +186,9 @@ describe("artifact", () => {
 		it("returns the most recent event", () => {
 			const art = artifactPath(root, "a");
 			appendEvent(art, { ts: 1, type: "started", status: "running" });
-			appendEvent(art, { ts: 5, type: "wip", status: "wip", message: "m" });
 			appendEvent(art, { ts: 9, type: "done", status: "done", exitCode: 0 });
 			expect(lastEvent(art)?.ts).toBe(9);
 			expect(lastEvent(art)?.type).toBe("done");
-		});
-	});
-
-	describe("lastUpdate", () => {
-		it("returns 0 when neither file exists", () => {
-			expect(lastUpdate(artifactPath(root, "a"))).toBe(0);
-		});
-
-		it("reflects the mtime of events.ndjson", async () => {
-			const art = artifactPath(root, "a");
-			appendEvent(art, { ts: 1, type: "started", status: "running" });
-			// mtime resolution can be coarse on some FS — bump it explicitly
-			const future = Date.now() + 2000;
-			// Wait a bit so mtime is reliably greater than Date.now() at call
-			await new Promise((r) => setTimeout(r, 10));
-			const mtime = lastUpdate(art);
-			expect(mtime).toBeGreaterThan(0);
-			expect(Number.isFinite(mtime)).toBe(true);
-			// future is just to show the API accepts a number — unused assertion
-			expect(future).toBeGreaterThan(0);
-		});
-
-		it("reflects the newer of the two files", async () => {
-			const art = artifactPath(root, "a");
-			appendEvent(art, { ts: 1, type: "started", status: "running" });
-			await new Promise((r) => setTimeout(r, 10));
-			writeOutput(art, "later");
-			const statusMtime = statSync(art.statusFile).mtimeMs;
-			const outputMtime = statSync(art.outputFile).mtimeMs;
-			expect(lastUpdate(art)).toBe(Math.max(statusMtime, outputMtime));
 		});
 	});
 });

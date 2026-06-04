@@ -7,14 +7,26 @@ import { CLI_SOURCE } from "./subagent-artifact-cli";
 import { artifactPath, lastEvent, type SubagentArtifact, type SubagentEvent } from "./artifact";
 
 /**
- * Notification cadence for interactive sub-agents.
- *
- * - "off"        — never notify the parent, regardless of artifact state.
- * - "milestones" — notify only on `started` / `done` / `error` / `cancelled`.
- *                  (Default.)
- * - "all"        — notify on every appended event, including wip/output_updated.
+ * System prompt sent to every interactive sub-agent. Tells the child how to
+ * signal completion so the parent can be notified, and where to write its
+ * result. The persona (if provided) is appended below this.
  */
-export type NotifyOnUpdate = "off" | "milestones" | "all";
+export const CHILD_SUBAGENT_PROTOCOL = `You are running inside a Pi sub-agent launched by a parent agent.
+
+To complete a turn, you must signal completion to the parent. There are three signals:
+
+  $ARTIFACT_DIR/cli.mjs done 0       # success — parent reads $ARTIFACT_DIR/output.md
+  $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
+  # 'cancelled' is only set by the parent via cancel_interactive_subagent
+
+Call exactly one of these when you have nothing more to add before waiting for
+the next user input. After calling 'done', the REPL stays open and you will
+receive follow-up prompts — do not exit the REPL yourself.
+
+Write your final result to $ARTIFACT_DIR/output.md (atomic write via a .tmp +
+rename is fine, or just append). The parent reads this file when it gets the
+'done' notification.`;
+
 
 export type InteractiveSubagentStatus = "running" | "cancelled" | "exited" | "unknown";
 
@@ -37,10 +49,9 @@ export interface InteractiveSubagentState {
 	launchScriptFile: string;
 	/** Absolute path to the artifact directory (events.ndjson + output.md). */
 	artifactDir: string;
-	/** Notification cadence requested by the spawner. */
-	notifyOnUpdate?: NotifyOnUpdate;
 	/**
 	 * Timestamp of the last artifact event we delivered a notification for.
+
 	 * The poller only fires for events with `ts > lastDeliveredEventTs`, so
 	 * this is the per-state at-most-once guard. Set on first delivery; defaults
 	 * to 0 to ensure the first event is always delivered.
@@ -287,9 +298,8 @@ export function launchInteractiveSubagent(params: {
 	contextText?: string | null;
 	/** Spawn in a detached named window (invisible) instead of a visible split. */
 	background?: boolean;
-	/** Notification cadence for completion; if set, a poller will fire on matching events. */
-	notifyOnUpdate?: NotifyOnUpdate;
 }): InteractiveSubagentState {
+
 	const id = randomBytes(4).toString("hex");
 	const cwd = resolve(params.cwd);
 	const background = params.background !== false; // default true (hidden)
@@ -299,10 +309,15 @@ export function launchInteractiveSubagent(params: {
 	mkdirSync(paths.artifactDir, { recursive: true });
 	writeFileSync(paths.promptFile, prompt, { encoding: "utf8", mode: 0o600 });
 
-	const systemPromptFile = params.persona ? paths.systemPromptFile : undefined;
-	if (params.persona) {
-		writeFileSync(paths.systemPromptFile, params.persona, { encoding: "utf8", mode: 0o600 });
-	}
+	// Always write a system prompt that explains the child protocol, and append
+	// the user's persona (if any) below it. This guarantees the child knows how
+	// to signal completion regardless of whether a persona was supplied.
+	const systemPromptContent = params.persona
+		? `${CHILD_SUBAGENT_PROTOCOL}\n\n# Persona\n\n${params.persona}`
+		: CHILD_SUBAGENT_PROTOCOL;
+	writeFileSync(paths.systemPromptFile, systemPromptContent, { encoding: "utf8", mode: 0o600 });
+	const systemPromptFile = paths.systemPromptFile;
+
 
 	// Create the pane FIRST (so we have a target for the launch script to attach
 	// to). If any later step throws, try to kill the orphan pane and rethrow.
@@ -346,8 +361,8 @@ export function launchInteractiveSubagent(params: {
 		selectPaneCommand: attach.selectPaneCommand,
 		launchScriptFile: paths.launchScriptFile,
 		artifactDir: paths.artifactDir,
-		notifyOnUpdate: params.notifyOnUpdate,
 	};
+
   interactiveSubagentRegistry.set(id, state);
   return state;
 }

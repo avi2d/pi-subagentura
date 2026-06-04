@@ -159,20 +159,21 @@ Parameters:
 - `cwd` — optional working directory
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `background` — spawn in a detached named window (invisible) instead of a visible horizontal split. Default `true` — your tmux layout is undisturbed and you can attach later with the returned `select-window` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `notifyOnUpdate` — controls how the parent agent learns about the sub-agent's progress:
-  - `"off"` (default if omitted) — never notify. Use `list_subagent_artifacts` / `read_subagent_artifact` to inspect manually.
-  - `"milestones"` (recommended) — pointer notification on `started` / `done` / `error` / `cancelled` events. The main agent reads the artifact via `read_subagent_artifact` to get the content.
-  - `"all"` — notify on every event including `wip` and `output_updated`. Use for live progress.
 
-The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle/WIP log) and `output.md` (clean prose the child writes when it has substantive content). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
+The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
 
-If you want the child pi to report progress, tell it (via the system prompt / persona) to use the inline CLI:
+#### Sub-agent completion protocol
+
+Every interactive sub-agent receives a built-in system prompt that tells it how to signal completion. The child **must** call one of these when it has nothing more to add before waiting for the next user input:
 
 ```bash
-$ARTIFACT_DIR/cli.mjs wip "step 1 done"           # append a wip event
-$ARTIFACT_DIR/cli.mjs wip "step 2" --progress 2/5  # with optional progress
-cat output.md | $ARTIFACT_DIR/cli.mjs output       # write/rewrite output.md atomically
+$ARTIFACT_DIR/cli.mjs done 0       # success — parent reads $ARTIFACT_DIR/output.md
+$ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
+# 'cancelled' is only set by the parent via cancel_interactive_subagent
 ```
+
+Write the final result to `$ARTIFACT_DIR/output.md` before calling `done`. After `done`, the REPL stays open and the child can be re-prompted via `tmux send-keys` to the pane. The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+
 
 #### `get_interactive_subagent_status`
 

@@ -87,9 +87,9 @@ describe("interactive-tmux", () => {
     // Tightened perms — only the owning user can read the script.
     expect(statSync(state.launchScriptFile).mode & 0o777).toBe(0o700);
 
-    // Registry has the state, including the notification flag we didn't pass.
+    // Registry has the state.
     expect(mod.interactiveSubagentRegistry.get(state.id)).toBe(state);
-    expect(state.notifyOnUpdate).toBeUndefined();
+
     // Artifact dir was created and the inline CLI was written.
     expect(state.artifactDir).toBeTruthy();
     expect(existsSync(state.artifactDir)).toBe(true);

@@ -20,20 +20,20 @@ import { join } from "node:path";
 
 // ── Types ───────────────────────────────────────────────────────────
 
-export type SubagentStatus = "running" | "wip" | "done" | "error" | "cancelled";
+export type SubagentStatus = "running" | "done" | "error" | "cancelled";
 
 export interface SubagentEvent {
 	/** Unix epoch milliseconds */
 	ts: number;
-	type: "started" | "wip" | "output_updated" | "tool_activity" | "done" | "error" | "cancelled";
+	type: "started" | "tool_activity" | "done" | "error" | "cancelled";
 	status: SubagentStatus;
 	message?: string;
 	/** For tool_activity: which tool was called and a short arg summary. */
 	tool?: string;
 	summary?: string;
-	progress?: { current: number; total?: number };
 	exitCode?: number;
 }
+
 
 export interface SubagentArtifact {
 	id: string;
@@ -147,20 +147,3 @@ export function lastEvent(art: SubagentArtifact): SubagentEvent | null {
 	return events.length > 0 ? events[events.length - 1] : null;
 }
 
-/**
- * Most recent modification time across the two files. Used by the poller as
- * a cheap "did anything change since last tick" signal — no need to re-parse
- * the NDJSON every poll.
- */
-export function lastUpdate(art: SubagentArtifact): number {
-	let mtime = 0;
-	for (const f of [art.statusFile, art.outputFile]) {
-		try {
-			const s = statSync(f);
-			if (s.mtimeMs > mtime) mtime = s.mtimeMs;
-		} catch {
-			// file may not exist yet
-		}
-	}
-	return mtime;
-}

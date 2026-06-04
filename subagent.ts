@@ -56,9 +56,9 @@ import {
 	pruneDeadInteractiveSubagents,
 	tmuxSetupHint,
 	type InteractiveSubagentState,
-	type NotifyOnUpdate,
 } from "./interactive-tmux";
 import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
+
 import { openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -355,28 +355,11 @@ const InteractiveParams = Type.Object({
     Type.Boolean({
       description:
         "Spawn the sub-agent in a detached named window (hidden from your tmux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
-    }),
+    })
   ),
-	notifyOnUpdate: Type.Optional(
-		Type.Union(
-			[
-				Type.Literal("off", {
-					description: "Never notify the parent; the sub-agent writes its artifact to disk silently.",
-				}),
-				Type.Literal("milestones", {
-					description: "Notify on lifecycle events (started/done/error/cancelled). Default. Pointer-only — the main agent reads the artifact on demand.",
-				}),
-				Type.Literal("all", {
-					description: "Notify on every artifact event, including wip and output_updated. Use for live progress.",
-				}),
-			],
-			{
-				description:
-					"Notification cadence for the artifact-driven poller. The main agent always reads the artifact via read_subagent_artifact; this controls when the parent gets a pointer message.",
-			},
-		),
-	),
 });
+
+
 
 
 // ── Extension ────────────────────────────────────────────────────────
@@ -474,24 +457,15 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
 
 // ── Interactive (tmux-backed) artifact poller ───────────────────
 
-/** True when the event should trigger a notification under the given cadence. */
-function shouldNotify(event: SubagentEvent, mode: NotifyOnUpdate): boolean {
-	if (mode === "off") return false;
-	// tool_activity is always silent — the TUI widget surfaces it, the LLM never sees it.
-	if (event.type === "tool_activity") return false;
-	// "started" is silent too — the TUI widget row appearing IS the started signal.
-	if (event.type === "started") return false;
-	// output_updated is no longer in any mode — the LLM sees the final result on done.
-	if (mode === "milestones") {
-		return (
-			event.type === "done" ||
-			event.type === "error" ||
-			event.type === "cancelled"
-		);
-	}
-	// "all": lifecycle + wip (legacy opt-in for live progress). started/tool_activity/output_updated still skipped.
-	return true;
+/** True when the event should trigger a wakeup notification to the parent. */
+function shouldNotify(event: SubagentEvent): boolean {
+	return (
+		event.type === "done" ||
+		event.type === "error" ||
+		event.type === "cancelled"
+	);
 }
+
 
 /**
  * Poll the artifact directory of every running interactive sub-agent and fire a
@@ -512,13 +486,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 
 	for (const state of interactiveSubagentRegistry.values()) {
 		if (state.status === "cancelled" || state.status === "exited" || state.status === "unknown") continue;
-		const mode = state.notifyOnUpdate ?? "off";
 
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
 
-		// Always update status based on the artifact, regardless of notification mode.
-		// (Even in 'off' mode, the registry should reflect that the sub-agent is done.)
+		// Update status based on the artifact: a done/error/cancelled event
+		// means the sub-agent is finished, regardless of notification policy.
 		if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) {
 			if (last.type === "cancelled") {
 				state.status = "cancelled";
@@ -529,7 +502,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		}
 
 		// Tail-read the child's session log and synthesize tool_activity events.
-		// Runs in every mode including 'off' — the artifact must reflect activity.
+		// TUI-widget only — the LLM never sees them.
 		tailReadSessionLog(state, art);
 
 		// Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
@@ -537,15 +510,16 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		const cursor = state.lastDeliveredEventTs ?? 0;
 		const events = readEvents(art, cursor + 1);
 
-		if (events.length > 0 && mode !== "off") {
+		if (events.length > 0) {
 			let maxTs = cursor;
 			for (const ev of events) {
 				if (ev.ts > maxTs) maxTs = ev.ts;
-				if (!shouldNotify(ev, mode)) continue;
+				if (!shouldNotify(ev)) continue;
 				deliverArtifactNotification(interactivePi, state, ev);
 			}
 			state.lastDeliveredEventTs = maxTs;
 		}
+
 
 		// TUI widget row: every iteration of the loop is a running sub-agent at this point.
 		runningCount++;
@@ -688,7 +662,8 @@ function agoStr(ms: number): string {
 	return `${Math.floor(m / 60)}h ago`;
 }
 
-/** Build the LLM-facing notification content. Pointer paths always; error or wip body inlined. */
+/** Build the LLM-facing notification content. Pointer paths always; error body inlined. */
+
 function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEvent): string {
 	const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
 	const outputPath = join(state.artifactDir, "output.md");
@@ -697,10 +672,8 @@ function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEv
 	let body = "";
 	if (event.type === "error") {
 		body = `\n${(event.message ?? "unknown error").slice(0, 500)}`;
-	} else if (event.type === "wip" && event.message) {
-		// wip events carry an agent-curated progress string; surface it for the LLM.
-		body = `\n${event.message}`;
-	}
+}
+
 	return `${header}${body}${pointer}`;
 }
 
@@ -712,7 +685,8 @@ function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagen
 				customType: "subagent-notify",
 				content: buildArtifactMessage(state, event),
 				display: true,
-				details: { subagentId: state.id, event, mode: state.notifyOnUpdate ?? "milestones" },
+				details: { subagentId: state.id, event },
+
 			},
 			{ deliverAs: "followUp" },
 		);
@@ -724,9 +698,8 @@ function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagen
 function iconFor(event: SubagentEvent): string {
 	switch (event.type) {
 		case "started":
-		case "wip":
-		case "output_updated":
 		case "tool_activity":
+
 			return "▶";
 		case "done":
 			return event.exitCode === 0 ? "✅" : "❌";
@@ -739,11 +712,8 @@ function iconFor(event: SubagentEvent): string {
 
 function labelFor(event: SubagentEvent): string {
 	switch (event.type) {
-		case "wip":
-			return "wip";
-		case "output_updated":
-			return "output updated";
 		case "tool_activity":
+
 			return "activity";
 		case "done":
 			return `done (exit ${event.exitCode ?? "?"})`;
@@ -1653,24 +1623,17 @@ export default function (pi: ExtensionAPI) {
 				cwd: targetCwd,
 				contextText,
 				background: params.background, // defaults to true (hidden) inside the helper
-				notifyOnUpdate: params.notifyOnUpdate,
 			});
+
 
 			const displayMode = state.windowName ? "background (new window)" : "visible split";
 			return {
 				content: [
 					{
 						type: "text",
-						text:
-							`Interactive sub-agent ${state.id} started (${displayMode}) in tmux pane ${state.paneId}.\n\n` +
-							`Artifact: ${state.artifactDir}\n` +
-							`Attach: ${state.attachCommand}\n` +
-							`From inside tmux: ${state.selectPaneCommand}\n` +
-							`Session: ${state.sessionFile}` +
-							(state.notifyOnUpdate && state.notifyOnUpdate !== "off"
-								? `\n\nWill notify on ${state.notifyOnUpdate} events.`
-								: ""),
+						text: `Interactive sub-agent ${state.id} started (${displayMode}) in tmux pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFrom inside tmux: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
 					},
+
 				],
 				details: { ...state, status: "started" },
 			};

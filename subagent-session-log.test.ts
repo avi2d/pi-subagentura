@@ -4,8 +4,8 @@
  * The interactive sub-agent poller in the parent process tail-reads the child's
  * session JSONL (which the child pi runtime writes automatically) and appends a
  * `tool_activity` event to `events.ndjson` for each toolCall block in the log.
- * This means sub-agents that don't call the `subagent-artifact wip` helper are
- * still observable in the artifact and the TUI widget.
+ * This means sub-agents don't need to call any helper to be observable.
+
  *
  * Strategy: write a fake session JSONL to a temp file, point a registry state
  * at it, then call `pollArtifactChanges` and assert the appended events.
@@ -23,7 +23,6 @@ function makeTmp(): string {
 
 function makeState(overrides: {
 	sessionFile?: string;
-	notifyOnUpdate?: "off" | "milestones" | "all";
 }): { id: string; artifactDir: string; state: InteractiveSubagentState } {
 	const id = "id-" + Math.random().toString(36).slice(2, 8);
 	const root = makeTmp();
@@ -42,10 +41,10 @@ function makeState(overrides: {
 		selectPaneCommand: "tmux select-pane -t '%99'",
 		launchScriptFile: "/tmp/launch.sh",
 		artifactDir,
-		notifyOnUpdate: overrides.notifyOnUpdate,
 	};
 	return { id, artifactDir, state };
 }
+
 
 async function importFresh() {
 	vi.resetModules();
@@ -365,7 +364,8 @@ describe("session-log tail-read", () => {
 
 	it("inlines the error message in the LLM notification but uses pointers on success", async () => {
 		const mod = await importFresh();
-		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
+		const { state, artifactDir } = makeState({});
+
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -399,7 +399,8 @@ describe("session-log tail-read", () => {
 
 	it("truncates the inline error message to 500 chars", async () => {
 		const mod = await importFresh();
-		const { state, artifactDir } = makeState({ notifyOnUpdate: "milestones" });
+		const { state, artifactDir } = makeState({});
+
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
 		const longMsg = "x".repeat(2000);
