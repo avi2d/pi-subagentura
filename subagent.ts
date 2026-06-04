@@ -8,6 +8,8 @@
  *   - get_subagent_result: Block until async job completes, return final output
  *   - cancel_subagent: Abort a running async job
  *   - prune_subagent_jobs: Remove all completed and failed jobs from the registry
+ *   - subagent_interactive: Spawn a separate tmux-backed Pi session users can attach to
+ *   - get_interactive_subagent_status / cancel_interactive_subagent: Inspect or stop tmux-backed sessions
  *   - list_available_models: List all known models with auth status for model validation
  *
  * Both spawn tools support optional `async` param for background execution.
@@ -44,6 +46,16 @@ import {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
+import {
+  cancelInteractiveSubagent,
+  formatInteractiveState,
+  interactiveSubagentRegistry,
+  isTmuxPaneAlive,
+  launchInteractiveSubagent,
+  pruneDeadInteractiveSubagents,
+  tmuxSetupHint,
+  type InteractiveSubagentState,
+} from "./interactive-tmux";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
@@ -305,6 +317,35 @@ const CancelParams = Type.Object({
       "Job ID returned by async subagent_with_context or subagent_isolated spawn",
   }),
 });
+
+const InteractiveParams = Type.Object({
+  name: Type.Optional(
+    Type.String({
+      description: "Display name for the tmux pane/session. Defaults to a task preview.",
+    }),
+  ),
+  task: Type.String({ description: "Task to start in the interactive sub-agent" }),
+  persona: Type.Optional(
+    Type.String({
+      description: "Optional persona / system prompt appended to the child Pi session",
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description: "Optional model override for the child Pi process",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({ description: "Working directory for the child Pi process" }),
+  ),
+  includeContext: Type.Optional(
+    Type.Boolean({
+      description:
+        "Include serialized parent conversation in the initial child prompt. Default false to keep the child session small.",
+    }),
+  ),
+});
+
 
 // ── Extension ────────────────────────────────────────────────────────
 
@@ -1218,6 +1259,189 @@ export default function (pi: ExtensionAPI) {
         ? theme.fg("error", `✕ Job ${jobId} cancelled`)
         : theme.fg("error", message);
       return new Text(text, 0, 0);
+    },
+  });
+
+  // ── Tool 6: spawn an attachable tmux-backed Pi session ──────────────
+  pi.registerTool({
+    name: "subagent_interactive",
+    label: "Interactive Subagent",
+    description: [
+      "Spawn a separate Pi process in a tmux pane and return immediately.",
+      "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
+      "Requires running pi inside tmux. The tool returns tmux attach/select commands and the child session file.",
+      "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
+    ].join("\n"),
+    parameters: InteractiveParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "subagent_interactive",
+        toolCallId: _toolCallId,
+        taskLength: params.task?.length ?? 0,
+        model: params.model ?? null,
+        cwd: params.cwd ?? ctx.cwd,
+        includeContext: params.includeContext ?? false,
+      });
+
+      let contextText: string | null = null;
+      if (params.includeContext === true) {
+        const branch = ctx.sessionManager.getBranch();
+        const messages = branch
+          .filter(
+            (e): e is typeof e & { type: "message" } => e.type === "message",
+          )
+          .map((e) => e.message);
+        contextText = serializeConversation(convertToLlm(messages));
+      }
+
+      const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
+      const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
+      const targetCwd = params.cwd ?? ctx.cwd;
+
+      try {
+        const state = launchInteractiveSubagent({
+          name,
+          task: params.task,
+          persona: params.persona,
+          model: params.model,
+          cwd: targetCwd,
+          contextText,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Interactive sub-agent ${state.id} started in tmux pane ${state.paneId}.\n\n` +
+                `Attach: ${state.attachCommand}\n` +
+                `From inside tmux: ${state.selectPaneCommand}\n` +
+                `Session: ${state.sessionFile}`,
+            },
+          ],
+          details: { ...state, status: "started" },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to start interactive sub-agent: ${msg}\n${tmuxSetupHint()}`,
+            },
+          ],
+          details: { status: "error", error: msg },
+          isError: true,
+        };
+      }
+    },
+
+    renderCall(args, theme) {
+      const task = String(args.task ?? "");
+      const preview = task.length > 60 ? `${task.slice(0, 57)}…` : task;
+      return new Text(
+        theme.fg("toolTitle", theme.bold("subagent_interactive ")) +
+          theme.fg("accent", String(args.name ?? preview)),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const details = result.details as Partial<InteractiveSubagentState> | undefined;
+      if ((result as any).isError) {
+        const first = result.content?.[0];
+        const text = first?.type === "text" ? first.text : "Failed to start interactive sub-agent";
+        return new Text(theme.fg("error", text), 0, 0);
+      }
+      const id = details?.id ?? "unknown";
+      const paneId = details?.paneId ?? "unknown";
+      return new Text(
+        theme.fg("accent", "⚡ ") +
+          theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
+          theme.fg("dim", ` — pane ${paneId}`),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool 7: inspect attachable tmux-backed sessions ────────────────
+  pi.registerTool({
+    name: "get_interactive_subagent_status",
+    label: "Get Interactive Subagent Status",
+    description:
+      "Inspect tmux-backed interactive subagents. Omit jobId to list all tracked sessions. Returns attach/select commands and session paths without capturing pane output.",
+    parameters: Type.Object({
+      jobId: Type.Optional(
+        Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      pruneDeadInteractiveSubagents();
+      const states = params.jobId
+        ? [interactiveSubagentRegistry.get(params.jobId)].filter(
+            (s): s is InteractiveSubagentState => Boolean(s),
+          )
+        : [...interactiveSubagentRegistry.values()];
+
+      if (states.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: params.jobId
+                ? `Interactive sub-agent ${params.jobId} not found.`
+                : "No interactive sub-agents are tracked.",
+            },
+          ],
+          details: { status: "not_found", jobId: params.jobId },
+          isError: Boolean(params.jobId),
+        };
+      }
+
+      const sections = states.map((state) => {
+        const alive = state.status === "running" && isTmuxPaneAlive(state.paneId);
+        return formatInteractiveState({
+          ...state,
+          status: alive ? state.status : state.status === "cancelled" ? "cancelled" : "unknown",
+        });
+      });
+
+      return {
+        content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+        details: {
+          count: states.length,
+          subagents: states.map((state) => ({ ...state })),
+        },
+      };
+    },
+  });
+
+  // ── Tool 8: cancel an attachable tmux-backed session ───────────────
+  pi.registerTool({
+    name: "cancel_interactive_subagent",
+    label: "Cancel Interactive Subagent",
+    description: "Kill the tmux pane for an interactive sub-agent by ID.",
+    parameters: Type.Object({
+      jobId: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      const state = cancelInteractiveSubagent(params.jobId);
+      if (!state) {
+        return {
+          content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} not found.` }],
+          details: { jobId: params.jobId, status: "not_found" },
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} cancelled.` }],
+        details: { ...state },
+      };
     },
   });
 

@@ -24,7 +24,7 @@
   },
   "files": [
     "subagent.ts",
-    "helpers.ts",
+    "interactive-tmux.ts",
     "README.md",
     "LICENSE"
   ],

@@ -4,7 +4,7 @@
 
 > **Note:** The `docs/` folder is managed by the [`pi-docs`](https://github.com/lmn451/pi-docs) package.
 
-A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
+A public [Pi](https://pi.dev) package that adds in-process and attachable sub-agent tools:
 
 - `subagent_with_context` — spawn a sub-agent that inherits the full conversation history
 - `subagent_isolated` — spawn a sub-agent with a fresh, empty context window
@@ -12,7 +12,10 @@ A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-The sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready.
+- `subagent_interactive` — spawn an attachable tmux-backed Pi session
+- `get_interactive_subagent_status` — list attachable sessions with pane/session metadata
+- `cancel_interactive_subagent` — kill an attachable sub-agent tmux pane
+The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there.
 
 ## Why use it?
 
@@ -22,6 +25,7 @@ The sub-agents run inside the current Pi process, stream live progress back to t
 - Run sub-agents in the background while continuing the main conversation
 - Poll, collect, or cancel background jobs on demand
 - Get live previews of running sub-agents (current turn, active tool, usage)
+- Attach to interactive sub-agent sessions for direct follow-ups and debugging
 
 ![Sub-agent demo](working.png)
 
@@ -127,6 +131,37 @@ Parameters:
 
 Remove all completed and failed subagent jobs from the registry. Running and cancelled jobs are preserved.
 
+
+### Interactive tmux Tools
+
+Use these when observability and manual follow-up matter more than in-process execution. They require running Pi inside tmux.
+
+#### `subagent_interactive`
+
+Starts a separate interactive `pi` process in a new tmux pane and returns immediately with:
+
+- sub-agent id
+- tmux pane id
+- `tmux attach ...` command
+- `tmux select-pane ...` command for use inside the same tmux session
+- child Pi session file path
+
+Parameters:
+
+- `task` — required initial task
+- `name` — optional display name for the pane/session
+- `persona` — optional system prompt appended to the child session
+- `model` — optional model override
+- `cwd` — optional working directory
+- `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
+
+#### `get_interactive_subagent_status`
+
+Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
+
+#### `cancel_interactive_subagent`
+
+Kills the tmux pane for an interactive sub-agent by id.
 ### `list_available_models`
 
 List all available AI models with auth status. Use this to validate model identifiers before passing them to subagent tools — prevents silent fallback to the parent session model.
@@ -142,6 +177,7 @@ Parameters:
 - “Spawn a context-aware sub-agent to continue debugging while we keep planning here.”
 - “Run a sub-agent in the background to run the test suite, then notify me when done.”
 - “Spawn two isolated async sub-agents to review this code from different angles, then collect both results.”
+- “Start an interactive sub-agent in tmux for investigating the auth bug; I’ll attach and guide it.”
 
 ## Development
 
