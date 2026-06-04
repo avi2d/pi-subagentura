@@ -26,9 +26,9 @@ import {
   convertToLlm,
   serializeConversation,
   ModelRegistry,
-} from "@mariozechner/pi-coding-agent";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Model } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
   buildLiveUpdate,
@@ -60,7 +60,7 @@ import { artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact,
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Footer Status Key ───────────────────────────────────────────────
@@ -418,15 +418,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
       if ((getInjectCount() as number) >= MAX_INJECT) {
         // Degrade to notify mode silently
         pi.sendMessage!(
-          [
-            {
-              customType: "subagent-notify",
-              content: `Inject cap exceeded for job ${jobState.id} — degraded to notify. ${summary}`,
-              display: true,
-              details: { jobId: jobState.id, result, mode: "notify" },
-            },
-          ] as any,
-          { deliverAs: "followUp" } as any,
+          {
+            customType: "subagent-notify",
+            content: `Inject cap exceeded for job ${jobState.id} — degraded to notify. ${summary}`,
+            display: true,
+            details: { jobId: jobState.id, result, mode: "notify" },
+          },
+          { deliverAs: "followUp" },
         );
         return;
       }
@@ -441,15 +439,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
         );
         // Also send a summary notification
         pi.sendMessage!(
-          [
-            {
-              customType: "subagent-notify",
-              content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
-              display: true,
-              details: { jobId: jobState.id, result, mode: "inject" },
-            },
-          ] as any,
-          { deliverAs: "followUp" } as any,
+          {
+            customType: "subagent-notify",
+            content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
+            display: true,
+            details: { jobId: jobState.id, result, mode: "inject" },
+          },
+          { deliverAs: "followUp" },
         );
       } finally {
         decrementInjectCount();
@@ -457,15 +453,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
     } else {
       // notify mode
       pi.sendMessage!(
-        [
-          {
-            customType: "subagent-notify",
-            content: summary,
-            display: true,
-            details: { jobId: jobState.id, result, mode: "notify" },
-          },
-        ] as any,
-        { deliverAs: "followUp" } as any,
+        {
+          customType: "subagent-notify",
+          content: summary,
+          display: true,
+          details: { jobId: jobState.id, result, mode: "notify" },
+        },
+        { deliverAs: "followUp" },
       );
     }
   } catch {
@@ -546,15 +540,13 @@ function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagen
 	const pointer = `\nArtifact: ${state.artifactDir}\nRead with: read_subagent_artifact({"id":"${state.id}"})`;
 	try {
 		pi.sendMessage!(
-			[
-				{
-					customType: "subagent-notify",
-					content: `${header}${body}${pointer}`,
-					display: true,
-					details: { subagentId: state.id, event, mode: state.notifyOnUpdate ?? "milestones" },
-				},
-			] as any,
-			{ deliverAs: "followUp" } as any,
+			{
+				customType: "subagent-notify",
+				content: `${header}${body}${pointer}`,
+				display: true,
+				details: { subagentId: state.id, event, mode: state.notifyOnUpdate ?? "milestones" },
+			},
+			{ deliverAs: "followUp" },
 		);
 	} catch {
 		// pi may be stale after session replacement

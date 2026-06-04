@@ -89,11 +89,11 @@ describe("pollArtifactChanges", () => {
 
 		expect(sendMessage).toHaveBeenCalledTimes(2); // started + done
 		const calls = sendMessage.mock.calls;
-		expect(calls[0][0][0].customType).toBe("subagent-notify");
-		expect(calls[0][0][0].content).toContain("started");
-		expect(calls[1][0][0].content).toContain("done");
-		expect(calls[1][0][0].content).toContain("Artifact:");
-		expect(calls[1][0][0].content).toContain(`read_subagent_artifact`);
+		expect(calls[0][0].customType).toBe("subagent-notify");
+		expect(calls[0][0].content).toContain("started");
+		expect(calls[1][0].content).toContain("done");
+		expect(calls[1][0].content).toContain("Artifact:");
+		expect(calls[1][0].content).toContain(`read_subagent_artifact`);
 		// cursor advanced
 		expect(state.lastDeliveredEventTs).toBe(2);
 	});
@@ -128,8 +128,8 @@ describe("pollArtifactChanges", () => {
 		mod.pollArtifactChanges({ sendMessage } as any);
 
 		expect(sendMessage).toHaveBeenCalledTimes(2);
-		expect(sendMessage.mock.calls[1][0][0].content).toContain("wip");
-		expect(sendMessage.mock.calls[1][0][0].content).toContain("step 1");
+		expect(sendMessage.mock.calls[1][0].content).toContain("wip");
+		expect(sendMessage.mock.calls[1][0].content).toContain("step 1");
 	});
 
 	it("is at-most-once per event (cursor advances)", async () => {
@@ -170,8 +170,8 @@ describe("pollArtifactChanges", () => {
 
 		// Should deliver done + cancelled, not started.
 		expect(sendMessage).toHaveBeenCalledTimes(2);
-		expect(sendMessage.mock.calls[0][0][0].content).toContain("done");
-		expect(sendMessage.mock.calls[1][0][0].content).toContain("cancelled");
+		expect(sendMessage.mock.calls[0][0].content).toContain("done");
+		expect(sendMessage.mock.calls[1][0].content).toContain("cancelled");
 		// cursor advanced to the latest
 		expect(state.lastDeliveredEventTs).toBe(3);
 	});
