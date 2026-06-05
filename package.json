@@ -2,6 +2,10 @@
   "name": "pi-subagentura",
   "version": "2.0.1",
   "description": "Public Pi package that adds in-process sub-agents via the SDK",
+
+  "author": "lmn451",
+
+  "license": "MIT",
   "main": "subagent.ts",
   "type": "module",
   "keywords": [
@@ -13,7 +17,6 @@
     "swarm",
     "crew"
   ],
-  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/lmn451/pi-subagentura"
@@ -58,5 +61,9 @@
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
     "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "is-path-inside": "^4.0.0",
+    "ndjson": "^2.0.0"
   }
 }

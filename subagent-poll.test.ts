@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendEvent, artifactPath } from "./artifact";
+import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
 	return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
@@ -49,14 +50,14 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("does nothing when registry is empty", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
 	it("fires a pointer notification on done. Started is silent.", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -80,7 +81,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("does NOT fire on tool_activity/started", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -97,7 +98,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("fires on error and cancelled too", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -114,7 +115,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("is at-most-once per event (cursor advances)", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -133,7 +134,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("delivers only events newer than lastDeliveredEventTs (backlog catch-up)", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		// Simulate a sub-agent that finished while the parent was down — events
 		// were already on disk before this poller started.
@@ -159,7 +160,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("marks the sub-agent as exited when a done event is seen", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -172,7 +173,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("marks the sub-agent as cancelled when a cancelled event is seen", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		mod.interactiveSubagentRegistry.set(state.id, state);
 		const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -183,7 +184,7 @@ describe("pollArtifactChanges", () => {
 	});
 
 	it("skips sub-agents that are not in 'running' status", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState();
 		state.status = "cancelled";
 		mod.interactiveSubagentRegistry.set(state.id, state);
@@ -196,7 +197,3 @@ describe("pollArtifactChanges", () => {
 	});
 });
 
-async function importFresh() {
-	vi.resetModules();
-	return import("./subagent");
-}

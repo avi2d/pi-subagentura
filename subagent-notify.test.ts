@@ -1033,3 +1033,41 @@ describe("notifyOnComplete", () => {
     });
   });
 });
+
+describe("read_subagent_artifact (invalid id)", () => {
+  /** Build the minimal ExtensionAPI mock and capture the tool def. */
+  function setupReadArtifactTool() {
+    const _api = {
+      registerTool: vi.fn(),
+      registerMessageRenderer: vi.fn(),
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+      on: vi.fn(),
+    };
+    registerExtension(_api as any);
+    return _api.registerTool.mock.calls.find(([t]: any[]) => t.name === "read_subagent_artifact")?.[0];
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cleanGlobals();
+  });
+
+  afterEach(() => {
+    cleanGlobals();
+  });
+
+  it("returns status:invalid_id with a precise message for a malformed id", async () => {
+    const toolDef = setupReadArtifactTool();
+    expect(toolDef).toBeDefined();
+
+    const result = await toolDef.execute("call-malformed", { id: "not-a-hex-id" }, undefined, undefined, {} as any);
+
+    expect(result.isError).toBe(true);
+    expect(result.details.status).toBe("invalid_id");
+    expect(result.details.id).toBe("not-a-hex-id");
+    const text = result.content[0].text;
+    expect(text).toContain("Invalid sub-agent id");
+    expect(text).toContain("not-a-hex-id");
+  });
+});
