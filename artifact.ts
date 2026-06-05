@@ -18,6 +18,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import ndjson from "ndjson";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -87,6 +88,11 @@ export function writeOutput(art: SubagentArtifact, content: string): void {
  * ts >= since are returned. Malformed lines are silently skipped (the
  * sub-agent CLI is the only writer, but a partial write could in theory
  * leave a truncated line).
+ *
+ * Uses the `ndjson` library with `strict: false` so a single bad line does not abort the whole
+ * file — ndjson drops the bad row and continues with the rest. Any trailing partial line (file
+ * did not end with a newline) is buffered by the parser and dropped on `end()`; it is treated as a
+ * in-progress write that the next reader will pick up once completed.
  */
 export function readEvents(art: SubagentArtifact, since?: number): SubagentEvent[] {
 	if (!existsSync(art.statusFile)) return [];
@@ -96,16 +102,16 @@ export function readEvents(art: SubagentArtifact, since?: number): SubagentEvent
 	} catch {
 		return [];
 	}
+	const parser = ndjson.parse({ strict: false });
 	const events: SubagentEvent[] = [];
-	for (const line of content.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const ev = JSON.parse(line) as SubagentEvent;
-			if (since === undefined || ev.ts >= since) events.push(ev);
-		} catch {
-			// Skip malformed lines (partial write, manual edit, etc.)
-		}
-	}
+	parser.on("data", (obj: unknown) => {
+		const ev = obj as SubagentEvent;
+		if (since === undefined || ev.ts >= since) events.push(ev);
+	});
+	// Non-strict mode never emits 'error' for bad JSON; attach a no-op so an unhandled error event
+	// can never crash the parent process.
+	parser.on("error", () => {});
+	parser.end(Buffer.from(content, "utf8"));
 	return events;
 }
 

@@ -59,12 +59,12 @@ import {
 } from "./interactive-tmux";
 import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
 
-import { openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-
+import ndjson from "ndjson";
 // ── Footer Status Key ─────────────────────────────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
 const WIDGET_KEY = "subagentura-activity";
@@ -544,13 +544,69 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 	}
 }
 
+/**
+ * Per-state ndjson parser instance used to tail-read the child's session JSONL.
+ *
+ * The parser buffers partial trailing lines internally (via split2 underneath), so we can
+ * safely write raw bytes from the file on every poll and let the parser emit complete JSON
+ * objects as 'data' events. This replaces a hand-rolled partial-line + cursor scheme that had
+ * three latent bugs:
+ *   - A 1 MiB per-tick read cap combined with cursor-pinning on a missing newline caused a
+ *     permanent re-read loop on any single JSONL line larger than 1 MiB (e.g. a multi-MB tool
+ *     call result that the child pi runtime writes as a single line).
+ *   - File truncation left the cursor pointing past EOF, silently dropping any post-truncation
+ *     content.
+ *   - A `require("node:fs").closeSync(fd)` call in the finally block leaked file descriptors on
+ *     Node < 22.12 in some bundling paths.
+ *
+ * Keyed by sub-agent id; one parser per state lives for the lifetime of the process. The parser
+ * is destroyed and recreated on file truncation so the buffered partial state is cleared.
+ */
+const sessionParsers = new Map<string, ReturnType<typeof ndjson.parse>>();
+
+/** Defensive upper bound on the per-tick Buffer.alloc. With ndjson, a partial line is buffered
+ * internally across polls, so the cap is no longer required for correctness — it is kept purely
+ * to bound worst-case memory if the file explodes in a single tick. 1 MiB is plenty. */
+const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
+
+/** Get-or-create the per-state session parser and wire its 'data' event to the entry handler. */
+function getOrCreateSessionParser(state: InteractiveSubagentState): ReturnType<typeof ndjson.parse> {
+	const existing = sessionParsers.get(state.id);
+	if (existing) return existing;
+	// strict: false → malformed lines are silently dropped instead of triggering an 'error' event
+	// that would force us to recreate the parser mid-stream. Same best-effort delivery semantics as
+	// the old hand-rolled try/catch around JSON.parse.
+	const parser = ndjson.parse({ strict: false });
+	parser.on("data", (entry: unknown) => {
+		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
+		processSessionLogEntry(state, art, entry as any);
+	});
+	// In non-strict mode the parser does not emit 'error' for bad JSON, but we still attach a no-op
+	// handler so an unhandled error event can never crash the process.
+	parser.on("error", () => {
+		// Drop the broken parser so the next tick creates a fresh one. The cursor is reset in the
+		// truncation handler, so this only fires for pathological non-truncation errors.
+		sessionParsers.delete(state.id);
+	});
+	sessionParsers.set(state.id, parser);
+	return parser;
+}
+
+/** Destroy a state's parser (used on truncation and on state removal). */
+function destroySessionParser(state: InteractiveSubagentState): void {
+	const parser = sessionParsers.get(state.id);
+	if (!parser) return;
+	try {
+		parser.end();
+	} catch {
+		// ignore — we're tearing down
+	}
+	sessionParsers.delete(state.id);
+}
+
 /** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
  *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
-/** Hard cap on the per-tick read window. Session JSONL files can grow quickly
- *  in a long-running sub-agent, so we never allocate more than this in a single
- *  tailRead call. 1 MiB is plenty for many thousands of typical entries. */
-const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
-function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifact): void {
+function tailReadSessionLog(state: InteractiveSubagentState, _art: SubagentArtifact): void {
 	const sessionFile = state.sessionFile;
 	if (!sessionFile) return;
 
@@ -561,10 +617,21 @@ function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifa
 		return; // file not yet created by the child
 	}
 
+	const initialCursor = state.lastDeliveredSessionByte ?? 0;
+	if (size < initialCursor) {
+		// File shrunk under us (truncation, rotation, manual edit). Reset cursor and parser and fall
+		// through to the read below so any content already written after the truncation is processed in
+		// the same tick (e.g. test does truncateSync → writeFileSync → poll). The parser is recreated so the
+		// buffered partial state is cleared. Any duplicate tool_activity events are acceptable — the
+		// artifact log is best-effort and the LLM never sees these (TUI-widget only).
+		state.lastDeliveredSessionByte = 0;
+		destroySessionParser(state);
+	}
 	const cursor = state.lastDeliveredSessionByte ?? 0;
 	if (size <= cursor) return;
 
-	// Cap the per-tick read so a runaway file can't trigger an unbounded Buffer.alloc.
+	// Defensive cap on per-tick allocation. ndjson handles partial lines correctly across writes,
+	// so a single multi-MB line split across ticks works fine — no cursor pin.
 	const requested = size - cursor;
 	const toRead = Math.min(requested, MAX_SESSION_READ_BYTES);
 	if (toRead <= 0) return;
@@ -583,60 +650,46 @@ function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifa
 			if (n <= 0) break;
 			bytesRead += n;
 		}
-		const chunk = buf.subarray(0, bytesRead).toString("utf8");
-		processSessionLogChunk(state, art, chunk);
-		// Only advance the cursor to the end of the LAST complete line in the chunk.
-		// If the chunk ends mid-line (partial trailing JSONL), the partial must be
-		// re-read on the next tick after the child finishes writing it. Advancing the
-		// cursor past the partial would silently drop bytes and corrupt the event log.
-		const endOfComplete = chunk.lastIndexOf("\n");
-		if (endOfComplete >= 0) {
-			state.lastDeliveredSessionByte = cursor + endOfComplete + 1;
-		}
-		// If no newline in chunk and we hit the cap, leave the cursor where it was:
-		// the child is still mid-line; we'll re-read from the same offset next tick.
+		if (bytesRead === 0) return;
+		const parser = getOrCreateSessionParser(state);
+		parser.write(buf.subarray(0, bytesRead));
+		// Always advance the cursor by the bytes we fed the parser. The parser buffers any partial
+		// trailing line internally and will emit the completed object on a later write. We do NOT
+		// rewind to the last newline the way the old code did — doing so would re-feed the same bytes
+		// to the parser and double-emit on the next tick.
+		state.lastDeliveredSessionByte = cursor + bytesRead;
 	} finally {
-		try { require("node:fs").closeSync(fd); } catch {}
+		try {
+			closeSync(fd);
+		} catch {
+			/* fd already closed or never opened — ignore */
+		}
 	}
 }
 
-/** Parse a chunk of session JSONL, append a tool_activity event per tool call. */
-function processSessionLogChunk(state: InteractiveSubagentState, art: SubagentArtifact, chunk: string): void {
-	const lines = chunk.split("\n");
-	// Last entry may be a partial line (the child hasn't finished writing it yet).
-	// We still process complete lines; the partial line will be re-read on the next tick.
-	const completeLines = chunk.endsWith("\n") ? lines : lines.slice(0, -1);
-	for (const line of completeLines) {
-		if (!line.trim()) continue;
-		let entry: any;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			// Skip malformed/partial — safer to drop than crash.
-			continue;
-		}
-		if (entry.type !== "message") continue;
-		const msg = entry.message;
-		if (!msg) continue;
+/** Process a single parsed JSONL entry from the session log; append tool_activity events. */
+function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentArtifact, entry: any): void {
+	if (entry.type !== "message") return;
+	const msg = entry.message;
+	if (!msg) return;
 
-		// Assistant message: extract toolCall blocks.
-		if (msg.role === "assistant" && Array.isArray(msg.content)) {
-			for (const block of msg.content) {
-				if (block.type !== "toolCall") continue;
-				const summary = summarizeToolCall(block.name, block.arguments);
-				if (!summary) continue;
-				const ev: SubagentEvent = {
-					ts: msg.timestamp ?? Date.now(),
-					type: "tool_activity",
-					status: "running",
-					tool: block.name,
-					summary,
-				};
-				appendEvent(art, ev);
-				state.lastToolName = block.name;
-				state.lastToolSummary = summary;
-				state.lastActivityAt = ev.ts;
-			}
+	// Assistant message: extract toolCall blocks.
+	if (msg.role === "assistant" && Array.isArray(msg.content)) {
+		for (const block of msg.content) {
+			if (block.type !== "toolCall") continue;
+			const summary = summarizeToolCall(block.name, block.arguments);
+			if (!summary) continue;
+			const ev: SubagentEvent = {
+				ts: msg.timestamp ?? Date.now(),
+				type: "tool_activity",
+				status: "running",
+				tool: block.name,
+				summary,
+			};
+			appendEvent(art, ev);
+			state.lastToolName = block.name;
+			state.lastToolSummary = summary;
+			state.lastActivityAt = ev.ts;
 		}
 	}
 }
