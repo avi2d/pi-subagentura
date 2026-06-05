@@ -2040,6 +2040,13 @@ export default function (pi: ExtensionAPI) {
       }
     } catch { /* best effort */ }
 
+    // Drop in-memory state for cancelled/exited interactive sub-agents. Without
+    // this, the Map grows unbounded across session_start/session_shutdown cycles
+    // and list_subagent_artifacts returns stale entries from previous sessions.
+    try {
+      interactiveSubagentRegistry.clear();
+    } catch { /* best effort */ }
+
     // Abort all running subagent sessions before clearing
     for (const job of jobRegistry.values()) {
       if (job.status === "running") {
