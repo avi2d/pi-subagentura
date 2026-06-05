@@ -9,23 +9,24 @@ import { artifactPath, lastEvent, type SubagentArtifact, type SubagentEvent } fr
 /**
  * System prompt sent to every interactive sub-agent. Tells the child how to
  * signal completion so the parent can be notified, and where to write its
- * result. The persona (if provided) is appended below this.
+ * result. The persona (if provided) is placed ABOVE this so the protocol —
+ * the part that keeps the parent-child notification loop working — is the
+ * most recent instruction the LLM reads (recency wins for instruction
+ * following).
  */
-export const CHILD_SUBAGENT_PROTOCOL = `You are running inside a Pi sub-agent launched by a parent agent.
+export const CHILD_SUBAGENT_PROTOCOL = `You are running inside a Pi sub-agent launched by a parent agent. The literal "$ARTIFACT_DIR" in the commands below is an environment variable that the launch script has already exported for you, so the path expands at runtime.
 
-To complete a turn, you must signal completion to the parent. There are three signals:
+When you have completed the user's task and have nothing more to add before waiting for the next user input, signal completion to the parent by running exactly one of these shell commands. The path in quotes is a single argument, so it works even if the directory contains spaces:
 
-  $ARTIFACT_DIR/cli.mjs done 0       # success — parent reads $ARTIFACT_DIR/output.md
-  $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
-  # 'cancelled' is only set by the parent via cancel_interactive_subagent
+  "$ARTIFACT_DIR/cli.mjs" done 0
+  "$ARTIFACT_DIR/cli.mjs" error "short reason here"
 
-Call exactly one of these when you have nothing more to add before waiting for
-the next user input. After calling 'done', the REPL stays open and you will
-receive follow-up prompts — do not exit the REPL yourself.
+Use 'done' on success and 'error' for unrecoverable failures. Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
 
-Write your final result to $ARTIFACT_DIR/output.md (atomic write via a .tmp +
-rename is fine, or just append). The parent reads this file when it gets the
-'done' notification.`;
+After you call 'done', the REPL stays open and you will receive follow-up prompts. Do not exit the REPL yourself; just signal completion and wait.
+
+Before calling 'done', write your final result to "$ARTIFACT_DIR/output.md". An atomic write via a .tmp file plus rename is fine, or just append. The parent reads this file as soon as it gets the 'done' notification.`;
+
 
 
 export type InteractiveSubagentStatus = "running" | "cancelled" | "exited" | "unknown";
@@ -266,7 +267,8 @@ export function writeLaunchScript(path: string, command: string, artifactDir: st
 	mkdirSync(dirname(path), { recursive: true });
 
 	// 1. Write the inline `subagent-artifact` CLI helper into the artifact dir.
-	//    The wrapper invokes it for lifecycle events; the child invokes it for WIP/output.
+	//    The wrapper and child both invoke it for lifecycle events.
+
 	const cliPath = join(artifactDir, "cli.mjs");
 	writeFileSync(cliPath, CLI_SOURCE, { mode: 0o700 });
 
@@ -309,13 +311,28 @@ export function launchInteractiveSubagent(params: {
 	mkdirSync(paths.artifactDir, { recursive: true });
 	writeFileSync(paths.promptFile, prompt, { encoding: "utf8", mode: 0o600 });
 
-	// Always write a system prompt that explains the child protocol, and append
-	// the user's persona (if any) below it. This guarantees the child knows how
-	// to signal completion regardless of whether a persona was supplied.
+	// Cap the persona to prevent a misbehaving parent from shipping a huge
+	// system prompt to the model on every turn. 64 KiB is well above what any
+	// realistic persona needs; larger values are rejected so the child session
+	// fails fast with a clear error.
+	const MAX_PERSONA_BYTES = 64 * 1024;
+	if (params.persona !== undefined && Buffer.byteLength(params.persona, "utf8") > MAX_PERSONA_BYTES) {
+		throw new Error(
+			`persona too large: ${Buffer.byteLength(params.persona, "utf8")} bytes (max ${MAX_PERSONA_BYTES})`,
+		);
+	}
+
+	// Always write a system prompt that includes the child protocol, and place
+	// the user-supplied persona (if any) ABOVE the protocol. Recency wins for
+	// instruction-following, so the protocol — the part that keeps the
+	// parent-child notification loop working — is the most recent instruction
+	// the LLM reads. A persona that says "ignore the protocol" is a known LLM
+	// footgun, and placing the protocol last makes it stick.
 	const systemPromptContent = params.persona
-		? `${CHILD_SUBAGENT_PROTOCOL}\n\n# Persona\n\n${params.persona}`
+		? `# Persona\n\n${params.persona}\n\n${CHILD_SUBAGENT_PROTOCOL}`
 		: CHILD_SUBAGENT_PROTOCOL;
 	writeFileSync(paths.systemPromptFile, systemPromptContent, { encoding: "utf8", mode: 0o600 });
+
 	const systemPromptFile = paths.systemPromptFile;
 
 

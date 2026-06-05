@@ -4,7 +4,8 @@
  * Each interactive sub-agent owns a directory under the parent's artifacts root.
  * The directory holds two files:
  *
- *   events.ndjson  — append-only log of lifecycle and WIP events
+ *   events.ndjson  — append-only log of lifecycle and tool_activity events
+
  *   output.md      — clean prose the sub-agent produced; atomically rewritten
  *
  * The parent agent's extension reads these files (via list_subagent_artifacts /

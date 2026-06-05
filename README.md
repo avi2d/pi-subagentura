@@ -188,7 +188,8 @@ Lists all known interactive sub-agents: id, name, status, and last-update timest
 
 #### `read_subagent_artifact`
 
-Reads a sub-agent's artifact by id. Returns the lifecycle/WIP event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content. This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content. This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+
 
 Parameters:
 - `id` — required sub-agent id

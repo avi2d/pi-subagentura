@@ -671,7 +671,8 @@ function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEv
 	const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;
 	let body = "";
 	if (event.type === "error") {
-		body = `\n${(event.message ?? "unknown error").slice(0, 500)}`;
+		body = `\n${sanitizeOutput((event.message ?? "unknown error").slice(0, 500))}`;
+
 }
 
 	return `${header}${body}${pointer}`;
@@ -1763,7 +1764,8 @@ export default function (pi: ExtensionAPI) {
     name: "read_subagent_artifact",
     label: "Read Subagent Artifact",
     description: [
-      "Read an interactive sub-agent's artifact on disk. Returns the lifecycle/WIP events and,",
+      "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
+
       "if present, the sub-agent's output.md. Use `since` (unix ms) to fetch only events newer than",
       "your last read.",
     ].join("\n"),

@@ -303,6 +303,188 @@ describe("interactive-tmux", () => {
   });
 });
 
+  // ------------------------------------------------------------------
+  // Tests for the child completion protocol (CHILD_SUBAGENT_PROTOCOL),
+  // the always-write system prompt behavior, the --append-system-prompt
+  // wiring, and the buildPiInteractiveCommand CLI builder.
+  // ------------------------------------------------------------------
+
+  describe("CHILD_SUBAGENT_PROTOCOL", () => {
+    it("names all three completion signals (done / error / cancelled)", async () => {
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      expect(CHILD_SUBAGENT_PROTOCOL).toContain("done");
+      expect(CHILD_SUBAGENT_PROTOCOL).toContain("error");
+      expect(CHILD_SUBAGENT_PROTOCOL).toContain("cancelled");
+    });
+
+    it("points the child to the two artifact paths", async () => {
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/output.md");
+      expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/cli.mjs");
+    });
+
+    it("tells the child to keep the REPL open after done", async () => {
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/REPL stays open/i);
+      expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/do not exit/i);
+    });
+  });
+
+  describe("system prompt is always written", () => {
+    // The "kills the orphan pane" test earlier in the file mocks node:fs to
+    // throw on launch-script writes and never un-mocks it. Our tests need
+    // real fs so launchInteractiveSubagent can write its files.
+    beforeEach(() => {
+      vi.doUnmock("node:fs");
+    });
+
+    it("writes a system-prompt file even when no persona is supplied", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh();
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      const state = mod.launchInteractiveSubagent({ name: "NoPersona", task: "x", cwd: tmp });
+      const sysFile = join(state.artifactDir, "nopersona-system.md");
+
+
+      expect(existsSync(sysFile)).toBe(true);
+      const content = readFileSync(sysFile, "utf8");
+      expect(content).toBe(CHILD_SUBAGENT_PROTOCOL);
+      expect(statSync(sysFile).mode & 0o777).toBe(0o600);
+    });
+
+    it("places the persona ABOVE the protocol (recency favors the protocol)", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh();
+      const state = mod.launchInteractiveSubagent({
+        name: "WithPersona",
+        task: "x",
+        persona: "PERSONA_MARKER",
+        cwd: tmp,
+      });
+
+      const sysFile = join(state.artifactDir, "withpersona-system.md");
+
+      const content = readFileSync(sysFile, "utf8");
+      const personaIdx = content.indexOf("PERSONA_MARKER");
+      const protocolIdx = content.indexOf("REPL stays open");
+      expect(personaIdx).toBeGreaterThan(-1);
+      expect(protocolIdx).toBeGreaterThan(-1);
+      expect(personaIdx).toBeLessThan(protocolIdx);
+    });
+
+    it("rejects personas larger than 64 KiB", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec(() => MOCK_PANE_ID + "\n");
+
+      const mod = await importFresh();
+      const tooBig = "x".repeat(64 * 1024 + 1);
+      let threw = false;
+      try {
+        mod.launchInteractiveSubagent({
+          name: "BigPersona",
+          task: "x",
+          persona: tooBig,
+          cwd: tmp,
+        });
+      } catch (err) {
+        threw = true;
+        expect((err as Error).message).toMatch(/persona too large/);
+      }
+      expect(threw).toBe(true);
+    });
+  });
+
+  describe("launch script wires --append-system-prompt", () => {
+    // See note above about the orphan-pane test's stale fs mock.
+    beforeEach(() => {
+      vi.doUnmock("node:fs");
+    });
+
+    it("embeds --append-system-prompt with the system-prompt file path", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh();
+      const state = mod.launchInteractiveSubagent({ name: "Wire", task: "x", cwd: tmp });
+
+      const launchScript = readFileSync(state.launchScriptFile, "utf8");
+      expect(launchScript).toContain("--append-system-prompt");
+      // Filename should appear (shell-escaped) in the launch script.
+      expect(launchScript).toMatch(/wire-system\.md/);
+    });
+  });
+
+  describe("buildPiInteractiveCommand", () => {
+    it("starts with `cd <cwd> &&` and shell-escapes the cwd", async () => {
+      const { buildPiInteractiveCommand } = await importFresh();
+      const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/tmp/has space" });
+      expect(cmd).toMatch(/^cd '\/tmp\/has space' &&/);
+    });
+
+    it("includes --session, --name, and the @<promptFile>", async () => {
+      const { buildPiInteractiveCommand } = await importFresh();
+      const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c" });
+      expect(cmd).toContain("--session '/s.jsonl'");
+      expect(cmd).toContain("--name 'n'");
+      // The prompt file is invoked via "@<file>" — verify the path appears in that form.
+      expect(cmd).toMatch(/'\@\/p\.md'$/);
+
+    });
+
+    it("omits --model when undefined", async () => {
+      const { buildPiInteractiveCommand } = await importFresh();
+      const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c" });
+      expect(cmd).not.toContain("--model");
+    });
+
+    it("includes --model when set, escaped", async () => {
+      const { buildPiInteractiveCommand } = await importFresh();
+      const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c", model: "p/m" });
+      expect(cmd).toContain("--model 'p/m'");
+    });
+
+    it("includes --append-system-prompt when systemPromptFile is set", async () => {
+      const { buildPiInteractiveCommand } = await importFresh();
+      const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c", systemPromptFile: "/s.md" });
+      expect(cmd).toContain("--append-system-prompt");
+      expect(cmd).toContain("/s.md");
+    });
+  });
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-tmux-"));
 }
