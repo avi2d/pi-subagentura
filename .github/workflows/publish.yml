@@ -39,7 +39,8 @@ jobs:
 
       - name: Run tests
         run: npm test
-
+      - name: Verify published tarball is loadable (regression: v2.0.0 missing helpers.ts)
+        run: npx vitest run published-tarball.test.ts
       - name: Verify package can be packed
         run: npm run pack:check
 
