@@ -271,7 +271,9 @@ describe("session-log tail-read", () => {
 			},
 		};
 		// Write a complete line + a truncated second line.
-		writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n{ \"type\": \"mess");
+		const complete = JSON.stringify(entry) + "\n";
+		const partial = '{ "type": "mess';
+		writeFileSync(state.sessionFile, complete + partial);
 
 		mod.pollArtifactChanges({} as any);
 
@@ -279,9 +281,44 @@ describe("session-log tail-read", () => {
 		const events = readEvents(art);
 		// Only the complete line was processed.
 		expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(1);
-		// Cursor advanced past the partial too (next poll re-reads it).
-		const size = state.lastDeliveredSessionByte ?? 0;
-		expect(size).toBeGreaterThan(0);
+		// Cursor must NOT advance past the partial line — it must stop at the
+		// end of the complete line so the partial gets re-read next tick.
+		expect(state.lastDeliveredSessionByte).toBe(Buffer.byteLength(complete, "utf8"));
+	});
+
+	it("re-reads a partial line once it is completed on a later poll", async () => {
+		const mod = await importFresh();
+		const { state, artifactDir } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const entry = {
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "t1", name: "write", arguments: { path: "/tmp/x" } }],
+				timestamp: 1700000000000,
+			},
+		};
+		const complete = JSON.stringify(entry) + "\n";
+		const partial = '{ "type": "mess';
+		writeFileSync(state.sessionFile, complete + partial);
+
+		// First poll: partial is detected, cursor stops at end of complete.
+		mod.pollArtifactChanges({} as any);
+		expect(state.lastDeliveredSessionByte).toBe(Buffer.byteLength(complete, "utf8"));
+
+		// Second poll: child finishes writing the partial. We need to APPEND to
+		// the file (not rewrite) so the byte offset after the partial is
+		// unchanged.
+		const { appendFileSync } = await import("node:fs");
+		appendFileSync(state.sessionFile, "age\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"t2\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]}}\n");
+
+
+		mod.pollArtifactChanges({} as any);
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const events = readEvents(art);
+		// Now BOTH tool_activity events should be present.
+		expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(2);
 	});
 
 	it("does nothing when the session file does not exist yet", async () => {

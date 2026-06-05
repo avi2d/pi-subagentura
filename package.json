@@ -27,7 +27,7 @@
     "interactive-tmux.ts",
     "artifact.ts",
     "subagent-artifact-cli.ts",
-    "README.md",
+    "helpers.ts",
     "LICENSE"
   ],
   "engines": {

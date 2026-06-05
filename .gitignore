@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 wow.jsonl
 logs/
+.omc/
+err*.*
+*.jsonl
+!subagent-find-artifact.test.ts

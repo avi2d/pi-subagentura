@@ -546,6 +546,10 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 
 /** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
  *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
+/** Hard cap on the per-tick read window. Session JSONL files can grow quickly
+ *  in a long-running sub-agent, so we never allocate more than this in a single
+ *  tailRead call. 1 MiB is plenty for many thousands of typical entries. */
+const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
 function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifact): void {
 	const sessionFile = state.sessionFile;
 	if (!sessionFile) return;
@@ -560,6 +564,11 @@ function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifa
 	const cursor = state.lastDeliveredSessionByte ?? 0;
 	if (size <= cursor) return;
 
+	// Cap the per-tick read so a runaway file can't trigger an unbounded Buffer.alloc.
+	const requested = size - cursor;
+	const toRead = Math.min(requested, MAX_SESSION_READ_BYTES);
+	if (toRead <= 0) return;
+
 	let fd: number;
 	try {
 		fd = openSync(sessionFile, "r");
@@ -567,17 +576,25 @@ function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifa
 		return;
 	}
 	try {
-		const len = size - cursor;
-		const buf = Buffer.alloc(len);
+		const buf = Buffer.alloc(toRead);
 		let bytesRead = 0;
-		while (bytesRead < len) {
-			const n = readSync(fd, buf, bytesRead, len - bytesRead, cursor + bytesRead);
+		while (bytesRead < toRead) {
+			const n = readSync(fd, buf, bytesRead, toRead - bytesRead, cursor + bytesRead);
 			if (n <= 0) break;
 			bytesRead += n;
 		}
 		const chunk = buf.subarray(0, bytesRead).toString("utf8");
 		processSessionLogChunk(state, art, chunk);
-		state.lastDeliveredSessionByte = cursor + bytesRead;
+		// Only advance the cursor to the end of the LAST complete line in the chunk.
+		// If the chunk ends mid-line (partial trailing JSONL), the partial must be
+		// re-read on the next tick after the child finishes writing it. Advancing the
+		// cursor past the partial would silently drop bytes and corrupt the event log.
+		const endOfComplete = chunk.lastIndexOf("\n");
+		if (endOfComplete >= 0) {
+			state.lastDeliveredSessionByte = cursor + endOfComplete + 1;
+		}
+		// If no newline in chunk and we hit the cap, leave the cursor where it was:
+		// the child is still mid-line; we'll re-read from the same offset next tick.
 	} finally {
 		try { require("node:fs").closeSync(fd); } catch {}
 	}
@@ -734,7 +751,15 @@ function labelFor(event: SubagentEvent): string {
  * default artifacts root (PI_CODING_AGENT_SESSION_DIR or ~/.pi/agent/sessions/subagentura).
  * For v1 this is a best-effort lookup; a future iteration can track all artifact roots.
  */
-function findArtifactById(id: string): SubagentArtifact | null {
+export function findArtifactById(id: string): SubagentArtifact | null {
+	// Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
+	// chars. Validate the id before joining it into a path so that an
+	// LLM-supplied id like "../../../etc" can't escape the artifact root
+	// (path.join normalises "..", so a malicious id would otherwise resolve
+	// to a sibling directory and get exfiltrated to the parent LLM via
+	// read_subagent_artifact).
+	if (!/^[a-f0-9]{8}$/.test(id)) return null;
+
 	const root = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
 	let topLevel: string[];
 	try {
@@ -754,6 +779,7 @@ function findArtifactById(id: string): SubagentArtifact | null {
 	}
 	return null;
 }
+
 /** Sanitize a string by redacting common sensitive patterns (API keys, tokens, JWTs). */
 function sanitizeOutput(text: string): string {
 	return text.replace(
@@ -830,10 +856,11 @@ export default function (pi: ExtensionAPI) {
 	// every running interactive sub-agent and fires pointer notifications for new events.
 	// The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).
 	if (!g2.__piSubagenturaInteractivePollerHandle) {
-		g2.__piSubagenturaInteractivePollerHandle = setInterval(
-			() => pollArtifactChanges(pi),
-			5000,
-		);
+		const handle = setInterval(() => pollArtifactChanges(pi), 5000);
+		// Don't pin the event loop on a long-lived parent. unref() lets the process exit
+		// cleanly when nothing else is keeping it alive (no other ref'd handles).
+		handle.unref?.();
+		g2.__piSubagenturaInteractivePollerHandle = handle;
 	}
   // ── Tool 1: inherits conversation history ────────────────────────
   pi.registerTool({
@@ -1987,9 +2014,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Session shutdown: abort all jobs and clear registry ──────────
+  // ── Session shutdown: abort all jobs, kill tmux panes, stop the poller ─
   (pi as any).on?.("session_shutdown", () => {
     const g2 = typeof global !== "undefined" ? global : globalThis;
+
+    // Stop the global poller so it doesn't fire after we're gone. Without
+    // clearInterval the handle would keep the event loop alive across restarts.
+    if (g2.__piSubagenturaInteractivePollerHandle) {
+      try {
+        clearInterval(g2.__piSubagenturaInteractivePollerHandle);
+      } catch { /* defensive */ }
+      g2.__piSubagenturaInteractivePollerHandle = undefined;
+    }
+
+    // Kill any tmux panes backing live interactive sub-agents. We can't leave them
+    // running — the parent process is shutting down. cancelInteractiveSubagent
+    // does the right thing (writes .cancelled, kills pane, lets trap record the event).
+    try {
+      for (const state of interactiveSubagentRegistry.values()) {
+        if (state.status === "running") {
+          try {
+            cancelInteractiveSubagent(state.id);
+          } catch { /* best effort */ }
+        }
+      }
+    } catch { /* best effort */ }
 
     // Abort all running subagent sessions before clearing
     for (const job of jobRegistry.values()) {
