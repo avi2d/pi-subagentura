@@ -59,7 +59,7 @@ import {
 } from "./interactive-tmux";
 import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
 
-import { openSync, readdirSync, readSync, statSync } from "node:fs";
+import { openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -751,6 +751,8 @@ function labelFor(event: SubagentEvent): string {
  * default artifacts root (PI_CODING_AGENT_SESSION_DIR or ~/.pi/agent/sessions/subagentura).
  * For v1 this is a best-effort lookup; a future iteration can track all artifact roots.
  */
+import isPathInside from "is-path-inside";
+
 export function findArtifactById(id: string): SubagentArtifact | null {
 	// Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
 	// chars. Validate the id before joining it into a path so that an
@@ -761,6 +763,15 @@ export function findArtifactById(id: string): SubagentArtifact | null {
 	if (!/^[a-f0-9]{8}$/.test(id)) return null;
 
 	const root = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
+	// Resolve the root once, with symlinks followed, so the containment check below
+	// is anchored on the real on-disk location. realpathSync throws if root doesn't
+	// exist; in that case there's nothing for us to find.
+	let realRoot: string;
+	try {
+		realRoot = realpathSync(root);
+	} catch {
+		return null;
+	}
 	let topLevel: string[];
 	try {
 		topLevel = readdirSync(root);
@@ -771,6 +782,19 @@ export function findArtifactById(id: string): SubagentArtifact | null {
 		const candidate = join(root, entry, "artifacts", id);
 		try {
 			if (statSync(candidate).isDirectory()) {
+				// statSync follows symlinks, so a symlink at
+				// <root>/<cwd>/artifacts/<id> pointing outside the artifact root
+				// would otherwise be returned as a valid artifact. Resolve the
+				// candidate with realpath and verify it is still inside the
+				// resolved root. realpathSync is safe here because statSync
+				// above already confirmed candidate exists as a directory.
+				let realCandidate: string;
+				try {
+					realCandidate = realpathSync(candidate);
+				} catch {
+					continue;
+				}
+				if (!isPathInside(realCandidate, realRoot)) continue;
 				return artifactPath(join(root, entry, "artifacts"), id);
 			}
 		} catch {
@@ -779,7 +803,6 @@ export function findArtifactById(id: string): SubagentArtifact | null {
 	}
 	return null;
 }
-
 /** Sanitize a string by redacting common sensitive patterns (API keys, tokens, JWTs). */
 function sanitizeOutput(text: string): string {
 	return text.replace(
