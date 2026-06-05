@@ -19,11 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-async function importFresh() {
-	vi.resetModules();
-	return import("./subagent");
-}
+import { importFresh } from "./test-utils";
 
 describe("findArtifactById (path-traversal guard)", () => {
 	let tmp: string;
@@ -51,7 +47,7 @@ describe("findArtifactById (path-traversal guard)", () => {
 	});
 
 	it("returns null for ids with path-traversal sequences", async () => {
-		const { findArtifactById } = await importFresh();
+		const { findArtifactById } = await importFresh<typeof import("./subagent")>("./subagent");
 		// Each of these would have resolved outside the artifact root before the fix.
 		// With the positive controls in beforeEach, the parent dir /etc and
 		// the sibling /legit-id exist on disk — so the pre-fix code would
@@ -63,7 +59,7 @@ describe("findArtifactById (path-traversal guard)", () => {
 	});
 
 	it("returns null for ids that do not match the 8-hex-char shape", async () => {
-		const { findArtifactById } = await importFresh();
+		const { findArtifactById } = await importFresh<typeof import("./subagent")>("./subagent");
 		// Either too short, too long, contains non-hex / non-ASCII / control
 		// chars, or uppercase hex (the regex is anchored to [a-f0-9], not
 		// case-insensitive — uppercase would survive any "looks like hex"
@@ -88,14 +84,14 @@ describe("findArtifactById (path-traversal guard)", () => {
 	it("returns the artifact for a well-formed id when present on disk", async () => {
 		// Sanity-check the fixture: the directory we created should be a directory.
 		expect(statSync(legitDir).isDirectory()).toBe(true);
-		const { findArtifactById } = await importFresh();
+		const { findArtifactById } = await importFresh<typeof import("./subagent")>("./subagent");
 		const art = findArtifactById("deadbeef");
 		expect(art, "well-formed id with matching dir on disk should be found").not.toBeNull();
 		expect(art!.id).toBe("deadbeef");
 	});
 
 	it("returns null for a well-formed id that does not exist on disk", async () => {
-		const { findArtifactById } = await importFresh();
+		const { findArtifactById } = await importFresh<typeof import("./subagent")>("./subagent");
 		expect(findArtifactById("feedface")).toBeNull();
 	});
 
@@ -114,7 +110,7 @@ describe("findArtifactById (path-traversal guard)", () => {
 		// Sanity: statSync follows the symlink, so the candidate IS a directory.
 		expect(statSync(legitDir).isDirectory()).toBe(true);
 
-		const { findArtifactById } = await importFresh();
+		const { findArtifactById } = await importFresh<typeof import("./subagent")>("./subagent");
 		const art = findArtifactById("deadbeef");
 		expect(art, "symlink escaping the artifact root must be rejected").toBeNull();
 	});

@@ -561,6 +561,12 @@ function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifa
 		return; // file not yet created by the child
 	}
 
+	// Truncation/rotation: if the file shrank below the cursor, reset.
+	// Otherwise the next read from the stale cursor would skip the new
+	// content written after rotation.
+	if (state.lastDeliveredSessionByte && size < state.lastDeliveredSessionByte) {
+		state.lastDeliveredSessionByte = 0;
+	}
 	const cursor = state.lastDeliveredSessionByte ?? 0;
 	if (size <= cursor) return;
 
@@ -1826,6 +1832,15 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params): Promise<any> {
+      // Validate the id shape FIRST so a malformed id gets a precise error
+      // instead of being collapsed into the generic "not found" message.
+      if (!/^[a-f0-9]{8}$/.test(params.id)) {
+        return {
+          content: [{ type: "text", text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.` }],
+          details: { id: params.id, status: "invalid_id" },
+          isError: true,
+        };
+      }
       const state = interactiveSubagentRegistry.get(params.id);
       const art = state
         ? artifactPath(dirname(state.artifactDir), basename(state.artifactDir))
