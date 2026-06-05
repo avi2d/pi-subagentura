@@ -8,6 +8,8 @@
  *   - get_subagent_result: Block until async job completes, return final output
  *   - cancel_subagent: Abort a running async job
  *   - prune_subagent_jobs: Remove all completed and failed jobs from the registry
+ *   - subagent_interactive: Spawn a separate tmux-backed Pi session users can attach to
+ *   - get_interactive_subagent_status / cancel_interactive_subagent: Inspect or stop tmux-backed sessions
  *   - list_available_models: List all known models with auth status for model validation
  *
  * Both spawn tools support optional `async` param for background execution.
@@ -20,13 +22,15 @@
 
 import {
   type ExtensionAPI,
+  type ExtensionContext,
+  type ExtensionUIContext,
   type Theme,
   convertToLlm,
   serializeConversation,
   ModelRegistry,
-} from "@mariozechner/pi-coding-agent";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Model } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
   buildLiveUpdate,
@@ -44,11 +48,26 @@ import {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
-import { Text, truncateToWidth } from "@mariozechner/pi-tui";
+import {
+	cancelInteractiveSubagent,
+	formatInteractiveState,
+	interactiveSubagentRegistry,
+	launchInteractiveSubagent,
+	pruneDeadInteractiveSubagents,
+	tmuxSetupHint,
+	type InteractiveSubagentState,
+} from "./interactive-tmux";
+import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
+
+import { openSync, readdirSync, readSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-// ── Footer Status Key ───────────────────────────────────────────────
+// ── Footer Status Key ─────────────────────────────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
+const WIDGET_KEY = "subagentura-activity";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 // Shared helpers are imported from ./helpers (SubagentResult, SubagentLiveStatus,
@@ -306,6 +325,43 @@ const CancelParams = Type.Object({
   }),
 });
 
+const InteractiveParams = Type.Object({
+  name: Type.Optional(
+    Type.String({
+      description: "Display name for the tmux pane/session. Defaults to a task preview.",
+    }),
+  ),
+  task: Type.String({ description: "Task to start in the interactive sub-agent" }),
+  persona: Type.Optional(
+    Type.String({
+      description: "Optional persona / system prompt appended to the child Pi session",
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description: "Optional model override for the child Pi process",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({ description: "Working directory for the child Pi process" }),
+  ),
+  includeContext: Type.Optional(
+    Type.Boolean({
+      description:
+        "Include serialized parent conversation in the initial child prompt. Default false to keep the child session small.",
+    }),
+  ),
+  background: Type.Optional(
+    Type.Boolean({
+      description:
+        "Spawn the sub-agent in a detached named window (hidden from your tmux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
+    })
+  ),
+});
+
+
+
+
 // ── Extension ────────────────────────────────────────────────────────
 
 // ── Inject cap tracking ─────────────────────────────────────────
@@ -348,15 +404,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
       if ((getInjectCount() as number) >= MAX_INJECT) {
         // Degrade to notify mode silently
         pi.sendMessage!(
-          [
-            {
-              customType: "subagent-notify",
-              content: `Inject cap exceeded for job ${jobState.id} — degraded to notify. ${summary}`,
-              display: true,
-              details: { jobId: jobState.id, result, mode: "notify" },
-            },
-          ] as any,
-          { deliverAs: "followUp" } as any,
+          {
+            customType: "subagent-notify",
+            content: `Inject cap exceeded for job ${jobState.id} — degraded to notify. ${summary}`,
+            display: true,
+            details: { jobId: jobState.id, result, mode: "notify" },
+          },
+          { deliverAs: "followUp" },
         );
         return;
       }
@@ -371,15 +425,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
         );
         // Also send a summary notification
         pi.sendMessage!(
-          [
-            {
-              customType: "subagent-notify",
-              content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
-              display: true,
-              details: { jobId: jobState.id, result, mode: "inject" },
-            },
-          ] as any,
-          { deliverAs: "followUp" } as any,
+          {
+            customType: "subagent-notify",
+            content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
+            display: true,
+            details: { jobId: jobState.id, result, mode: "inject" },
+          },
+          { deliverAs: "followUp" },
         );
       } finally {
         decrementInjectCount();
@@ -387,15 +439,13 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
     } else {
       // notify mode
       pi.sendMessage!(
-        [
-          {
-            customType: "subagent-notify",
-            content: summary,
-            display: true,
-            details: { jobId: jobState.id, result, mode: "notify" },
-          },
-        ] as any,
-        { deliverAs: "followUp" } as any,
+        {
+          customType: "subagent-notify",
+          content: summary,
+          display: true,
+          details: { jobId: jobState.id, result, mode: "notify" },
+        },
+        { deliverAs: "followUp" },
       );
     }
   } catch {
@@ -405,16 +455,311 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
   jobState.notificationDelivered = true;
 }
 
+// ── Interactive (tmux-backed) artifact poller ───────────────────
+
+/** True when the event should trigger a wakeup notification to the parent. */
+function shouldNotify(event: SubagentEvent): boolean {
+	return (
+		event.type === "done" ||
+		event.type === "error" ||
+		event.type === "cancelled"
+	);
+}
+
+
 /**
- * Build a concise one-line summary for a completed async subagent.
- * Sanitizes output (strips API keys, tokens, secrets).
+ * Poll the artifact directory of every running interactive sub-agent and fire a
+ * pointer-only notification for any new events that match the spawner's cadence.
+ *
+ * Backwards-compatible with sub-agents that finished during parent downtime:
+ * we walk the artifact log, deliver events newer than `lastDeliveredEventTs`,
+ * then advance the cursor. This naturally handles restart / backlog cases.
  */
-/** Sanitize a string by redacting common sensitive patterns */
+export function pollArtifactChanges(pi: ExtensionAPI): void {
+	const g2 = typeof global !== "undefined" ? global : globalThis;
+	const interactivePi = (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
+	if (!interactivePi) return;
+
+	let runningCount = 0;
+	const widgetRows: string[] = [];
+	const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
+
+	for (const state of interactiveSubagentRegistry.values()) {
+		if (state.status === "cancelled" || state.status === "exited" || state.status === "unknown") continue;
+
+		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
+		const last = lastEvent(art);
+
+		// Update status based on the artifact: a done/error/cancelled event
+		// means the sub-agent is finished, regardless of notification policy.
+		if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) {
+			if (last.type === "cancelled") {
+				state.status = "cancelled";
+			} else {
+				state.status = "exited";
+			}
+			if (last.exitCode !== undefined) state.exitCode = last.exitCode;
+		}
+
+		// Tail-read the child's session log and synthesize tool_activity events.
+		// TUI-widget only — the LLM never sees them.
+		tailReadSessionLog(state, art);
+
+		// Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
+		// so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
+		const cursor = state.lastDeliveredEventTs ?? 0;
+		const events = readEvents(art, cursor + 1);
+
+		if (events.length > 0) {
+			let maxTs = cursor;
+			for (const ev of events) {
+				if (ev.ts > maxTs) maxTs = ev.ts;
+				if (!shouldNotify(ev)) continue;
+				deliverArtifactNotification(interactivePi, state, ev);
+			}
+			state.lastDeliveredEventTs = maxTs;
+		}
+
+
+		// TUI widget row: every iteration of the loop is a running sub-agent at this point.
+		runningCount++;
+		widgetRows.push(formatActivityRow(state));
+	}
+
+	// Paint footer + widget. Both are TUI-only — never reach the LLM.
+	if (ui) {
+		try {
+			ui.setStatus(
+				FOOTER_KEY,
+				runningCount > 0 ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running` : undefined,
+			);
+		} catch {
+			/* ui stale */
+		}
+		try {
+			ui.setWidget(WIDGET_KEY, widgetRows.length > 0 ? widgetRows : undefined, { placement: "belowEditor" });
+		} catch {
+			/* ui stale */
+		}
+	}
+}
+
+/** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
+ *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
+function tailReadSessionLog(state: InteractiveSubagentState, art: SubagentArtifact): void {
+	const sessionFile = state.sessionFile;
+	if (!sessionFile) return;
+
+	let size: number;
+	try {
+		size = statSync(sessionFile).size;
+	} catch {
+		return; // file not yet created by the child
+	}
+
+	const cursor = state.lastDeliveredSessionByte ?? 0;
+	if (size <= cursor) return;
+
+	let fd: number;
+	try {
+		fd = openSync(sessionFile, "r");
+	} catch {
+		return;
+	}
+	try {
+		const len = size - cursor;
+		const buf = Buffer.alloc(len);
+		let bytesRead = 0;
+		while (bytesRead < len) {
+			const n = readSync(fd, buf, bytesRead, len - bytesRead, cursor + bytesRead);
+			if (n <= 0) break;
+			bytesRead += n;
+		}
+		const chunk = buf.subarray(0, bytesRead).toString("utf8");
+		processSessionLogChunk(state, art, chunk);
+		state.lastDeliveredSessionByte = cursor + bytesRead;
+	} finally {
+		try { require("node:fs").closeSync(fd); } catch {}
+	}
+}
+
+/** Parse a chunk of session JSONL, append a tool_activity event per tool call. */
+function processSessionLogChunk(state: InteractiveSubagentState, art: SubagentArtifact, chunk: string): void {
+	const lines = chunk.split("\n");
+	// Last entry may be a partial line (the child hasn't finished writing it yet).
+	// We still process complete lines; the partial line will be re-read on the next tick.
+	const completeLines = chunk.endsWith("\n") ? lines : lines.slice(0, -1);
+	for (const line of completeLines) {
+		if (!line.trim()) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			// Skip malformed/partial — safer to drop than crash.
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		const msg = entry.message;
+		if (!msg) continue;
+
+		// Assistant message: extract toolCall blocks.
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type !== "toolCall") continue;
+				const summary = summarizeToolCall(block.name, block.arguments);
+				if (!summary) continue;
+				const ev: SubagentEvent = {
+					ts: msg.timestamp ?? Date.now(),
+					type: "tool_activity",
+					status: "running",
+					tool: block.name,
+					summary,
+				};
+				appendEvent(art, ev);
+				state.lastToolName = block.name;
+				state.lastToolSummary = summary;
+				state.lastActivityAt = ev.ts;
+			}
+		}
+	}
+}
+
+/** Short, human-readable summary of a tool call. Returns null for uninteresting tools. */
+function summarizeToolCall(name: string, args: any): string | null {
+	if (!args || typeof args !== "object") return null;
+	switch (name) {
+		case "bash": {
+			const cmd = typeof args.command === "string" ? args.command : null;
+			if (!cmd) return null;
+			return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
+		}
+		case "write":
+		case "edit":
+		case "read": {
+			const p = typeof args.path === "string" ? args.path : null;
+			if (!p) return null;
+			return p;
+		}
+		default:
+			return null; // skip grep/find/ls etc. — too noisy for the widget
+	}
+}
+
+/** Format a single TUI widget row for a running sub-agent. */
+function formatActivityRow(state: InteractiveSubagentState): string {
+	const ago = state.lastActivityAt ? ` (${agoStr(Date.now() - state.lastActivityAt)})` : "";
+	const summary = state.lastToolSummary ?? "starting…";
+	return `▶ ${state.name}: ${summary}${ago}`;
+}
+
+function agoStr(ms: number): string {
+	if (ms < 0) ms = 0;
+	if (ms < 1000) return "just now";
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s ago`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ago`;
+	return `${Math.floor(m / 60)}h ago`;
+}
+
+/** Build the LLM-facing notification content. Pointer paths always; error body inlined. */
+
+function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEvent): string {
+	const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
+	const outputPath = join(state.artifactDir, "output.md");
+	const logPath = join(state.artifactDir, "events.ndjson");
+	const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;
+	let body = "";
+	if (event.type === "error") {
+		body = `\n${sanitizeOutput((event.message ?? "unknown error").slice(0, 500))}`;
+
+}
+
+	return `${header}${body}${pointer}`;
+}
+
+/** Send a single pointer-only notification for one artifact event. */
+function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagentState, event: SubagentEvent): void {
+	try {
+		pi.sendMessage!(
+			{
+				customType: "subagent-notify",
+				content: buildArtifactMessage(state, event),
+				display: true,
+				details: { subagentId: state.id, event },
+
+			},
+			{ deliverAs: "followUp" },
+		);
+	} catch {
+		// pi may be stale after session replacement
+	}
+}
+
+function iconFor(event: SubagentEvent): string {
+	switch (event.type) {
+		case "started":
+		case "tool_activity":
+
+			return "▶";
+		case "done":
+			return event.exitCode === 0 ? "✅" : "❌";
+		case "error":
+			return "❌";
+		case "cancelled":
+			return "🚫";
+	}
+}
+
+function labelFor(event: SubagentEvent): string {
+	switch (event.type) {
+		case "tool_activity":
+
+			return "activity";
+		case "done":
+			return `done (exit ${event.exitCode ?? "?"})`;
+		case "error":
+			return "error";
+		case "cancelled":
+			return "cancelled";
+		// "started" is intentionally dropped — it would only fire on the very first poll
+		// and the widget row is a better signal than a one-shot message.
+		case "started":
+			return "started";
+	}
+}
+/**
+ * Find an artifact dir for an id that isn't in the current registry. We can't use the
+ * registry (it's lost across process restarts) so we ask the file system. We scan the
+ * default artifacts root (PI_CODING_AGENT_SESSION_DIR or ~/.pi/agent/sessions/subagentura).
+ * For v1 this is a best-effort lookup; a future iteration can track all artifact roots.
+ */
+function findArtifactById(id: string): SubagentArtifact | null {
+	const root = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
+	let topLevel: string[];
+	try {
+		topLevel = readdirSync(root);
+	} catch {
+		return null;
+	}
+	for (const entry of topLevel) {
+		const candidate = join(root, entry, "artifacts", id);
+		try {
+			if (statSync(candidate).isDirectory()) {
+				return artifactPath(join(root, entry, "artifacts"), id);
+			}
+		} catch {
+			/* not here */
+		}
+	}
+	return null;
+}
+/** Sanitize a string by redacting common sensitive patterns (API keys, tokens, JWTs). */
 function sanitizeOutput(text: string): string {
-  return text.replace(
-    /(sk-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|-----BEGIN[\s\w]+KEY-----|AKIA[\w]{16}|ghp_[\w]{36}|gho_[\w]{36}|ghu_[\w]{36}|xox[abp]-[\w-]+|AIza[\w-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g,
-    "[REDACTED]",
-  );
+	return text.replace(
+		/(sk-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|-----BEGIN[\s\w]+KEY-----|AKIA[\w]{16}|ghp_[\w]{36}|gho_[\w]{36}|ghu_[\w]{36}|xox[abp]-[\w-]+|AIza[\w-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g,
+		"[REDACTED]",
+	);
 }
 
 function buildNotifySummary(jobId: string, result: SubagentResult): string {
@@ -432,36 +777,35 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
   }
   return summary;
 }
-
 // ── Notification TUI Renderer ──────────────────────────────────
 function renderSubagentNotify(
-  message: any,
-  options: { expanded?: boolean },
-  theme: Theme,
+	message: any,
+	options: { expanded?: boolean },
+	theme: Theme,
 ): Text {
-  const details = message.details as Record<string, unknown> | undefined;
-  const isInject = details?.mode === "inject";
-  const isError = details?.result && (details.result as SubagentResult).isError;
-  const text = message.content ?? "";
+	const details = message.details as Record<string, unknown> | undefined;
+	const isInject = details?.mode === "inject";
+	const isError = details?.result && (details.result as SubagentResult).isError;
+	const text = message.content ?? "";
 
-  let line: string;
-  if (!options.expanded) {
-    line = isError ? theme.fg("error", text) : theme.fg("accent", text);
-  } else {
-    const output = sanitizeOutput(
-      ((details?.result as SubagentResult)?.output ?? "")
-        .slice(0, 500)
-        .replace(/\s+/g, " "),
-    );
-    const header = isInject
-      ? theme.fg("accent", "⚡ Injected Sub-agent Result")
-      : isError
-        ? theme.fg("error", "❌ Sub-agent Failed")
-        : theme.fg("success", "✅ Sub-agent Completed");
-    const body = theme.fg("dim", text);
-    line = `${header}\n${body}\n${output}`;
-  }
-  return new Text(line, 0, 0);
+	let line: string;
+	if (!options.expanded) {
+		line = isError ? theme.fg("error", text) : theme.fg("accent", text);
+	} else {
+		const output = sanitizeOutput(
+			((details?.result as SubagentResult)?.output ?? "")
+				.slice(0, 500)
+				.replace(/\s+/g, " "),
+		);
+		const header = isInject
+			? theme.fg("accent", "⚡ Injected Sub-agent Result")
+			: isError
+				? theme.fg("error", "❌ Sub-agent Failed")
+				: theme.fg("success", "✅ Sub-agent Completed");
+		const body = theme.fg("dim", text);
+		line = `${header}\n${body}\n${output}`;
+	}
+	return new Text(line, 0, 0);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -470,14 +814,27 @@ export default function (pi: ExtensionAPI) {
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaInjectCount = 0;
 
-  // Register notification renderer before any tools
-  (pi as any).registerMessageRenderer?.(
-    "subagent-notify",
-    (message: any, options: any, theme: Theme) => {
-      return renderSubagentNotify(message, options, theme);
-    },
-  );
+  // Capture ctx.ui for the artifact poller (it runs from a setInterval and has no ctx).
+  // The handler is registered on every default-export invocation; the last one wins,
+  // which is the same pi the poller uses via __piSubagenturaPiRef.
+  pi.on("session_start", (_event, ctx) => {
+    g2.__piSubagenturaUi = ctx.ui;
+  });
+  pi.on("session_shutdown", () => {
+    // Don't null the ui ref here — the poller may still fire one last tick on shutdown,
+    // and stale ctx errors are already caught at the call sites.
+  });
 
+  // Register notification renderer before any tools
+	// One global interval for the whole session. Each tick walks the artifact dir of
+	// every running interactive sub-agent and fires pointer notifications for new events.
+	// The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).
+	if (!g2.__piSubagenturaInteractivePollerHandle) {
+		g2.__piSubagenturaInteractivePollerHandle = setInterval(
+			() => pollArtifactChanges(pi),
+			5000,
+		);
+	}
   // ── Tool 1: inherits conversation history ────────────────────────
   pi.registerTool({
     name: "subagent_with_context",
@@ -1221,6 +1578,277 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool 6: spawn an attachable tmux-backed Pi session ──────────────
+  pi.registerTool({
+    name: "subagent_interactive",
+    label: "Interactive Subagent",
+    description: [
+      "Spawn a separate Pi process in a tmux pane and return immediately.",
+      "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
+      "Requires running pi inside tmux. The tool returns tmux attach/select commands and the child session file.",
+      "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
+    ].join("\n"),
+    parameters: InteractiveParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      debugLog("info", "tool_call", {
+        toolName: "subagent_interactive",
+        toolCallId: _toolCallId,
+        taskLength: params.task?.length ?? 0,
+        model: params.model ?? null,
+        cwd: params.cwd ?? ctx.cwd,
+        includeContext: params.includeContext ?? false,
+      });
+
+      let contextText: string | null = null;
+      if (params.includeContext === true) {
+        const branch = ctx.sessionManager.getBranch();
+        const messages = branch
+          .filter(
+            (e): e is typeof e & { type: "message" } => e.type === "message",
+          )
+          .map((e) => e.message);
+        contextText = serializeConversation(convertToLlm(messages));
+      }
+
+      const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
+      const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
+      const targetCwd = params.cwd ?? ctx.cwd;
+
+		try {
+			const state = launchInteractiveSubagent({
+				name,
+				task: params.task,
+				persona: params.persona,
+				model: params.model,
+				cwd: targetCwd,
+				contextText,
+				background: params.background, // defaults to true (hidden) inside the helper
+			});
+
+
+			const displayMode = state.windowName ? "background (new window)" : "visible split";
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Interactive sub-agent ${state.id} started (${displayMode}) in tmux pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFrom inside tmux: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+					},
+
+				],
+				details: { ...state, status: "started" },
+			};
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to start interactive sub-agent: ${msg}\n${tmuxSetupHint()}`,
+            },
+          ],
+          details: { status: "error", error: msg },
+          isError: true,
+        };
+      }
+    },
+
+    renderCall(args, theme) {
+      const task = String(args.task ?? "");
+      const preview = task.length > 60 ? `${task.slice(0, 57)}…` : task;
+      return new Text(
+        theme.fg("toolTitle", theme.bold("subagent_interactive ")) +
+          theme.fg("accent", String(args.name ?? preview)),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const details = result.details as Partial<InteractiveSubagentState> | undefined;
+      if ((result as any).isError) {
+        const first = result.content?.[0];
+        const text = first?.type === "text" ? first.text : "Failed to start interactive sub-agent";
+        return new Text(theme.fg("error", text), 0, 0);
+      }
+      const id = details?.id ?? "unknown";
+      const paneId = details?.paneId ?? "unknown";
+      return new Text(
+        theme.fg("accent", "⚡ ") +
+          theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
+          theme.fg("dim", ` — pane ${paneId}`),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool 7: inspect attachable tmux-backed sessions ────────────────
+  pi.registerTool({
+    name: "get_interactive_subagent_status",
+    label: "Get Interactive Subagent Status",
+    description:
+      "Inspect tmux-backed interactive subagents. Omit jobId to list all tracked sessions. Returns attach/select commands and session paths without capturing pane output.",
+    parameters: Type.Object({
+      jobId: Type.Optional(
+        Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      pruneDeadInteractiveSubagents();
+      const states = params.jobId
+        ? [interactiveSubagentRegistry.get(params.jobId)].filter(
+            (s): s is InteractiveSubagentState => Boolean(s),
+          )
+        : [...interactiveSubagentRegistry.values()];
+
+      if (states.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: params.jobId
+                ? `Interactive sub-agent ${params.jobId} not found.`
+                : "No interactive sub-agents are tracked.",
+            },
+          ],
+          details: { status: "not_found", jobId: params.jobId },
+          isError: Boolean(params.jobId),
+        };
+      }
+
+      const sections = states.map((state) => {
+        return formatInteractiveState(state);
+      });
+
+      return {
+        content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+        details: {
+          count: states.length,
+          subagents: states.map((state) => ({ ...state })),
+        },
+      };
+    },
+  });
+
+  // ── Tool 8: cancel an attachable tmux-backed session ───────────────
+  pi.registerTool({
+    name: "cancel_interactive_subagent",
+    label: "Cancel Interactive Subagent",
+    description: "Kill the tmux pane for an interactive sub-agent by ID.",
+    parameters: Type.Object({
+      jobId: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      const state = cancelInteractiveSubagent(params.jobId);
+      if (!state) {
+        return {
+          content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} not found.` }],
+          details: { jobId: params.jobId, status: "not_found" },
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} cancelled.` }],
+        details: { ...state },
+      };
+    },
+  });
+
+  // ── Tool: read an interactive sub-agent's artifact ───────────────
+  // The artifact (events.ndjson + output.md) is the source of truth for what the
+  // sub-agent did. The main agent calls this when it wants to know more than the pointer.
+  pi.registerTool({
+    name: "read_subagent_artifact",
+    label: "Read Subagent Artifact",
+    description: [
+      "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
+
+      "if present, the sub-agent's output.md. Use `since` (unix ms) to fetch only events newer than",
+      "your last read.",
+    ].join("\n"),
+    parameters: Type.Object({
+      id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+      since: Type.Optional(Type.Number({ description: "Only return events with ts >= this unix-ms timestamp" })),
+      includeOutput: Type.Optional(Type.Boolean({ description: "Include the sub-agent's output.md content (default true)" })),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      const state = interactiveSubagentRegistry.get(params.id);
+      const art = state
+        ? artifactPath(dirname(state.artifactDir), basename(state.artifactDir))
+        : findArtifactById(params.id);
+      if (!art) {
+        return {
+          content: [{ type: "text", text: `No artifact found for sub-agent ${params.id}.` }],
+          details: { id: params.id, status: "not_found" },
+          isError: true,
+        };
+      }
+      const events = readEvents(art, params.since);
+      const output = params.includeOutput === false ? null : readOutput(art);
+      const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Artifact for ${params.id} (${events.length} event${events.length === 1 ? "" : "s"}${params.since ? ` since ${params.since}` : ""}).\n` +
+              `Last event: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"}\n` +
+              `Output: ${output === null ? "(not written yet)" : `${output.length} chars`}`,
+          },
+        ],
+        details: { id: params.id, artifactDir: art.dir, events, output, lastEvent },
+      };
+    },
+  });
+
+  // ── Tool: list known interactive sub-agent artifacts ─────────────
+  pi.registerTool({
+    name: "list_subagent_artifacts",
+    label: "List Subagent Artifacts",
+    description: [
+      "List all known interactive sub-agents (in this session and from past sessions whose",
+      "artifacts are still on disk). Returns id, name, status, and last-update time. Use",
+      "read_subagent_artifact to fetch a specific one.",
+    ].join("\n"),
+    parameters: Type.Object({}),
+
+    async execute(): Promise<any> {
+      pruneDeadInteractiveSubagents();
+      const states = [...interactiveSubagentRegistry.values()];
+      const summary = states.map((s) => {
+        const art = artifactPath(dirname(s.artifactDir), basename(s.artifactDir));
+        const last = lastEvent(art);
+        return {
+          id: s.id,
+          name: s.name,
+          status: s.status,
+          lastEvent: last,
+          lastUpdate: last?.ts,
+          artifactDir: s.artifactDir,
+        };
+      });
+      if (summary.length === 0) {
+        return {
+          content: [{ type: "text", text: "No interactive sub-agents are tracked." }],
+          details: { count: 0, subagents: [] },
+        };
+      }
+      const lines = summary.map((s) => {
+        const ev = s.lastEvent;
+        const evStr = ev ? `last: ${ev.type}${ev.message ? ` (${ev.message.slice(0, 60)})` : ""}` : "no events yet";
+        return `${s.id}  ${s.name}  ${s.status}  ${evStr}`;
+      });
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { count: summary.length, subagents: summary },
+      };
+    },
+  });
+
   // ── Tool 6: list available models ────────────────────────────────
   pi.registerTool({
     name: "list_available_models",
@@ -1399,3 +2027,4 @@ export {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
+export { interactiveSubagentRegistry } from "./interactive-tmux";

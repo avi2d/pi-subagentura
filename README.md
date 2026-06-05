@@ -4,7 +4,7 @@
 
 > **Note:** The `docs/` folder is managed by the [`pi-docs`](https://github.com/lmn451/pi-docs) package.
 
-A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
+A public [Pi](https://pi.dev) package that adds in-process and attachable sub-agent tools:
 
 - `subagent_with_context` — spawn a sub-agent that inherits the full conversation history
 - `subagent_isolated` — spawn a sub-agent with a fresh, empty context window
@@ -12,7 +12,12 @@ A public [Pi](https://pi.dev) package that adds in-process sub-agent tools:
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-The sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready.
+- `subagent_interactive` — spawn an attachable tmux-backed Pi session with artifact-based progress
+- `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
+- `cancel_interactive_subagent` — kill an attachable sub-agent tmux pane
+- `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
+- `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
+The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 ## Why use it?
 
@@ -22,6 +27,7 @@ The sub-agents run inside the current Pi process, stream live progress back to t
 - Run sub-agents in the background while continuing the main conversation
 - Poll, collect, or cancel background jobs on demand
 - Get live previews of running sub-agents (current turn, active tool, usage)
+- Attach to interactive sub-agent sessions for direct follow-ups and debugging
 
 ![Sub-agent demo](working.png)
 
@@ -127,6 +133,69 @@ Parameters:
 
 Remove all completed and failed subagent jobs from the registry. Running and cancelled jobs are preserved.
 
+
+### Interactive tmux Tools
+
+Use these when observability and manual follow-up matter more than in-process execution. They require running Pi inside tmux. Interactive sub-agents write their progress to a per-sub-agent artifact directory on disk; the pane is for live monitoring, the artifact is the source of truth.
+
+#### `subagent_interactive`
+
+Starts a separate interactive `pi` process in a tmux window and returns immediately with:
+
+- sub-agent id
+- tmux pane id
+- `tmux attach ...` command (works from outside tmux)
+- `tmux select-pane ...` or `tmux select-window ...` command for use inside the same tmux session
+- child Pi session file path
+- artifact directory (events.ndjson + output.md)
+- the tmux window name (in background mode) so you can find it in your window list
+
+Parameters:
+
+- `task` — required initial task
+- `name` — optional display name for the pane/session
+- `persona` — optional system prompt appended to the child session
+- `model` — optional model override
+- `cwd` — optional working directory
+- `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
+- `background` — spawn in a detached named window (invisible) instead of a visible horizontal split. Default `true` — your tmux layout is undisturbed and you can attach later with the returned `select-window` command. Pass `background: false` for a side-by-side split you can watch in real time.
+
+The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
+
+#### Sub-agent completion protocol
+
+Every interactive sub-agent receives a built-in system prompt that tells it how to signal completion. The child **must** call one of these when it has nothing more to add before waiting for the next user input:
+
+```bash
+$ARTIFACT_DIR/cli.mjs done 0       # success — parent reads $ARTIFACT_DIR/output.md
+$ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
+# 'cancelled' is only set by the parent via cancel_interactive_subagent
+```
+
+Write the final result to `$ARTIFACT_DIR/output.md` before calling `done`. After `done`, the REPL stays open and the child can be re-prompted via `tmux send-keys` to the pane. The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+
+
+#### `get_interactive_subagent_status`
+
+Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
+
+#### `cancel_interactive_subagent`
+Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
+
+#### `list_subagent_artifacts`
+
+Lists all known interactive sub-agents: id, name, status, and last-update timestamp. Use this to discover sub-agents that finished while the parent was away.
+
+#### `read_subagent_artifact`
+
+Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content. This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+
+
+Parameters:
+- `id` — required sub-agent id
+- `since` — optional unix-ms timestamp; only return events with `ts >= since`
+- `includeOutput` — include `output.md` (default `true`)
+
 ### `list_available_models`
 
 List all available AI models with auth status. Use this to validate model identifiers before passing them to subagent tools — prevents silent fallback to the parent session model.
@@ -142,6 +211,7 @@ Parameters:
 - “Spawn a context-aware sub-agent to continue debugging while we keep planning here.”
 - “Run a sub-agent in the background to run the test suite, then notify me when done.”
 - “Spawn two isolated async sub-agents to review this code from different angles, then collect both results.”
+- “Start an interactive sub-agent in tmux for investigating the auth bug; I’ll attach and guide it.”
 
 ## Development
 
