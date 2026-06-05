@@ -11,11 +11,12 @@
  * at it, then call `pollArtifactChanges` and assert the appended events.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendEvent, artifactPath, readEvents } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
 	return mkdtempSync(join(tmpdir(), "pi-subagentura-session-log-"));
@@ -46,10 +47,6 @@ function makeState(overrides: {
 }
 
 
-async function importFresh() {
-	vi.resetModules();
-	return import("./subagent");
-}
 
 describe("session-log tail-read", () => {
 	let root: string;
@@ -67,7 +64,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("appends a tool_activity event for a bash tool call", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -110,7 +107,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("appends tool_activity for write, edit, read with file paths", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -140,7 +137,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("skips tools with no summary (grep, find, ls, custom)", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -166,7 +163,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("truncates long bash commands to 80 chars", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -192,7 +189,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("cursor advances — second poll with no new lines does not duplicate", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -219,7 +216,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("picks up new lines written between polls", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -258,7 +255,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("tolerates a partial trailing line without crashing", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -287,7 +284,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("re-reads a partial line once it is completed on a later poll", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -310,7 +307,6 @@ describe("session-log tail-read", () => {
 		// Second poll: child finishes writing the partial. We need to APPEND to
 		// the file (not rewrite) so the byte offset after the partial is
 		// unchanged.
-		const { appendFileSync } = await import("node:fs");
 		appendFileSync(state.sessionFile, "age\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"t2\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]}}\n");
 
 
@@ -322,7 +318,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("does nothing when the session file does not exist yet", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state } = makeState({
 			sessionFile: "/tmp/does-not-exist-" + Math.random() + ".jsonl",
 		});
@@ -333,7 +329,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("updates state.lastToolSummary and lastActivityAt for the widget", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -355,7 +351,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("paints the TUI widget when ui ref is set", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state } = makeState({});
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -387,7 +383,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("clears the widget and footer when no sub-agents are running", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		// Empty registry.
 		const setStatus = vi.fn();
 		const setWidget = vi.fn();
@@ -400,7 +396,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("inlines the error message in the LLM notification but uses pointers on success", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 
 		mod.interactiveSubagentRegistry.set(state.id, state);
@@ -435,7 +431,7 @@ describe("session-log tail-read", () => {
 	});
 
 	it("truncates the inline error message to 500 chars", async () => {
-		const mod = await importFresh();
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state, artifactDir } = makeState({});
 
 		mod.interactiveSubagentRegistry.set(state.id, state);
@@ -452,5 +448,20 @@ describe("session-log tail-read", () => {
 		const match = content.match(/x+/);
 		expect(match).not.toBeNull();
 		expect(match![0].length).toBeLessThanOrEqual(500);
+	});
+
+	it("resets the cursor when the session log is truncated below it", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+		// write 1KB of content, poll to advance cursor
+		writeFileSync(state.sessionFile, "x".repeat(1024) + "\n");
+		mod.pollArtifactChanges({} as any);
+		expect(state.lastDeliveredSessionByte).toBe(1025);
+		// truncate to 0, then write new content
+		writeFileSync(state.sessionFile, "new\n");
+		mod.pollArtifactChanges({} as any);
+		// cursor should have been reset, so it now points past the new content
+		expect(state.lastDeliveredSessionByte).toBe(4);
 	});
 });

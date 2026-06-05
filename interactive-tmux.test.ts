@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { importFresh } from "./test-utils";
 
 /** Standard tmux pane id returned by mocks when "new-window"/"split-window" is called. */
 const MOCK_PANE_ID = "%42";
@@ -37,7 +38,7 @@ describe("interactive-tmux", () => {
 
   it("is unavailable when TMUX env var is missing", async () => {
     process.env.TMUX = "";
-    const { isTmuxAvailable } = await importFresh();
+    const { isTmuxAvailable } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(isTmuxAvailable()).toBe(false);
   });
 
@@ -56,7 +57,7 @@ describe("interactive-tmux", () => {
       return "";
     });
 
-    const mod = await importFresh();
+    const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     // No `background` flag — should default to true (hidden).
     const state = mod.launchInteractiveSubagent({
       name: "Demo",
@@ -111,7 +112,7 @@ describe("interactive-tmux", () => {
       return "";
     });
 
-    const mod = await importFresh();
+    const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     const state = mod.launchInteractiveSubagent({
       name: "Demo",
       task: "Run tests",
@@ -161,7 +162,7 @@ describe("interactive-tmux", () => {
       };
     });
 
-    const mod = await importFresh();
+    const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(() =>
       mod.launchInteractiveSubagent({
         name: "Demo",
@@ -189,7 +190,7 @@ describe("interactive-tmux", () => {
       if (args[0] === "show-options") return "0\n";
       return "";
     });
-    const mod1 = await importFresh();
+    const mod1 = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(mod1.readPaneExitCode(MOCK_PANE_ID)).toBe(0);
 
     // Mock returning empty string (option not yet set).
@@ -197,7 +198,7 @@ describe("interactive-tmux", () => {
       if (args[0] === "show-options") return "\n";
       return "";
     });
-    const mod2 = await importFresh();
+    const mod2 = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(mod2.readPaneExitCode(MOCK_PANE_ID)).toBeNull();
 
     // Mock throwing (pane dead / option unset).
@@ -205,7 +206,7 @@ describe("interactive-tmux", () => {
       if (args[0] === "show-options") throw new Error("no such pane");
       return "";
     });
-    const mod3 = await importFresh();
+    const mod3 = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(mod3.readPaneExitCode(MOCK_PANE_ID)).toBeNull();
   });
 
@@ -226,7 +227,7 @@ describe("interactive-tmux", () => {
       },
     }));
 
-    const mod = await importFresh();
+    const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     expect(mod.readPaneExitCode(MOCK_PANE_ID)).toBeNull();
 
     // The execFileSync call must use stdio that explicitly ignores stderr.
@@ -245,7 +246,7 @@ describe("interactive-tmux", () => {
     process.env.PI_CODING_AGENT_SESSION_DIR = makeTmp();
     process.env.TMUX = makeArgs().TMUX;
 
-    const mod = await importFresh();
+    const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
     const { appendEvent, artifactPath } = await import("./artifact");
     const { mkdirSync } = await import("node:fs");
 
@@ -311,20 +312,20 @@ describe("interactive-tmux", () => {
 
   describe("CHILD_SUBAGENT_PROTOCOL", () => {
     it("names all three completion signals (done / error / cancelled)", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       expect(CHILD_SUBAGENT_PROTOCOL).toContain("done");
       expect(CHILD_SUBAGENT_PROTOCOL).toContain("error");
       expect(CHILD_SUBAGENT_PROTOCOL).toContain("cancelled");
     });
 
     it("points the child to the two artifact paths", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/output.md");
       expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/cli.mjs");
     });
 
     it("tells the child to keep the REPL open after done", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/REPL stays open/i);
       expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/do not exit/i);
     });
@@ -351,8 +352,8 @@ describe("interactive-tmux", () => {
         return "";
       });
 
-      const mod = await importFresh();
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh();
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const state = mod.launchInteractiveSubagent({ name: "NoPersona", task: "x", cwd: tmp });
       const sysFile = join(state.artifactDir, "nopersona-system.md");
 
@@ -376,7 +377,7 @@ describe("interactive-tmux", () => {
         return "";
       });
 
-      const mod = await importFresh();
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const state = mod.launchInteractiveSubagent({
         name: "WithPersona",
         task: "x",
@@ -402,7 +403,7 @@ describe("interactive-tmux", () => {
 
       installMockExec(() => MOCK_PANE_ID + "\n");
 
-      const mod = await importFresh();
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const tooBig = "x".repeat(64 * 1024 + 1);
       let threw = false;
       try {
@@ -439,7 +440,7 @@ describe("interactive-tmux", () => {
         return "";
       });
 
-      const mod = await importFresh();
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const state = mod.launchInteractiveSubagent({ name: "Wire", task: "x", cwd: tmp });
 
       const launchScript = readFileSync(state.launchScriptFile, "utf8");
@@ -451,13 +452,13 @@ describe("interactive-tmux", () => {
 
   describe("buildPiInteractiveCommand", () => {
     it("starts with `cd <cwd> &&` and shell-escapes the cwd", async () => {
-      const { buildPiInteractiveCommand } = await importFresh();
+      const { buildPiInteractiveCommand } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/tmp/has space" });
       expect(cmd).toMatch(/^cd '\/tmp\/has space' &&/);
     });
 
     it("includes --session, --name, and the @<promptFile>", async () => {
-      const { buildPiInteractiveCommand } = await importFresh();
+      const { buildPiInteractiveCommand } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c" });
       expect(cmd).toContain("--session '/s.jsonl'");
       expect(cmd).toContain("--name 'n'");
@@ -467,19 +468,19 @@ describe("interactive-tmux", () => {
     });
 
     it("omits --model when undefined", async () => {
-      const { buildPiInteractiveCommand } = await importFresh();
+      const { buildPiInteractiveCommand } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c" });
       expect(cmd).not.toContain("--model");
     });
 
     it("includes --model when set, escaped", async () => {
-      const { buildPiInteractiveCommand } = await importFresh();
+      const { buildPiInteractiveCommand } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c", model: "p/m" });
       expect(cmd).toContain("--model 'p/m'");
     });
 
     it("includes --append-system-prompt when systemPromptFile is set", async () => {
-      const { buildPiInteractiveCommand } = await importFresh();
+      const { buildPiInteractiveCommand } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const cmd = buildPiInteractiveCommand({ sessionFile: "/s.jsonl", name: "n", promptFile: "/p.md", cwd: "/c", systemPromptFile: "/s.md" });
       expect(cmd).toContain("--append-system-prompt");
       expect(cmd).toContain("/s.md");
@@ -487,9 +488,4 @@ describe("interactive-tmux", () => {
   });
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-tmux-"));
-}
-
-async function importFresh() {
-  vi.resetModules();
-  return import("./interactive-tmux");
 }
