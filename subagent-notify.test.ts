@@ -1,4 +1,9 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { appendEvent, artifactPath, writeOutput } from "./artifact";
+import { importFresh } from "./test-utils";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { SubagentResult } from "./helpers";
 
@@ -1069,5 +1074,152 @@ describe("read_subagent_artifact (invalid id)", () => {
     const text = result.content[0].text;
     expect(text).toContain("Invalid sub-agent id");
     expect(text).toContain("not-a-hex-id");
+  });
+});
+
+describe("read_subagent_artifact (output reporting)", () => {
+  function tmp() {
+    return mkdtempSync(join(tmpdir(), "pi-subagentura-read-out-"));
+  }
+
+  function makeArtifactWithDone(id: string, parentDir: string) {
+    const dir = join(parentDir, id);
+    const state: import("./interactive-tmux").InteractiveSubagentState = {
+      id,
+      name: "Test",
+      task: "t",
+      paneId: "%99",
+      sessionFile: "/tmp/sess.jsonl",
+      cwd: "/tmp",
+      startedAt: 1,
+      status: "exited",
+      attachCommand: "tmux attach",
+      selectPaneCommand: "tmux select-pane",
+      launchScriptFile: "/tmp/launch.sh",
+      artifactDir: dir,
+    };
+    const art = artifactPath(parentDir, id);
+    appendEvent(art, { ts: 1, type: "started", status: "running" });
+    appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    return { state, art, dir };
+  }
+
+  function makeReadTool(mod: any) {
+    const _api = {
+      registerTool: vi.fn(),
+      registerMessageRenderer: vi.fn(),
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+      on: vi.fn(),
+    };
+    (mod as any).default(_api as any);
+    return _api.registerTool.mock.calls.find(([t]: any[]) => t.name === "read_subagent_artifact")?.[0];
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cleanGlobals();
+  });
+
+  afterEach(() => {
+    cleanGlobals();
+  });
+
+  it("reports '(sub-agent exited without writing output.md — last event: done @ <ts>)' when output.md is missing and the agent finished", async () => {
+    const id = "ab12cd34";
+    const parent = tmp();
+    try {
+      const { state } = makeArtifactWithDone(id, parent);
+      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+      const readTool = makeReadTool(mod);
+      expect(readTool).toBeDefined();
+
+      const result = await readTool.execute("call-1", { id }, undefined, undefined, {} as any);
+      const text = result.content[0].text;
+      expect(text).toContain("Output: (sub-agent exited without writing output.md");
+      expect(text).toContain("last event: done @ 2");
+      expect(text).not.toContain("not written yet");
+      expect(result.details.output).toBeNull();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports '(<N> events, last: <type> @ <ts> — output.md not written yet)' when output.md is missing and the agent is still running", async () => {
+    const id = "ab12cd35";
+    const parent = tmp();
+    try {
+      const dir = join(parent, id);
+      const state: import("./interactive-tmux").InteractiveSubagentState = {
+        id,
+        name: "Test",
+        task: "t",
+        paneId: "%99",
+        sessionFile: "/tmp/sess.jsonl",
+        cwd: "/tmp",
+        startedAt: 1,
+        status: "running",
+        attachCommand: "tmux attach",
+        selectPaneCommand: "tmux select-pane",
+        launchScriptFile: "/tmp/launch.sh",
+        artifactDir: dir,
+      };
+      const art = artifactPath(parent, id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, { ts: 2, type: "tool_activity", status: "running", tool: "bash", summary: "ls" });
+
+      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+
+      const readTool = makeReadTool(mod);
+      const result = await readTool.execute("call-2", { id }, undefined, undefined, {} as any);
+      const text = result.content[0].text;
+      expect(text).toContain("Output: (2 events");
+      expect(text).toContain("last: tool_activity @ 2");
+      expect(text).toContain("output.md not written yet");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports '(empty — 0 chars)' when output.md exists but is empty", async () => {
+    const id = "ab12cd36";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent);
+      writeOutput(art, "");
+
+      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+
+      const readTool = makeReadTool(mod);
+      const result = await readTool.execute("call-3", { id }, undefined, undefined, {} as any);
+      const text = result.content[0].text;
+      expect(text).toContain("Output: (empty — 0 chars)");
+      expect(result.details.output).toBe("");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports '<N> chars' when output.md has content", async () => {
+    const id = "ab12cd37";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent);
+      writeOutput(art, "Hello, world!");
+
+      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+
+      const readTool = makeReadTool(mod);
+      const result = await readTool.execute("call-4", { id }, undefined, undefined, {} as any);
+      const text = result.content[0].text;
+      expect(text).toContain("Output: 13 chars");
+      expect(result.details.output).toBe("Hello, world!");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 });

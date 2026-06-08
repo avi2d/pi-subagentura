@@ -1953,6 +1953,20 @@ export default function (pi: ExtensionAPI) {
       const events = readEvents(art, params.since);
       const output = params.includeOutput === false ? null : readOutput(art);
       const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+      // Distinguish three cases when output is missing/empty so the caller
+      // doesn't see a misleading "not written yet" after the sub-agent has
+      // already exited (the common case: model finished without writing).
+      let outputText: string;
+      if (output === null) {
+        const exited = lastEvent && (lastEvent.type === "done" || lastEvent.type === "error" || lastEvent.type === "cancelled");
+        outputText = exited
+          ? `(sub-agent exited without writing output.md — last event: ${lastEvent.type} @ ${lastEvent.ts})`
+          : `(${events.length} events, last: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"} — output.md not written yet)`;
+      } else if (output.length === 0) {
+        outputText = "(empty — 0 chars)";
+      } else {
+        outputText = `${output.length} chars`;
+      }
       return {
         content: [
           {
@@ -1960,7 +1974,7 @@ export default function (pi: ExtensionAPI) {
             text:
               `Artifact for ${params.id} (${events.length} event${events.length === 1 ? "" : "s"}${params.since ? ` since ${params.since}` : ""}).\n` +
               `Last event: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"}\n` +
-              `Output: ${output === null ? "(not written yet)" : `${output.length} chars`}`,
+              `Output: ${outputText}`,
           },
         ],
         details: { id: params.id, artifactDir: art.dir, events, output, lastEvent },
