@@ -13,10 +13,21 @@ import { artifactPath, lastEvent, type SubagentArtifact, type SubagentEvent } fr
  * the part that keeps the parent-child notification loop working — is the
  * most recent instruction the LLM reads (recency wins for instruction
  * following).
+ *
+ * `artifactDir` is the resolved absolute path baked into the prompt so the
+ * child can use it directly in `write` tool calls. Bash commands and `cli.mjs`
+ * calls still work via the exported `ARTIFACT_DIR` env var from the launch
+ * script, but the `write` tool treats its `path` argument as a literal string,
+ * so we must give it the absolute path up front.
  */
-export const CHILD_SUBAGENT_PROTOCOL = `You are running inside a Pi sub-agent launched by a parent agent. The literal "$ARTIFACT_DIR" in the commands below is an environment variable that the launch script has already exported for you, so the path expands at runtime.
+export function buildChildSubagentProtocol(artifactDir: string): string {
+	const cliPath = `${artifactDir}/cli.mjs`;
+	const outputPath = `${artifactDir}/output.md`;
+	return `You are running inside a Pi sub-agent launched by a parent agent.
 
-When you have completed the user's task and have nothing more to add before waiting for the next user input, signal completion to the parent by running exactly one of these shell commands. The path in quotes is a single argument, so it works even if the directory contains spaces:
+Your artifact directory is: ${artifactDir}. Use this exact path in your \`write\` tool calls — the \`write\` tool does not expand shell variables, so the literal path above is the only thing that will land in the right place.
+
+When you have completed the user's task and have nothing more to add before waiting for the next user input, signal completion to the parent by running exactly one of these shell commands. The path in quotes is a single argument, so it works even if the directory contains spaces. The launch script exports \`ARTIFACT_DIR\` to the shell, so the \`$ARTIFACT_DIR\` form below expands correctly in bash and in \`cli.mjs\` calls:
 
   "$ARTIFACT_DIR/cli.mjs" done 0
   "$ARTIFACT_DIR/cli.mjs" error "short reason here"
@@ -25,9 +36,10 @@ Use 'done' on success and 'error' for unrecoverable failures. Do not call 'cance
 
 After you call 'done', the REPL stays open and you will receive follow-up prompts. Do not exit the REPL yourself; just signal completion and wait.
 
-Before calling 'done', write your final result to "$ARTIFACT_DIR/output.md". An atomic write via a .tmp file plus rename is fine, or just append. The parent reads this file as soon as it gets the 'done' notification.`;
+Before calling 'done', write your final result to ${outputPath} (the literal absolute path, not \$ARTIFACT_DIR/output.md — the \`write\` tool will not expand it). An atomic write via a .tmp file plus rename is fine, or just append. The parent reads this file as soon as it gets the 'done' notification.
 
-
+(For reference: ${cliPath} is the lifecycle CLI that records started / done / error / cancelled events for the parent to discover. The bash examples above invoke it via "\$ARTIFACT_DIR/cli.mjs" because \$ARTIFACT_DIR is exported to your shell.)`;
+}
 
 export type InteractiveSubagentStatus = "running" | "cancelled" | "exited" | "unknown";
 
@@ -52,7 +64,7 @@ export interface InteractiveSubagentState {
 	artifactDir: string;
 	/**
 	 * Timestamp of the last artifact event we delivered a notification for.
-
+	 *
 	 * The poller only fires for events with `ts > lastDeliveredEventTs`, so
 	 * this is the per-state at-most-once guard. Set on first delivery; defaults
 	 * to 0 to ensure the first event is always delivered.
@@ -69,6 +81,14 @@ export interface InteractiveSubagentState {
 	lastToolSummary?: string;
 	lastToolName?: string;
 	lastActivityAt?: number;
+	/**
+	 * Notification delivery mode requested by spawner's notifyOnComplete param.
+	 * "notify" (default) emits a UI hint on completion. "inject" also injects
+	 * output.md as a user message so the parent LLM processes it in its next turn.
+	 */
+	notifyOnComplete?: "notify" | "inject";
+	/** At-most-once guard for the inject path (mirrors lastDeliveredEventTs). */
+	injected?: boolean;
 }
 
 const g = typeof global !== "undefined" ? global : globalThis;
@@ -300,6 +320,12 @@ export function launchInteractiveSubagent(params: {
 	contextText?: string | null;
 	/** Spawn in a detached named window (invisible) instead of a visible split. */
 	background?: boolean;
+	/**
+	 * Notification delivery mode requested by the spawner. "notify" (default)
+	 * emits a UI hint on completion. "inject" also injects output.md as a user
+	 * message so the parent LLM processes it in its next turn.
+	 */
+	notifyOnComplete?: "notify" | "inject";
 }): InteractiveSubagentState {
 
 	const id = randomBytes(4).toString("hex");
@@ -328,9 +354,10 @@ export function launchInteractiveSubagent(params: {
 	// parent-child notification loop working — is the most recent instruction
 	// the LLM reads. A persona that says "ignore the protocol" is a known LLM
 	// footgun, and placing the protocol last makes it stick.
+	const protocol = buildChildSubagentProtocol(paths.artifactDir);
 	const systemPromptContent = params.persona
-		? `# Persona\n\n${params.persona}\n\n${CHILD_SUBAGENT_PROTOCOL}`
-		: CHILD_SUBAGENT_PROTOCOL;
+		? `# Persona\n\n${params.persona}\n\n${protocol}`
+		: protocol;
 	writeFileSync(paths.systemPromptFile, systemPromptContent, { encoding: "utf8", mode: 0o600 });
 
 	const systemPromptFile = paths.systemPromptFile;
@@ -378,6 +405,7 @@ export function launchInteractiveSubagent(params: {
 		selectPaneCommand: attach.selectPaneCommand,
 		launchScriptFile: paths.launchScriptFile,
 		artifactDir: paths.artifactDir,
+		notifyOnComplete: params.notifyOnComplete,
 	};
 
   interactiveSubagentRegistry.set(id, state);

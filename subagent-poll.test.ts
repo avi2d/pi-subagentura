@@ -7,9 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEvent, artifactPath } from "./artifact";
+import { appendEvent, artifactPath, writeOutput } from "./artifact";
 import { importFresh } from "./test-utils";
-
 function makeTmp(): string {
 	return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
 }
@@ -194,6 +193,120 @@ describe("pollArtifactChanges", () => {
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	// Inject-mode tests: when a sub-agent is spawned with notifyOnComplete:
+	// "inject" and finishes with a `done` event, the poller also calls
+	// pi.sendUserMessage with output.md so the parent LLM processes it in its
+	// next turn. Mirrors the async subagent's inject delivery.
+	describe("inject mode for interactive sub-agents", () => {
+		beforeEach(() => {
+			(globalThis as any).__piSubagenturaInjectCount = 0;
+		});
+
+		it("calls sendUserMessage with output.md on done when state.notifyOnComplete === 'inject'", async () => {
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			state.notifyOnComplete = "inject";
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "the sub-agent's final answer");
+
+			const sendMessage = vi.fn();
+			const sendUserMessage = vi.fn();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+			// Both the pointer notification and the inject fire.
+			expect(sendMessage).toHaveBeenCalledTimes(1);
+			expect(sendUserMessage).toHaveBeenCalledTimes(1);
+			const [userContent, userOpts] = sendUserMessage.mock.calls[0];
+			expect(userContent).toBe("the sub-agent's final answer");
+			expect(userOpts).toMatchObject({ deliverAs: "followUp" });
+			// At-most-once guard flipped.
+			expect(state.injected).toBe(true);
+		});
+
+		it("does NOT call sendUserMessage when state.notifyOnComplete is unset (default: notify)", async () => {
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "should not be injected");
+
+			const sendMessage = vi.fn();
+			const sendUserMessage = vi.fn();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+			// Pointer fires; inject does not.
+			expect(sendMessage).toHaveBeenCalledTimes(1);
+			expect(sendUserMessage).not.toHaveBeenCalled();
+			expect(state.injected).toBeUndefined();
+		});
+
+		it("does NOT call sendUserMessage when state.notifyOnComplete === 'notify' (explicit)", async () => {
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			state.notifyOnComplete = "notify";
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "should not be injected");
+
+			const sendMessage = vi.fn();
+			const sendUserMessage = vi.fn();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+			expect(sendMessage).toHaveBeenCalledTimes(1);
+			expect(sendUserMessage).not.toHaveBeenCalled();
+		});
+
+		it("is at-most-once: a second poll does NOT re-inject (state.injected guard)", async () => {
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			state.notifyOnComplete = "inject";
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "the answer");
+
+			const sendMessage = vi.fn();
+			const sendUserMessage = vi.fn();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+			expect(sendUserMessage).toHaveBeenCalledTimes(1);
+
+			// Second poll: no new events (cursor advanced), inject is gated by state.injected.
+			sendMessage.mockClear();
+			sendUserMessage.mockClear();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+			expect(sendMessage).not.toHaveBeenCalled();
+			expect(sendUserMessage).not.toHaveBeenCalled();
+		});
+
+		it("does not call sendUserMessage when output.md is missing", async () => {
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			state.notifyOnComplete = "inject";
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			// Intentionally NOT writing output.md
+
+			const sendMessage = vi.fn();
+			const sendUserMessage = vi.fn();
+			mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+			// output.md missing: inject is skipped, but the state is still marked injected
+			// to prevent re-attempts on later polls.
+			expect(sendUserMessage).not.toHaveBeenCalled();
+			expect(state.injected).toBe(true);
+		});
 	});
 });
 

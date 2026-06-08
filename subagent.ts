@@ -357,6 +357,12 @@ const InteractiveParams = Type.Object({
         "Spawn the sub-agent in a detached named window (hidden from your tmux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
     })
   ),
+  notifyOnComplete: Type.Optional(
+    Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
+      description:
+        'How to surface the sub-agent result on completion. "notify" (default) just emits a UI hint. "inject" also injects the output as a user message so the parent LLM processes it in its next turn.',
+    }),
+  ),
 });
 
 
@@ -518,6 +524,50 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 				deliverArtifactNotification(interactivePi, state, ev);
 			}
 			state.lastDeliveredEventTs = maxTs;
+		}
+
+		// Inject-mode delivery: on a fresh `done` event, also push output.md into the
+		// parent LLM's next turn. Mirrors deliverNotification's MAX_INJECT cap so many
+		// concurrent completions cannot blow up the conversation. Gated on
+		// `state.injected` to fire at most once per sub-agent.
+		if (
+			last &&
+			last.type === "done" &&
+			state.notifyOnComplete === "inject" &&
+			!state.injected
+		) {
+			const output = readOutput(art);
+			if (output !== null) {
+				if (getInjectCount() >= MAX_INJECT) {
+					// Degrade silently: pointer notification was already delivered above,
+					// so the user still sees a hint. We just don't inject.
+					try {
+						interactivePi.sendMessage!(
+							{
+								customType: "subagent-notify",
+								content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
+								display: true,
+								details: { subagentId: state.id, mode: "notify" },
+							},
+							{ deliverAs: "followUp" },
+						);
+					} catch { /* pi stale */ }
+				} else {
+					incrementInjectCount();
+					try {
+						(interactivePi as any).sendUserMessage?.(
+							output || "(sub-agent produced no output)",
+							{ deliverAs: "followUp" },
+						);
+					} finally {
+						decrementInjectCount();
+					}
+				}
+			}
+			// Mark injected unconditionally so we don't re-attempt on a subsequent poll
+			// when the cap flips back under threshold. The pointer notification is still
+			// gated by `lastDeliveredEventTs`, so re-polls are no-ops anyway.
+			state.injected = true;
 		}
 
 
@@ -1727,6 +1777,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: targetCwd,
 				contextText,
 				background: params.background, // defaults to true (hidden) inside the helper
+				notifyOnComplete: params.notifyOnComplete ?? "notify",
 			});
 
 

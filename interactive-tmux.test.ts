@@ -305,29 +305,59 @@ describe("interactive-tmux", () => {
 });
 
   // ------------------------------------------------------------------
-  // Tests for the child completion protocol (CHILD_SUBAGENT_PROTOCOL),
+  // Tests for the child completion protocol (buildChildSubagentProtocol),
   // the always-write system prompt behavior, the --append-system-prompt
   // wiring, and the buildPiInteractiveCommand CLI builder.
   // ------------------------------------------------------------------
 
-  describe("CHILD_SUBAGENT_PROTOCOL", () => {
+  describe("buildChildSubagentProtocol", () => {
+    // Fixture artifact dir used by the protocol tests. The function bakes the
+    // path into the rendered prompt, so each test asserts against the same value.
+    const FIXTURE_DIR = "/tmp/pi-subagentura-fixture";
+
     it("names all three completion signals (done / error / cancelled)", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
-      expect(CHILD_SUBAGENT_PROTOCOL).toContain("done");
-      expect(CHILD_SUBAGENT_PROTOCOL).toContain("error");
-      expect(CHILD_SUBAGENT_PROTOCOL).toContain("cancelled");
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      expect(protocol).toContain("done");
+      expect(protocol).toContain("error");
+      expect(protocol).toContain("cancelled");
     });
 
-    it("points the child to the two artifact paths", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
-      expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/output.md");
-      expect(CHILD_SUBAGENT_PROTOCOL).toContain("$ARTIFACT_DIR/cli.mjs");
+    it("points the child to the literal artifact paths (no shell var for write tool)", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      // The rendered protocol must use the literal absolute path, not a shell var.
+      expect(protocol).toContain(`${FIXTURE_DIR}/cli.mjs`);
+      expect(protocol).toContain(`${FIXTURE_DIR}/output.md`);
+      // The literal path appears FIRST, before any explanatory mention of
+      // $ARTIFACT_DIR/output.md, so the LLM sees the actionable form first.
+      const literalIdx = protocol.indexOf(`${FIXTURE_DIR}/output.md`);
+      const explanatoryIdx = protocol.indexOf("$ARTIFACT_DIR/output.md");
+      expect(literalIdx).toBeGreaterThan(-1);
+      expect(explanatoryIdx).toBeGreaterThan(-1);
+      expect(literalIdx).toBeLessThan(explanatoryIdx);
+    });
+
+    it("still shows the bash $ARTIFACT_DIR form for cli.mjs (env-var shell usage)", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      // The bash examples still use $ARTIFACT_DIR because the launch script exports it.
+      expect(protocol).toContain("$ARTIFACT_DIR/cli.mjs");
     });
 
     it("tells the child to keep the REPL open after done", async () => {
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
-      expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/REPL stays open/i);
-      expect(CHILD_SUBAGENT_PROTOCOL).toMatch(/do not exit/i);
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      expect(protocol).toMatch(/REPL stays open/i);
+      expect(protocol).toMatch(/do not exit/i);
+    });
+
+    it("embeds the literal artifact dir in the rendered prompt", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol("/tmp/some-other-dir");
+      expect(protocol).toContain("/tmp/some-other-dir");
+      // Sanity: the fixture from a different call must not appear here.
+      expect(protocol).not.toContain("/tmp/pi-subagentura-fixture");
     });
   });
 
@@ -353,14 +383,16 @@ describe("interactive-tmux", () => {
       });
 
       const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
-      const { CHILD_SUBAGENT_PROTOCOL } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const state = mod.launchInteractiveSubagent({ name: "NoPersona", task: "x", cwd: tmp });
       const sysFile = join(state.artifactDir, "nopersona-system.md");
 
 
       expect(existsSync(sysFile)).toBe(true);
       const content = readFileSync(sysFile, "utf8");
-      expect(content).toBe(CHILD_SUBAGENT_PROTOCOL);
+      // The system prompt must match the protocol function output for the
+      // sub-agent's resolved artifactDir (the literal absolute path).
+      expect(content).toBe(buildChildSubagentProtocol(state.artifactDir));
       expect(statSync(sysFile).mode & 0o777).toBe(0o600);
     });
 
@@ -447,6 +479,87 @@ describe("interactive-tmux", () => {
       expect(launchScript).toContain("--append-system-prompt");
       // Filename should appear (shell-escaped) in the launch script.
       expect(launchScript).toMatch(/wire-system\.md/);
+    });
+  });
+
+  describe("InteractiveSubagentState.notifyOnComplete", () => {
+    // The state field and the launchInteractiveSubagent param are the two
+    // integration points for the inject-mode feature. Launching a real tmux
+    // pane in tests is impractical, so we only assert the param shape / default
+    // value: the helper must accept notifyOnComplete and propagate it to the
+    // returned state, defaulting to undefined when omitted.
+
+    beforeEach(() => {
+      vi.doUnmock("node:fs");
+    });
+
+    it("is undefined on the state when notifyOnComplete is not passed to launchInteractiveSubagent", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const state = mod.launchInteractiveSubagent({ name: "NoNotify", task: "x", cwd: tmp });
+
+      // Default: no notification mode requested. The poller falls back to notify.
+      expect(state.notifyOnComplete).toBeUndefined();
+      expect(state.injected).toBeUndefined();
+    });
+
+    it("propagates notifyOnComplete: 'inject' from launchInteractiveSubagent to the state", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const state = mod.launchInteractiveSubagent({
+        name: "InjectMode",
+        task: "x",
+        cwd: tmp,
+        notifyOnComplete: "inject",
+      });
+
+      expect(state.notifyOnComplete).toBe("inject");
+    });
+
+    it("propagates notifyOnComplete: 'notify' from launchInteractiveSubagent to the state", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const state = mod.launchInteractiveSubagent({
+        name: "NotifyMode",
+        task: "x",
+        cwd: tmp,
+        notifyOnComplete: "notify",
+      });
+
+      expect(state.notifyOnComplete).toBe("notify");
     });
   });
 
