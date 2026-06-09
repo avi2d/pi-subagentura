@@ -360,7 +360,7 @@ const InteractiveParams = Type.Object({
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
-        'How to surface the sub-agent result on completion. "notify" (default) just emits a UI hint. "inject" also injects the output as a user message so the parent LLM processes it in its next turn.',
+        'How to surface the sub-agent result on completion. "inject" (default) also injects output.md as a user message so the parent LLM processes it in its next turn. "notify" emits a UI hint only — no LLM turn is triggered. Falls back to a pointer hint if the inject cap is exceeded.',
     }),
   ),
 });
@@ -1777,7 +1777,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: targetCwd,
 				contextText,
 				background: params.background, // defaults to true (hidden) inside the helper
-				notifyOnComplete: params.notifyOnComplete ?? "notify",
+				notifyOnComplete: params.notifyOnComplete ?? "inject",
 			});
 
 
