@@ -58,6 +58,7 @@ import {
 	type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
+import type { Usage } from "./helpers";
 
 import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -65,6 +66,13 @@ import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import ndjson from "ndjson";
+
+export type SubagentDetails =
+  | { status: "started"; jobId: string; contextMessages: number }
+  | { status: "running"; subagentStatus: SubagentLiveStatus; model?: string }
+  | { status: "done" | "error"; usage: Usage; model?: string; usageSummary?: string; contextMessages?: number }
+  | { status: "cancelled" | "not_found" }
+  | { status: "invalid_id"; id: string };
 // ── Footer Status Key ─────────────────────────────────────────────────────────────────────
 const FOOTER_KEY = "subagentura-running";
 const WIDGET_KEY = "subagentura-activity";
@@ -81,10 +89,8 @@ async function runSubagent(
   cwd: string,
   contextText: string | null,
   signal: AbortSignal | undefined,
-  // @ts-expect-error — AgentToolResult<T> requires type arg; unknown is a safe placeholder
-  onUpdate: ((partial: AgentToolResult) => void) | undefined,
-  // @ts-expect-error — Model<TApi> requires type arg; unknown is a safe placeholder
-  defaultModel: Model | undefined,
+  onUpdate: ((partial: AgentToolResult<any>) => void) | undefined,
+  defaultModel: Model<any> | undefined,
   parentModelRegistry: ModelRegistry | undefined,
 ): Promise<SubagentResult> {
   try {
@@ -148,22 +154,20 @@ function renderSubagentCall(
 }
 
 function renderSubagentResult(
-  // @ts-expect-error — AgentToolResult<T> requires type arg
-  result: AgentToolResult,
+  result: AgentToolResult<any> & { isError?: boolean },
   { expanded, isPartial }: { expanded: boolean; isPartial: boolean },
   theme: Theme,
   _context: unknown,
 ) {
   // Async spawn result: show compact "started" display
-  if ((result.details as Record<string, unknown>)?.status === "started") {
-    return renderAsyncSpawn(result.details as Record<string, unknown>, theme);
+  if (result.details?.status === "started") {
+    return renderAsyncSpawn(result.details, theme);
   }
 
   if (isPartial) {
-    const status = result.details?.subagentStatus as
-      | SubagentLiveStatus
-      | undefined;
-    const model = result.details?.model as string | undefined;
+    const runningDetails = result.details?.status === "running" ? result.details : undefined;
+    const status = runningDetails?.subagentStatus;
+    const model = runningDetails?.model;
 
     let text =
       theme.fg("accent", "● ") + theme.fg("toolTitle", "Sub-agent working");
@@ -217,7 +221,7 @@ function renderSubagentResult(
     return new Text(theme.fg("error", text), 0, 0);
   }
 
-  const usageStr = result.details?.usageSummary as string | undefined;
+  const usageStr = (result.details as { usageSummary?: string } | undefined)?.usageSummary;
 
   if (usageStr) {
     const header = theme.fg("success", "✓ ") + theme.fg("muted", usageStr);
@@ -239,10 +243,10 @@ function renderSubagentResult(
  * Compact display: "⚡ Sub-agent started — job abc12345"
  */
 function renderAsyncSpawn(
-  details: Record<string, unknown>,
+  details: Extract<SubagentDetails, { status: "started" }>,
   theme: Theme,
 ): Text {
-  const jobId = String(details.jobId ?? "unknown");
+  const jobId = details.jobId;
   const text =
     theme.fg("accent", "⚡ ") +
     theme.fg("toolTitle", `Sub-agent started — job ${jobId}`) +
@@ -503,8 +507,8 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 				state.status = "cancelled";
 			} else {
 				state.status = "exited";
+				if (last.exitCode !== undefined) state.exitCode = last.exitCode;
 			}
-			if (last.exitCode !== undefined) state.exitCode = last.exitCode;
 		}
 
 		// Tail-read the child's session log and synthesize tool_activity events.
@@ -718,26 +722,28 @@ function tailReadSessionLog(state: InteractiveSubagentState, _art: SubagentArtif
 }
 
 /** Process a single parsed JSONL entry from the session log; append tool_activity events. */
-function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentArtifact, entry: any): void {
-	if (entry.type !== "message") return;
-	const msg = entry.message;
+function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentArtifact, entry: Record<string, unknown>): void {
+	const e = entry as { type?: string; message?: Record<string, unknown> };
+	if (e.type !== "message") return;
+	const msg = e.message;
 	if (!msg) return;
 
 	// Assistant message: extract toolCall blocks.
 	if (msg.role === "assistant" && Array.isArray(msg.content)) {
-		for (const block of msg.content) {
-			if (block.type !== "toolCall") continue;
-			const summary = summarizeToolCall(block.name, block.arguments);
+		for (const rawBlock of msg.content) {
+			const block = rawBlock as { type?: string; name?: string; arguments?: unknown } | undefined;
+			if (!block || block.type !== "toolCall") continue;
+			const summary = summarizeToolCall(block.name ?? "", block.arguments);
 			if (!summary) continue;
 			const ev: SubagentEvent = {
-				ts: msg.timestamp ?? Date.now(),
+				ts: (msg.timestamp as number) ?? Date.now(),
 				type: "tool_activity",
 				status: "running",
-				tool: block.name,
+				tool: block.name ?? "",
 				summary,
 			};
 			appendEvent(art, ev);
-			state.lastToolName = block.name;
+			state.lastToolName = block.name ?? "";
 			state.lastToolSummary = summary;
 			state.lastActivityAt = ev.ts;
 		}
@@ -745,18 +751,19 @@ function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentAr
 }
 
 /** Short, human-readable summary of a tool call. Returns null for uninteresting tools. */
-function summarizeToolCall(name: string, args: any): string | null {
+function summarizeToolCall(name: string, args: unknown): string | null {
 	if (!args || typeof args !== "object") return null;
+	const a = args as Record<string, unknown>;
 	switch (name) {
 		case "bash": {
-			const cmd = typeof args.command === "string" ? args.command : null;
+			const cmd = typeof a.command === "string" ? a.command : null;
 			if (!cmd) return null;
 			return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
 		}
 		case "write":
 		case "edit":
 		case "read": {
-			const p = typeof args.path === "string" ? args.path : null;
+			const p = typeof a.path === "string" ? a.path : null;
 			if (!p) return null;
 			return p;
 		}
@@ -816,37 +823,44 @@ function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagen
 	}
 }
 
-function iconFor(event: SubagentEvent): string {
-	switch (event.type) {
-		case "started":
-		case "tool_activity":
+/** Assert that a value is never (exhaustiveness checker). */
+function assertNever(value: never): never {
+	throw new Error(`Unexpected value: ${value}`);
+}
 
-			return "▶";
-		case "done":
-			return event.exitCode === 0 ? "✅" : "❌";
-		case "error":
-			return "❌";
-		case "cancelled":
-			return "🚫";
-	}
+function iconFor(event: SubagentEvent): string {
+  switch (event.type) {
+    case "started":
+    case "tool_activity":
+      return "▶";
+    case "done":
+      return event.exitCode === 0 ? "✅" : "❌";
+    case "error":
+      return "❌";
+    case "cancelled":
+      return "🚫";
+    default:
+      return assertNever(event);
+  }
 }
 
 function labelFor(event: SubagentEvent): string {
-	switch (event.type) {
-		case "tool_activity":
-
-			return "activity";
-		case "done":
-			return `done (exit ${event.exitCode ?? "?"})`;
-		case "error":
-			return "error";
-		case "cancelled":
-			return "cancelled";
-		// "started" is intentionally dropped — it would only fire on the very first poll
-		// and the widget row is a better signal than a one-shot message.
-		case "started":
-			return "started";
-	}
+  switch (event.type) {
+    case "tool_activity":
+      return "activity";
+    case "done":
+      return `done (exit ${event.exitCode ?? "?"})`;
+    case "error":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    // "started" is intentionally dropped — it would only fire on the very first poll
+    // and the widget row is a better signal than a one-shot message.
+    case "started":
+      return "started";
+    default:
+      return assertNever(event);
+  }
 }
 /**
  * Find an artifact dir for an id that isn't in the current registry. We can't use the
@@ -931,13 +945,13 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
 }
 // ── Notification TUI Renderer ──────────────────────────────────
 function renderSubagentNotify(
-	message: any,
+	message: { content?: string; details?: unknown },
 	options: { expanded?: boolean },
 	theme: Theme,
 ): Text {
-	const details = message.details as Record<string, unknown> | undefined;
+	const details = message.details as { mode?: string; result?: SubagentResult } | undefined;
 	const isInject = details?.mode === "inject";
-	const isError = details?.result && (details.result as SubagentResult).isError;
+	const isError = details?.result?.isError;
 	const text = message.content ?? "";
 
 	let line: string;
@@ -945,9 +959,7 @@ function renderSubagentNotify(
 		line = isError ? theme.fg("error", text) : theme.fg("accent", text);
 	} else {
 		const output = sanitizeOutput(
-			((details?.result as SubagentResult)?.output ?? "")
-				.slice(0, 500)
-				.replace(/\s+/g, " "),
+			(details?.result?.output ?? "").slice(0, 500).replace(/\s+/g, " "),
 		);
 		const header = isInject
 			? theme.fg("accent", "⚡ Injected Sub-agent Result")
@@ -1202,7 +1214,8 @@ export default function (pi: ExtensionAPI) {
       );
 
       const usageStr = formatUsage(result.usage, result.model);
-      const details: Record<string, unknown> = {
+      const details: SubagentDetails = {
+        status: result.isError ? "error" : "done",
         contextMessages: messages.length,
         usage: result.usage,
         model: result.model,
@@ -1406,7 +1419,8 @@ export default function (pi: ExtensionAPI) {
       );
 
       const usageStr = formatUsage(result.usage, result.model);
-      const details: Record<string, unknown> = {
+      const details: SubagentDetails = {
+        status: result.isError ? "error" : "done",
         usage: result.usage,
         model: result.model,
         usageSummary: usageStr,
@@ -1503,7 +1517,7 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, options, theme, context) {
-      const details = result.details as Record<string, unknown> | undefined;
+      const details = result.details as SubagentDetails | undefined;
       if (details?.status === "running") {
         // Force isPartial to get the live preview rendering
         return renderSubagentResult(
@@ -1586,7 +1600,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       const usageStr = formatUsage(result.usage, result.model);
-      const details: Record<string, unknown> = {
+      const details: SubagentDetails = {
+        status: result.isError ? "error" : "done",
         usage: result.usage,
         model: result.model,
         usageSummary: usageStr,
@@ -1716,7 +1731,7 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme, _context) {
-      const details = result.details as Record<string, unknown> | undefined;
+      const details = result.details as (SubagentDetails & { jobId?: string }) | undefined;
       const jobId = String(details?.jobId ?? "unknown");
       const cancelled = details?.status === "cancelled";
       const firstContent = result.content?.[0];
@@ -2151,7 +2166,7 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme, _context) {
-      const details = result.details as Record<string, unknown> | undefined;
+      const details = result.details as { removed?: number } | undefined;
       const removed = Number(details?.removed ?? 0);
       const text =
         removed > 0

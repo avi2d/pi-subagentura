@@ -90,16 +90,16 @@ describe("session_shutdown handler", () => {
     // Stub the global timers. setInterval returns a fake handle with a
     // vi.fn() unref method; clearInterval is a no-op spy.
     fakeHandle = { unref: vi.fn() };
-    setIntervalSpy = vi
+    setIntervalSpy = (vi
       .spyOn(globalThis, "setInterval")
-      .mockReturnValue(fakeHandle as any);
-    clearIntervalSpy = vi
+      .mockReturnValue(fakeHandle as any)) as any;
+    clearIntervalSpy = (vi
       .spyOn(globalThis, "clearInterval")
-      .mockImplementation(() => {});
+      .mockImplementation(() => {})) as any;
 
     // Spy on cancelInteractiveSubagent so the handler's iteration logic
     // can be observed without touching the filesystem or running tmux.
-    cancelSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagent");
+    cancelSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagent") as any;
     cancelSpy.mockImplementation(((id: string) =>
       interactiveTmux.interactiveSubagentRegistry.get(id)) as any);
   });

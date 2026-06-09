@@ -91,16 +91,15 @@ export interface InteractiveSubagentState {
 	injected?: boolean;
 }
 
-const g = typeof global !== "undefined" ? global : globalThis;
-
-if (!g.__piSubagenturaInteractiveRegistry) {
-  g.__piSubagenturaInteractiveRegistry = new Map<string, InteractiveSubagentState>();
+declare global {
+	var __piSubagenturaInteractiveRegistry: Map<string, InteractiveSubagentState> | undefined;
 }
 
-export const interactiveSubagentRegistry = g.__piSubagenturaInteractiveRegistry as Map<
-  string,
-  InteractiveSubagentState
->;
+if (!globalThis.__piSubagenturaInteractiveRegistry) {
+	globalThis.__piSubagenturaInteractiveRegistry = new Map<string, InteractiveSubagentState>();
+}
+
+export const interactiveSubagentRegistry = globalThis.__piSubagenturaInteractiveRegistry!;
 
 function commandExists(command: string): boolean {
   try {
@@ -501,8 +500,8 @@ export function pruneDeadInteractiveSubagents(): void {
 				state.status = "cancelled";
 			} else {
 				state.status = "exited";
+				if (last.exitCode !== undefined) state.exitCode = last.exitCode;
 			}
-			if (last.exitCode !== undefined) state.exitCode = last.exitCode;
 			continue;
 		}
 		// Fallback: pane object itself is gone (tmux server died, kill-pane ran before trap).

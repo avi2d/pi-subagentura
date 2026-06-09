@@ -20,21 +20,17 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { join } from "node:path";
 import ndjson from "ndjson";
 
+
 // ── Types ───────────────────────────────────────────────────────────
 
 export type SubagentStatus = "running" | "done" | "error" | "cancelled";
 
-export interface SubagentEvent {
-	/** Unix epoch milliseconds */
-	ts: number;
-	type: "started" | "tool_activity" | "done" | "error" | "cancelled";
-	status: SubagentStatus;
-	message?: string;
-	/** For tool_activity: which tool was called and a short arg summary. */
-	tool?: string;
-	summary?: string;
-	exitCode?: number;
-}
+export type SubagentEvent =
+	| { ts: number; type: "started"; status: "running"; message?: string }
+	| { ts: number; type: "tool_activity"; status: "running"; tool?: string; summary?: string; message?: string }
+	| { ts: number; type: "done"; status: "done"; exitCode?: number; message?: string; summary?: string }
+	| { ts: number; type: "error"; status: "error"; message?: string; exitCode?: number }
+	| { ts: number; type: "cancelled"; status: "cancelled"; message?: string };
 
 
 export interface SubagentArtifact {

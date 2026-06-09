@@ -693,7 +693,6 @@ describe("race condition: cancel during await", () => {
         cost: 0,
         turns: 0,
       },
-      model: "test/model",
       isError: true,
       errorMessage: "The operation was aborted",
     });
@@ -811,6 +810,7 @@ describe("cancellation guard in promise chain", () => {
         turns: 0,
       },
       isError: true,
+      errorMessage: "cancelled before completion",
     });
     jobRegistry.set(job.id, job);
     if (job.status !== "cancelled") {
@@ -866,6 +866,7 @@ describe("cancellation guard in promise chain", () => {
         turns: 0,
       },
       isError: true,
+      errorMessage: "cancelled before completion",
     });
     if (job.status !== "cancelled") {
       throw new Error("Guard should have prevented this");

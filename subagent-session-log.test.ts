@@ -98,10 +98,13 @@ describe("session-log tail-read", () => {
 		const art = artifactPath(join(artifactDir, ".."), state.id);
 		const events = readEvents(art);
 		expect(events).toHaveLength(1);
-		expect(events[0].type).toBe("tool_activity");
-		expect(events[0].tool).toBe("bash");
-		expect(events[0].summary).toBe("rg TODO src/");
-		expect(events[0].status).toBe("running");
+		const event = events[0];
+		expect(event.type).toBe("tool_activity");
+		if (event.type === "tool_activity") {
+			expect(event.tool).toBe("bash");
+			expect(event.summary).toBe("rg TODO src/");
+		}
+		expect(event.status).toBe("running");
 		// Cursor advanced.
 		expect(state.lastDeliveredSessionByte).toBeGreaterThan(0);
 	});

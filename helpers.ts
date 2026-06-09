@@ -11,8 +11,6 @@ import { resolve } from "node:path";
 import { getModel, getProviders } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai";
 
-// Note: Model<TApi> and AgentToolResult<T> are SDK generics. We use `unknown` as
-// the type argument to avoid strict generic instantiation issues with tsc.
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import {
@@ -21,8 +19,11 @@ import {
   ModelRegistry,
   SessionManager,
   type AgentSession,
+  type AgentSessionEvent,
+  type ExtensionAPI,
+  type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-
+import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
 const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
@@ -82,26 +83,24 @@ export const ACTIVE_TOOL_DEBOUNCE_MS = 150;
 
 // ── Types ───────────────────────────────────────────────────────────
 
-export interface SubagentResult {
-  output: string;
-  usage: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    cost: number;
-    turns: number;
-  };
-  model?: string;
-  isError: boolean;
-  errorMessage?: string;
+export interface Usage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  turns: number;
 }
+
+export type SubagentResult =
+  | { isError: false; output: string; usage: Usage; model?: string }
+  | { isError: true; output: string; usage: Usage; model?: undefined; errorMessage: string };
 
 export interface SubagentLiveStatus {
   turn: number;
   activeTool?: { name: string; args: Record<string, unknown> };
   output: string;
-  usage: SubagentResult["usage"];
+  usage: Usage;
 }
 
 // ── Async Job Types ─────────────────────────────────────────────────
@@ -152,9 +151,13 @@ if (!g.__piSubagenturaRegistry) {
 
 export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 
-// Declare global piref for notification delivery (set by extension factory, read by delivery code)
 declare global {
-  var __piSubagenturaPiRef: unknown; // ExtensionAPI ref — set in subagent.ts factory
+  var __piSubagenturaRegistry: Map<string, JobState> | undefined;
+  var __piSubagenturaInteractiveRegistry: Map<string, InteractiveSubagentState> | undefined;
+  var __piSubagenturaPiRef: ExtensionAPI | undefined;
+  var __piSubagenturaUi: ExtensionUIContext | undefined;
+  var __piSubagenturaInjectCount: number | undefined;
+  var __piSubagenturaInteractivePollerHandle: ReturnType<typeof setInterval> | undefined;
 }
 
 // Initialize the global pi ref
@@ -230,8 +233,7 @@ export function generateJobId(): string {
  */
 export function resolveModel(
   modelId: string | undefined,
-  // @ts-expect-error — Model<TApi> requires type arg; unknown is a safe placeholder
-  defaultModel: Model | undefined,
+  defaultModel: Model<any> | undefined,
   parentModelRegistry?: ModelRegistry,
 ) {
   if (!modelId) return defaultModel;
@@ -254,14 +256,12 @@ export function resolveModel(
   // Fall back to global static registry (built-in models only)
   if (modelId.includes("/")) {
     const [provider, id] = modelId.split("/", 2);
-    // @ts-expect-error — getModel requires KnownProvider union; we trust the caller
-    return getModel(provider, id) ?? defaultModel;
+    return getModel(provider as any, id) ?? defaultModel;
   }
 
   // Bare id — exact match across all providers
   for (const provider of getProviders()) {
-    // @ts-expect-error — KnownProvider cast needed; string is assignable to it at runtime
-    const found = getModel(provider, modelId);
+    const found = getModel(provider as any, modelId);
     if (found) return found;
   }
 
@@ -275,7 +275,7 @@ export function formatTokens(count: number): string {
 }
 
 export function formatUsage(
-  u: SubagentResult["usage"],
+  u: Usage,
   model?: string,
 ): string {
   const parts: string[] = [];
@@ -292,8 +292,7 @@ export function formatUsage(
 export function buildLiveUpdate(
   status: SubagentLiveStatus,
   model?: string,
-  // @ts-expect-error — AgentToolResult<T> requires type arg; unknown is a safe placeholder
-): AgentToolResult {
+): AgentToolResult<any> {
   return {
     content: [{ type: "text", text: status.output }],
     details: {
@@ -313,10 +312,8 @@ export interface StartSubagentJobParams {
   cwd: string;
   contextText: string | null;
   signal: AbortSignal | undefined;
-  // @ts-expect-error — AgentToolResult<T> requires type arg
-  onUpdate: ((partial: AgentToolResult) => void) | undefined;
-  // @ts-expect-error — Model<TApi> requires type arg
-  defaultModel: Model | undefined;
+  onUpdate: ((partial: AgentToolResult<any>) => void) | undefined;
+  defaultModel: Model<any> | undefined;
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
@@ -466,7 +463,7 @@ export async function startSubagentJob(
   }
 
   // Wire session events
-  unsubscribe = session.subscribe((event) => {
+  unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     switch (event.type) {
       case "turn_start": {
         liveStatus.turn++;
@@ -480,11 +477,11 @@ export async function startSubagentJob(
         debugLog("info", "tool_start", {
           jobId,
           toolName: event.toolName,
-          args: event.args as Record<string, unknown>,
+          args: event.args,
         });
         setActiveToolDebounced({
           name: event.toolName,
-          args: event.args as Record<string, unknown>,
+          args: event.args,
         });
         break;
       }
@@ -548,7 +545,7 @@ export async function startSubagentJob(
   // Launch the prompt in a promise chain (NOT awaited — returns immediately).
   // The jobPromise represents the full lifecycle: prompt → extraction → cleanup.
   const jobPromise = (async (): Promise<SubagentResult> => {
-    let result: SubagentResult;
+    let result!: SubagentResult;
     try {
       debugLog("info", "prompt_start", { jobId });
       await session.prompt(finalPrompt);
@@ -602,15 +599,24 @@ export async function startSubagentJob(
         }
       }
 
-      result = {
-        output: finalOutput || "(no output)",
-        usage,
-        model: session.model
-          ? `${session.model.provider}/${session.model.id}`
-          : undefined,
-        isError: !!session.agent.state.errorMessage,
-        errorMessage: session.agent.state.errorMessage,
-      };
+      if (session.agent.state.errorMessage) {
+        result = {
+          isError: true,
+          output: finalOutput || "(no output)",
+          usage,
+          model: undefined,
+          errorMessage: session.agent.state.errorMessage,
+        };
+      } else {
+        result = {
+          isError: false,
+          output: finalOutput || "(no output)",
+          usage,
+          model: session.model
+            ? `${session.model.provider}/${session.model.id}`
+            : undefined,
+        };
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
@@ -640,7 +646,7 @@ export async function startSubagentJob(
         outputLength: result.output.length,
         output: result.output.slice(0, 200),
         isError: result.isError,
-        errorMessage: result.errorMessage ?? null,
+        errorMessage: "errorMessage" in result ? result.errorMessage : null,
         usage: result.usage,
       });
       if (activeToolTimer) {
