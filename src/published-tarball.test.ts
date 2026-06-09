@@ -26,7 +26,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const REPO = resolve(fileURLToPath(import.meta.url), "..");
+const REPO = resolve(fileURLToPath(import.meta.url), "..", "..");
 const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
 	name: string;
 	version: string;
@@ -84,7 +84,7 @@ function localImports(source: string): string[] {
 
 /** Local module `./foo` resolves to either `./foo.ts` or `./foo/index.ts`. */
 function resolvesInTarball(mod: string, entries: string[]): boolean {
-	return entries.includes(`${mod}.ts`) || entries.includes(`${mod}/index.ts`);
+	return entries.includes(`src/${mod}.ts`) || entries.includes(`src/${mod}/index.ts`);
 }
 
 describe("published tarball", () => {
@@ -110,16 +110,16 @@ describe("published tarball", () => {
 		const missing = PKG.files.filter((f) => !entries.includes(f));
 		expect(
 			missing,
-			`tarball is missing files declared in package.json: ${missing.join(", ")}`,
+			`tarball is missing files declared in package.json: ${missing.join(", ")}`
 		).toEqual([]);
 	});
 
-	it("contains helpers.ts (regression test for the v2.0.0 publish bug)", () => {
+	it("contains src/helpers.ts (regression test for the v2.0.0 publish bug)", () => {
 		expect(
 			entries,
-			"helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
-				"Re-add it to package.json `files`.",
-		).toContain("helpers.ts");
+			"src/helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
+				"Re-add it to package.json `files`."
+		).toContain("src/helpers.ts");
 	});
 
 	it("every local import in shipped .ts files resolves to a file in the tarball", () => {

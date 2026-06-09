@@ -4,7 +4,7 @@
   "description": "Public Pi package that adds in-process sub-agents via the SDK",
   "author": "lmn451",
   "license": "MIT",
-  "main": "subagent.ts",
+  "main": "src/subagent.ts",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -24,12 +24,13 @@
     "url": "https://github.com/lmn451/pi-subagentura/issues"
   },
   "files": [
-    "subagent.ts",
-    "interactive-tmux.ts",
-    "artifact.ts",
-    "subagent-artifact-cli.ts",
-    "helpers.ts",
-    "LICENSE"
+    "LICENSE",
+    "src/ndjson.d.ts",
+    "src/artifact.ts",
+    "src/helpers.ts",
+    "src/interactive-tmux.ts",
+    "src/subagent.ts",
+    "src/subagent-artifact-cli.ts"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -39,7 +40,7 @@
   },
   "pi": {
     "extensions": [
-      "./subagent.ts"
+      "./src/subagent.ts"
     ]
   },
   "scripts": {
