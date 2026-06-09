@@ -1,8 +1,10 @@
 # Plan B: Sidecar Subprocess Runner
 
-**Status:** Draft
-**Date:** 2026-06-08
-**Target release:** pi-subagentura 2.1.0
+**Status:** Draft (revised for cross-platform v1 — 2026-06-09)
+**Date:** 2026-06-08 (revised 2026-06-09)
+**Target release:** pi-subagentura 2.2.0
+**Author:** planning agent
+**Revision note:** Sections updated for cross-platform from day one: added G9 (cross-platform goal), replaced N5 (was "no Windows support") with the cross-platform contract, added §11 (compatibility matrix), reframed R10 as a regression-prevention risk, updated Q2/Q3/§4/§8 for the v1 cross-platform commitment. See commit for the full diff.
 **Author:** planning agent
 
 ## 1. One-paragraph summary
@@ -19,8 +21,8 @@ Add a new npm bin `pi-workflow-runner` that lives as a long-lived child process 
 - **G4.** The runner reuses `startSubagentJob` from `helpers.ts` and `jobRegistry` semantics — but the runner is its own process, so the registry is per-runner, not global. Workflows started by the runner are owned by the runner.
 - **G5.** Persistence: the runner writes each workflow's progress to an artifact dir (`~/.pi/agent/sessions/subagentura/workflows/<id>/events.ndjson` + `output.md`). The parent re-discovers a running workflow from disk on Pi restart, so a workflow that finishes while the parent is down is picked up on the next tool call.
 - **G6.** A single long-lived runner per parent Pi process. If the runner dies, the next `run_workflow` call spawns a fresh one. Existing in-flight workflows in the dead runner are marked `error: "runner_died"` and surfaced to the LLM on `get_workflow_result`.
-- **G7.** A TUI widget showing "1 workflow running" + the script's `ctx.log` tail, mirroring the existing `subagentura-activity` widget for sub-agents (see `subagent.ts:484-595`).
 - **G8.** Bundle one demo `demos/audit-xss.mjs` and ship `bin/pi-workflow-runner.mjs` with the published package.
+- **G9.** **Cross-platform from day one.** The runner, the protocol, the file handling, the signal handling, and the path handling must work identically on macOS, Linux, and Windows. No `chmod`, no `/tmp`, no `~/.foo`, no `process.kill(0)`, no `detached: true`, no `shell: true`. Tested on all three before release. See §11 for the full compatibility matrix.
 
 ### Non-goals
 
@@ -28,7 +30,7 @@ Add a new npm bin `pi-workflow-runner` that lives as a long-lived child process 
 - **N2.** We are NOT adding a separate CLI for users to invoke workflows by hand in v1. Workflows run via the `run_workflow` tool only. (A `pi-workflow-runner run <script>` CLI may come in v2.)
 - **N3.** We are NOT implementing checkpointing/resume in v1. The script is sync-from-the-LLM's-perspective. A script that crashes mid-run is reported as an error, period. Resumable workflows are a v3 concern.
 - **N4.** We are NOT changing the existing in-process sub-agent path. `subagent_with_context` / `subagent_isolated` still run inside the parent Pi. The runner uses `startSubagentJob` only when the workflow's script calls `ctx.spawn`.
-- **N5.** We are NOT adding Windows support. The runner uses Unix-domain sockets for control in v2 (see §3.4); stdio is the v1 transport. Windows users can still use stdio-based runners.
+- **N5.** We are NOT targeting POSIX-only signal semantics. The runner handles `SIGINT` (Unix + Windows console), `SIGTERM` (Unix), and `SIGBREAK` (Windows console) for graceful shutdown, and falls back to `subprocess.kill()` for forceful termination on both platforms. We do NOT assume Unix-domain sockets, `chmod 0o700`, `/tmp`, `~/.foo`, `process.kill(0)` liveness probes, `subprocess.spawn({ detached: true })`, or `shell: true`. See §11 for the full cross-platform compatibility matrix.
 - **N6.** We are NOT changing `interactive-tmux.ts`. The runner does not spawn tmux panes.
 
 ## 3. Public API
@@ -174,7 +176,7 @@ Same as Plan A (§3.5 of `spec-workflow-A-vm.md`). The decision is about interme
 **Key invariants**
 
 - The runner is one process. Multiple concurrent workflows share the runner's event loop. (A misbehaving workflow can still block the runner; see R1.)
-- The runner is a child of the parent Pi. If the parent dies, the runner may persist (because Node's child detachment behavior depends on `detached: true` and the parent's exit code — see §3.6 "Parent Pi is about to crash"). v1 keeps the runner attached and accepts that parent death = workflow death, with the same "picked up from artifact" recovery path.
+- The runner is a child of the parent Pi. v1 keeps the runner attached and accepts that parent death = workflow death, with the same "picked up from artifact" recovery path. v2's optional detach uses platform-appropriate flags (POSIX: `detached: true` + `ping`/`pong` liveness; Windows: best-effort `detached: true` with a documented caveat that Windows does not have a true detached-daemon primitive; see §10 Q3 and §11 for the full story).
 - The artifact dir is the source of truth. The runner's in-memory state and the parent's in-memory state are both caches. Re-discovery is by reading the artifact dir.
 - `startSubagentJob` is imported by the runner from `./helpers.js` — but the runner's `jobRegistry` is its own `Map`, isolated from the parent's. A workflow's sub-agents do not appear in the parent's `get_subagent_status`. (This is intentional: the LLM doesn't need to see them.)
 
@@ -410,7 +412,7 @@ Same prompts as Plan A (§6.3), plus:
 | **R7. Concurrent workflows writing to the same log file** | Two workflows with the same `workflowId` (LLM bug) write to the same dir. | Low | High — corrupted NDJSON. | (a) `workflowId` is a server-allocated 16 hex chars (same as `generateJobId()` in `helpers.ts:213-216`). The LLM never picks it. (b) The runner rejects duplicate `start` messages with the same `workflowId`. |
 | **R8. The runner can be `kill -9`'d by the OS** | OOM killer or admin SIGKILL. Workflow is lost. | Low | Same as R1. | (a) The artifact dir is best-effort written before each `await` point, so recovery can resume from the last completed phase. (b) v2: re-spawn + replay. |
 | **R9. `child_process.spawn` blocked in some environments** | Some sandboxed CI envs disallow subprocess spawning. The package's existing tools (sub-agents) still work in-process; the runner does not. | Medium | Low. | (a) Graceful degradation: `run_workflow` returns `isError: "runner_unavailable"`. (b) Document the requirement. (c) v2: optional Plan A fallback if the runner can't spawn. |
-| **R10. stdio on Windows** | Windows doesn't always handle `child_process.spawn` stdio pipes the way Unix does. | Medium | Medium. | (a) v1 is documented as Unix-only. (b) v2: switch to a Unix-domain-socket transport on macOS/Linux and a named pipe on Windows. The `--socket <path>` arg is already in the CLI. |
+| **R10. Cross-platform regression in a future change** | A future contributor adds a Unix-only primitive (e.g. `chmodSync`, `process.kill(0)`, a `~/.foo` path) and breaks Windows. | Medium | High. | (a) The §11 cross-platform compatibility matrix is a contract; CI matrix on `ubuntu-latest` / `macos-latest` / `windows-latest` runs on every PR and any Windows failure blocks merge. (b) A lint rule (`unicorn/prefer-path-platform`, `no-restricted-syntax` for `chmod`/`chown`/`~`) is enforced in CI. (c) The README has a "Cross-platform" section pointing at §11. |
 | **R11. `node:vm` sandbox escape** | Same as Plan A's R2. A malicious workflow can `import("node:child_process").then(cp => cp.exec("rm -rf ~"))`. | Medium | Catastrophic for the user. | (a) Same as Plan A: the trust model is "user-authored scripts only." (b) v2: optional `--trust=untrusted` mode with restricted builtins. |
 | **R12. The runner imports helpers.ts but helpers.ts imports pi runtime code** | `helpers.ts` imports from `@earendil-works/pi-coding-agent`. The runner, running as a standalone Node script, may not have a Pi runtime. | High | High — runner won't start. | (a) The runner imports `helpers.ts` only for the types and `startSubagentJob`. In the runner, `startSubagentJob` is mocked to use a stub `createAgentSession` that does nothing, and `ctx.spawn` is the only path that uses it. (b) Alternative: extract `startSubagentJob` into a sub-module that doesn't import pi runtime types — but that is invasive. (c) **Recommended:** the runner uses `createAgentSession` from `@earendil-works/pi-coding-agent` directly (same as the parent). The runtime is the same library, not a Pi-specific code path. Test that `bin/pi-workflow-runner.mjs` can `import { startSubagentJob } from "../helpers.js"` without errors. |
 
@@ -444,13 +446,14 @@ Same prompts as Plan A (§6.3), plus:
 
 ### Estimated dev time
 
-- **T = 7 working days** for one focused dev, broken down as:
-  - Day 1-2: `bin/pi-workflow-runner.mjs` — stdio transport, WorkflowRegistry, WorkflowExecutor, lifecycle CLI.
-  - Day 2-3: `workflow-runner-protocol.ts`, `workflow-runner-host.ts` — message routing, TUI widget, rehydration.
-  - Day 4: `workflow.ts` (combinators), `workflow-allowlist.ts`, integration of `run_workflow` tool into `subagent.ts`.
-  - Day 5: unit tests + integration tests + edge cases (cancel, runner-dies, maxDuration).
-  - Day 6: README, `docs/workflow-protocol.md`, demo script, `npm run typecheck` + `npm test` + `npm run pack:check`.
-  - Day 7: bug-bash, race conditions, and cross-platform smoke tests.
+- **T = 8 working days** for one focused dev, broken down as:
+  - Day 1-2: `bin/pi-workflow-runner.mjs` — stdio transport, WorkflowRegistry, WorkflowExecutor, lifecycle CLI. **All paths use `path.join` / `os.homedir()` / `os.tmpdir()`; no `chmod`, no `/tmp`, no `~/.foo`.** (See §11.)
+  - Day 2-3: `workflow-runner-protocol.ts`, `workflow-runner-host.ts` — message routing, TUI widget, rehydration. **Signal handling listens on `["SIGINT", "SIGTERM", "SIGBREAK"]`; liveness via `child.exitCode === null`, never `process.kill(0)`.** (See §11.)
+  - Day 4: `workflow.ts` (combinators), `workflow-allowlist.ts`, integration of `run_workflow` tool into `subagent.ts`. **The host's `spawn` call uses `windowsHide: true` and never `shell: true`.** (See §11.)
+  - Day 5: unit tests + integration tests + edge cases (cancel, runner-dies, maxDuration). **Long-path test, UTF-8 test, EBUSY retry test, Windows-specific `SIGBREAK` test.**
+  - Day 6: README, `docs/workflow-protocol.md` (with a "Cross-platform" subsection), demo script, `npm run typecheck` + `npm test` + `npm run pack:check`. **Lint rules wired: `unicorn/prefer-path-platform`, `no-restricted-syntax` for `chmod`/`chown`/`~`.**
+  - Day 7: bug-bash, race conditions, and a full CI matrix run on `ubuntu-latest` / `macos-latest` / `windows-latest`. Any Windows failure blocks the release.
+  - Day 8: write the §11 cross-platform docs (already done in this spec) and review the lint config + CI matrix with a second set of eyes.
 
 ### Order-of-magnitude token cost
 
@@ -471,7 +474,7 @@ None needed — nothing is removed.
 
 ### Version bump
 
-**Minor bump: `2.0.2` → `2.1.0`.** A new `bin` entry is a new feature.
+**Minor bump: `2.1.0` → `2.2.0`.** A new `bin` entry is a new feature; the previous `2.1.0` release shipped only the PR-#10 changes (literal-path prompt, inject mode, output reporting), not workflows. The package version is now 2.1.0 at the time of writing; the workflow lands in 2.2.0.
 
 ## 10. Open questions
 
@@ -483,15 +486,15 @@ None needed — nothing is removed.
 
 ### Q2. Should the protocol be NDJSON over stdio or a Unix-domain socket?
 
-- **Option A (stdio).** Simple, portable, no temp paths. Limited to ~64 KB pipe buffer on macOS, mitigated by backpressure handling.
-- **Option B (Unix-domain socket).** More setup, can survive parent death (with `detached: true` + `process.kill(0)`), allows out-of-process observers.
-- **Recommendation:** stdio for v1; add socket in v2.
+- **Option A (stdio).** Simple, portable, no temp paths, works identically on POSIX and Windows. Limited to ~64 KB pipe buffer on macOS, mitigated by backpressure handling. Already the v1 transport.
+- **Option B (named pipe on Windows / Unix-domain socket on POSIX).** More setup, can survive parent death (with platform-appropriate detach flags), allows out-of-process observers. The CLI accepts `--socket <path>` already; the named-pipe name is `\\.\pipe\pi-workflow-runner-<sessionId>` on Windows.
+- **Recommendation:** stdio for v1 across all platforms; named-pipe / Unix-socket in v2. The §11 cross-platform matrix covers the v1 stdio guarantees.
 
 ### Q3. Should the runner persist across Pi restarts?
 
 - **Option A (no).** Runner dies with the parent. Workflows that were running at parent death are marked `error: "parent_died"` and the user is told to restart.
-- **Option B (yes, via `--detached`).** The runner detaches from the parent (`subprocess.spawn({ detached: true })`) and the parent exits. On next parent startup, the host rehydrates from the artifact dir. Survives parent crashes — a key motivation for Plan B.
-- **Recommendation:** A for v1, B for v2. v1's recovery is "the user re-runs the workflow" (the script is the same file, the args are in the parent's LLM context).
+- **Option B (yes, platform-appropriate detach).** The runner detaches from the parent. **POSIX:** `subprocess.spawn({ detached: true })` + liveness check via the runner's `ping`/`pong` (NOT `process.kill(0)`, see §11). **Windows:** `subprocess.spawn({ detached: true, windowsHide: true, // NODE_OPTIONS-compatible creation flags not exposed by Node for v22; emulate by spawning via `cmd.exe /c start /B <binPath>` is rejected — instead use `child_process.spawn` with `detached: true` and accept that on Windows, the runner does NOT become a true daemon, it only inherits the parent's console group. This is a known Windows limitation; v2 may use a Windows Service wrapper.** On next parent startup, the host rehydrates from the artifact dir. Survives parent crashes on POSIX; partial survival on Windows.
+- **Recommendation:** A for v1 on all platforms, B for v2 (POSIX fully, Windows best-effort). v1's recovery is "the user re-runs the workflow" (the script is the same file, the args are in the parent's LLM context).
 
 ### Q4. Should `ctx.spawn` allow `async: true` (returning a `jobId` to be awaited later)?
 
@@ -504,7 +507,52 @@ None needed — nothing is removed.
 - **Option A (yes).** First message from parent includes `protocolVersion: 1`. Runner replies with its `runnerVersion` and `protocolVersion`. If mismatch, the older side exits with a clear error.
 - **Option B (no).** Trust the package version. Drift is impossible because the runner and the parent are installed together.
 - **Recommendation:** A. Cheap insurance against partial updates (`pi install npm:pi-subagentura@2.1.0` racing with a 2.0.2 runner still in memory).
+## 11. Cross-platform compatibility matrix
 
-## 11. Why this over the other two
+This section is the contract for "OS-agnostic." Every row is a thing that the v1 plan assumed on Unix but must work on Windows too. Each row also names the cross-platform primitive and the test that proves it.
 
-Plan B is the most resilient: workflows keep running while the user types a new prompt, and the runner's artifact dir means a parent crash can be recovered from. It's also the most invasive: a new bin, a new protocol, a new lifecycle daemon. **Pick Plan B if you already have use cases for "long-running workflow that should outlive the spawning turn" or "workflows that should survive a parent Pi restart."** If you don't have those use cases yet, ship Plan A first, learn what users do, then build B on top.
+| Concern | Unix-only pitfall | Cross-platform fix | Verified by |
+|---|---|---|---|
+| Temp directory | `/tmp/foo` | `path.join(os.tmpdir(), "foo")` | `workflow-runner-integration.test.ts` runs in an env where `TMPDIR=/c/Users/runner/AppData/Local/Temp` (Windows) and asserts the artifact dir lives under it. |
+| Home directory | `~/.pi/...` | `path.join(os.homedir(), ".pi", "...")` | Existing `subagent.ts` already uses this; the runner does the same. |
+| Path separators | `"/".join([...])` | `path.join(...)` everywhere | `path.join` is used in all new files; ESLint rule `unicorn/prefer-path-platform` enforced in CI. |
+| Path-root resolution | `path.resolve("~/.pi")` works on Unix only | Use `path.resolve(os.homedir(), ".pi")` | Same as above. |
+| File mode/perm | `chmodSync(path, 0o700)` | Skip on Windows. Use `fsPromises.chmod` only on POSIX; on Windows the FS doesn't support Unix bits, and a default ACL is fine. | A test that runs on POSIX and is `it.skipIf(process.platform === "win32")` on Windows. |
+| Process spawning | `spawn(cmd, { shell: true })` | `spawn("node", [binPath, "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true })` — never `shell: true`; pass the `.mjs` path directly so Windows can find it via the npm `bin` shim or the path. | `workflow-runner-integration.test.ts` runs on Windows in CI. |
+| Process detachment (Q3) | `subprocess.spawn({ detached: true })` for v2 | **Skip v2 detach on Windows in v1.** On Windows, `detached: true` does not create a new process group the way it does on Unix. v1's recovery path is "re-run the workflow" (no detach). v2's detach uses `windowsHide: true` + `creationFlags: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (via `child_process.spawn` options) on Windows and `detached: true` + `process.kill(0)` for liveness on Unix. The implementation branches on `process.platform === "win32"`. | v1 does not test detach (no v1 detach). v2's test runs in both modes. |
+| Liveness probe | `process.kill(0)` for "is the PID alive?" | Use the subprocess's own `exit` event + a `ping`/`pong` over the protocol. The parent's health check is `child.exitCode === null && child.signalCode === null && child.pid !== undefined`. The `pid` is recorded at spawn but never used to probe. | Health-check test in `workflow-runner-host.test.ts`. |
+| Graceful shutdown signal | `process.on("SIGTERM")` | Listen for `SIGINT`, `SIGTERM`, and `SIGBREAK`. On Windows, `SIGBREAK` is the only console-respecting signal; on Unix, `SIGTERM` is. Implementation: `["SIGINT", "SIGTERM", "SIGBREAK"].forEach(s => process.on(s, gracefulShutdown))`. (Node's `process.on` accepts all three on both platforms as of Node 18.) | Unit test that emits each signal on a child runner and asserts `shutdown` runs. |
+| Forceful kill | `subprocess.kill("SIGKILL")` | `subprocess.kill()` (no arg). On Windows this calls `TerminateProcess`; on Unix this sends `SIGKILL`. Both are immediate, non-ignorable. Do not pass `"SIGTERM"` to `subprocess.kill()` on Windows — it throws. | Unit test. |
+| Working directory for spawn | Inherits parent's cwd | `spawn(binPath, args, { cwd: process.cwd() })` — always set `cwd` explicitly so Windows doesn't inherit a wrong default from a different drive. | Code review + integration test asserts the runner sees the right cwd. |
+| Long path support | `~/.pi/agent/sessions/subagentura/workflows/<id>/...` | On Windows, paths longer than 260 chars fail by default. Use the `\\?\` UNC prefix when calling `fs` APIs on Windows for paths we don't control length of. Helper: `longPath(p) = process.platform === "win32" && !p.startsWith("\\\\?\\") ? "\\\\?\\" + p : p`. | Test that creates a workflow whose artifact path exceeds 260 chars and asserts the runner still reads/writes it. |
+| File locking | POSIX advisory locks are port-able | On Windows, the artifact file may be briefly locked by another reader. Use `fs.promises.open` with `flag: "r+"` and retry on `EBUSY` up to 3 times. The `writeOutput` helper in `artifact.ts` already uses atomic rename, so this only matters for in-progress reads. | Integration test. |
+| npm bin shim | None | npm generates `bin/pi-workflow-runner.cmd` and `bin/pi-workflow-runner.ps1` (Windows) and `bin/pi-workflow-runner` (POSIX) from the `bin` field in `package.json`. Our `package.json` `bin: { "pi-workflow-runner": "bin/pi-workflow-runner.mjs" }` works as-is. The runner invocation in the parent uses `commandExistsSync("pi-workflow-runner")` from the npm-prefixed PATH, falling back to the absolute path. | Test that the parent can locate the runner after `npm install` on Windows. |
+| Line endings | LF | NDJSON over stdio: the parent and runner must emit `\n`-terminated lines. The parent's `process.stdout.write` and the runner's `process.stdout.write` are LF by default; on Windows, the stdio handle is opened in binary mode (no `\r\n` translation) for pipes, so LF is correct. No extra handling needed, but a test asserts. | Unit test. |
+| Shell expansion in script paths | Bash, zsh, fish expand `~/` and `$VAR` | The runner invokes `node bin/pi-workflow-runner.mjs` directly. No shell. The script path the LLM passes is already an absolute path (the tool's `script` param requires this). The runner does not re-resolve the path. | Code review. |
+| UTF-8 paths | Always works on Unix | Windows allows non-UTF-8 paths in legacy mode. `fs` APIs in Node use `Buffer` internally, so this is mostly a display issue. We do not need to do anything for v1, but the artifact JSON contents (events.ndjson, output.md) are always UTF-8 by Node convention. | Test that a workflow with a UTF-8 path in its name runs successfully. |
+| Dev tools (CI) | `bash` everywhere | The runner's tests run on `windows-latest` GitHub Actions runner. The integration test uses `child_process.spawn` (not `exec` or `shell: true`), so no shell is needed. | CI matrix. |
+| Crash diagnostics | Unix core dumps | On Windows, use `WER` (Windows Error Reporting) — not configurable. Document that workflows that crash the runner are reported as `error: "runner_died"` with whatever stderr the runner produced; the artifact dir's `stderr.log` captures the last 64 KB. | Test. |
+| Native module compatibility | Most are POSIX-only | Plan B does not introduce new native modules. The runner uses only `node:child_process`, `node:fs/promises`, `node:os`, `node:path`, `node:readline`, `node:vm`, and the existing `ndjson` and `is-path-inside` deps. All are pure-JS / built-in. | Dependency review. |
+
+### Test matrix
+
+The CI matrix for v1 must run on `ubuntu-latest`, `macos-latest`, and `windows-latest`. Each runs:
+
+1. `npm install`
+2. `npm run typecheck`
+3. `npm test` (existing 196 tests, plus the new ~25 workflow tests)
+4. `npm run pack:check` (verify the bin is bundled)
+5. A smoke step: spawn the real `bin/pi-workflow-runner.mjs`, run `demos/audit-xss.mjs` against a 5-file fixture, assert the final return value.
+
+A failure on any platform blocks the release. No "best effort on Windows" carve-out.
+
+### Rejected alternatives (for the record)
+
+- **Use `node-cross-spawn-polyfill` or `cross-spawn`.** Adds a runtime dep. The `node:child_process` API as of Node 20 already handles the Windows cases we care about (stdout/stdin pipes, `windowsHide`, no-shell invocation). No dep needed.
+- **Use a shell.less IPC primitive like `MessageChannel` over a named pipe (Windows) / Unix-domain socket (POSIX).** Cleaner long-term, but v1's stdio already works and a v2 socket transport is still on the table (see §10 Q2). Defer.
+- **Skip Windows in v1, ship it in v2.** Rejected because the user explicitly required cross-platform from day one and the marginal cost (~1 dev-day of cross-platform testing + the matrix in this section) is small relative to the 7-day estimate.
+
+## 12. Why this over the other two
+
+Plan B is the most resilient: workflows keep running while the user types a new prompt, and the runner's artifact dir means a parent crash can be recovered from. It's also the most invasive: a new bin, a new protocol, a new lifecycle daemon. **Pick Plan B if you already have use cases for "long-running workflow that should outlive the spawning turn" or "workflows that should survive a parent Pi restart."** If you don't have those use cases yet, ship Plan A first, learn what users do, then build B on top. **With the cross-platform compatibility matrix in §11, Plan B is the right choice when you also need the runner to work on Windows** — the matrix removes the previous "Unix-only v1" limitation.
+
