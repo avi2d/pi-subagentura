@@ -159,6 +159,7 @@ Parameters:
 - `cwd` — optional working directory
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `background` — spawn in a detached named window (invisible) instead of a visible horizontal split. Default `true` — your tmux layout is undisturbed and you can attach later with the returned `select-window` command. Pass `background: false` for a side-by-side split you can watch in real time.
+- `notifyOnComplete` — `"inject"` (default) or `"notify"`; controls how the parent LLM is woken up on completion. See [Completion notifications: notify vs inject](#completion-notifications-notify-vs-inject) below.
 
 The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
 
@@ -167,12 +168,21 @@ The sub-agent's work is **always** written to the artifact dir as `events.ndjson
 Every interactive sub-agent receives a built-in system prompt that tells it how to signal completion. The child **must** call one of these when it has nothing more to add before waiting for the next user input:
 
 ```bash
-$ARTIFACT_DIR/cli.mjs done 0       # success — parent reads $ARTIFACT_DIR/output.md
+$ARTIFACT_DIR/cli.mjs done 0       # success — parent reads the literal output.md path baked into the child prompt
 $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
 # 'cancelled' is only set by the parent via cancel_interactive_subagent
 ```
 
-Write the final result to `$ARTIFACT_DIR/output.md` before calling `done`. After `done`, the REPL stays open and the child can be re-prompted via `tmux send-keys` to the pane. The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+The child's system prompt embeds the **literal absolute path** of the artifact dir at the top, e.g. `Your artifact directory is: /Users/.../artifacts/<id>`. Use that literal path in any `write` tool call (the `write` tool does not expand `$ARTIFACT_DIR`) — the bash examples above work because the launch script exports `ARTIFACT_DIR` to the shell. After `done`, the REPL stays open and the child can be re-prompted via `tmux send-keys` to the pane. The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+
+#### Completion notifications: notify vs inject
+
+Interactive sub-agents deliver their completion to the parent through one of two modes (selected via `notifyOnComplete`):
+
+- `"inject"` (**default** for `subagent_interactive`) — the sub-agent's `output.md` is pushed into the parent LLM's conversation as a new user message. The parent LLM gets a turn and can summarize, chain into the next step, or call more tools. Use this when the sub-agent's output is part of a multi-step pipeline.
+- `"notify"` — only a TUI hint is shown (status line + widget). The parent LLM is **not** woken up. The human has to prompt the parent manually to read the sub-agent's output. Use this for spawn-and-forget side-quests.
+
+Both modes share a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents finish at the same time, the rest degrade silently to `notify` (UI hint only) to keep the parent conversation from flooding. The cap is concurrent, not lifetime — once some injects settle, more can fire.
 
 
 #### `get_interactive_subagent_status`
