@@ -1012,8 +1012,9 @@ export default function (pi: ExtensionAPI) {
       '  - task: "Continue debugging while we plan next steps", async: true, notifyOnComplete: "notify"',
       '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
       "",
-      "For async (background) execution, the main agent continues immediately.",
-      "Use async only if user asked to do so or is willing to continue the conversation.",
+      "For async (background) execution, the main agent continues immediately."
+      "IMPORTANT: Async sub-agents DO NOT inherit the parent's abort signal. Cancelling the parent turn or a tool timeout will NOT stop them. You must use cancel_subagent to abort."
+      "Use async only if user asked to do so or is willing to continue the conversation."
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
     ].join("\n"),
     parameters: BaseParams,
@@ -1248,7 +1249,8 @@ export default function (pi: ExtensionAPI) {
       '  - task: "Give me a second opinion on this approach", model: "anthropic/claude-sonnet-4-5"',
       '  - task: "Analyze this code without context contamination", async: true, notifyOnComplete: "inject"',
       "",
-      "For async (background) execution, the main agent continues immediately.",
+      "For async (background) execution, the main agent continues immediately."
+      "IMPORTANT: Async sub-agents DO NOT inherit the parent's abort signal. Cancelling the parent turn or a tool timeout will NOT stop them. Use cancel_subagent to abort."
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
     ].join("\n"),
     parameters: BaseParams,

@@ -105,6 +105,8 @@ Best for:
 
 When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Use these tools to manage async jobs:
 
+> **Caution:** Unlike sync sub-agents, async sub-agents **do not inherit the parent's abort signal**. Cancelling the parent turn or a tool timeout will NOT stop a running async sub-agent. You must explicitly call `cancel_subagent` with its jobId to abort it.
+
 #### `get_subagent_status`
 
 Poll an async subagent job by jobId. Returns a live preview of the subagent's current turn, active tool, and partial output.
