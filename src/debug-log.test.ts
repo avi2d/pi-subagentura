@@ -73,4 +73,30 @@ describe("debugLog", () => {
 
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
   });
+
+  it("captures tool name and args on tool_start events", async () => {
+    process.env.SUBAGENT_DEBUG_LOG_DIR = testDir;
+
+    vi.resetModules();
+    const { debugLog } = await import("./helpers");
+
+    const toolArgs = { command: "rg TODO src/", timeout: 5000 };
+    debugLog("info", "tool_start", {
+      jobId: "job-123",
+      toolName: "bash",
+      args: toolArgs,
+    });
+
+    const logFile = currentLogFile();
+    const content = readFileSync(logFile, "utf-8");
+    const lines = content.trim().split("\n");
+    const entry = JSON.parse(lines[lines.length - 1]);
+
+    expect(entry.event).toBe("tool_start");
+    expect(entry.toolName).toBe("bash");
+    expect(entry.args).toEqual(toolArgs);
+    expect(entry.jobId).toBe("job-123");
+
+    delete process.env.SUBAGENT_DEBUG_LOG_DIR;
+  });
 });
