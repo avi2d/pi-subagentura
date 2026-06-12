@@ -66,6 +66,14 @@ export interface InteractiveSubagentState {
 	cwd: string;
 	model?: string;
 	startedAt: number;
+	/**
+	 * Lifecycle status. Transition triggers:
+	 * - spawn sets "running" (interactive-tmux.ts setup)
+	 * - cli.mjs done / error event in events.ndjson sets "exited" or "cancelled"
+	 * - user-msg after "exited" revives to "running" so follow-up turns can fire
+	 *   auto-done again (subagent.ts processSessionLogEntry)
+	 * - cancel_interactive_subagent tool sets "cancelled"
+	 */
 	status: InteractiveSubagentStatus;
 	/** Captured child pi exit code (0 = success). Undefined while still running. */
 	exitCode?: number;
