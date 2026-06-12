@@ -55,11 +55,16 @@ For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJS
 If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a fallback \`error\` event from your session log, but only if your final assistant turn ended with stopReason "stop" and you have not produced any output for 10 seconds. That fallback may not include the full result if output.md is missing. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If the wrapper detects an auto-fallback it will not double-inject, so do not worry about being late — but a late done is still better than no done. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
 }
 
-// Note: "idle" is included as a forward-compatible status. It is the natural post-turn state on
-// interactive sub-agents that called `cli.mjs done` (REPL still open, pane alive). The current
-// PR doesn't set it (auto-done is the only path that produces a non-"running" status here), but
-// follow-up work adds the child-protocol-driven path that uses it. Including it now keeps the
-// revival check at subagent.ts:765 type-safe when both PRs are stacked.
+/**
+ * Sub-agent status for the interactive (tmux-backed) registry.
+ *
+ * - "running"  — child is processing a turn (last artifact event is "started" or absent)
+ * - "idle"     — child finished a turn, REPL is open, pane alive; ready for a follow-up prompt
+ * - "cancelled" — parent called cancel_interactive_subagent; terminal, no follow-up allowed
+ * - "exited"   — child pi process is actually gone (pane dead, or it called `error`); terminal
+ * - "unknown"  — can't determine (rare; pane dead but no recorded event)
+ */
+export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
 export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
@@ -138,7 +143,13 @@ export interface InteractiveSubagentState {
 	 */
 	notifyOnComplete?: "notify" | "inject";
 	/** At-most-once guard for the inject path (mirrors lastDeliveredEventTs). */
-	injected?: boolean;
+	/**
+ * Timestamp of the last artifact `done` event whose output was injected into the parent.
+ * Mirrors `lastDeliveredEventTs` but only for the inject path. Compared against the current `done`
+ * event's `ts` so each NEW turn re-injects (follow-up support). Set on first inject; `undefined` means
+ * "never injected".
+ */
+	lastInjectedEventTs?: number;
 }
 
 declare global {
@@ -534,29 +545,51 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 }
 
 /**
- * Mark running sub-agents as exited/cancelled based on their artifact's last event.
- * The artifact is the source of truth — the pane is just a viewport. If the artifact has
- * a `done` / `error` / `cancelled` event, the sub-agent is finished. Otherwise the
- * sub-agent is still running. We also fall back to `isTmuxPaneAlive` for cases where the
- * tmux server died before the wrapper's trap could record the event.
+ * Pure status-decision matrix used by both `pruneDeadInteractiveSubagents` (here) and the
+ * artifact poller in `subagent.ts`. Pulled out so the rules are testable without a live tmux.
+ *
+ * Semantics: a `done` event means "this turn is finished" — the child's REPL stays open and the
+ * child is ready for a follow-up prompt. Only `error` / pane-dead / `cancelled` are terminal.
+ */
+export function deriveInteractiveSubagentStatus(
+	lastEvent: SubagentEvent | null,
+	paneAlive: boolean,
+): InteractiveSubagentStatus {
+	if (lastEvent) {
+		if (lastEvent.type === "cancelled") return "cancelled";
+		if (lastEvent.type === "error") return "exited"; // child declared it unrecoverable; terminal
+		if (lastEvent.type === "done") return paneAlive ? "idle" : "exited";
+	}
+	return paneAlive ? "running" : "unknown";
+}
+
+/**
+ * Update registry status for every tracked sub-agent based on the artifact's last event and
+ * tmux pane liveness. Idempotent — safe to call on every poll tick.
+ *
+ * Follow-up support: a `done` event with a live pane is the "idle" state, NOT exited. The child
+ * is between turns, REPL is open, and `send_interactive_subagent_message` will accept more prompts.
+ * Only when the pane is actually gone (or the child called `error`) is the sub-agent terminal.
+ *
+ * Edge case: if the pane is dead and no `done` event was recorded (tmux died before the launch
+ * trap could write it), fall back to the session-file existence check — same heuristic as before.
  */
 export function pruneDeadInteractiveSubagents(): void {
 	for (const state of interactiveSubagentRegistry.values()) {
-		if (state.status !== "running") continue;
+		if (state.status !== "running" && state.status !== "idle") continue;
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
-		if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) {
-			if (last.type === "cancelled") {
-				state.status = "cancelled";
-			} else {
-				state.status = "exited";
-				if (last.exitCode !== undefined) state.exitCode = last.exitCode;
-			}
-			continue;
+		const paneAlive = isTmuxPaneAlive(state.paneId);
+		let next = deriveInteractiveSubagentStatus(last, paneAlive);
+		// Session-file fallback: if the pane is gone and no event was recorded, the child died.
+		// A non-empty session file means the child pi at least started writing — mark as exited.
+		if (next === "unknown" && state.sessionFile && existsSync(state.sessionFile)) {
+			next = "exited";
 		}
-		// Fallback: pane object itself is gone (tmux server died, kill-pane ran before trap).
-		if (!isTmuxPaneAlive(state.paneId)) {
-			state.status = existsSync(state.sessionFile) ? "exited" : "unknown";
+		if (next === state.status) continue;
+		state.status = next;
+		if (next === "exited" && last && last.type === "done" && last.exitCode !== undefined) {
+			state.exitCode = last.exitCode;
 		}
 	}
 }

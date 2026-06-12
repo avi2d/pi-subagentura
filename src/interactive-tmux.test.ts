@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deriveInteractiveSubagentStatus } from "./interactive-tmux";
 import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -302,7 +303,45 @@ describe("interactive-tmux", () => {
       expect(state.status).toBe("cancelled");
     }
   });
-});
+
+
+	describe("deriveInteractiveSubagentStatus (pure status-decision matrix)", () => {
+
+
+		// Event factories — keep them tiny, the matrix is what matters.
+		const startedEv = { ts: 1, type: "started" as const, status: "running" as const };
+		const doneEv = { ts: 2, type: "done" as const, status: "done" as const, exitCode: 0 };
+		const errorEv = { ts: 3, type: "error" as const, status: "error" as const, message: "boom" };
+		const cancelledEv = { ts: 4, type: "cancelled" as const, status: "cancelled" as const };
+
+		it("started event + pane alive → 'running' (mid-turn)", () => {
+			expect(deriveInteractiveSubagentStatus(startedEv, true)).toBe("running");
+		});
+		it("no event + pane alive → 'running' (about to start)", () => {
+			expect(deriveInteractiveSubagentStatus(null, true)).toBe("running");
+		});
+		it("done event + pane alive → 'idle' (the follow-up case)", () => {
+			expect(deriveInteractiveSubagentStatus(doneEv, true)).toBe("idle");
+		});
+		it("done event + pane dead → 'exited' (terminal)", () => {
+			expect(deriveInteractiveSubagentStatus(doneEv, false)).toBe("exited");
+		});
+		it("error event + pane alive → 'exited' (child declared it unrecoverable)", () => {
+			expect(deriveInteractiveSubagentStatus(errorEv, true)).toBe("exited");
+		});
+		it("error event + pane dead → 'exited'", () => {
+			expect(deriveInteractiveSubagentStatus(errorEv, false)).toBe("exited");
+		});
+		it("cancelled event + pane alive → 'cancelled' (terminal regardless of pane)", () => {
+			expect(deriveInteractiveSubagentStatus(cancelledEv, true)).toBe("cancelled");
+		});
+		it("cancelled event + pane dead → 'cancelled'", () => {
+			expect(deriveInteractiveSubagentStatus(cancelledEv, false)).toBe("cancelled");
+		});
+		it("no event + pane dead → 'unknown'", () => {
+			expect(deriveInteractiveSubagentStatus(null, false)).toBe("unknown");
+		});
+	});
 
   // ------------------------------------------------------------------
   // Tests for the child completion protocol (buildChildSubagentProtocol),
@@ -522,7 +561,7 @@ describe("interactive-tmux", () => {
 
       // Default: no notification mode requested. The poller falls back to notify.
       expect(state.notifyOnComplete).toBeUndefined();
-      expect(state.injected).toBeUndefined();
+			expect(state.lastInjectedEventTs).toBeUndefined();
     });
 
     it("propagates notifyOnComplete: 'inject' from launchInteractiveSubagent to the state", async () => {
@@ -610,6 +649,8 @@ describe("interactive-tmux", () => {
       expect(cmd).toContain("/s.md");
     });
   });
+});
+
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-tmux-"));
 }

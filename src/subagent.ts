@@ -10,6 +10,7 @@
  *   - prune_subagent_jobs: Remove all completed and failed jobs from the registry
  *   - subagent_interactive: Spawn a separate tmux-backed Pi session users can attach to
  *   - get_interactive_subagent_status / cancel_interactive_subagent: Inspect or stop tmux-backed sessions
+ *   - send_interactive_subagent_message: Send a follow-up prompt into a live interactive sub-agent's REPL
  *   - list_available_models: List all known models with auth status for model validation
  *
  * Both spawn tools support optional `async` param for background execution.
@@ -50,14 +51,28 @@ import {
 } from "./helpers";
 import {
 	cancelInteractiveSubagent,
+	deriveInteractiveSubagentStatus,
 	formatInteractiveState,
 	interactiveSubagentRegistry,
+	isTmuxPaneAlive,
 	launchInteractiveSubagent,
+	sendCommandToTmuxPane,
 	pruneDeadInteractiveSubagents,
 	tmuxSetupHint,
 	type InteractiveSubagentState,
 } from "./interactive-tmux";
-import { appendEvent, artifactPath, lastEvent, readEvents, readOutput, type SubagentArtifact, type SubagentEvent } from "./artifact";
+import {
+	appendEvent,
+	artifactPath,
+	lastEvent,
+	listOutputTurns,
+	readEvents,
+	readOutput,
+	readOutputForTurn,
+	snapshotOutput,
+	type SubagentArtifact,
+	type SubagentEvent,
+} from "./artifact";
 import type { Usage } from "./helpers";
 
 import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
@@ -507,14 +522,14 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
 
-		// Update status based on the artifact: a done/error/cancelled event
-		// means the sub-agent is finished, regardless of notification policy.
-		if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) {
-			if (last.type === "cancelled") {
-				state.status = "cancelled";
-			} else {
-				state.status = "exited";
-				if (last.exitCode !== undefined) state.exitCode = last.exitCode;
+		// Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
+		// which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
+		// here and the inject path below will fire again.
+		const next = deriveInteractiveSubagentStatus(last, isTmuxPaneAlive(state.paneId));
+		if (next !== state.status) {
+			state.status = next;
+			if (next === "exited" && last && last.type === "done" && last.exitCode !== undefined) {
+				state.exitCode = last.exitCode;
 			}
 		}
 
@@ -546,17 +561,19 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 			state.lastDeliveredEventTs = maxTs;
 		}
 
+		// Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
+		// history is preserved even though the child overwrites output.md each turn. Runs for any
+		// notifyOnComplete mode because the history is useful regardless of how the parent gets woken up.
+		// Idempotent: if lastInjectedEventTs === last.ts (re-poll), we skip.
+		if (last && last.type === "done" && state.lastInjectedEventTs !== last.ts) {
+			const allEvents = readEvents(art);
+			const turnNumber = allEvents.filter((e) => e.type === "done").length;
+			snapshotOutput(art, turnNumber);
+		}
 
-		// Inject-mode delivery: on a fresh `done` event, also push output.md into the
-		// parent LLM's next turn. Mirrors deliverNotification's MAX_INJECT cap so many
-		// concurrent completions cannot blow up the conversation. Gated on
-		// `state.injected` to fire at most once per sub-agent.
-		if (
-			last &&
-			last.type === "done" &&
-			state.notifyOnComplete === "inject" &&
-			!state.injected
-		) {
+		// Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
+		// Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
+		// so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
 			const output = readOutput(art);
 			if (output !== null) {
 				if (getInjectCount() >= MAX_INJECT) {
@@ -585,10 +602,9 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 					}
 				}
 			}
-			// Mark injected unconditionally so we don't re-attempt on a subsequent poll
-			// when the cap flips back under threshold. The pointer notification is still
-			// gated by `lastDeliveredEventTs`, so re-polls are no-ops anyway.
-			state.injected = true;
+			// Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
+			// turn has a fresh ts, so the comparison re-fires.
+			state.lastInjectedEventTs = last.ts;
 		}
 
 
@@ -2072,22 +2088,92 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: send a follow-up message to a live interactive sub-agent ──────
+  // The child REPL stays open after `done` (see buildChildSubagentProtocol in
+  // interactive-tmux.ts), so the parent can push a new prompt into the same
+  // session via tmux send-keys. Model context is preserved across messages —
+  // this is a true follow-up turn, not a fresh spawn.
+  pi.registerTool({
+    name: "send_interactive_subagent_message",
+    label: "Send Interactive Subagent Message",
+    description: [
+      "Send a follow-up prompt to a live interactive sub-agent. The message is delivered into the",
+      "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
+      "is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its",
+      "system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
+      "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
+    ].join("\n"),
+    parameters: Type.Object({
+      id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+      message: Type.String({ description: "The follow-up prompt text to send into the child's REPL" }),
+    }),
+
+    async execute(_toolCallId, params): Promise<any> {
+      // Validate the id shape first for a precise error.
+      if (!/^[a-f0-9]{8}$/.test(params.id)) {
+        return {
+          content: [{ type: "text", text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.` }],
+          details: { id: params.id, status: "invalid_id" },
+          isError: true,
+        };
+      }
+      const state = interactiveSubagentRegistry.get(params.id);
+      if (!state) {
+        return {
+          content: [{ type: "text", text: `Interactive sub-agent ${params.id} not found.` }],
+          details: { id: params.id, status: "not_found" },
+          isError: true,
+        };
+      }
+		// Accept both "running" (mid-turn) and "idle" (REPL open, between turns) — that's the whole
+		// point of follow-up support. Mid-turn sends are safe: tmux send-keys just queues keystrokes
+		// in the REPL input buffer, which submits when the current turn finishes.
+		if (state.status !== "running" && state.status !== "idle") {
+			return {
+				content: [{ type: "text", text: `Interactive sub-agent ${params.id} is ${state.status}; follow-up messages can only be sent to running or idle sub-agents. Spawn a new one if needed.` }],
+				details: { id: params.id, status: state.status },
+				isError: true,
+			};
+		}
+      // sendCommandToTmuxPane uses tmux send-keys; it throws synchronously if the
+      // pane is gone (e.g. the child exited between the status check and now).
+      // Wrap so the parent gets a structured error instead of an exception trace.
+      try {
+        sendCommandToTmuxPane(state.paneId, params.message);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Failed to send message to interactive sub-agent ${params.id}: ${msg}` }],
+          details: { id: params.id, status: "send_failed", paneId: state.paneId, error: msg },
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.` }],
+        details: { id: params.id, paneId: state.paneId, messageLength: params.message.length, status: "sent" },
+      };
+    },
+  });
+
   // ── Tool: read an interactive sub-agent's artifact ───────────────
   // The artifact (events.ndjson + output.md) is the source of truth for what the
   // sub-agent did. The main agent calls this when it wants to know more than the pointer.
+  // The artifact (events.ndjson + output.md + output-N.md snapshots) is the source of truth for what
+  // the sub-agent did. The main agent calls this when it wants to know more than the pointer.
   pi.registerTool({
     name: "read_subagent_artifact",
     label: "Read Subagent Artifact",
     description: [
       "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
-
-      "if present, the sub-agent's output.md. Use `since` (unix ms) to fetch only events newer than",
-      "your last read.",
+      "if present, the sub-agent's output.md (the latest turn's content) or a specific turn's snapshot.",
+      "Use `since` (unix ms) to fetch only events newer than your last read. Use `turn` to read a",
+      "specific historical turn's output-N.md instead of the latest output.md.",
     ].join("\n"),
     parameters: Type.Object({
       id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
       since: Type.Optional(Type.Number({ description: "Only return events with ts >= this unix-ms timestamp" })),
-      includeOutput: Type.Optional(Type.Boolean({ description: "Include the sub-agent's output.md content (default true)" })),
+      includeOutput: Type.Optional(Type.Boolean({ description: "Include the output (default true). Set false to fetch only events." })),
+      turn: Type.Optional(Type.Number({ description: "Read a specific turn's output-N.md snapshot. Omit to read the latest output.md." })),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
@@ -2112,22 +2198,32 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const events = readEvents(art, params.since);
-      const output = params.includeOutput === false ? null : readOutput(art);
+      // `turn` reads a specific output-N.md snapshot; otherwise read the latest output.md. The turn
+      // param implies includeOutput (you can't read a turn without wanting its content).
+      const wantsOutput = params.includeOutput !== false || params.turn !== undefined;
+      const output = wantsOutput ? (params.turn !== undefined ? readOutputForTurn(art, params.turn) : readOutput(art)) : null;
       const lastEvent = events.length > 0 ? events[events.length - 1] : null;
       // Distinguish three cases when output is missing/empty so the caller
       // doesn't see a misleading "not written yet" after the sub-agent has
       // already exited (the common case: model finished without writing).
       let outputText: string;
       if (output === null) {
-        const exited = lastEvent && (lastEvent.type === "done" || lastEvent.type === "error" || lastEvent.type === "cancelled");
-        outputText = exited
-          ? `(sub-agent exited without writing output.md — last event: ${lastEvent.type} @ ${lastEvent.ts})`
-          : `(${events.length} events, last: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"} — output.md not written yet)`;
+        if (params.turn !== undefined) {
+          outputText = `(no snapshot for turn ${params.turn} — the poller may not have run yet, or this turn number is past the history)`;
+        } else {
+          const exited = lastEvent && (lastEvent.type === "done" || lastEvent.type === "error" || lastEvent.type === "cancelled");
+          outputText = exited
+            ? `(sub-agent exited without writing output.md — last event: ${lastEvent.type} @ ${lastEvent.ts})`
+            : `(${events.length} events, last: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"} — output.md not written yet)`;
+        }
       } else if (output.length === 0) {
         outputText = "(empty — 0 chars)";
       } else {
         outputText = `${output.length} chars`;
       }
+      // Available turns summary so the caller knows what history exists.
+      const availableTurns = listOutputTurns(art);
+      const turnsLine = availableTurns.length > 0 ? `Available turns: [${availableTurns.join(", ")}]\n` : "";
       return {
         content: [
           {
@@ -2135,10 +2231,12 @@ export default function (pi: ExtensionAPI) {
             text:
               `Artifact for ${params.id} (${events.length} event${events.length === 1 ? "" : "s"}${params.since ? ` since ${params.since}` : ""}).\n` +
               `Last event: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"}\n` +
+              (params.turn !== undefined ? `Reading turn: ${params.turn}\n` : "") +
+              turnsLine +
               `Output: ${outputText}`,
           },
         ],
-        details: { id: params.id, artifactDir: art.dir, events, output, lastEvent },
+        details: { id: params.id, artifactDir: art.dir, events, output, lastEvent, availableTurns },
       };
     },
   });
