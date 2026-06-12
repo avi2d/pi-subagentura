@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { appendEvent, artifactPath, readEvents } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import { importFresh } from "./test-utils";
@@ -101,7 +101,7 @@ describe("auto-done fallback", () => {
 		const sendMessage = vi.fn();
 		mod.pollArtifactChanges({ sendMessage } as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const done = events.find((e) => e.type === "done");
 		expect(done).toBeDefined();
@@ -120,7 +120,7 @@ describe("auto-done fallback", () => {
 
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const err = events.find((e) => e.type === "error");
 		expect(err).toBeDefined();
@@ -138,7 +138,7 @@ describe("auto-done fallback", () => {
 
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(state.artifactDir.replace(state.id, ""), state.id);
+		const art = artifactPath(dirname(state.artifactDir), state.id);
 		const events = readEvents(art);
 		const err = events.find((e) => e.type === "error");
 		expect(err).toBeDefined();
@@ -155,7 +155,7 @@ describe("auto-done fallback", () => {
 
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const synthesized = events.find((e) => e.type === "done" || e.type === "error");
 		expect(synthesized).toBeUndefined();
@@ -172,7 +172,7 @@ describe("auto-done fallback", () => {
 
 			mod.pollArtifactChanges({} as any);
 
-			const art = artifactPath(join(artifactDir, ".."), state.id);
+			const art = artifactPath(dirname(artifactDir), state.id);
 			const events = readEvents(art);
 			const synthesized = events.find((e) => e.type === "done" || e.type === "error");
 			expect(synthesized).toBeUndefined();
@@ -187,7 +187,7 @@ describe("auto-done fallback", () => {
 
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		expect(events.filter((e) => e.type === "done" || e.type === "error")).toHaveLength(0);
 	});
@@ -197,7 +197,7 @@ describe("auto-done fallback", () => {
 		const { state, artifactDir } = makeState({ outputContent: "result" });
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		appendEvent(art, { ts: Date.now() - 100, type: "done", status: "done", exitCode: 0 });
 
 		mod.pollArtifactChanges({} as any);
@@ -217,7 +217,7 @@ describe("auto-done fallback", () => {
 		mod.pollArtifactChanges({} as any);
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const doneEvents = events.filter((e) => e.type === "done");
 		expect(doneEvents).toHaveLength(1);
@@ -233,7 +233,7 @@ describe("auto-done fallback", () => {
 		const callsAfterAuto = sendMessage.mock.calls.length;
 		expect(callsAfterAuto).toBeGreaterThan(0);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		appendEvent(art, { ts: Date.now(), type: "done", status: "done", exitCode: 0 });
 
 		sendMessage.mockClear();
@@ -334,7 +334,7 @@ describe("auto-done fallback", () => {
 
 		expect(state.lastStopReason).toBe("stop");
 		expect(state.lastStopReasonAt).toBe(stopTs);
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const done = events.find((e) => e.type === "done");
 		expect(done).toBeDefined();
@@ -368,7 +368,7 @@ describe("auto-done fallback", () => {
 
 		mod.pollArtifactChanges({} as any);
 
-		const art = artifactPath(join(artifactDir, ".."), state.id);
+		const art = artifactPath(dirname(artifactDir), state.id);
 		const events = readEvents(art);
 		const err = events.find((e) => e.type === "error");
 		expect(err).toBeDefined();
