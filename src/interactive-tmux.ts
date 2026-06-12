@@ -25,6 +25,8 @@ export function buildChildSubagentProtocol(artifactDir: string): string {
 	const outputPath = `${artifactDir}/output.md`;
 	return `You are running inside a Pi sub-agent launched by a parent agent. The parent agent reads your work from two files in your artifact directory and from one CLI command. You MUST follow this protocol or your work will be lost.
 
+BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary in step 3. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
+
 Your artifact directory is: ${artifactDir}
 
   output.md      — your final result (prose, findings, code, whatever the parent asked for)

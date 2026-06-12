@@ -354,6 +354,15 @@ describe("interactive-tmux", () => {
       expect(protocol).toMatch(/do not call .\/exit.|press Ctrl-D/i);
     });
 
+    it("tells the child to be brief (avoid verbose preambles, short summary in step 3)", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      // The BE BRIEF directive lives at the top of the protocol so it gets
+      // high attention. We match the literal "BE BRIEF" token so the exact
+      // wording can be tuned without breaking the test.
+      expect(protocol).toMatch(/BE BRIEF/);
+    });
+
     it("embeds the literal artifact dir in the rendered prompt", async () => {
       const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const protocol = buildChildSubagentProtocol("/tmp/some-other-dir");
