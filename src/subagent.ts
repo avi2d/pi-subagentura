@@ -849,8 +849,11 @@ function maybeAutoDone(state: InteractiveSubagentState, art: SubagentArtifact, p
 	} else {
 		const fallback = state.lastStopText;
 		const baseMessage = "sub-agent stopped without writing output.md";
+		const FALLBACK_SLICE = 500;
 		const message = fallback && fallback.length > 0
-			? `${baseMessage} — last assistant message: ${fallback.slice(0, 500)}`
+			? fallback.length > FALLBACK_SLICE
+				? `${baseMessage} — last assistant message: ${fallback.slice(0, FALLBACK_SLICE)}… (truncated)`
+				: `${baseMessage} — last assistant message: ${fallback}`
 			: baseMessage;
 		ev = { ts, type: "error", status: "error", message, exitCode: 1 };
 		state.exitCode = 1;

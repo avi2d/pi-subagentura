@@ -327,6 +327,44 @@ describe("auto-done fallback", () => {
 		expect(after.lastStopText).toBeUndefined();
 	});
 
+	it("appends a '… (truncated)' marker to the synthesized error when lastStopText exceeds the slice length", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const longText = "X".repeat(1000); // >500 char slice threshold
+		const ts = Date.now() - 11_000;
+		writeAssistantTurn(state.sessionFile, ts, "stop", longText);
+
+		mod.pollArtifactChanges({} as any);
+
+		const events = readEvents(artifactPath(dirname(state.artifactDir), state.id));
+		const err = events.find((e) => e.type === "error");
+		expect(err).toBeDefined();
+		const msg = err && err.type === "error" ? err.message : "";
+		expect(msg).toMatch(/… \(truncated\)/);
+		expect(msg).toContain("X".repeat(500));
+		expect(msg).not.toContain("X".repeat(501)); // slice is exact
+	});
+
+	it("does NOT append a '… (truncated)' marker when lastStopText fits within the slice length", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const shortText = "short text that fits in the slice"; // well under 500
+		const ts = Date.now() - 11_000;
+		writeAssistantTurn(state.sessionFile, ts, "stop", shortText);
+
+		mod.pollArtifactChanges({} as any);
+
+		const events = readEvents(artifactPath(dirname(state.artifactDir), state.id));
+		const err = events.find((e) => e.type === "error");
+		const msg = err && err.type === "error" ? err.message : "";
+		expect(msg).not.toMatch(/… \(truncated\)/);
+		expect(msg).toContain(shortText);
+	});
+
 	// ─── End-to-end: real session JSONL is the only input ────────────
 	// Mirrors the production failure mode seen in 4 silent sub-agents in
 	// ~/.pi/agent/sessions/subagentura. The only input to the poller is a
