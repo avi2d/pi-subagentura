@@ -193,8 +193,6 @@ Both modes share a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents 
 Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
 
 #### `cancel_interactive_subagent`
-Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
-#### `cancel_interactive_subagent`
 
 Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
 
@@ -223,11 +221,6 @@ Parameters:
 - `includeOutput` — include the output (default `true`); ignored if `turn` is set (turn implies output)
 - `turn` — optional turn number; read `output-N.md` for that specific turn instead of the latest `output.md`
 
-
-Parameters:
-- `id` — required sub-agent id
-- `since` — optional unix-ms timestamp; only return events with `ts >= since`
-- `includeOutput` — include `output.md` (default `true`)
 
 ### `list_available_models`
 
