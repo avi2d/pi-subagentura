@@ -868,7 +868,12 @@ function maybeAutoDone(state: InteractiveSubagentState, art: SubagentArtifact, p
 	appendEvent(art, ev);
 	state.autoDoneForTurnAt = ts;
 	state.lastDeliveredEventTs = ts;
-	state.injected = true;
+	// In inject mode, leave `injected` unset so the regular inject path at
+	// lines 547-585 picks up the synthesized `done` event on the next poll.
+	// For all other modes (notify, undefined), mark as injected here because
+	// the inject path will never fire — this prevents accidental re-inject
+	// if a late explicit `done` later matches the cursor.
+	state.injected = state.notifyOnComplete !== "inject";
 
 	// Fire the pointer notification immediately so the parent does not wait for the next 5s poll tick.
 	// Suppress here only — the regular `events` loop below uses the autoDoneForTurnAt guard.

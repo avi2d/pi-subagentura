@@ -365,6 +365,43 @@ describe("auto-done fallback", () => {
 		expect(msg).toContain(shortText);
 	});
 
+	it("auto-fallback does NOT mark state.injected when notifyOnComplete is 'inject' (so the regular inject path can fire next poll)", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({ outputContent: "final result" });
+		state.notifyOnComplete = "inject";
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const ts = Date.now() - 11_000;
+		writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
+
+		mod.pollArtifactChanges({} as any);
+
+		// W1 fix: in inject mode, leave state.injected unset so the regular
+		// inject path at lines 547-585 picks up the synthesized `done` event
+		// on the next poll. With the old behavior (state.injected = true
+		// unconditionally), inject mode would silently degrade to pointer-only.
+		const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
+		expect(after.injected).not.toBe(true);
+	});
+
+	it("auto-fallback DOES mark state.injected when notifyOnComplete is 'notify' (no inject path to defer to)", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({ outputContent: "final result" });
+		state.notifyOnComplete = "notify";
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		const ts = Date.now() - 11_000;
+		writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
+
+		mod.pollArtifactChanges({} as any);
+
+		// For non-inject modes, the inject path at lines 547-585 will never
+		// fire (gated on notifyOnComplete === "inject"). Marking injected
+		// here is a no-op-defensive; what matters is no regression.
+		const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
+		expect(after.injected).toBe(true);
+	});
+
 	// ─── End-to-end: real session JSONL is the only input ────────────
 	// Mirrors the production failure mode seen in 4 silent sub-agents in
 	// ~/.pi/agent/sessions/subagentura. The only input to the poller is a
