@@ -65,7 +65,6 @@ If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a
  * - "unknown"  — can't determine (rare; pane dead but no recorded event)
  */
 export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
-export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
 	id: string;
@@ -150,6 +149,13 @@ export interface InteractiveSubagentState {
  * "never injected".
  */
 	lastInjectedEventTs?: number;
+	/**
+	 * Auto-fallback "already notified" flag (PR #11). Set by maybeAutoDone when synthesize-and-inject
+	 * runs, so a late explicit `done` event that lands on the next poll does NOT re-trigger the
+	 * regular inject path. Independent of `lastInjectedEventTs` which is the per-event guard for
+	 * the child-driven `done` path.
+	 */
+	injected?: boolean;
 }
 
 declare global {

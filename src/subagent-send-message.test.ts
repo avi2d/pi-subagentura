@@ -95,8 +95,6 @@ describe("send_interactive_subagent_message", () => {
 		});
 		expect(result.content[0].text).toContain("Sent follow-up to interactive sub-agent abc12345");
 		expect(result.content[0].text).toContain("pane %99");
-		expect(result.content[0].text).toContain("Sent follow-up to interactive sub-agent abc12345");
-		expect(result.content[0].text).toContain("pane %99");
 	});
 
 	it("accepts 'idle' sub-agents (the follow-up case — child between turns, REPL open)", async () => {
@@ -128,6 +126,54 @@ describe("send_interactive_subagent_message", () => {
 		expect(result.content[0].text).toMatch(/Invalid sub-agent id/);
 	});
 
+	it.each(["", "   ", "\n\n", "\t  \n"])("rejects empty / whitespace-only message: %j", async (message) => {
+		// An empty Enter in the child REPL would submit a blank prompt and confuse the child;
+		// reject it before any registry / tmux work happens.
+		const toolDef = getToolDef(api, "send_interactive_subagent_message");
+		const result = await toolDef.execute("call-empty", { id: "abc12345", message });
+
+		expect(mockGet).not.toHaveBeenCalled();
+		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(result.isError).toBe(true);
+		expect(result.details.status).toBe("empty_message");
+		expect(result.details.messageLength).toBe(0);
+		expect(result.content[0].text).toMatch(/empty/i);
+	});
+
+	it("rejects a message larger than 64 KiB", async () => {
+		// Symmetric with MAX_PERSONA_BYTES in interactive-tmux.ts. 64 KiB UTF-8 is well above any
+		// realistic follow-up prompt; larger values risk blowing the child REPL history.
+		const toolDef = getToolDef(api, "send_interactive_subagent_message");
+		const message = "x".repeat(64 * 1024 + 1);
+		const result = await toolDef.execute("call-huge", { id: "abc12345", message });
+
+		expect(mockGet).not.toHaveBeenCalled();
+		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(result.isError).toBe(true);
+		expect(result.details).toMatchObject({
+			id: "abc12345",
+			status: "message_too_large",
+			messageLength: 64 * 1024 + 1,
+			maxBytes: 64 * 1024,
+		});
+		expect(result.content[0].text).toMatch(/too large/);
+		expect(result.content[0].text).toMatch(/65536/);
+	});
+
+	it("accepts a message exactly at the 64 KiB boundary", async () => {
+		// Boundary check: 64 KiB is allowed, 64 KiB + 1 is not.
+		mockGet.mockReturnValue(runningState());
+		mockSendCommandToTmuxPane.mockReturnValue(undefined);
+
+		const toolDef = getToolDef(api, "send_interactive_subagent_message");
+		const message = "x".repeat(64 * 1024);
+		const result = await toolDef.execute("call-boundary", { id: "abc12345", message });
+
+		expect(mockSendCommandToTmuxPane).toHaveBeenCalledWith("%99", message);
+		expect(result.isError).toBeFalsy();
+		expect(result.details.status).toBe("sent");
+		expect(result.details.messageLength).toBe(64 * 1024);
+	});
 	it("rejects unknown sub-agent ids", async () => {
 		mockGet.mockReturnValue(undefined);
 

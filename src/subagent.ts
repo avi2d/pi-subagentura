@@ -574,6 +574,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		// Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
 		// Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
 		// so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
+		if (last && last.type === "done" && state.notifyOnComplete === "inject" && state.lastInjectedEventTs !== last.ts) {
 			const output = readOutput(art);
 			if (output !== null) {
 				if (getInjectCount() >= MAX_INJECT) {
@@ -2093,6 +2094,12 @@ export default function (pi: ExtensionAPI) {
   // interactive-tmux.ts), so the parent can push a new prompt into the same
   // session via tmux send-keys. Model context is preserved across messages —
   // this is a true follow-up turn, not a fresh spawn.
+  //
+  // Caps: the message must be non-empty (an empty Enter in the REPL would submit a
+  // blank prompt) and at most MAX_FOLLOWUP_BYTES UTF-8 bytes (symmetric with
+  // MAX_PERSONA_BYTES in interactive-tmux.ts — 64 KiB is well above any realistic
+  // follow-up prompt; larger values are rejected up-front with a structured error).
+  const MAX_FOLLOWUP_BYTES = 64 * 1024;
   pi.registerTool({
     name: "send_interactive_subagent_message",
     label: "Send Interactive Subagent Message",
@@ -2105,7 +2112,7 @@ export default function (pi: ExtensionAPI) {
     ].join("\n"),
     parameters: Type.Object({
       id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
-      message: Type.String({ description: "The follow-up prompt text to send into the child's REPL" }),
+      message: Type.String({ description: "The follow-up prompt text to send into the child's REPL (must be non-empty; max 64 KiB)" }),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
@@ -2114,6 +2121,24 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.` }],
           details: { id: params.id, status: "invalid_id" },
+          isError: true,
+        };
+      }
+      // Content validation (no registry I/O): fail fast on empty / oversized messages.
+      // An empty message would submit a blank Enter in the child REPL; an oversized message
+      // is more than the child can usefully consume and risks blowing the REPL history.
+      if (params.message.trim().length === 0) {
+        return {
+          content: [{ type: "text", text: "Message is empty; send a non-empty follow-up prompt." }],
+          details: { id: params.id, status: "empty_message", messageLength: 0 },
+          isError: true,
+        };
+      }
+      const messageBytes = Buffer.byteLength(params.message, "utf8");
+      if (messageBytes > MAX_FOLLOWUP_BYTES) {
+        return {
+          content: [{ type: "text", text: `Message too large: ${messageBytes} bytes (max ${MAX_FOLLOWUP_BYTES}). Shorten the prompt and try again.` }],
+          details: { id: params.id, status: "message_too_large", messageLength: messageBytes, maxBytes: MAX_FOLLOWUP_BYTES },
           isError: true,
         };
       }

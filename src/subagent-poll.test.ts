@@ -212,11 +212,15 @@ describe("pollArtifactChanges", () => {
 		expect(state.status).toBe("cancelled");
 	});
 
-	it("skips sub-agents that are not in 'running' or 'idle' status", async () => {
-		// cancelled / exited / unknown are terminal — the poll loop must not re-deliver events for them.
-		// 'idle' is NOT terminal: the child is between turns and awaiting follow-up, so the poll loop
-		// MUST keep processing it (otherwise follow-up `done` events would never fire pointer/inject).
-		for (const terminal of ["cancelled", "exited", "unknown"] as const) {
+	it("skips sub-agents that are strictly terminal (cancelled, unknown)", async () => {
+		// 'cancelled' and 'unknown' are strictly terminal — the poll loop must not re-deliver events
+		// for them and they cannot be revived.
+		// 'exited' is INTENTIONALLY not in this list: the user-role revival at processSessionLogEntry
+		// can revive an 'exited' sub-agent back to 'running' on a follow-up user message. The poll
+		// loop must keep tail-reading the session log for 'exited' sub-agents so the revival is
+		// reachable. (See subagent-auto-done.test.ts for the revival tests.)
+		// 'idle' is between-turns, not terminal — must always be processed for follow-up support.
+		for (const terminal of ["cancelled", "unknown"] as const) {
 			vi.resetModules();
 			const mod = await importFresh<typeof import("./subagent")>("./subagent");
 			const { state, artifactDir } = makeState();
