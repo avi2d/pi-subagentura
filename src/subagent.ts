@@ -752,6 +752,13 @@ function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentAr
 	// user follow-up after a previous auto-done would not be allowed to fire again.
 	if (msg.role === "user") {
 		state.autoDoneForTurnAt = undefined;
+		// Reset the per-turn stop-capture so a new turn does not inherit stale data
+		// from the previous one. Without this, a turn that ends with stopReason:"stop"
+		// but no assistant text would fall back to the prior turn's `lastStopText` in
+		// the synthesized error message.
+		state.lastStopReason = undefined;
+		state.lastStopReasonAt = undefined;
+		state.lastStopText = undefined;
 		// If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn),
 		// revive it to "running" so the for-loop keeps tail-reading the session log. Without this, a
 		// user follow-up after auto-done would be silently ignored and the next auto-done opportunity missed.

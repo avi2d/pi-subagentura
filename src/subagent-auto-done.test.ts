@@ -299,6 +299,34 @@ describe("auto-done fallback", () => {
 		expect(state.lastStopText).toBeUndefined();
 	});
 
+	it("a user message in the session log clears the per-turn stop-capture (lastStopReason, lastStopReasonAt, lastStopText)", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state } = makeState({});
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		// Simulate a prior turn that captured stop-capture state.
+		state.lastStopReason = "stop";
+		state.lastStopReasonAt = Date.now() - 60_000;
+		state.lastStopText = "STALE_TEXT_FROM_PRIOR_TURN";
+
+		// A user follow-up arrives.
+		const userTs = Date.now() - 30_000;
+		writeFileSync(
+			state.sessionFile,
+			JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "do more" }], timestamp: userTs } }) + "\n",
+			{ flag: "a" },
+		);
+
+		mod.pollArtifactChanges({} as any);
+
+		// All three per-turn fields must be cleared, matching the reset of
+		// autoDoneForTurnAt on the same code path.
+		const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
+		expect(after.lastStopReason).toBeUndefined();
+		expect(after.lastStopReasonAt).toBeUndefined();
+		expect(after.lastStopText).toBeUndefined();
+	});
+
 	// ─── End-to-end: real session JSONL is the only input ────────────
 	// Mirrors the production failure mode seen in 4 silent sub-agents in
 	// ~/.pi/agent/sessions/subagentura. The only input to the poller is a
