@@ -447,18 +447,20 @@ describe("auto-done fallback", () => {
 	// The model produced a 10K-char audit at t=183s, then sat in the REPL for
 	// 4.5 minutes until the parent prompted it with "u didnt make the done".
 	// With the fix, auto-done would have fired at t=193s — 4.5 minutes BEFORE
-	// the user had to notice and prompt. Skips if the production artifact
-	// is not present (e.g. CI without the local session dir).
+	// the user had to notice and prompt. Skips if the production session is
+	// not present (e.g. CI without the local session dir).
+	//
+	// SAFETY: the production session JSONL is read-only input; the replay
+	// runs against a tmp artifactDir. The production dir is never written to.
 	it("regression: notdone.jsonl would have auto-recovered the 10K audit at t=193s", async () => {
 		const fs = await import("node:fs");
-		const sessionFile = "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/2026-06-11T19-25-31-403Z-fb57cd05.jsonl";
-		const artifactDir = "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/artifacts/fb57cd05";
-		if (!fs.existsSync(sessionFile) || !fs.existsSync(artifactDir)) {
-			console.warn("skip: real notdone.jsonl not present at", sessionFile);
+		const sourceSession = "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/2026-06-11T19-25-31-403Z-fb57cd05.jsonl";
+		if (!fs.existsSync(sourceSession)) {
+			console.warn("skip: real notdone.jsonl not present at", sourceSession);
 			return;
 		}
 
-		const lines = fs.readFileSync(sessionFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const lines = fs.readFileSync(sourceSession, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 		let firstStop: { timestamp: number } | null = null;
 		let firstStopText = "";
 		for (const e of lines) {
@@ -480,13 +482,15 @@ describe("auto-done fallback", () => {
 		expect(firstStop).not.toBeNull();
 		expect(firstStopText.length).toBeGreaterThan(5000);
 
-		// Wipe the artifact so the poll starts fresh.
-		try { fs.unlinkSync(`${artifactDir}/events.ndjson`); } catch {}
-		try { fs.unlinkSync(`${artifactDir}/output.md`); } catch {}
-		fs.mkdirSync(artifactDir, { recursive: true });
-
-		const tmpRoot = makeTmp();
-		const replaySession = `${tmpRoot}/session.jsonl`;
+		// Replay into a tmp dir, NOT the production artifact dir. The
+		// poller computes the artifact via
+		//   artifactPath(dirname(state.artifactDir), basename(state.artifactDir))
+		// so point state.artifactDir at a fresh tmp leaf and let
+		// ensureArtifactDir() create it on first appendEvent.
+		const replayRoot = makeTmp();
+		const replayId = "notdone-replay";
+		const replayArtifactDir = join(replayRoot, replayId);
+		const replaySession = join(replayRoot, "session.jsonl");
 		fs.writeFileSync(
 			replaySession,
 			JSON.stringify({
@@ -501,8 +505,8 @@ describe("auto-done fallback", () => {
 		);
 
 		const mod = await importFresh<typeof import("./subagent")>("./subagent");
-		mod.interactiveSubagentRegistry.set("notdone-replay", {
-			id: "notdone-replay",
+		mod.interactiveSubagentRegistry.set(replayId, {
+			id: replayId,
 			name: "notdone.jsonl Replay",
 			task: "(replay)",
 			paneId: "%1",
@@ -513,14 +517,13 @@ describe("auto-done fallback", () => {
 			attachCommand: "n/a",
 			selectPaneCommand: "n/a",
 			launchScriptFile: "n/a",
-			artifactDir,
+			artifactDir: replayArtifactDir,
 		});
 
 		mod.pollArtifactChanges({} as any);
 
-		// The poller computes the artifact via artifactPath(dirname(state.artifactDir), basename(state.artifactDir)),
-		// which is exactly the dir we wiped. Read events.ndjson directly.
-		const eventsFile = `${artifactDir}/events.ndjson`;
+		// The poller wrote a synthesized event into the tmp artifact dir.
+		const eventsFile = join(replayArtifactDir, "events.ndjson");
 		expect(fs.existsSync(eventsFile)).toBe(true);
 		const events = fs.readFileSync(eventsFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 		const err = events.find((e) => e.type === "error");
@@ -528,5 +531,14 @@ describe("auto-done fallback", () => {
 		const msg = err && err.type === "error" ? err.message : "";
 		expect(msg).toMatch(/without writing output\.md/);
 		expect(msg).toMatch(/Test Quality Audit Report/);
+
+		// Defensive: confirm we did NOT touch the production dir. If
+		// events.ndjson exists there, its mtime must predate this test run.
+		const productionArtifactDir = "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/artifacts/fb57cd05";
+		const productionEvents = join(productionArtifactDir, "events.ndjson");
+		if (fs.existsSync(productionEvents)) {
+			const stat = fs.statSync(productionEvents);
+			expect(stat.mtimeMs).toBeLessThan(Date.now() - 1000);
+		}
 	});
 });
