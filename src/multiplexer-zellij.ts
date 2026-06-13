@@ -223,8 +223,10 @@ export class ZellijMultiplexer implements Multiplexer {
 		}
 
 		// Visible split: focus by pane id.
+		// NOTE: no \; chaining here — that's tmux-only syntax.
+		// Zellij doesn't support command chaining.
 		return {
-			attachCommand: `zellij attach ${escapedSession} \\; zellij action focus-pane ${opts.paneId}`,
+			attachCommand: `zellij attach ${escapedSession}`,
 			focusCommand: `zellij action focus-pane ${opts.paneId}`,
 		};
 	}

@@ -368,9 +368,26 @@ describe("multiplexer-zellij", () => {
 		const cmds = mux.buildAttachCommands({ paneId: "42" });
 
 		expect(cmds.attachCommand).toBe(
-			"zellij attach 'main' \\; zellij action focus-pane 42",
+			"zellij attach 'main'",
 		);
 		expect(cmds.focusCommand).toBe("zellij action focus-pane 42");
+	});
+
+	it("attachCommand for visible split does NOT use tmux \; chaining (zellij doesn't support it)", async () => {
+		process.env.ZELLIJ = "0";
+		process.env.ZELLIJ_SESSION_NAME = "main";
+
+		const { ZellijMultiplexer } = await importFresh<typeof import("./multiplexer-zellij")>(
+			"./multiplexer-zellij",
+		);
+		const mux = new ZellijMultiplexer();
+		const cmds = mux.buildAttachCommands({ paneId: "42" });
+
+		// Zellij does not support tmux-style \; command chaining.
+		// The attach command should be a simple `zellij attach <sess>`
+		// without chained actions.
+		expect(cmds.attachCommand).not.toContain("\\;");
+		expect(cmds.attachCommand).toBe("zellij attach 'main'");
 	});
 
 	it("buildAttachCommands uses _sessionName when ZELLIJ_SESSION_NAME is not set", async () => {
