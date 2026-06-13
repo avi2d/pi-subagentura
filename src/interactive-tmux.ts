@@ -23,25 +23,44 @@ import { artifactPath, lastEvent, type SubagentArtifact, type SubagentEvent } fr
 export function buildChildSubagentProtocol(artifactDir: string): string {
 	const cliPath = `${artifactDir}/cli.mjs`;
 	const outputPath = `${artifactDir}/output.md`;
-	return `You are running inside a Pi sub-agent launched by a parent agent.
+	return `You are running inside a Pi sub-agent launched by a parent agent. The parent agent reads your work from two files in your artifact directory and from one CLI command. You MUST follow this protocol or your work will be lost.
 
-Your artifact directory is: ${artifactDir}. Use this exact path in your \`write\` tool calls — the \`write\` tool does not expand shell variables, so the literal path above is the only thing that will land in the right place.
+BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary in step 3. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
 
-When you have completed the user's task and have nothing more to add before waiting for the next user input, signal completion to the parent by running exactly one of these shell commands. The path in quotes is a single argument, so it works even if the directory contains spaces. The launch script exports \`ARTIFACT_DIR\` to the shell, so the \`$ARTIFACT_DIR\` form below expands correctly in bash and in \`cli.mjs\` calls:
+Your artifact directory is: ${artifactDir}
 
-  "$ARTIFACT_DIR/cli.mjs" done 0
-  "$ARTIFACT_DIR/cli.mjs" error "short reason here"
+  output.md      — your final result (prose, findings, code, whatever the parent asked for)
+  events.ndjson  — append-only lifecycle log (managed by the wrapper, you do not write to it)
+  cli.mjs        — the wrapper's lifecycle helper, invoked via bash
 
-Use 'done' on success and 'error' for unrecoverable failures. Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
+Use the literal path above in your \`write\` tool calls — the \`write\` tool does not expand \$ARTIFACT_DIR or any other shell variable, so a path like "\$ARTIFACT_DIR/output.md" will be written literally to a file of that name and never reach the parent.
 
-After you call 'done', the REPL stays open and you will receive follow-up prompts. Do not exit the REPL yourself; just signal completion and wait.
+When your task is done, follow this checklist in order. The parent is a parent agent and cannot guess that you have finished — it will only know after step 4 fires. Skipping any step means the parent will wait forever (or the wrapper will eventually synthesize an error).
 
-Before calling 'done', write your final result to ${outputPath} (the literal absolute path, not \$ARTIFACT_DIR/output.md — the \`write\` tool will not expand it). An atomic write via a .tmp file plus rename is fine, or just append. The parent reads this file as soon as it gets the 'done' notification.
+  1. Stop calling tools. If you are mid-tool-call, finish it.
+  2. Write your final result to ${outputPath} using the \`write\` tool. Use the exact path above. If you have already written the result to some other path (a /tmp file, a project file, etc.), copy or append it to output.md so the parent can read it.
+  3. Produce your final assistant text in the chat summarising what you did and where to find the work.
+  4. Run exactly one of these bash commands. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
 
-(For reference: ${cliPath} is the lifecycle CLI that records started / done / error / cancelled events for the parent to discover. The bash examples above invoke it via "\$ARTIFACT_DIR/cli.mjs" because \$ARTIFACT_DIR is exported to your shell.)`;
+       "$ARTIFACT_DIR/cli.mjs" done 0       # success
+       "$ARTIFACT_DIR/cli.mjs" error "short reason"   # unrecoverable failure
+
+  5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 4 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
+
+Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
+
+For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJSON line to events.ndjson. The parent reads that file every few seconds. The atomic write pattern (write to .tmp, then rename onto output.md) is fine if you want crash-safety.
+
+─── HARDENING REMINDER (read this last, it is the most recent instruction on purpose) ───
+If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a fallback \`error\` event from your session log, but only if your final assistant turn ended with stopReason "stop" and you have not produced any output for 10 seconds. That fallback may not include the full result if output.md is missing. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If the wrapper detects an auto-fallback it will not double-inject, so do not worry about being late — but a late done is still better than no done. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
 }
 
-export type InteractiveSubagentStatus = "running" | "cancelled" | "exited" | "unknown";
+// Note: "idle" is included as a forward-compatible status. It is the natural post-turn state on
+// interactive sub-agents that called `cli.mjs done` (REPL still open, pane alive). The current
+// PR doesn't set it (auto-done is the only path that produces a non-"running" status here), but
+// follow-up work adds the child-protocol-driven path that uses it. Including it now keeps the
+// revival check at subagent.ts:765 type-safe when both PRs are stacked.
+export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
 	id: string;
@@ -54,6 +73,14 @@ export interface InteractiveSubagentState {
 	cwd: string;
 	model?: string;
 	startedAt: number;
+	/**
+	 * Lifecycle status. Transition triggers:
+	 * - spawn sets "running" (interactive-tmux.ts setup)
+	 * - cli.mjs done / error event in events.ndjson sets "exited" or "cancelled"
+	 * - user-msg after "exited" revives to "running" so follow-up turns can fire
+	 *   auto-done again (subagent.ts processSessionLogEntry)
+	 * - cancel_interactive_subagent tool sets "cancelled"
+	 */
 	status: InteractiveSubagentStatus;
 	/** Captured child pi exit code (0 = success). Undefined while still running. */
 	exitCode?: number;
@@ -81,6 +108,29 @@ export interface InteractiveSubagentState {
 	lastToolSummary?: string;
 	lastToolName?: string;
 	lastActivityAt?: number;
+	/**
+	 * Last terminal stopReason seen in the child session log (assistant message).
+	 * One of "stop" | "length" | "error" | "aborted". Updated whenever we tail-read a new
+ * assistant message. Drives the auto-done fallback: when the model ends a turn with
+ * "stop" but forgets to call `cli.mjs done`, the parent synthesizes a completion event.
+	 */
+	lastStopReason?: "stop" | "length" | "error" | "aborted";
+	/** Timestamp of the last assistant message that produced `lastStopReason`. Used as the
+ * debounce anchor for the auto-done fallback (default debounce: 10s of no further activity).
+	 */
+	lastStopReasonAt?: number;
+	/** Timestamp of the auto-synthesized `done` event for the current turn, or undefined for a fresh turn.
+ * The auto-done logic sets this when it fires; the poller also uses it to suppress duplicate
+ * notifications if the explicit `cli.mjs done` lands shortly after the fallback synthesis.
+ * Cleared on a new user-role message in the session log (next turn starts).
+	 */
+	autoDoneForTurnAt?: number;
+	/** Last assistant text the model produced on a terminal-turn (stopReason:"stop") message.
+ * Captured at session-log tail-read time. Used as fallback content in the synthesized error
+ * event when output.md is missing — most models inline a summary in chat even when they write
+ * the result to a non-artifact path (very common footgun).
+	 */
+	lastStopText?: string;
 	/**
 	 * Notification delivery mode requested by spawner's notifyOnComplete param.
 	 * "notify" (default) emits a UI hint on completion. "inject" also injects

@@ -495,7 +495,14 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 	const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
 	for (const state of interactiveSubagentRegistry.values()) {
-		if (state.status === "cancelled" || state.status === "exited" || state.status === "unknown") continue;
+		// Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
+		// revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
+		// follow-up user message lands in the session log (auto-done case). To make that reachable,
+		// the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
+		// status-update block below may re-mark the state as "exited" (based on a stale synthesized
+		// error event in the artifact) but the revival, running later in the same poll via
+		// tailReadSessionLog, will reset it to "running" within this same tick.
+		if (state.status === "cancelled" || state.status === "unknown") continue;
 
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
@@ -515,6 +522,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		// TUI-widget only — the LLM never sees them.
 		tailReadSessionLog(state, art);
 
+		// Auto-done fallback: synthesize a completion event when the model ended its turn with
+		// stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
+		// event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
+		// guard so the events loop below will not re-notify.
+		maybeAutoDone(state, art, interactivePi, Date.now());
+
 		// Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
 		// so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
 		const cursor = state.lastDeliveredEventTs ?? 0;
@@ -525,10 +538,14 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 			for (const ev of events) {
 				if (ev.ts > maxTs) maxTs = ev.ts;
 				if (!shouldNotify(ev)) continue;
+				// If auto-done already fired for this turn, skip any later explicit `done` events:
+				// they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
+				if (state.autoDoneForTurnAt !== undefined && ev.ts >= state.autoDoneForTurnAt && ev.type === "done") continue;
 				deliverArtifactNotification(interactivePi, state, ev);
 			}
 			state.lastDeliveredEventTs = maxTs;
 		}
+
 
 		// Inject-mode delivery: on a fresh `done` event, also push output.md into the
 		// parent LLM's next turn. Mirrors deliverNotification's MAX_INJECT cap so many
@@ -622,6 +639,15 @@ const sessionParsers = new Map<string, ReturnType<typeof ndjson.parse>>();
  * internally across polls, so the cap is no longer required for correctness — it is kept purely
  * to bound worst-case memory if the file explodes in a single tick. 1 MiB is plenty. */
 const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Auto-done debounce window. When the child ends a turn with stopReason:"stop" and the model has
+ * not produced any new session-log activity (assistant or user message, tool call, etc.) for this long,
+ * the parent synthesizes a completion event. Default 10s is long enough to cover the model streaming its
+ * final tool call's toolResult back and short enough that the parent does not wait long after the child is
+ * visibly idle. Tunable in one place.
+ */
+const AUTO_DONE_DEBOUNCE_MS = 10_000;
 
 /** Get-or-create the per-state session parser and wire its 'data' event to the entry handler. */
 function getOrCreateSessionParser(state: InteractiveSubagentState): ReturnType<typeof ndjson.parse> {
@@ -728,15 +754,49 @@ function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentAr
 	const msg = e.message;
 	if (!msg) return;
 
-	// Assistant message: extract toolCall blocks.
+	// New user-role message = a new turn. Clear the per-turn auto-done guard so the
+	// next `stopReason: "stop"` is treated as a fresh completion candidate. Without this, a
+	// user follow-up after a previous auto-done would not be allowed to fire again.
+	if (msg.role === "user") {
+		state.autoDoneForTurnAt = undefined;
+		// Reset the per-turn stop-capture so a new turn does not inherit stale data
+		// from the previous one. Without this, a turn that ends with stopReason:"stop"
+		// but no assistant text would fall back to the prior turn's `lastStopText` in
+		// the synthesized error message.
+		state.lastStopReason = undefined;
+		state.lastStopReasonAt = undefined;
+		state.lastStopText = undefined;
+		// If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn)
+		// OR "idle" (the natural post-turn state once follow-up work lands), revive it to "running"
+		// so the for-loop keeps tail-reading the session log. Without this, a user follow-up after
+		// a previous completion would be silently ignored and the next auto-done / done-event
+		// opportunity missed. Both paths share the same revival semantics: a user-role entry means
+		// a new turn is starting, regardless of how the previous turn ended.
+		if (state.status === "exited" || state.status === "idle") state.status = "running";
+		return;
+	}
+
+	// Assistant message: extract toolCall blocks AND record stopReason for the auto-done fallback.
 	if (msg.role === "assistant" && Array.isArray(msg.content)) {
+		const ts = (msg.timestamp as number) ?? Date.now();
+		const stopReason = (msg as { stopReason?: string }).stopReason;
+		if (stopReason === "stop" || stopReason === "length" || stopReason === "error" || stopReason === "aborted") {
+			state.lastStopReason = stopReason;
+			state.lastStopReasonAt = ts;
+			// Capture the textual summary the model produced for the final turn. Used as fallback
+			// content when auto-synthesizing an `error` event for a child that stopped without writing output.md.
+			if (stopReason === "stop") {
+				const text = extractAssistantText(msg.content);
+				if (text) state.lastStopText = text;
+			}
+		}
 		for (const rawBlock of msg.content) {
 			const block = rawBlock as { type?: string; name?: string; arguments?: unknown } | undefined;
 			if (!block || block.type !== "toolCall") continue;
 			const summary = summarizeToolCall(block.name ?? "", block.arguments);
 			if (!summary) continue;
 			const ev: SubagentEvent = {
-				ts: (msg.timestamp as number) ?? Date.now(),
+				ts,
 				type: "tool_activity",
 				status: "running",
 				tool: block.name ?? "",
@@ -746,6 +806,92 @@ function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentAr
 			state.lastToolName = block.name ?? "";
 			state.lastToolSummary = summary;
 			state.lastActivityAt = ev.ts;
+		}
+	}
+}
+
+/** Concatenate text blocks from an assistant message's content array. Empty string if none. */
+function extractAssistantText(content: unknown[]): string {
+	let out = "";
+	for (const block of content) {
+		const b = block as { type?: string; text?: string };
+		if (b?.type === "text" && typeof b.text === "string") {
+			if (out) out += "\n";
+			out += b.text;
+		}
+	}
+	return out;
+}
+
+/**
+ * Auto-done fallback. The protocol requires the child to call `cli.mjs done` after writing
+ * output.md, but LLMs routinely forget. We observe the child's session log and synthesize a
+ * completion event when:
+ *   1. The most recent assistant message had stopReason "stop" (the model finished a turn naturally), AND
+ *   2. The model has not produced any new session-log activity for AUTO_DONE_DEBOUNCE_MS, AND
+ *   3. No explicit done/error/cancelled event is in the artifact log yet, AND
+ *   4. We have not already synthesized one for this turn.
+ *
+ * The synthesized event is appended to events.ndjson so the regular poller path picks it up; we also
+ * advance the cursor and the `injected` flag so a late-arriving explicit `done` (or a duplicate poller pass)
+ * does not double-notify. When output.md is missing, we synthesize `error` instead and include the child's
+ * last assistant text as a fallback message — most models inline a summary in chat even when the actual
+ * result landed at a different path.
+ */
+function maybeAutoDone(state: InteractiveSubagentState, art: SubagentArtifact, pi: ExtensionAPI, now: number): void {
+	if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
+	if (state.lastStopReason !== "stop") return;
+	const stopAt = state.lastStopReasonAt ?? 0;
+	if (now - stopAt < AUTO_DONE_DEBOUNCE_MS) return;
+
+	// Explicit signal still wins. If the wrapper already wrote done/error/cancelled, do not synthesize.
+	const last = lastEvent(art);
+	if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) return;
+
+	// Detect output.md state. We want to synthesize `done` only when the model has actually produced a result.
+	const output = readOutput(art);
+	const hasOutput = output !== null && output.length > 0;
+
+	const ts = now;
+	let ev: SubagentEvent;
+	if (hasOutput) {
+		ev = { ts, type: "done", status: "done", exitCode: 0, summary: "auto-detected from session stopReason:stop" };
+	} else {
+		const fallback = state.lastStopText;
+		const baseMessage = "sub-agent stopped without writing output.md";
+		const FALLBACK_SLICE = 500;
+		const message = fallback && fallback.length > 0
+			? fallback.length > FALLBACK_SLICE
+				? `${baseMessage} — last assistant message: ${fallback.slice(0, FALLBACK_SLICE)}… (truncated)`
+				: `${baseMessage} — last assistant message: ${fallback}`
+			: baseMessage;
+		ev = { ts, type: "error", status: "error", message, exitCode: 1 };
+		state.exitCode = 1;
+	}
+	// NOTE: we deliberately do NOT set state.status="exited" here. The synthesized event is in the artifact,
+	// so the next poll's art-status check at the top of the for-loop will set it. Keeping status as "running"
+	// for this iteration lets the for-loop continue processing the state on subsequent polls — critical for
+	// the multi-turn case where the user attaches to the REPL and sends a follow-up; the new user message
+	// needs to be tail-read to clear the auto-done guard. The TUI widget does not show this state because the
+	// synthesized event was already delivered, and the next poll will transition status to "exited" after the
+	// follow-up turn completes.
+	appendEvent(art, ev);
+	state.autoDoneForTurnAt = ts;
+	state.lastDeliveredEventTs = ts;
+	// In inject mode, leave `injected` unset so the regular inject path at
+	// lines 547-585 picks up the synthesized `done` event on the next poll.
+	// For all other modes (notify, undefined), mark as injected here because
+	// the inject path will never fire — this prevents accidental re-inject
+	// if a late explicit `done` later matches the cursor.
+	state.injected = state.notifyOnComplete !== "inject";
+
+	// Fire the pointer notification immediately so the parent does not wait for the next 5s poll tick.
+	// Suppress here only — the regular `events` loop below uses the autoDoneForTurnAt guard.
+	if (pi) {
+		try {
+			deliverArtifactNotification(pi, state, ev);
+		} catch {
+			// pi may be stale; the event is on disk and will be picked up by the next tick anyway.
 		}
 	}
 }

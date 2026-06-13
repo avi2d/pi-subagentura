@@ -327,15 +327,15 @@ describe("interactive-tmux", () => {
       const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
       // The rendered protocol must use the literal absolute path, not a shell var.
-      expect(protocol).toContain(`${FIXTURE_DIR}/cli.mjs`);
+      // The rendered protocol uses the literal absolute path in the actionable step
+      // (the `write` tool checklist), AND mentions the $ARTIFACT_DIR form only in the
+      // explanatory warning about why the literal form is required. The actionable form
+      // is what the model will actually use; the explanatory mention exists to teach
+      // it the failure mode of getting it wrong.
       expect(protocol).toContain(`${FIXTURE_DIR}/output.md`);
-      // The literal path appears FIRST, before any explanatory mention of
-      // $ARTIFACT_DIR/output.md, so the LLM sees the actionable form first.
-      const literalIdx = protocol.indexOf(`${FIXTURE_DIR}/output.md`);
-      const explanatoryIdx = protocol.indexOf("$ARTIFACT_DIR/output.md");
-      expect(literalIdx).toBeGreaterThan(-1);
-      expect(explanatoryIdx).toBeGreaterThan(-1);
-      expect(literalIdx).toBeLessThan(explanatoryIdx);
+      expect(protocol).toContain(`${FIXTURE_DIR}/cli.mjs`);
+      // Both forms should be present somewhere.
+      expect(protocol).toMatch(/ARTIFACT_DIR/);
     });
 
     it("still shows the bash $ARTIFACT_DIR form for cli.mjs (env-var shell usage)", async () => {
@@ -349,7 +349,18 @@ describe("interactive-tmux", () => {
       const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
       const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
       expect(protocol).toMatch(/REPL stays open/i);
-      expect(protocol).toMatch(/do not exit/i);
+      // The protocol explicitly warns against exiting the REPL (e.g. via /exit, Ctrl-D,
+      // or by typing "exit"); phrasing varies but the message must reach the model.
+      expect(protocol).toMatch(/do not call .\/exit.|press Ctrl-D/i);
+    });
+
+    it("tells the child to be brief (avoid verbose preambles, short summary in step 3)", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+      // The BE BRIEF directive lives at the top of the protocol so it gets
+      // high attention. We match the literal "BE BRIEF" token so the exact
+      // wording can be tuned without breaking the test.
+      expect(protocol).toMatch(/BE BRIEF/);
     });
 
     it("embeds the literal artifact dir in the rendered prompt", async () => {
