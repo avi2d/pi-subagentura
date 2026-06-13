@@ -54,9 +54,9 @@ import {
 	deriveInteractiveSubagentStatus,
 	formatInteractiveState,
 	interactiveSubagentRegistry,
-	isTmuxPaneAlive,
+	isPaneAlive,
 	launchInteractiveSubagent,
-	sendCommandToTmuxPane,
+	sendCommandToPane,
 	pruneDeadInteractiveSubagents,
 	tmuxSetupHint,
 	type InteractiveSubagentState,
@@ -347,7 +347,7 @@ const CancelParams = Type.Object({
 const InteractiveParams = Type.Object({
   name: Type.Optional(
     Type.String({
-      description: "Display name for the tmux pane/session. Defaults to a task preview.",
+      description: "Display name for the sub-agent session. Defaults to a task preview.",
     }),
   ),
   task: Type.String({ description: "Task to start in the interactive sub-agent" }),
@@ -373,13 +373,19 @@ const InteractiveParams = Type.Object({
   background: Type.Optional(
     Type.Boolean({
       description:
-        "Spawn the sub-agent in a detached named window (hidden from your tmux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
+        "Spawn the sub-agent in a detached named window (hidden from your mux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
     })
   ),
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
         'How to surface the sub-agent result on completion. "inject" (default) also injects output.md as a user message so the parent LLM processes it in its next turn. "notify" emits a UI hint only — no LLM turn is triggered. Falls back to a pointer hint if the inject cap is exceeded.',
+    }),
+  ),
+  mux: Type.Optional(
+    Type.Union([Type.Literal("auto"), Type.Literal("tmux"), Type.Literal("zellij")], {
+      description:
+        'Which multiplexer backend to use. "auto" (default) picks based on environment: zellij if ZELLIJ_SESSION_NAME is set, tmux if TMUX is set, then whichever backend binary is available. "tmux" forces tmux. "zellij" forces zellij.',
     }),
   ),
 });
@@ -525,7 +531,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		// Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
 		// which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
 		// here and the inject path below will fire again.
-		const next = deriveInteractiveSubagentStatus(last, isTmuxPaneAlive(state.paneId));
+		const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
 		if (next !== state.status) {
 			state.status = next;
 			if (next === "exited" && last && last.type === "done" && last.exitCode !== undefined) {
@@ -1909,14 +1915,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Tool 6: spawn an attachable tmux-backed Pi session ──────────────
+	// ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
   pi.registerTool({
     name: "subagent_interactive",
     label: "Interactive Subagent",
     description: [
-      "Spawn a separate Pi process in a tmux pane and return immediately.",
+		"Spawn a separate Pi process in a tmux/zellij pane and return immediately.",
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
-      "Requires running pi inside tmux. The tool returns tmux attach/select commands and the child session file.",
+		"Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
     ].join("\n"),
     parameters: InteractiveParams,
@@ -1956,15 +1962,16 @@ export default function (pi: ExtensionAPI) {
 				contextText,
 				background: params.background, // defaults to true (hidden) inside the helper
 				notifyOnComplete: params.notifyOnComplete ?? "inject",
+				muxPreference: params.mux, // pass through user's mux preference
 			});
 
 
-			const displayMode = state.windowName ? "background (new window)" : "visible split";
+			const displayMode = state.windowName ? "background (new window/tab)" : "visible split";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Interactive sub-agent ${state.id} started (${displayMode}) in tmux pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFrom inside tmux: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+						text: `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
 					},
 
 				],
@@ -2160,11 +2167,11 @@ export default function (pi: ExtensionAPI) {
 				isError: true,
 			};
 		}
-      // sendCommandToTmuxPane uses tmux send-keys; it throws synchronously if the
-      // pane is gone (e.g. the child exited between the status check and now).
-      // Wrap so the parent gets a structured error instead of an exception trace.
-      try {
-        sendCommandToTmuxPane(state.paneId, params.message);
+		// sendCommandToPane uses send-keys + Enter; it throws synchronously if the
+		// pane is gone (e.g. the child exited between the status check and now).
+		// Wrap so the parent gets a structured error instead of an exception trace.
+		try {
+			sendCommandToPane(state, params.message);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {

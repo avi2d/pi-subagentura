@@ -12,13 +12,13 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-- `subagent_interactive` — spawn an attachable tmux-backed Pi session with artifact-based progress
+- `subagent_interactive` — spawn an attachable mux-backed Pi session (tmux/zellij) with artifact-based progress
 - `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
-- `cancel_interactive_subagent` — kill an attachable sub-agent tmux pane
-- `send_interactive_subagent_message` — send a follow-up prompt into a live sub-agent's REPL (preserves the child's model context)
+- `cancel_interactive_subagent` — kill an attachable interactive sub-agent pane
+- `send_interactive_subagent_message` — send a follow-up into a live sub-agent's REPL (preserves child context)
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
-The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
+The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
 
@@ -137,21 +137,21 @@ Parameters:
 Remove all completed and failed subagent jobs from the registry. Running and cancelled jobs are preserved.
 
 
-### Interactive tmux Tools
+### Interactive Sub-agent Tools
 
-Use these when observability and manual follow-up matter more than in-process execution. They require running Pi inside tmux. Interactive sub-agents write their progress to a per-sub-agent artifact directory on disk; the pane is for live monitoring, the artifact is the source of truth.
+Use these when observability and manual follow-up matter more than in-process execution. They require a terminal multiplexer (tmux or zellij). If the parent Pi session is not running inside one, the sub-agent is automatically spawned in a new detached session that you attach to later. Interactive sub-agents write their progress to a per-sub-agent artifact directory on disk; the pane is for live monitoring, the artifact is the source of truth.
 
 #### `subagent_interactive`
 
-Starts a separate interactive `pi` process in a tmux window and returns immediately with:
+Starts a separate interactive `pi` process in a tmux/zellij pane and returns immediately with:
 
 - sub-agent id
-- tmux pane id
-- `tmux attach ...` command (works from outside tmux)
-- `tmux select-pane ...` or `tmux select-window ...` command for use inside the same tmux session
+- pane id and mux backend (tmux or zellij)
+- `attach` command (works from outside the mux session)
+- `focus` command (works from inside the same mux session)
 - child Pi session file path
 - artifact directory (events.ndjson + output.md)
-- the tmux window name (in background mode) so you can find it in your window list
+- the window/tab name (in background mode) so you can find it in your mux UI
 
 Parameters:
 
@@ -161,7 +161,8 @@ Parameters:
 - `model` — optional model override
 - `cwd` — optional working directory
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
-- `background` — spawn in a detached named window (invisible) instead of a visible horizontal split. Default `true` — your tmux layout is undisturbed and you can attach later with the returned `select-window` command. Pass `background: false` for a side-by-side split you can watch in real time.
+- `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
+- `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
 - `notifyOnComplete` — `"inject"` (default) or `"notify"`; controls how the parent LLM is woken up on completion. See [Completion notifications: notify vs inject](#completion-notifications-notify-vs-inject) below.
 
 The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts, so sub-agents that finish while you're away are picked up on the next poll.
@@ -176,7 +177,7 @@ $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
 # 'cancelled' is only set by the parent via cancel_interactive_subagent
 ```
 
-The child's system prompt embeds the **literal absolute path** of the artifact dir at the top, e.g. `Your artifact directory is: /Users/.../artifacts/<id>`. Use that literal path in any `write` tool call (the `write` tool does not expand `$ARTIFACT_DIR`) — the bash examples above work because the launch script exports `ARTIFACT_DIR` to the shell. After `done`, the REPL stays open and the child can be re-prompted via `tmux send-keys` to the pane. The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+The child's system prompt embeds the **literal absolute path** of the artifact dir at the top, e.g. `Your artifact directory is: /Users/.../artifacts/<id>`. Use that literal path in any `write` tool call (the `write` tool does not expand `$ARTIFACT_DIR`) — the bash examples above work because the launch script exports `ARTIFACT_DIR` to the shell. After `done`, the REPL stays open and the child can be re-prompted via `send_interactive_subagent_message` (delivers text + Enter to the child's pane via the same backend that created it). The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
 
 #### Completion notifications: notify vs inject
 
@@ -194,13 +195,12 @@ Lists tracked interactive sub-agents, attach/select commands, and session paths.
 
 #### `cancel_interactive_subagent`
 
-Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
+Kills the mux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
 
 #### `send_interactive_subagent_message`
 
-Sends a follow-up prompt to a running interactive sub-agent by id. The message is delivered into the child's existing REPL via `tmux send-keys`, so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its system prompt) call `cli.mjs done 0` again when finished, which wakes the parent via the usual `notifyOnComplete` path.
-
-Refuses to send if the sub-agent is not in the registry, is not in `running` status, or if tmux itself rejects the `send-keys` call (e.g. the pane was killed between status check and send). All three failure modes return a structured `isError: true` result.
+Sends a follow-up prompt to a running interactive sub-agent by id. The message is delivered into the child's existing REPL via the sub-agent's mux backend (tmux send-keys or zellij write-chars + write 13), so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its system prompt) call `cli.mjs done 0` again when finished, which wakes the parent via the usual `notifyOnComplete` path.
+Refuses to send if the sub-agent is not in the registry, is not in `running` status, or if the mux itself rejects the send call (e.g. the pane was killed between status check and send). All three failure modes return a structured `isError: true` result.
 
 Parameters:
 - `id` — required sub-agent id

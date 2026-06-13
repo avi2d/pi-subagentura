@@ -65,6 +65,7 @@ describe("subagent_interactive notifyOnComplete default", () => {
 			cwd: "/tmp",
 			startedAt: Date.now(),
 			status: "running",
+			mux: "tmux",
 			attachCommand: "tmux attach -t s",
 			selectPaneCommand: "tmux select-pane -t '%99'",
 			launchScriptFile: "/tmp/launch.sh",
