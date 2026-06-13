@@ -34,6 +34,7 @@ function makeState(
     cwd: "/tmp",
     startedAt: Date.now(),
     status,
+    mux: "tmux",
     attachCommand: "tmux attach -t " + id,
     selectPaneCommand: "tmux select-pane -t '%" + id + "'",
     launchScriptFile: "/tmp/launch-" + id + ".sh",

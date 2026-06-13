@@ -38,6 +38,7 @@ function makeState(overrides: {
 		cwd: "/tmp",
 		startedAt: Date.now(),
 		status: "running",
+		mux: "tmux",
 		attachCommand: "tmux attach -t sess",
 		selectPaneCommand: "tmux select-pane -t '%99'",
 		launchScriptFile: "/tmp/launch.sh",
