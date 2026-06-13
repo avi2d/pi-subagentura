@@ -33,6 +33,7 @@ import {
 	getMux,
 	NoMultiplexerAvailableError,
 	type MuxName,
+	type Multiplexer,
 } from "./multiplexer";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 
@@ -352,6 +353,8 @@ export function launchInteractiveSubagent(params: {
 	 * message so the parent LLM processes it in its next turn.
 	 */
 	notifyOnComplete?: "notify" | "inject";
+	/** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
+	muxPreference?: "auto" | "tmux" | "zellij";
 }): InteractiveSubagentState {
 
 	const id = randomBytes(4).toString("hex");
@@ -393,7 +396,7 @@ export function launchInteractiveSubagent(params: {
 	// with a setup hint if neither backend is usable.
 	let mux;
 	try {
-		mux = getMux();
+		mux = getMux({ preference: params.muxPreference });
 	} catch (err) {
 		if (err instanceof NoMultiplexerAvailableError) {
 			throw new Error(`${err.message}\n${tmuxSetupHint()}`);
@@ -456,6 +459,35 @@ export function launchInteractiveSubagent(params: {
 	return state;
 }
 
+
+/**
+ * Resolve the multiplexer that created a given sub-agent state. Uses
+ * `state.mux` to dispatch to the right backend via `getMux({ preference:
+ * state.mux })`, which returns a cached instance so the exec probe is
+ * paid once per process.
+ */
+function getMuxForState(state: InteractiveSubagentState): Multiplexer {
+	return getMux({ preference: state.mux });
+}
+
+/**
+ * Probe whether a pane is still alive, using the mux that created it.
+ * Mux-agnostic — replaces `isTmuxPaneAlive(paneId)`.
+ */
+export function isPaneAlive(state: InteractiveSubagentState): boolean {
+	return getMuxForState(state).isPaneAlive(state.paneId);
+}
+
+/**
+ * Send a command (text + Enter) to a pane, using the mux that created it.
+ * Mux-agnostic — replaces `sendCommandToTmuxPane(paneId, command)`.
+ */
+export function sendCommandToPane(state: InteractiveSubagentState, command: string): void {
+	const mux = getMuxForState(state);
+	mux.sendKeys(state.paneId, command);
+	mux.sendEnter(state.paneId);
+}
+
 /**
  * Probe a tmux pane. Kept as a thin helper for the existing call sites in
  * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
@@ -465,9 +497,8 @@ export function isTmuxPaneAlive(paneId: string): boolean {
 }
 
 /**
- * Send a command to a tmux pane. Kept for the existing `send_interactive_subagent_message`
- * call site; PR #2 will route through `state.mux` so this becomes mux-agnostic
- * (and can use zellij's `paste` for atomic long-message delivery).
+ * Send a command to a tmux pane. Backward-compat alias — prefer
+ * `sendCommandToPane(state, command)` which is mux-agnostic.
  */
 export function sendCommandToTmuxPane(paneId: string, command: string): void {
 	const mux = new TmuxMultiplexer();
@@ -493,8 +524,7 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 
 	// 3. Kill the pane via the backend that created it. The wrapper's EXIT
 	//    trap fires and records the event.
-	const mux = new TmuxMultiplexer();
-	// (PR #2 will swap the conditional to dispatch on state.mux once zellij
+	const mux = getMuxForState(state);
 	//  is real. For now both branches resolve to tmux.)
 	if (mux.isPaneAlive(state.paneId)) {
 		mux.killPane(state.paneId);
@@ -522,22 +552,26 @@ export function deriveInteractiveSubagentStatus(
 }
 
 /**
- * Update registry status for every tracked sub-agent based on the artifact's last event and
- * the pane liveness. Idempotent — safe to call on every poll tick.
+ * Update registry status for every tracked sub-agent based on the artifact's
+ * last event and pane liveness (via the mux that created each pane).
+ * Idempotent — safe to call on every poll tick.
  *
- * Follow-up support: a `done` event with a live pane is the "idle" state, NOT exited. The child
- * is between turns, REPL is open, and `send_interactive_subagent_message` will accept more prompts.
- * Only when the pane is actually gone (or the child called `error`) is the sub-agent terminal.
+ * Follow-up support: a `done` event with a live pane is the "idle" state,
+ * NOT exited. The child is between turns, REPL is open, and
+ * `send_interactive_subagent_message` will accept more prompts. Only when
+ * the pane is actually gone (or the child called `error`) is the sub-agent
+ * terminal.
  *
- * Edge case: if the pane is dead and no `done` event was recorded (mux died before the launch
- * trap could write it), fall back to the session-file existence check — same heuristic as before.
+ * Edge case: if the pane is dead and no `done` event was recorded (mux died
+ * before the launch trap could write it), fall back to the session-file
+ * existence check — same heuristic as before.
  */
 export function pruneDeadInteractiveSubagents(): void {
 	for (const state of interactiveSubagentRegistry.values()) {
 		if (state.status !== "running" && state.status !== "idle") continue;
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
-		const paneAlive = isTmuxPaneAlive(state.paneId);
+		const paneAlive = isPaneAlive(state);
 		let next = deriveInteractiveSubagentStatus(last, paneAlive);
 		// Session-file fallback: if the pane is gone and no event was recorded, the child died.
 		// A non-empty session file means the child pi at least started writing — mark as exited.
@@ -556,6 +590,7 @@ export function formatInteractiveState(state: InteractiveSubagentState): string 
 	const elapsed = Math.floor((Date.now() - state.startedAt) / 1000);
 	const lines: string[] = [
 		`${state.name} (${state.id}) — ${state.status}, ${elapsed}s`,
+		`Mux: ${state.mux}`,
 		`Pane: ${state.paneId}`,
 	];
 	if (state.windowName) lines.push(`Window: ${state.windowName}`);
@@ -564,7 +599,7 @@ export function formatInteractiveState(state: InteractiveSubagentState): string 
 		`Artifact: ${state.artifactDir}`,
 		`Session: ${state.sessionFile}`,
 		`Attach: ${state.attachCommand}`,
-		`From inside tmux: ${state.selectPaneCommand}`,
+		`Focus: ${state.selectPaneCommand}`,
 	);
 	return lines.join("\n");
 }

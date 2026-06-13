@@ -86,6 +86,8 @@ export interface Multiplexer {
 		background: boolean;
 		parentPane?: string;
 		windowName?: string;
+		/** Unique id (8 hex) for naming the new session when parent is not in a mux. */
+		id?: string;
 	}): { paneId: string; windowName?: string };
 
 	/**

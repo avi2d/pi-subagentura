@@ -2,18 +2,18 @@
  * Tests for the `send_interactive_subagent_message` tool.
  *
  * Verifies that the parent-facing tool:
- *   - calls `sendCommandToTmuxPane` with the right pane id and message
+ *   - calls `sendCommandToPane` with the right pane id and message
  *   - refuses invalid / unknown / non-running sub-agents
  *   - returns a structured error if tmux itself rejects the send-keys call
  *
- * The tool uses `sendCommandToTmuxPane` (which shells out to `tmux send-keys`)
+ * The tool uses `sendCommandToPane` (which shells out to `tmux send-keys`)
  * and `interactiveSubagentRegistry` — both are mocked here so the test stays
  * hermetic and doesn't require a live tmux server.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockSendCommandToTmuxPane, mockGet } = vi.hoisted(() => ({
-	mockSendCommandToTmuxPane: vi.fn(),
+const { mockSendCommandToPane, mockGet } = vi.hoisted(() => ({
+	mockSendCommandToPane: vi.fn(),
 	mockGet: vi.fn(),
 }));
 
@@ -22,7 +22,7 @@ vi.mock("./interactive-tmux", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./interactive-tmux")>();
 	return {
 		...actual,
-		sendCommandToTmuxPane: mockSendCommandToTmuxPane,
+		sendCommandToPane: mockSendCommandToPane,
 		interactiveSubagentRegistry: {
 			get: mockGet,
 		} as any,
@@ -76,7 +76,7 @@ describe("send_interactive_subagent_message", () => {
 
 	it("sends the message to the pane and returns success details", async () => {
 		mockGet.mockReturnValue(runningState());
-		mockSendCommandToTmuxPane.mockReturnValue(undefined);
+		mockSendCommandToPane.mockReturnValue(undefined);
 
 		const toolDef = getToolDef(api, "send_interactive_subagent_message");
 		const result = await toolDef.execute("call-1", {
@@ -85,7 +85,7 @@ describe("send_interactive_subagent_message", () => {
 		});
 
 		expect(mockGet).toHaveBeenCalledWith("abc12345");
-		expect(mockSendCommandToTmuxPane).toHaveBeenCalledWith("%99", "now do step 2");
+		expect(mockSendCommandToPane).toHaveBeenCalledWith(expect.objectContaining({ paneId: "%99" }), "now do step 2");
 		expect(result.isError).toBeFalsy();
 		expect(result.details).toMatchObject({
 			id: "abc12345",
@@ -101,7 +101,7 @@ describe("send_interactive_subagent_message", () => {
 		// 'idle' is the whole point of the follow-up flow: the child finished a turn, REPL is still
 		// open, status='idle' (not 'exited'). The tool must accept sends in this state.
 		mockGet.mockReturnValue(runningState({ status: "idle" }));
-		mockSendCommandToTmuxPane.mockReturnValue(undefined);
+		mockSendCommandToPane.mockReturnValue(undefined);
 
 		const toolDef = getToolDef(api, "send_interactive_subagent_message");
 		const result = await toolDef.execute("call-1b", {
@@ -109,7 +109,7 @@ describe("send_interactive_subagent_message", () => {
 			message: "follow-up after turn 1",
 		});
 
-		expect(mockSendCommandToTmuxPane).toHaveBeenCalledWith("%99", "follow-up after turn 1");
+		expect(mockSendCommandToPane).toHaveBeenCalledWith(expect.objectContaining({ paneId: "%99" }), "follow-up after turn 1");
 		expect(result.isError).toBeFalsy();
 		expect(result.details.status).toBe("sent");
 	});
@@ -120,7 +120,7 @@ describe("send_interactive_subagent_message", () => {
 		const result = await toolDef.execute("call-2", { id: "not-hex", message: "hi" });
 
 		expect(mockGet).not.toHaveBeenCalled();
-		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(mockSendCommandToPane).not.toHaveBeenCalled();
 		expect(result.isError).toBe(true);
 		expect(result.details.status).toBe("invalid_id");
 		expect(result.content[0].text).toMatch(/Invalid sub-agent id/);
@@ -133,7 +133,7 @@ describe("send_interactive_subagent_message", () => {
 		const result = await toolDef.execute("call-empty", { id: "abc12345", message });
 
 		expect(mockGet).not.toHaveBeenCalled();
-		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(mockSendCommandToPane).not.toHaveBeenCalled();
 		expect(result.isError).toBe(true);
 		expect(result.details.status).toBe("empty_message");
 		expect(result.details.messageLength).toBe(0);
@@ -148,7 +148,7 @@ describe("send_interactive_subagent_message", () => {
 		const result = await toolDef.execute("call-huge", { id: "abc12345", message });
 
 		expect(mockGet).not.toHaveBeenCalled();
-		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(mockSendCommandToPane).not.toHaveBeenCalled();
 		expect(result.isError).toBe(true);
 		expect(result.details).toMatchObject({
 			id: "abc12345",
@@ -163,13 +163,13 @@ describe("send_interactive_subagent_message", () => {
 	it("accepts a message exactly at the 64 KiB boundary", async () => {
 		// Boundary check: 64 KiB is allowed, 64 KiB + 1 is not.
 		mockGet.mockReturnValue(runningState());
-		mockSendCommandToTmuxPane.mockReturnValue(undefined);
+		mockSendCommandToPane.mockReturnValue(undefined);
 
 		const toolDef = getToolDef(api, "send_interactive_subagent_message");
 		const message = "x".repeat(64 * 1024);
 		const result = await toolDef.execute("call-boundary", { id: "abc12345", message });
 
-		expect(mockSendCommandToTmuxPane).toHaveBeenCalledWith("%99", message);
+		expect(mockSendCommandToPane).toHaveBeenCalledWith(expect.objectContaining({ paneId: "%99" }), message);
 		expect(result.isError).toBeFalsy();
 		expect(result.details.status).toBe("sent");
 		expect(result.details.messageLength).toBe(64 * 1024);
@@ -180,7 +180,7 @@ describe("send_interactive_subagent_message", () => {
 		const toolDef = getToolDef(api, "send_interactive_subagent_message");
 		const result = await toolDef.execute("call-3", { id: "deadbeef", message: "hi" });
 
-		expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+		expect(mockSendCommandToPane).not.toHaveBeenCalled();
 		expect(result.isError).toBe(true);
 		expect(result.details.status).toBe("not_found");
 	});
@@ -193,7 +193,7 @@ describe("send_interactive_subagent_message", () => {
 			const toolDef = getToolDef(api, "send_interactive_subagent_message");
 			const result = await toolDef.execute("call-4", { id: "abc12345", message: "hi" });
 
-			expect(mockSendCommandToTmuxPane).not.toHaveBeenCalled();
+			expect(mockSendCommandToPane).not.toHaveBeenCalled();
 			expect(result.isError).toBe(true);
 			expect(result.details.status).toBe(status);
 			expect(result.content[0].text).toContain(`is ${status}`);
@@ -202,7 +202,7 @@ describe("send_interactive_subagent_message", () => {
 
 	it("returns a structured error when tmux send-keys throws (pane gone between check and send)", async () => {
 		mockGet.mockReturnValue(runningState());
-		mockSendCommandToTmuxPane.mockImplementation(() => {
+		mockSendCommandToPane.mockImplementation(() => {
 			throw new Error("can't find pane: %99");
 		});
 
