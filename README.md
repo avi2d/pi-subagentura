@@ -15,9 +15,12 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `subagent_interactive` — spawn an attachable tmux-backed Pi session with artifact-based progress
 - `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
 - `cancel_interactive_subagent` — kill an attachable sub-agent tmux pane
+- `send_interactive_subagent_message` — send a follow-up prompt into a live sub-agent's REPL (preserves the child's model context)
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
 The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
+
+Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
 
 ## Why use it?
 
@@ -190,21 +193,34 @@ Both modes share a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents 
 Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
 
 #### `cancel_interactive_subagent`
+
 Kills the tmux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
 
+#### `send_interactive_subagent_message`
+
+Sends a follow-up prompt to a running interactive sub-agent by id. The message is delivered into the child's existing REPL via `tmux send-keys`, so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its system prompt) call `cli.mjs done 0` again when finished, which wakes the parent via the usual `notifyOnComplete` path.
+
+Refuses to send if the sub-agent is not in the registry, is not in `running` status, or if tmux itself rejects the `send-keys` call (e.g. the pane was killed between status check and send). All three failure modes return a structured `isError: true` result.
+
+Parameters:
+- `id` — required sub-agent id
+- `message` — required follow-up prompt text
 #### `list_subagent_artifacts`
 
 Lists all known interactive sub-agents: id, name, status, and last-update timestamp. Use this to discover sub-agents that finished while the parent was away.
 
 #### `read_subagent_artifact`
 
-Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content. This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content (the latest turn's output). This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
 
+For follow-up support, the parent poller snapshots `output.md` into `output-N.md` after each new `done` event (where N is the turn number). Pass `turn: N` to read a specific historical turn's snapshot. The response's `details.availableTurns` lists all turns with snapshots.
 
 Parameters:
 - `id` — required sub-agent id
 - `since` — optional unix-ms timestamp; only return events with `ts >= since`
-- `includeOutput` — include `output.md` (default `true`)
+- `includeOutput` — include the output (default `true`); ignored if `turn` is set (turn implies output)
+- `turn` — optional turn number; read `output-N.md` for that specific turn instead of the latest `output.md`
+
 
 ### `list_available_models`
 

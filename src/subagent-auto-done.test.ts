@@ -294,10 +294,14 @@ describe("auto-done fallback", () => {
 		const { state, artifactDir } = makeState({ outputContent: "result" });
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
-// Simulate the post-turn state that follow-up work produces: the child called `cli.mjs done`
-// (so the poller set status to "idle") and the parent has just sent a follow-up keystroke
-// into the REPL. The user-role entry in the session log must revive status so the next
-// auto-done / done-event opportunity fires for the new turn.
+		// Simulate the post-turn state that follow-up work produces: the child called `cli.mjs done`
+		// (so a `done` event is in the artifact and the poller would naturally transition to "idle" via
+		// deriveInteractiveSubagentStatus), and the parent has just sent a follow-up keystroke into
+		// the REPL. The user-role entry in the session log must revive status so the next
+		// auto-done / done-event opportunity fires for the new turn.
+		const art = artifactPath(join(artifactDir, ".."), state.id);
+		appendEvent(art, { ts: 1, type: "started", status: "running" });
+		appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 		state.status = "idle";
 		mod.pollArtifactChanges({} as any);
 		expect(state.status).toBe("idle");

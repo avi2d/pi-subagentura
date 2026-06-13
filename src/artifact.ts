@@ -2,15 +2,15 @@
  * Sub-agent artifact storage.
  *
  * Each interactive sub-agent owns a directory under the parent's artifacts root.
- * The directory holds two files:
+ * The directory holds three kinds of files:
  *
- *   events.ndjson  — append-only log of lifecycle and tool_activity events
-
- *   output.md      — clean prose the sub-agent produced; atomically rewritten
- *
- * The parent agent's extension reads these files (via list_subagent_artifacts /
- * read_subagent_artifact) to learn what the sub-agent did. The pane is for live
- * monitoring only; the artifact is the source of truth.
+ *   events.ndjson    — append-only log of lifecycle and tool_activity events
+ *   output.md        — latest output the sub-agent produced; atomically rewritten each turn
+ *   output-N.md      — per-turn snapshots: written by the parent poller on each new `done` event,
+ *                      where N is the count of `done` events in events.ndjson at the time of the snapshot.
+ *                      These preserve full turn history so a parent can re-read earlier turns even after
+ *                      output.md is overwritten. The poller writes them right after it sees a new done event,
+ *                      so by protocol (write output.md before calling done) the snapshot reflects that turn.
  *
  * Files survive parent-agent restarts, so a sub-agent can complete while the
  * parent is down and the parent can catch up by reading the artifact later.
@@ -75,6 +75,65 @@ export function writeOutput(art: SubagentArtifact, content: string): void {
 	const tmp = art.outputFile + ".tmp";
 	writeFileSync(tmp, content, { mode: 0o600 });
 	renameSync(tmp, art.outputFile);
+}
+
+/**
+ * Path of the per-turn snapshot file: `${artifactDir}/output-N.md`.
+ * Exported so the poller (and tests) can name the file consistently.
+ */
+export function outputPathForTurn(art: SubagentArtifact, turn: number): string {
+	return join(art.dir, `output-${turn}.md`);
+}
+
+/**
+ * Snapshot the latest output.md into output-N.md, where N is the caller's choice (typically the
+ * count of `done` events in events.ndjson at the moment of the snapshot). No-op if output.md is missing.
+ * The snapshot uses an atomic rename from a sibling .tmp file, matching writeOutput's durability.
+ *
+ * Callers should pass N = events.filter(type === "done").length so that a re-poll of the same event
+ * would compute the same N — but a guard inside would be brittle. Trust the caller.
+ */
+export function snapshotOutput(art: SubagentArtifact, turn: number): void {
+	if (!existsSync(art.outputFile)) return;
+	const target = outputPathForTurn(art, turn);
+	const tmp = target + ".tmp";
+	const content = readFileSync(art.outputFile, "utf8");
+	writeFileSync(tmp, content, { mode: 0o600 });
+	renameSync(tmp, target);
+}
+
+/**
+ * Read a specific turn's snapshot (output-N.md). Returns null if the snapshot doesn't exist.
+ */
+export function readOutputForTurn(art: SubagentArtifact, turn: number): string | null {
+	const target = outputPathForTurn(art, turn);
+	if (!existsSync(target)) return null;
+	try {
+		return readFileSync(target, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * List the turn numbers for which a snapshot exists. Sorted ascending. Used by read_subagent_artifact
+ * to summarize the available history.
+ */
+export function listOutputTurns(art: SubagentArtifact): number[] {
+	if (!existsSync(art.dir)) return [];
+	let entries: string[];
+	try {
+		entries = readdirSync(art.dir);
+	} catch {
+		return [];
+	}
+	const turns: number[] = [];
+	for (const name of entries) {
+		const m = /^output-(\d+)\.md$/.exec(name);
+		if (m) turns.push(Number(m[1]));
+	}
+	turns.sort((a, b) => a - b);
+	return turns;
 }
 
 // ── Reads ───────────────────────────────────────────────────────────

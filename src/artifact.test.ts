@@ -8,8 +8,12 @@ import {
 	ensureArtifactDir,
 	lastEvent,
 	listArtifacts,
+	listOutputTurns,
+	outputPathForTurn,
 	readEvents,
 	readOutput,
+	readOutputForTurn,
+	snapshotOutput,
 	writeOutput,
 	type SubagentEvent,
 } from "./artifact";
@@ -189,6 +193,69 @@ describe("artifact", () => {
 			appendEvent(art, { ts: 9, type: "done", status: "done", exitCode: 0 });
 			expect(lastEvent(art)?.ts).toBe(9);
 			expect(lastEvent(art)?.type).toBe("done");
+		});
+
+	});
+
+	describe("per-turn snapshots (output-N.md)", () => {
+		it("snapshotOutput copies the current output.md into output-N.md", () => {
+			const art = artifactPath(root, "snap1");
+			writeOutput(art, "first turn's answer");
+			snapshotOutput(art, 1);
+			expect(existsSync(outputPathForTurn(art, 1))).toBe(true);
+			expect(readOutputForTurn(art, 1)).toBe("first turn's answer");
+			// output.md is untouched (it's the source).
+			expect(readOutput(art)).toBe("first turn's answer");
+		});
+
+		it("preserves history across multiple snapshots — earlier turns aren't overwritten", () => {
+			const art = artifactPath(root, "snap2");
+			// Turn 1
+			writeOutput(art, "answer v1");
+			snapshotOutput(art, 1);
+			// Turn 2: child overwrites output.md, poller snapshots again
+			writeOutput(art, "answer v2");
+			snapshotOutput(art, 2);
+			// Turn 3
+			writeOutput(art, "answer v3");
+			snapshotOutput(art, 3);
+
+			expect(readOutputForTurn(art, 1)).toBe("answer v1");
+			expect(readOutputForTurn(art, 2)).toBe("answer v2");
+			expect(readOutputForTurn(art, 3)).toBe("answer v3");
+			// Latest output.md is v3.
+			expect(readOutput(art)).toBe("answer v3");
+		});
+
+		it("readOutputForTurn returns null when the snapshot doesn't exist", () => {
+			const art = artifactPath(root, "snap3");
+			writeOutput(art, "v1");
+			snapshotOutput(art, 1);
+			expect(readOutputForTurn(art, 2)).toBe(null);
+			expect(readOutputForTurn(art, 99)).toBe(null);
+		});
+
+		it("snapshotOutput is a no-op when output.md is missing", () => {
+			const art = artifactPath(root, "snap4");
+			// No writeOutput call — output.md doesn't exist.
+			snapshotOutput(art, 1);
+			expect(existsSync(outputPathForTurn(art, 1))).toBe(false);
+		});
+
+		it("listOutputTurns returns the turn numbers for which a snapshot exists, sorted", () => {
+			const art = artifactPath(root, "snap5");
+			writeOutput(art, "a");
+			snapshotOutput(art, 2); // out of order to verify sort
+			writeOutput(art, "b");
+			snapshotOutput(art, 1);
+			writeOutput(art, "c");
+			snapshotOutput(art, 3);
+			expect(listOutputTurns(art)).toEqual([1, 2, 3]);
+		});
+
+		it("listOutputTurns returns [] when the artifact dir doesn't exist", () => {
+			const art = artifactPath(root, "snap6-nonexistent");
+			expect(listOutputTurns(art)).toEqual([]);
 		});
 	});
 });
