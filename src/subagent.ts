@@ -495,7 +495,14 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 	const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
 	for (const state of interactiveSubagentRegistry.values()) {
-		if (state.status === "cancelled" || state.status === "exited" || state.status === "unknown") continue;
+		// Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
+		// revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
+		// follow-up user message lands in the session log (auto-done case). To make that reachable,
+		// the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
+		// status-update block below may re-mark the state as "exited" (based on a stale synthesized
+		// error event in the artifact) but the revival, running later in the same poll via
+		// tailReadSessionLog, will reset it to "running" within this same tick.
+		if (state.status === "cancelled" || state.status === "unknown") continue;
 
 		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 		const last = lastEvent(art);
@@ -759,10 +766,13 @@ function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentAr
 		state.lastStopReason = undefined;
 		state.lastStopReasonAt = undefined;
 		state.lastStopText = undefined;
-		// If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn),
-		// revive it to "running" so the for-loop keeps tail-reading the session log. Without this, a
-		// user follow-up after auto-done would be silently ignored and the next auto-done opportunity missed.
-		if (state.status === "exited") state.status = "running";
+		// If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn)
+		// OR "idle" (the natural post-turn state once follow-up work lands), revive it to "running"
+		// so the for-loop keeps tail-reading the session log. Without this, a user follow-up after
+		// a previous completion would be silently ignored and the next auto-done / done-event
+		// opportunity missed. Both paths share the same revival semantics: a user-role entry means
+		// a new turn is starting, regardless of how the previous turn ended.
+		if (state.status === "exited" || state.status === "idle") state.status = "running";
 		return;
 	}
 

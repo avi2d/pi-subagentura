@@ -263,6 +263,59 @@ describe("auto-done fallback", () => {
 		expect(state.autoDoneForTurnAt).toBeUndefined();
 	});
 
+	it("a new user message in the session log revives status from 'exited' to 'running' (auto-done case)", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state, artifactDir } = makeState({ outputContent: "result" });
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+		mod.pollArtifactChanges({} as any);
+		// Simulate the post-synthesized-error state: the poller's main loop sets status to "exited"
+		// once the synthesized error event lands in the artifact. The user has now sent a follow-up;
+		// we want to verify the user-role revival clears "exited" too.
+		state.status = "exited";
+
+		const userMsg = {
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "thanks, also do X" }],
+				timestamp: Date.now(),
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+		// Status revived so the next auto-done / done-event opportunity can fire for the new turn.
+		expect(state.status).toBe("running");
+	});
+
+	it("a new user message in the session log revives status from 'idle' to 'running' (follow-up case)", async () => {
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+		const { state, artifactDir } = makeState({ outputContent: "result" });
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+// Simulate the post-turn state that follow-up work produces: the child called `cli.mjs done`
+// (so the poller set status to "idle") and the parent has just sent a follow-up keystroke
+// into the REPL. The user-role entry in the session log must revive status so the next
+// auto-done / done-event opportunity fires for the new turn.
+		state.status = "idle";
+		mod.pollArtifactChanges({} as any);
+		expect(state.status).toBe("idle");
+
+		const userMsg = {
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "follow-up after turn 1" }],
+				timestamp: Date.now(),
+			},
+		};
+		writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
+
+		mod.pollArtifactChanges({} as any);
+		expect(state.status).toBe("running");
+	});
+
 	it("captures stopReason and lastStopText from real session JSONL tail-read", async () => {
 		const mod = await importFresh<typeof import("./subagent")>("./subagent");
 		const { state } = makeState({});

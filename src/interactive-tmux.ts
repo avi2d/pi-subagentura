@@ -55,7 +55,12 @@ For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJS
 If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a fallback \`error\` event from your session log, but only if your final assistant turn ended with stopReason "stop" and you have not produced any output for 10 seconds. That fallback may not include the full result if output.md is missing. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If the wrapper detects an auto-fallback it will not double-inject, so do not worry about being late — but a late done is still better than no done. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
 }
 
-export type InteractiveSubagentStatus = "running" | "cancelled" | "exited" | "unknown";
+// Note: "idle" is included as a forward-compatible status. It is the natural post-turn state on
+// interactive sub-agents that called `cli.mjs done` (REPL still open, pane alive). The current
+// PR doesn't set it (auto-done is the only path that produces a non-"running" status here), but
+// follow-up work adds the child-protocol-driven path that uses it. Including it now keeps the
+// revival check at subagent.ts:765 type-safe when both PRs are stacked.
+export type InteractiveSubagentStatus = "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
 	id: string;
