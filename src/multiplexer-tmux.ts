@@ -58,20 +58,17 @@ export class TmuxMultiplexer implements Multiplexer {
 	readonly name = "tmux" as const;
 
 	/**
-	 * True iff `tmux` is on PATH AND the parent process is inside a tmux
-	 * server. The env-var check is the same one the original code used;
-	 * PR #1 keeps it as a hard requirement for the "auto" path so existing
-	 * users who only have tmux keep their behavior. Callers that explicitly
-	 * want the "spawn in a fresh detached session" path need to use
-	 * `TmuxMultiplexer` directly (or pre-flight with `isAvailable`), not
-	 * `getMux({ preference: "auto" })`.
+	 * True iff the `tmux` binary is on PATH. Does NOT require the parent
+	 * process to be attached to a tmux server (the relaxed-spawn path in
+	 * `createPane` handles unattached parents by creating a detached session).
 	 *
-	 * Note: for the relaxed-spawn path to work, callers must short-circuit
-	 * the availability check and call `createPane` directly. The wrapper
-	 * `launchInteractiveSubagent` in `interactive-tmux.ts` does this.
+	 * The env-var heuristic (`process.env.TMUX`) lives in `getMux()`'s
+	 * auto-resolution, not here — `isAvailable` is a pure binary-availability
+	 * check so the fallback path in `getMux()` can find a backend even when
+	 * the user is running in a plain terminal.
 	 */
 	isAvailable(): boolean {
-		return Boolean(process.env.TMUX && commandExists("tmux"));
+		return commandExists("tmux");
 	}
 
 	/**
