@@ -1,10 +1,47 @@
-import { execFileSync } from "node:child_process";
+/**
+ * Interactive sub-agent orchestrator (tmux/zellij).
+ *
+ * PR #1 refactor: this file used to do all tmux exec calls inline. Those
+ * moved to `multiplexer-tmux.ts` behind the `Multiplexer` interface in
+ * `multiplexer.ts`. This file is now the thin orchestrator:
+ *
+ *   - defines the lifecycle state (`InteractiveSubagentState`) and registry
+ *   - builds the launch script and the per-child paths
+ *   - picks a `Multiplexer` via `getMux()` and stores its name on the state
+ *   - dispatches the helper operations (is-alive, send-keys, kill) to the
+ *     right backend
+ *   - derives status and formats the user-facing summary
+ *
+ * No tmux-specific `execFileSync("tmux", ...)` calls remain in this file —
+ * the new home for them is `multiplexer-tmux.ts`. The PR also relaxes the
+ * spawn check: a child can be created even when the parent is not in a
+ * tmux/zellij session (a new detached session is created on the fly; the
+ * user attaches via the returned `attachCommand`).
+ *
+ * The exports kept here are the public surface consumed by `subagent.ts`
+ * and the test suite. Their signatures are preserved verbatim so the rest
+ * of the codebase compiles unchanged.
+ */
+
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
 import { artifactPath, lastEvent, type SubagentArtifact, type SubagentEvent } from "./artifact";
+import {
+	getMux,
+	NoMultiplexerAvailableError,
+	type MuxName,
+} from "./multiplexer";
+import { TmuxMultiplexer } from "./multiplexer-tmux";
+
+// Re-export the tmux-specific `readPaneExitCode` for the test suite. The
+// launch script's EXIT trap still writes the @pi-exit-code pane option
+// (it's a no-op on non-tmux systems thanks to `2>/dev/null || true`); this
+// helper is the only place that reads it back. The artifact's `done`
+// event is the source of truth in production.
+export { readPaneExitCode } from "./multiplexer-tmux";
 
 /**
  * System prompt sent to every interactive sub-agent. Tells the child how to
@@ -56,7 +93,7 @@ If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a
 }
 
 /**
- * Sub-agent status for the interactive (tmux-backed) registry.
+ * Sub-agent status for the interactive registry.
  *
  * - "running"  — child is processing a turn (last artifact event is "started" or absent)
  * - "idle"     — child finished a turn, REPL is open, pane alive; ready for a follow-up prompt
@@ -71,8 +108,15 @@ export interface InteractiveSubagentState {
 	name: string;
 	task: string;
 	paneId: string;
-	/** tmux window name (set when spawned in background mode via new-window -n). */
+	/** tmux window name / zellij tab name (set when spawned in background mode via new-window -n / new-tab). */
 	windowName?: string;
+	/**
+	 * Which backend was used to spawn this sub-agent. Set once at spawn time
+	 * and never changes — all later operations on the child (is-alive,
+	 * send-keys, kill, attach) route through this backend. Pre-PR-2 this is
+	 * always "tmux".
+	 */
+	mux: MuxName;
 	sessionFile: string;
 	cwd: string;
 	model?: string;
@@ -115,25 +159,25 @@ export interface InteractiveSubagentState {
 	/**
 	 * Last terminal stopReason seen in the child session log (assistant message).
 	 * One of "stop" | "length" | "error" | "aborted". Updated whenever we tail-read a new
- * assistant message. Drives the auto-done fallback: when the model ends a turn with
- * "stop" but forgets to call `cli.mjs done`, the parent synthesizes a completion event.
+	 * assistant message. Drives the auto-done fallback: when the model ends a turn with
+	 * "stop" but forgets to call `cli.mjs done`, the parent synthesizes a completion event.
 	 */
 	lastStopReason?: "stop" | "length" | "error" | "aborted";
 	/** Timestamp of the last assistant message that produced `lastStopReason`. Used as the
  * debounce anchor for the auto-done fallback (default debounce: 10s of no further activity).
-	 */
+ */
 	lastStopReasonAt?: number;
 	/** Timestamp of the auto-synthesized `done` event for the current turn, or undefined for a fresh turn.
  * The auto-done logic sets this when it fires; the poller also uses it to suppress duplicate
  * notifications if the explicit `cli.mjs done` lands shortly after the fallback synthesis.
  * Cleared on a new user-role message in the session log (next turn starts).
-	 */
+ */
 	autoDoneForTurnAt?: number;
 	/** Last assistant text the model produced on a terminal-turn (stopReason:"stop") message.
  * Captured at session-log tail-read time. Used as fallback content in the synthesized error
  * event when output.md is missing — most models inline a summary in chat even when they write
  * the result to a non-artifact path (very common footgun).
-	 */
+ */
 	lastStopText?: string;
 	/**
 	 * Notification delivery mode requested by spawner's notifyOnComplete param.
@@ -168,185 +212,99 @@ if (!globalThis.__piSubagenturaInteractiveRegistry) {
 
 export const interactiveSubagentRegistry = globalThis.__piSubagenturaInteractiveRegistry!;
 
-function commandExists(command: string): boolean {
-  try {
-    execFileSync("/bin/sh", ["-lc", `command -v ${shellEscape(command)}`], {
-      stdio: "ignore",
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
+/**
+ * True iff a tmux server is running and the parent is attached to one of its
+ * sessions. Kept for backward compat with the existing `isTmuxAvailable`
+ * name; PR #2's `isAnyMuxAvailable` will be the mux-agnostic version.
+ */
 export function isTmuxAvailable(): boolean {
-  return Boolean(process.env.TMUX && commandExists("tmux"));
+	return new TmuxMultiplexer().isAvailable();
 }
 
+/** Setup hint shown to the user when no mux is available. Mux-agnostic. */
 export function tmuxSetupHint(): string {
-  return "Start pi inside tmux, for example: tmux new -A -s pi 'pi'";
-}
-
-export function shellEscape(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+	return (
+		"Start pi inside tmux or zellij, for example:\n" +
+		"  tmux new -A -s pi 'pi'\n" +
+		"  zellij --session pi  (or just start pi inside an existing zellij session)"
+	);
 }
 
 function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
-  );
+	return (
+		value
+			.toLowerCase()
+			.replace(/[^a-z0-9._-]+/g, "-")
+			.replace(/-+/g, "-")
+			.replace(/^-|-$/g, "") || "subagent"
+	);
 }
 
 function defaultSessionRoot(): string {
-  return process.env.PI_CODING_AGENT_SESSION_DIR
-    ? resolve(process.env.PI_CODING_AGENT_SESSION_DIR)
-    : join(homedir(), ".pi", "agent", "sessions");
+	return process.env.PI_CODING_AGENT_SESSION_DIR
+		? resolve(process.env.PI_CODING_AGENT_SESSION_DIR)
+		: join(homedir(), ".pi", "agent", "sessions");
 }
 
 function sessionDirFor(cwd: string): string {
-  const cwdLabel = `${safeSegment(basename(cwd))}-${randomBytes(3).toString("hex")}`;
-  return join(defaultSessionRoot(), "subagentura", cwdLabel);
+	const cwdLabel = `${safeSegment(basename(cwd))}-${randomBytes(3).toString("hex")}`;
+	return join(defaultSessionRoot(), "subagentura", cwdLabel);
 }
 
 export function createInteractiveSubagentPaths(params: {
-  id: string;
-  name: string;
-  cwd: string;
+	id: string;
+	name: string;
+	cwd: string;
 }): { sessionFile: string; artifactDir: string; promptFile: string; systemPromptFile: string; launchScriptFile: string } {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const label = safeSegment(params.name);
-  const dir = sessionDirFor(params.cwd);
-  const artifactDir = join(dir, "artifacts", params.id);
-  return {
-    sessionFile: join(dir, `${timestamp}-${params.id}.jsonl`),
-    artifactDir,
-    promptFile: join(artifactDir, `${label}-prompt.md`),
-    systemPromptFile: join(artifactDir, `${label}-system.md`),
-    launchScriptFile: join(artifactDir, `${label}-launch.sh`),
-  };
+	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const label = safeSegment(params.name);
+	const dir = sessionDirFor(params.cwd);
+	const artifactDir = join(dir, "artifacts", params.id);
+	return {
+		sessionFile: join(dir, `${timestamp}-${params.id}.jsonl`),
+		artifactDir,
+		promptFile: join(artifactDir, `${label}-prompt.md`),
+		systemPromptFile: join(artifactDir, `${label}-system.md`),
+		launchScriptFile: join(artifactDir, `${label}-launch.sh`),
+	};
 }
 
 export function buildInteractivePrompt(params: {
-  task: string;
-  contextText?: string | null;
+	task: string;
+	contextText?: string | null;
 }): string {
-  if (!params.contextText) return params.task;
-  return [
-    "You are an interactive sub-agent running in your own Pi session.",
-    "The parent session context is included below for reference.",
-    "",
-    "--- Parent session context ---",
-    params.contextText,
-    "--- End parent session context ---",
-    "",
-    "Task:",
-    params.task,
-  ].join("\n");
+	if (!params.contextText) return params.task;
+	return [
+		"You are an interactive sub-agent running in your own Pi session.",
+		"The parent session context is included below for reference.",
+		"",
+		"--- Parent session context ---",
+		params.contextText,
+		"--- End parent session context ---",
+		"",
+		"Task:",
+		params.task,
+	].join("\n");
 }
 
 export function buildPiInteractiveCommand(params: {
-  sessionFile: string;
-  name: string;
-  promptFile: string;
-  systemPromptFile?: string;
-  model?: string;
-  cwd: string;
+	sessionFile: string;
+	name: string;
+	promptFile: string;
+	systemPromptFile?: string;
+	model?: string;
+	cwd: string;
 }): string {
-  const parts = ["pi", "--session", shellEscape(params.sessionFile), "--name", shellEscape(params.name)];
-  if (params.model) {
-    parts.push("--model", shellEscape(params.model));
-  }
-  if (params.systemPromptFile) {
-    parts.push("--append-system-prompt", shellEscape(params.systemPromptFile));
-  }
-  parts.push(shellEscape(`@${params.promptFile}`));
-  return `cd ${shellEscape(params.cwd)} && ${parts.join(" ")}`;
-}
-
-function getPaneLocation(paneId: string): { session: string; window: string; pane: string } {
-  const output = execFileSync(
-    "tmux",
-    ["display-message", "-p", "-t", paneId, "#{session_name}\t#{window_index}\t#{pane_index}"],
-    { encoding: "utf8" },
-  ).trim();
-  const [session, window, pane] = output.split("\t");
-  return { session, window, pane };
-}
-
-export function buildTmuxAttachCommands(
-  paneId: string,
-  opts: { windowName?: string } = {},
-): { attachCommand: string; selectPaneCommand: string } {
-  if (opts.windowName) {
-    // Background mode: pane lives in a named detached window. Attach command
-    // chains `attach -t <session>` with `select-window -t <windowName>` so it
-    // works from outside the session too. Inside-tmux callers get the same
-    // effect via `\\;` chaining — the attach errors with "nested sessions"
-    // but the select-window still runs.
-    const location = getPaneLocation(paneId);
-    return {
-      attachCommand: `tmux attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
-      selectPaneCommand: `tmux select-window -t ${shellEscape(opts.windowName)}`,
-    };
-  }
-  const location = getPaneLocation(paneId);
-  const targetWindow = `${location.session}:${location.window}`;
-  return {
-    attachCommand: `tmux attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(targetWindow)} \\; select-pane -t ${shellEscape(paneId)}`,
-    selectPaneCommand: `tmux select-pane -t ${shellEscape(paneId)}`,
-  };
-}
-
-export function createTmuxPane(
-  name: string,
-  cwd: string,
-  opts: { background: boolean },
-): { paneId: string; windowName?: string } {
-  if (!isTmuxAvailable()) {
-    throw new Error(`tmux is not available. ${tmuxSetupHint()}`);
-  }
-  let paneId: string;
-  let windowName: string | undefined;
-  if (opts.background) {
-    // Spawn in a new detached window — invisible to the user until they select
-    // it. Each background sub-agent gets its own named window so they don't
-    // clobber each other in the tmux window list.
-    windowName = safeSegment(name);
-    paneId = execFileSync(
-      "tmux",
-      ["new-window", "-d", "-n", windowName, "-P", "-F", "#{pane_id}", "-c", cwd],
-      { encoding: "utf8" },
-    ).trim();
-  } else {
-    // Visible horizontal split — parent pane keeps focus. Same session,
-    // immediately adjacent to the parent's pane.
-    const args = ["split-window", "-d", "-h", "-P", "-F", "#{pane_id}", "-c", cwd];
-    if (process.env.TMUX_PANE) {
-      args.splice(4, 0, "-t", process.env.TMUX_PANE);
-    }
-    paneId = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-  }
-  if (!paneId.startsWith("%")) {
-    throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
-  }
-  if (!opts.background) {
-    // Pane title is cosmetic and the new window already shows `name`.
-    try {
-      execFileSync("tmux", ["select-pane", "-t", paneId, "-T", name], { encoding: "utf8" });
-    } catch {
-      // Pane title is cosmetic and can fail on older tmux versions.
-    }
-  }
-  return { paneId, windowName };
-}
-
-export function sendCommandToTmuxPane(paneId: string, command: string): void {
-  execFileSync("tmux", ["send-keys", "-t", paneId, "-l", command], { encoding: "utf8" });
-  execFileSync("tmux", ["send-keys", "-t", paneId, "Enter"], { encoding: "utf8" });
+	const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+	const parts = ["pi", "--session", escape(params.sessionFile), "--name", escape(params.name)];
+	if (params.model) {
+		parts.push("--model", escape(params.model));
+	}
+	if (params.systemPromptFile) {
+		parts.push("--append-system-prompt", escape(params.systemPromptFile));
+	}
+	parts.push(escape(`@${params.promptFile}`));
+	return `cd ${escape(params.cwd)} && ${parts.join(" ")}`;
 }
 
 export function writeLaunchScript(path: string, command: string, artifactDir: string): void {
@@ -362,11 +320,13 @@ export function writeLaunchScript(path: string, command: string, artifactDir: st
 	//    - exports ARTIFACT_DIR so the child inherits it;
 	//    - calls `cli.mjs start` to record the started event;
 	//    - traps EXIT to call `cli.mjs done <code>` (or `cancelled` if a .cancelled flag is present);
-	//    - also writes the @pi-exit-code pane option for the readPaneExitCode fallback.
+	//    - also writes the @pi-exit-code pane option for the readPaneExitCode fallback
+	//      (tmux-only; the `2>/dev/null || true` makes it a silent no-op on other muxes).
+	const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
 	const script = [
 		"#!/bin/bash",
 		"set -e",
-		`export ARTIFACT_DIR=${shellEscape(artifactDir)}`,
+		`export ARTIFACT_DIR=${escape(artifactDir)}`,
 		`"${cliPath}" start`,
 		`trap 'if [ -f "${artifactDir}/.cancelled" ]; then "${cliPath}" cancelled; else "${cliPath}" done "$?"; fi; tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true' EXIT`,
 		command,
@@ -428,10 +388,29 @@ export function launchInteractiveSubagent(params: {
 
 	const systemPromptFile = paths.systemPromptFile;
 
+	// Resolve the multiplexer up front so a clear error reaches the caller
+	// before we start writing files. The resolver throws NoMultiplexerAvailableError
+	// with a setup hint if neither backend is usable.
+	let mux;
+	try {
+		mux = getMux();
+	} catch (err) {
+		if (err instanceof NoMultiplexerAvailableError) {
+			throw new Error(`${err.message}\n${tmuxSetupHint()}`);
+		}
+		throw err;
+	}
 
 	// Create the pane FIRST (so we have a target for the launch script to attach
 	// to). If any later step throws, try to kill the orphan pane and rethrow.
-	const { paneId, windowName } = createTmuxPane(params.name, cwd, { background });
+	const { paneId, windowName } = mux.createPane({
+		name: params.name,
+		cwd,
+		background,
+		parentPane: process.env.TMUX_PANE,
+		windowName: safeSegment(params.name),
+		id,
+	});
 	try {
 		const command = buildPiInteractiveCommand({
 			sessionFile: paths.sessionFile,
@@ -442,85 +421,58 @@ export function launchInteractiveSubagent(params: {
 			cwd,
 		});
 		writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
-		sendCommandToTmuxPane(paneId, `bash ${shellEscape(paths.launchScriptFile)}`);
+		const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+		mux.sendKeys(paneId, `bash ${escape(paths.launchScriptFile)}`);
+		mux.sendEnter(paneId);
 	} catch (err) {
-		// F2 fix: orphan-pane guard. If writeLaunchScript or sendCommandToTmuxPane
-		// throws after the pane was created, kill the pane before rethrowing so
-		// we don't leak it into the user's tmux.
-		try {
-			execFileSync("tmux", ["kill-pane", "-t", paneId], { stdio: "ignore" });
-		} catch {
-			/* best effort */
-		}
+		// Orphan-pane guard. If writeLaunchScript or sendKeys throws after
+		// the pane was created, kill the pane before rethrowing so we don't
+		// leak it into the user's mux server.
+		mux.killPane(paneId);
 		throw err;
 	}
 
-	const attach = buildTmuxAttachCommands(paneId, { windowName });
+	const attach = mux.buildAttachCommands({ paneId, windowName });
 	const state: InteractiveSubagentState = {
 		id,
 		name: params.name,
 		task: params.task,
 		paneId,
 		windowName,
+		mux: mux.name,
 		sessionFile: paths.sessionFile,
 		cwd,
 		model: params.model,
 		startedAt: Date.now(),
 		status: "running",
 		attachCommand: attach.attachCommand,
-		selectPaneCommand: attach.selectPaneCommand,
+		selectPaneCommand: attach.focusCommand,
 		launchScriptFile: paths.launchScriptFile,
 		artifactDir: paths.artifactDir,
 		notifyOnComplete: params.notifyOnComplete,
 	};
 
-  interactiveSubagentRegistry.set(id, state);
-  return state;
-}
-
-
-export function isTmuxPaneAlive(paneId: string): boolean {
-  try {
-    execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{pane_id}"], {
-      stdio: "ignore",
-    });
-    return true;
-  } catch {
-    return false;
-  }
+	interactiveSubagentRegistry.set(id, state);
+	return state;
 }
 
 /**
- * Read the @pi-exit-code pane option set by the launch script's EXIT trap.
- * Returns the numeric exit code, or null if the option is not set (child still
- * running) or the pane is dead.
+ * Probe a tmux pane. Kept as a thin helper for the existing call sites in
+ * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
  */
-export function readPaneExitCode(paneId: string): number | null {
-  try {
-    const value = execFileSync(
-      "tmux",
-      ["show-options", "-p", "-v", "-t", paneId, "@pi-exit-code"],
-      // stderr must be ignored: while the child is still running the option is
-      // unset and tmux would otherwise print `invalid option: @pi-exit-code` to
-      // the parent's stderr (the agent's TUI). We rely on the non-zero exit +
-      // catch below to detect "not set", not on stderr.
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
-    if (!value) return null;
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  } catch {
-    // Option unset (still running) or pane dead.
-    return null;
-  }
+export function isTmuxPaneAlive(paneId: string): boolean {
+	return new TmuxMultiplexer().isPaneAlive(paneId);
 }
 
-export function captureTmuxPane(paneId: string, lines = 80): string {
-  return execFileSync(
-    "tmux",
-    ["capture-pane", "-p", "-t", paneId, "-S", `-${Math.max(1, lines)}`],
-    { encoding: "utf8" },
-  );
+/**
+ * Send a command to a tmux pane. Kept for the existing `send_interactive_subagent_message`
+ * call site; PR #2 will route through `state.mux` so this becomes mux-agnostic
+ * (and can use zellij's `paste` for atomic long-message delivery).
+ */
+export function sendCommandToTmuxPane(paneId: string, command: string): void {
+	const mux = new TmuxMultiplexer();
+	mux.sendKeys(paneId, command);
+	mux.sendEnter(paneId);
 }
 
 export function cancelInteractiveSubagent(id: string): InteractiveSubagentState | undefined {
@@ -539,13 +491,13 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 	// 2. Update the registry. The poller combines this with the artifact's last event.
 	state.status = "cancelled";
 
-	// 3. Kill the pane. The wrapper's EXIT trap fires and records the event.
-	try {
-		if (isTmuxPaneAlive(state.paneId)) {
-			execFileSync("tmux", ["kill-pane", "-t", state.paneId], { encoding: "utf8" });
-		}
-	} catch {
-		// Best effort.
+	// 3. Kill the pane via the backend that created it. The wrapper's EXIT
+	//    trap fires and records the event.
+	const mux = new TmuxMultiplexer();
+	// (PR #2 will swap the conditional to dispatch on state.mux once zellij
+	//  is real. For now both branches resolve to tmux.)
+	if (mux.isPaneAlive(state.paneId)) {
+		mux.killPane(state.paneId);
 	}
 	return state;
 }
@@ -571,13 +523,13 @@ export function deriveInteractiveSubagentStatus(
 
 /**
  * Update registry status for every tracked sub-agent based on the artifact's last event and
- * tmux pane liveness. Idempotent — safe to call on every poll tick.
+ * the pane liveness. Idempotent — safe to call on every poll tick.
  *
  * Follow-up support: a `done` event with a live pane is the "idle" state, NOT exited. The child
  * is between turns, REPL is open, and `send_interactive_subagent_message` will accept more prompts.
  * Only when the pane is actually gone (or the child called `error`) is the sub-agent terminal.
  *
- * Edge case: if the pane is dead and no `done` event was recorded (tmux died before the launch
+ * Edge case: if the pane is dead and no `done` event was recorded (mux died before the launch
  * trap could write it), fall back to the session-file existence check — same heuristic as before.
  */
 export function pruneDeadInteractiveSubagents(): void {
