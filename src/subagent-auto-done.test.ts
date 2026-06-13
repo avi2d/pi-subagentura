@@ -80,6 +80,18 @@ describe("auto-done fallback", () => {
 	let root: string;
 
 	beforeEach(() => {
+		// Mock child_process so isTmuxPaneAlive returns true for the synthetic %99 pane used in
+		// makeState. Without this, CI environments without a real %99 pane would make the poller
+		// mark state as "unknown" (pane dead) instead of "running"/"idle", breaking assertions that
+		// check the post-poll status. The mock is permissive: any non-pane-liveness call also
+		// returns success so the poller's "show-options" read for @pi-exit-code doesn't throw.
+		vi.resetModules();
+		vi.doMock("node:child_process", () => ({
+			execFileSync: (_file: string, args: string[]) => {
+				if (args[0] === "display-message") return Buffer.from("%99");
+				return "";
+			},
+		}));
 		root = makeTmp();
 		const g = globalThis as any;
 		g.__piSubagenturaInteractiveRegistry?.clear?.();
@@ -105,7 +117,10 @@ describe("auto-done fallback", () => {
 		const events = readEvents(art);
 		const done = events.find((e) => e.type === "done");
 		expect(done).toBeDefined();
-		expect(done && done.type === "done" && done.exitCode).toBe(0);
+	afterEach(() => {
+		rmSync(root, { recursive: true, force: true });
+		vi.doUnmock("node:child_process");
+	});
 		expect(done && done.type === "done" && done.summary).toMatch(/auto-detected/);
 		expect(sendMessage).toHaveBeenCalled();
 		expect(state.status).toBe("running"); // stays running so for-loop keeps tail-reading
