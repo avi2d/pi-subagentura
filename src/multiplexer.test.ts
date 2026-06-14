@@ -57,6 +57,28 @@ describe("getMux relaxed-spawn resolution", () => {
 		expect(mux.name).toBe("tmux");
 	});
 
+	it("getMux auto returns ZellijMultiplexer when only the zellij binary exists (relaxed-spawn fallback)", async () => {
+		// Regression for the auto-resolution asymmetry: with no env vars set and
+		// only zellij on PATH, auto must fall back to zellij (its isAvailable is
+		// now binary-only). Previously it threw because zellij.isAvailable()
+		// required ZELLIJ === "0".
+		vi.doMock("node:child_process", () => ({
+			execFileSync: (_file: string, args: string[]) => {
+				const joined = args.join(" ");
+				if (joined.includes("command -v 'zellij'")) return "";
+				if (joined.includes("command -v 'tmux'")) throw new Error("no tmux");
+				throw new Error("unexpected exec: " + joined);
+			},
+		} as unknown as typeof import("node:child_process")));
+
+		const { getMux, __resetMuxInstances } =
+			await importFresh<typeof import("./multiplexer")>("./multiplexer");
+		__resetMuxInstances();
+
+		const mux = getMux({ preference: "auto" });
+		expect(mux.name).toBe("zellij");
+	});
+
 	it("getMux throws NoMultiplexerAvailableError when neither binary exists", async () => {
 		// Arrange: mock execFileSync so commandExists always throws.
 		vi.doMock("node:child_process", () => ({

@@ -88,14 +88,18 @@ export interface Multiplexer {
 		windowName?: string;
 		/** Unique id (8 hex) for naming the new session when parent is not in a mux. */
 		id?: string;
-	}): { paneId: string; windowName?: string };
+	}): { paneId: string; windowName?: string; session?: string };
 
 	/**
 	 * Probe whether the pane is still alive (the backend still knows about
 	 * it). MUST NOT throw — return false on any failure (dead pane, backend
 	 * down, pane id malformed). Used by the artifact poller on every tick.
+	 *
+	 * @param session  The session returned by `createPane`. zellij needs it to
+	 *                 target the right server; tmux ignores it (pane ids are
+	 *                 server-global).
 	 */
-	isPaneAlive(paneId: string): boolean;
+	isPaneAlive(paneId: string, session?: string): boolean;
 
 	/**
 	 * Send literal text to the pane's shell input buffer, character-by-character.
@@ -104,21 +108,30 @@ export interface Multiplexer {
 	 *
 	 * The text may contain newlines (used by the launch script template);
 	 * backends are expected to deliver them verbatim.
+	 *
+	 * @param session  The session returned by `createPane` (zellij needs it;
+	 *                 tmux ignores it).
 	 */
-	sendKeys(paneId: string, text: string): void;
+	sendKeys(paneId: string, text: string, session?: string): void;
 
 	/**
 	 * Send a single Enter / Return key to the pane, submitting whatever is
 	 * in the input buffer. Kept separate from `sendKeys` because the encoding
 	 * differs (tmux uses a key name, zellij uses a byte value).
+	 *
+	 * @param session  The session returned by `createPane` (zellij needs it;
+	 *                 tmux ignores it).
 	 */
-	sendEnter(paneId: string): void;
+	sendEnter(paneId: string, session?: string): void;
 
 	/**
 	 * Kill the pane. MUST be best-effort: no throw on already-dead panes.
 	 * Used by the cancel path and the orphan-pane guard.
+	 *
+	 * @param session  The session returned by `createPane` (zellij needs it;
+	 *                 tmux ignores it).
 	 */
-	killPane(paneId: string): void;
+	killPane(paneId: string, session?: string): void;
 
 	/**
 	 * Build the user-facing commands to attach to (or focus) the child's pane.
@@ -135,7 +148,7 @@ export interface Multiplexer {
 	 * — they should be safe to display verbatim and survive a paste into any
 	 * shell (no quoting required by the caller).
 	 */
-	buildAttachCommands(opts: { paneId: string; windowName?: string }): {
+	buildAttachCommands(opts: { paneId: string; windowName?: string; session?: string }): {
 		attachCommand: string;
 		focusCommand: string;
 	};
