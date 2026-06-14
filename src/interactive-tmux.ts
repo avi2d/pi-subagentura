@@ -118,6 +118,16 @@ export interface InteractiveSubagentState {
 	 * always "tmux".
 	 */
 	mux: MuxName;
+	/**
+	 * The mux session the pane lives in, as returned by `createPane`. Needed to
+	 * address the pane in later ops on backends whose pane ids are scoped to a
+	 * session (zellij targets every action with `--session <name>`). Undefined
+	 * for tmux (pane ids are server-global). Set once at spawn time; never
+	 * changes — like `paneId`/`windowName`, it must be persisted on the state
+	 * rather than held on the shared backend instance, which the resolver
+	 * reuses across spawns.
+	 */
+	muxSession?: string;
 	sessionFile: string;
 	cwd: string;
 	model?: string;
@@ -412,7 +422,7 @@ export function launchInteractiveSubagent(params: {
 
 	// Create the pane FIRST (so we have a target for the launch script to attach
 	// to). If any later step throws, try to kill the orphan pane and rethrow.
-	const { paneId, windowName } = mux.createPane({
+	const { paneId, windowName, session: muxSession } = mux.createPane({
 		name: params.name,
 		cwd,
 		background,
@@ -431,17 +441,17 @@ export function launchInteractiveSubagent(params: {
 		});
 		writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
 		const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
-		mux.sendKeys(paneId, `bash ${escape(paths.launchScriptFile)}`);
-		mux.sendEnter(paneId);
+		mux.sendKeys(paneId, `bash ${escape(paths.launchScriptFile)}`, muxSession);
+		mux.sendEnter(paneId, muxSession);
 	} catch (err) {
 		// Orphan-pane guard. If writeLaunchScript or sendKeys throws after
 		// the pane was created, kill the pane before rethrowing so we don't
 		// leak it into the user's mux server.
-		mux.killPane(paneId);
+		mux.killPane(paneId, muxSession);
 		throw err;
 	}
 
-	const attach = mux.buildAttachCommands({ paneId, windowName });
+	const attach = mux.buildAttachCommands({ paneId, windowName, session: muxSession });
 	const state: InteractiveSubagentState = {
 		id,
 		name: params.name,
@@ -449,6 +459,7 @@ export function launchInteractiveSubagent(params: {
 		paneId,
 		windowName,
 		mux: mux.name,
+		muxSession,
 		sessionFile: paths.sessionFile,
 		cwd,
 		model: params.model,
@@ -481,7 +492,7 @@ function getMuxForState(state: InteractiveSubagentState): Multiplexer {
  * Mux-agnostic — replaces `isTmuxPaneAlive(paneId)`.
  */
 export function isPaneAlive(state: InteractiveSubagentState): boolean {
-	return getMuxForState(state).isPaneAlive(state.paneId);
+	return getMuxForState(state).isPaneAlive(state.paneId, state.muxSession);
 }
 
 /**
@@ -490,8 +501,8 @@ export function isPaneAlive(state: InteractiveSubagentState): boolean {
  */
 export function sendCommandToPane(state: InteractiveSubagentState, command: string): void {
 	const mux = getMuxForState(state);
-	mux.sendKeys(state.paneId, command);
-	mux.sendEnter(state.paneId);
+	mux.sendKeys(state.paneId, command, state.muxSession);
+	mux.sendEnter(state.paneId, state.muxSession);
 }
 
 /**
@@ -531,9 +542,8 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 	// 3. Kill the pane via the backend that created it. The wrapper's EXIT
 	//    trap fires and records the event.
 	const mux = getMuxForState(state);
-	//  is real. For now both branches resolve to tmux.)
-	if (mux.isPaneAlive(state.paneId)) {
-		mux.killPane(state.paneId);
+	if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+		mux.killPane(state.paneId, state.muxSession);
 	}
 	return state;
 }
