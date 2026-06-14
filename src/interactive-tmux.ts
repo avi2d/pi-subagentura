@@ -290,7 +290,13 @@ export function buildInteractivePrompt(params: {
 	task: string;
 	contextText?: string | null;
 }): string {
-	if (!params.contextText) return params.task;
+	const footer =
+		"\n\n" +
+		"When you finish, write your result to output.md " +
+		"(path from the system prompt), then run:\n" +
+		'  "$ARTIFACT_DIR/cli.mjs" done 0';
+
+	if (!params.contextText) return params.task + footer;
 	return [
 		"You are an interactive sub-agent running in your own Pi session.",
 		"The parent session context is included below for reference.",
@@ -301,7 +307,7 @@ export function buildInteractivePrompt(params: {
 		"",
 		"Task:",
 		params.task,
-	].join("\n");
+	].join("\n") + footer;
 }
 
 export function buildPiInteractiveCommand(params: {
