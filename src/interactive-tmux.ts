@@ -141,14 +141,20 @@ export interface InteractiveSubagentState {
 	 * output.md as a user message so the parent LLM processes it in its next turn.
 	 */
 	notifyOnComplete?: "notify" | "inject";
-	/** At-most-once guard for the inject path (mirrors lastDeliveredEventTs). */
 	/**
- * Timestamp of the last artifact `done` event whose output was injected into the parent.
- * Mirrors `lastDeliveredEventTs` but only for the inject path. Compared against the current `done`
- * event's `ts` so each NEW turn re-injects (follow-up support). Set on first inject; `undefined` means
- * "never injected".
- */
+	 * At-most-once guard for the inject path (mirrors lastDeliveredEventTs, inject-only). Compared
+	 * against the current `done` event's `ts` so each NEW turn re-injects (follow-up support). Set on
+	 * first inject; `undefined` means "never injected".
+	 */
 	lastInjectedEventTs?: number;
+	/**
+	 * At-most-once guard for the per-turn `output-N.md` snapshot. Compared against the current `done`
+	 * event's `ts` so each NEW turn snapshots exactly once. Distinct from `lastInjectedEventTs`, which is
+	 * only set in `inject` mode — snapshots run in every notifyOnComplete mode, so they need their own
+	 * cursor or the default `notify` mode would re-snapshot every poll tick and could overwrite an
+	 * earlier turn's snapshot with a later turn's in-progress output.md.
+	 */
+	lastSnapshotEventTs?: number;
 	/**
 	 * Auto-fallback "already notified" flag (PR #11). Set by maybeAutoDone when synthesize-and-inject
 	 * runs, so a late explicit `done` event that lands on the next poll does NOT re-trigger the

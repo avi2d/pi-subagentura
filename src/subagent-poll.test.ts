@@ -487,6 +487,47 @@ describe("pollArtifactChanges", () => {
 
 			expect(existsSync(join(art.dir, "output-1.md"))).toBe(true);
 		});
+
+		it("in notify mode, a follow-up overwriting output.md before its done event does NOT corrupt the prior turn's snapshot", async () => {
+			// Regression: the snapshot guard must not reuse lastInjectedEventTs (only set in inject mode).
+			// In the default notify mode that field stays undefined, so a pre-fix poller re-snapshotted
+			// every tick — and once a follow-up turn overwrote output.md before its own done landed, it
+			// clobbered output-1.md (turn 1's history) with the in-progress turn-2 content.
+			vi.resetModules();
+			vi.doMock("node:child_process", () => ({
+				execFileSync: (_file: string, args: string[]) => {
+					if (args[0] === "display-message") return Buffer.from("#99");
+					return "";
+				},
+			}));
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+			const { state, artifactDir } = makeState();
+			// notifyOnComplete left undefined (default 'notify') — the broken path.
+			mod.interactiveSubagentRegistry.set(state.id, state);
+			const art = artifactPath(join(artifactDir, ".."), state.id);
+
+			// Turn 1 completes and is snapshotted.
+			appendEvent(art, { ts: 1, type: "started", status: "running" });
+			appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "answer v1");
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+			expect(readFileSync(join(art.dir, "output-1.md"), "utf8")).toBe("answer v1");
+
+			// Follow-up turn: the child overwrites output.md but its done event has NOT landed yet
+			// (last event is still the turn-1 done@ts2). A poll lands in this window.
+			writeOutput(art, "answer v2 in progress");
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+
+			// output-1.md must still hold turn 1's content — not the in-progress turn-2 output.
+			expect(readFileSync(join(art.dir, "output-1.md"), "utf8")).toBe("answer v1");
+
+			// When turn 2's done finally lands, it snapshots to output-2.md, leaving turn 1 intact.
+			appendEvent(art, { ts: 3, type: "done", status: "done", exitCode: 0 });
+			writeOutput(art, "answer v2 final");
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+			expect(readFileSync(join(art.dir, "output-1.md"), "utf8")).toBe("answer v1");
+			expect(readFileSync(join(art.dir, "output-2.md"), "utf8")).toBe("answer v2 final");
+		});
 	});
 });
 

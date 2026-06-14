@@ -562,13 +562,14 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		}
 
 		// Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
-		// history is preserved even though the child overwrites output.md each turn. Runs for any
-		// notifyOnComplete mode because the history is useful regardless of how the parent gets woken up.
-		// Idempotent: if lastInjectedEventTs === last.ts (re-poll), we skip.
-		if (last && last.type === "done" && state.lastInjectedEventTs !== last.ts) {
+		// history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
+		// so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
+		// `lastInjectedEventTs` would corrupt history in the default `notify` mode.
+		if (last && last.type === "done" && state.lastSnapshotEventTs !== last.ts) {
 			const allEvents = readEvents(art);
 			const turnNumber = allEvents.filter((e) => e.type === "done").length;
 			snapshotOutput(art, turnNumber);
+			state.lastSnapshotEventTs = last.ts;
 		}
 
 		// Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
