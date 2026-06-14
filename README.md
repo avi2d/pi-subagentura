@@ -18,9 +18,52 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `send_interactive_subagent_message` — send a follow-up into a live sub-agent's REPL (preserves child context)
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
+- `workflow` — run an agent-authored JS script that deterministically orchestrates isolated sub-agents (`agent`/`parallel`/`pipeline`)
 The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
+
+## Workflows
+
+The `workflow` tool ports Claude Code's *Dynamic Workflows* model: the main agent authors a small
+JavaScript script that deterministically orchestrates **isolated** sub-agents. Intermediate results
+live in script variables rather than the parent's context window, so you can fan out many sub-agents
+(review pipelines, research sweeps, migrations) without context pressure.
+
+```js
+export const meta = { name: "review", description: "review files in parallel", phases: [{ title: "scan" }] };
+
+phase("scan");
+const reviews = await parallel(
+  files.map((f) => () => agent(`Review ${f} for bugs`, { schema: FINDINGS_SCHEMA })),
+);
+return reviews.filter(Boolean);
+```
+
+Injected into the script:
+
+- `agent(prompt, opts?)` — spawn one isolated sub-agent (same path as `subagent_isolated`). `opts`:
+  `{ schema?, label?, phase?, model?, persona? }`. Without `schema` returns the final text; with a
+  JSON Schema it returns a validated object, or `null` after retries. Returns `null` on sub-agent
+  error, so scripts can `.filter(Boolean)`.
+- `parallel(thunks)` — run `() => Promise` thunks concurrently (barrier); failures become `null`.
+- `pipeline(items, ...stages)` — stream each item through stages with no barrier between stages.
+- `phase(title)` / `log(msg)` — progress UI only.
+- `args` — the JSON you pass in the tool's `args` param. `budget` — `{ total, spent(), remaining() }`.
+
+Constraints: `Date.now()`, `Math.random()`, and argless `new Date()` **throw** (determinism);
+concurrency is capped automatically (`min(16, cores−2)`); more than 1000 agents or 4096 items per
+call throws. `meta` must be a pure literal.
+
+**Fidelity note:** unlike Claude Code, Pi sub-agents return free-form text (there is no tool-call
+structured-output layer), so `schema` is enforced by instructing the sub-agent to emit JSON, then
+parsing/validating with bounded retries. It is robust but not 100% — schema misses surface as `null`
+plus a logged warning, never a silent drop.
+
+**v1 scope:** runs to completion before returning (abortable via the parent signal). Deferred to a
+later version: background (non-blocking) execution, tmux/worktree process-backed agents
+(`opts.isolation`), `agentType` routing, saved/named workflows and `workflow()` composition, and
+resume journaling.
 
 ## Why use it?
 
