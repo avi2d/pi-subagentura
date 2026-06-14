@@ -37,11 +37,16 @@ describe("interactive-tmux", () => {
     vi.doUnmock("node:child_process");
   });
 
-  it("is unavailable when TMUX env var is missing", async () => {
-    process.env.TMUX = "";
-    const { isTmuxAvailable } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
-    expect(isTmuxAvailable()).toBe(false);
-  });
+	it("is unavailable when tmux binary is not on PATH", async () => {
+		process.env.TMUX = "";
+		vi.doMock("node:child_process", () => ({
+			execFileSync: () => {
+				throw new Error("command not found");
+			},
+		} as unknown as typeof import("node:child_process")));
+		const { isTmuxAvailable } = await importFresh<typeof import("./interactive-tmux")>("./interactive-tmux");
+		expect(isTmuxAvailable()).toBe(false);
+	});
 
   it("launches in background mode by default (new-window) and stores window-name attach commands", async () => {
     const tmp = makeTmp();
@@ -267,6 +272,7 @@ describe("interactive-tmux", () => {
         cwd: "/tmp",
         startedAt: Date.now(),
         status: "running",
+        mux: "tmux",
         attachCommand: "",
         selectPaneCommand: "",
         launchScriptFile: "/dev/null",
@@ -293,6 +299,7 @@ describe("interactive-tmux", () => {
         cwd: "/tmp",
         startedAt: Date.now(),
         status: "running",
+        mux: "tmux",
         attachCommand: "",
         selectPaneCommand: "",
         launchScriptFile: "/dev/null",

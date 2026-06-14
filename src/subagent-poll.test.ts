@@ -28,6 +28,7 @@ function makeState(): {
 		sessionFile: "/tmp/sess.jsonl",
 		cwd: "/tmp",
 		startedAt: Date.now(),
+		mux: "tmux",
 		status: "running",
 		attachCommand: "tmux attach -t sess",
 		selectPaneCommand: "tmux select-pane -t '%99'",

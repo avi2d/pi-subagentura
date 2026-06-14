@@ -29,6 +29,9 @@
     "src/artifact.ts",
     "src/helpers.ts",
     "src/interactive-tmux.ts",
+    "src/multiplexer.ts",
+    "src/multiplexer-tmux.ts",
+    "src/multiplexer-zellij.ts",
     "src/subagent.ts",
     "src/subagent-artifact-cli.ts"
   ],
