@@ -864,13 +864,42 @@ function extractAssistantText(content: unknown[]): string {
  */
 function maybeAutoDone(state: InteractiveSubagentState, art: SubagentArtifact, pi: ExtensionAPI, now: number): void {
 	if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
+
 	if (state.lastStopReason !== "stop") return;
+
 	const stopAt = state.lastStopReasonAt ?? 0;
+
 	if (now - stopAt < AUTO_DONE_DEBOUNCE_MS) return;
 
+
+
 	// Explicit signal still wins. If the wrapper already wrote done/error/cancelled, do not synthesize.
-	const last = lastEvent(art);
-	if (last && (last.type === "done" || last.type === "error" || last.type === "cancelled")) return;
+
+	// NOTE: we scan ALL events, not just lastEvent(): tailReadSessionLog runs immediately before us
+
+	// and may have just appended a `tool_activity` row whose ts is from the session log (often EARLIER
+
+	// than the child's explicit done) — making `lastEvent` return a tool_activity and silently miss the
+
+	// existing terminal event. That would synthesize a duplicate AND the events loop below would
+
+	// re-deliver the original (its `ev.ts >= autoDoneForTurnAt` guard fails because the explicit done
+
+	// has a smaller ts than the synthesized one), causing a double-notify. See the regression test
+
+	// `does NOT synthesize when an explicit done event is present AND a tool_activity was appended
+
+	// after it in the same poll` in subagent-auto-done.test.ts.
+
+	const existingTerminal = readEvents(art).some(
+
+		(ev) => ev.type === "done" || ev.type === "error" || ev.type === "cancelled",
+
+	);
+
+	if (existingTerminal) return;
+
+
 
 	// Detect output.md state. We want to synthesize `done` only when the model has actually produced a result.
 	const output = readOutput(art);

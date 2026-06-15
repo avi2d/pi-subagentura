@@ -209,20 +209,179 @@ describe("auto-done fallback", () => {
 	});
 
 	it("does NOT synthesize when an explicit done event already exists in the artifact", async () => {
+
 		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+
 		const { state, artifactDir } = makeState({ outputContent: "result" });
+
 		mod.interactiveSubagentRegistry.set(state.id, state);
 
+
+
 		const art = artifactPath(dirname(artifactDir), state.id);
+
 		appendEvent(art, { ts: Date.now() - 100, type: "done", status: "done", exitCode: 0 });
+
+
 
 		mod.pollArtifactChanges({} as any);
 
+
+
 		const events = readEvents(art);
+
 		const doneEvents = events.filter((e) => e.type === "done");
+
 		expect(doneEvents).toHaveLength(1);
+
 		expect(state.autoDoneForTurnAt).toBeUndefined();
+
 	});
+
+
+
+	// Regression: the child called `cli.mjs done` (so a `done` event is already in events.ndjson),
+
+	// but the session log contains a tool call (e.g. `write output.md` or `bash cli.mjs done 0`)
+
+	// that tailReadSessionLog has not yet processed. On THIS poll, tailReadSessionLog appends a
+
+	// `tool_activity` row to events.ndjson AFTER the explicit done — making `lastEvent` return the
+
+	// tool_activity and the previous `lastEvent().type === "done"` guard miss. The fallback then
+
+	// synthesizes a duplicate `done` and the events loop re-delivers the explicit one, causing
+
+	// a double-notify. This was observed in production on 2026-06-15 (subagentura sessions under
+
+	// pi-agents-5c91e6). The fix scans ALL events for a terminal type, not just lastEvent.
+
+	it("regression: does NOT synthesize when an explicit done is present AND a tool_activity is appended after it in the same poll", async () => {
+
+		const mod = await importFresh<typeof import("./subagent")>("./subagent");
+
+		const { state, artifactDir } = makeState({ outputContent: "result" });
+
+		mod.interactiveSubagentRegistry.set(state.id, state);
+
+
+
+		const art = artifactPath(dirname(artifactDir), state.id);
+
+		// Explicit done from the child. ts SMALLER than the tool_activity ts we will produce next,
+
+		// so the file order is: [done@SMALL, tool_activity@MEDIUM, ...] — lastEvent is the tool_activity.
+
+		const explicitTs = Date.now() - 20_000;
+
+		appendEvent(art, { ts: explicitTs, type: "done", status: "done", exitCode: 0 });
+
+
+
+		// Session log: a `write` tool call (so tailReadSessionLog appends a tool_activity) plus an
+
+		// assistant message with stopReason "stop" (so the auto-done preconditions are met).
+
+		// The tool-call timestamp is later than the explicit done but still 11s in the past relative
+
+		// to "now" so the debounce has elapsed.
+
+		const toolTs = explicitTs + 5_000; // later than the explicit done
+
+		const assistantTs = toolTs + 100;
+
+		writeFileSync(
+
+			state.sessionFile,
+
+			JSON.stringify({
+
+				type: "message",
+
+				message: {
+
+					role: "assistant",
+
+					content: [
+
+						{ type: "text", text: "result text" },
+
+						{
+
+							type: "toolCall",
+
+							name: "write",
+
+							arguments: { path: "/tmp/result.md", content: "result" },
+
+						},
+
+					],
+
+					api: "openai",
+
+					provider: "openai",
+
+					model: "gpt-4",
+
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+
+					stopReason: "stop",
+
+					timestamp: assistantTs,
+
+				},
+
+			}) + "\n",
+
+		);
+
+
+
+		// makeState already set lastStopReasonAt = Date.now() - 11_000 (past debounce). After this
+
+		// poll, tailReadSessionLog will set lastStopReasonAt to assistantTs. Since assistantTs is
+
+		// 20s+ in the past, the debounce is comfortably satisfied. The previous lastStopReasonAt
+
+		// was also past the debounce, so either way the time check would pass.
+
+		const sendMessage = vi.fn();
+
+		mod.pollArtifactChanges({ sendMessage } as any);
+
+
+
+		const events = readEvents(art);
+
+		const doneEvents = events.filter((e) => e.type === "done");
+
+		// Without the fix: there would be a synthesized `done` here (in addition to the explicit one).
+
+		expect(doneEvents).toHaveLength(1);
+
+		expect(doneEvents[0].ts).toBe(explicitTs);
+
+		expect(state.autoDoneForTurnAt).toBeUndefined();
+
+		// The sendMessage call (if any) must be for the original done only, never a second time
+
+		// for the synthesized one. We check that sendMessage was called at most once with content
+
+		// matching the done event — the simplest assertion is "no synthesized event was sent".
+
+		const sendMessageCalls = sendMessage.mock.calls.filter((call) => {
+
+			const text = JSON.stringify(call);
+
+			return text.includes("auto-detected from session stopReason:stop");
+
+		});
+
+		expect(sendMessageCalls).toHaveLength(0);
+
+	});
+
 
 	it("does NOT synthesize twice (idempotent across repeated polls)", async () => {
 		const mod = await importFresh<typeof import("./subagent")>("./subagent");
