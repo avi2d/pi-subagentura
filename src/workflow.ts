@@ -13,10 +13,30 @@
 // `startSubagentJob` primitive the other tools use, so intermediate results live in script
 // variables rather than the parent agent's context window.
 //
-// NOTE: `vm.runInNewContext` is NOT an escape-proof jail (`globalThis` is reachable, and
-// constructor escapes are not blockable in `vm`). This is acceptable because the script author is
-// the trusted main agent. The guarantees we actually make: no Node globals (require/process/module)
-// are injected, and Date.now()/Math.random()/argless `new Date()` throw inside a script.
+// NOTE: `vm.runInNewContext` is NOT an escape-proof jail. The script author is the trusted main
+
+// agent, so we don't try to be one. The guarantees we actually make:
+
+//   - No Node globals (process/require/module/Buffer/...) are injected into the sandbox.
+
+//   - `Date.now()`, `Math.random()`, and argless `new Date()` throw when called DIRECTLY
+
+//     (i.e. as bare identifiers resolved in the sandbox scope). This blocks the obvious
+
+//     non-determinism footguns for a model writing naive script code.
+
+//   - `eval(code)` and `new Function(code)` are NOT blocked: the code they evaluate runs in
+
+//     the real global scope and can reach the real `Date.now()` / `Math.random()`. A script
+
+//     author who goes out of their way to be non-deterministic can be — and the script
+
+//     author is trusted, so that's fine. Sub-agent results are non-deterministic too
+
+//     (LLM output), so "deterministic orchestration" below only means deterministic control
+
+//     flow, not deterministic end-to-end results.
+
 
 import { runInNewContext } from "node:vm";
 import { cpus } from "node:os";
@@ -627,10 +647,19 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     name: "workflow",
     label: "Workflow",
     description: [
-      "Run an agent-authored JavaScript workflow that deterministically orchestrates ISOLATED",
-      "sub-agents. The script's intermediate results live in script variables, not in your context",
-      "window — use this to fan out dozens of sub-agents (review pipelines, research sweeps,",
-      "migrations) without context pressure.",
+
+      "Run an agent-authored JavaScript workflow that orchestrates ISOLATED sub-agents with",
+
+      "deterministic control flow (parallel/pipeline/barrier semantics are exact, but",
+
+      "sub-agent outputs themselves are LLM-driven and non-deterministic). The script's",
+
+      "intermediate results live in script variables, not in your context window — use this to",
+
+      "fan out dozens of sub-agents (review pipelines, research sweeps, migrations) without",
+
+      "context pressure.",
+
       "",
       "Script shape:",
       "  export const meta = { name: 'my-flow', description: '...', phases: [{ title: 'Scan' }] };",
@@ -650,8 +679,12 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  args                   -> the JSON you pass in `args`.",
       "  budget                 -> { total, spent(), remaining() } token accounting.",
       "",
-      "Constraints: Date.now()/Math.random()/argless new Date() throw (determinism). Concurrency is",
+      "Constraints: Date.now()/Math.random()/argless new Date() throw when called directly",
+
+      "(a determined script can still reach the real ones via eval/Function). Concurrency is",
+
       `capped automatically; >${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws.`,
+
       "v1 runs to completion before returning (abortable). meta MUST be a pure literal.",
     ].join("\n"),
     parameters: Type.Object({

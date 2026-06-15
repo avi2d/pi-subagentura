@@ -18,7 +18,8 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `send_interactive_subagent_message` — send a follow-up into a live sub-agent's REPL (preserves child context)
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
-- `workflow` — run an agent-authored JS script that deterministically orchestrates isolated sub-agents (`agent`/`parallel`/`pipeline`)
+- `workflow` — run an agent-authored JS script that orchestrates isolated sub-agents with deterministic control flow (`agent`/`parallel`/`pipeline`)
+
 The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
@@ -26,9 +27,12 @@ Interactive sub-agents support **follow-up turns**: the parent can push a new pr
 ## Workflows
 
 The `workflow` tool ports Claude Code's *Dynamic Workflows* model: the main agent authors a small
-JavaScript script that deterministically orchestrates **isolated** sub-agents. Intermediate results
-live in script variables rather than the parent's context window, so you can fan out many sub-agents
-(review pipelines, research sweeps, migrations) without context pressure.
+JavaScript script that orchestrates **isolated** sub-agents with deterministic control flow. Intermediate
+results live in script variables rather than the parent's context window, so you can fan out many
+sub-agents (review pipelines, research sweeps, migrations) without context pressure. Note: sub-agent
+outputs are LLM-driven and non-deterministic; "deterministic" here means the orchestration logic, not
+the end-to-end result.
+
 
 ```js
 export const meta = { name: "review", description: "review files in parallel", phases: [{ title: "scan" }] };
@@ -51,9 +55,12 @@ Injected into the script:
 - `phase(title)` / `log(msg)` — progress UI only.
 - `args` — the JSON you pass in the tool's `args` param. `budget` — `{ total, spent(), remaining() }`.
 
-Constraints: `Date.now()`, `Math.random()`, and argless `new Date()` **throw** (determinism);
-concurrency is capped automatically (`min(16, cores−2)`); more than 1000 agents or 4096 items per
-call throws. `meta` must be a pure literal.
+Constraints: `Date.now()`, `Math.random()`, and argless `new Date()` **throw** when called directly
+(the obvious non-determinism footgun for naive script code). `eval`/`Function` are not blocked, so a
+determined script can still reach the real `Date.now()` / `Math.random()` — the script author is the
+trusted main agent. Concurrency is capped automatically (`min(16, cores−2)`); more than 1000 agents
+or 4096 items per call throws. `meta` must be a pure literal.
+
 
 **Fidelity note:** unlike Claude Code, Pi sub-agents return free-form text (there is no tool-call
 structured-output layer), so `schema` is enforced by instructing the sub-agent to emit JSON, then
