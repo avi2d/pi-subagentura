@@ -1,6 +1,6 @@
 # pi-subagentura — Agent Guidelines
 
-A public [Pi](https://pi.dev) extension that adds in-process and attachable sub-agent tools. This file is for AI coding agents (and humans) working on the codebase. It is project-specific on top of the universal guidelines in `~/.pi/agent/AGENTS.md`.
+A public [Pi](https://pi.dev) extension that adds in-process and attachable sub-agent tools. This file is for AI coding agents (and humans) working on the codebase.
 
 ## What this project is
 
@@ -26,16 +26,16 @@ The pre-push hook (`simple-git-hooks` → `lint-staged` → `prettier --check`) 
 
 ## Source layout (the 30-second tour)
 
-| File | Purpose |
-|------|---------|
-| `src/subagent.ts` | **Main entry.** ~2.5k LOC. All tool registration, the auto-done fallback, the per-turn snapshot logic, the interactive sub-agent poller. Most of the project's behavior lives here. |
-| `src/helpers.ts` | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `findSubagentArtifact` for the `read_subagent_artifact` tool. |
-| `src/artifact.ts` | The on-disk artifact protocol: `events.ndjson`, `output.md`, `output-N.md` snapshots, atomic writes via `*.tmp` + `renameSync`. |
-| `src/interactive-tmux.ts` | Spawns `pi --session ...` in a tmux pane; provides `send_interactive_subagent_message` and the follow-up-turn machinery. |
-| `src/multiplexer*.ts` | Pluggable multiplexer backend. tmux and zellij. The registry lets us detect the host's available backend at runtime. |
-| `src/subagent-artifact-cli.ts` | The tiny `cli.mjs` wrapper that the child shells out to. The protocol is: write `output.md`, then call `cli.mjs done N`. |
-| `src/workflow.ts` | The `workflow` tool (v1, on `feat/workflow-tool` branch — see "Known quirks" below). |
-| `src/test-utils.ts` | `importFresh` helper used by tests that need to reset module-level state (interactive sub-agent registry, mux mock, etc.). |
+| File                           | Purpose                                                                                                                                                                             |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/subagent.ts`              | **Main entry.** ~2.5k LOC. All tool registration, the auto-done fallback, the per-turn snapshot logic, the interactive sub-agent poller. Most of the project's behavior lives here. |
+| `src/helpers.ts`               | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `findSubagentArtifact` for the `read_subagent_artifact` tool.                                           |
+| `src/artifact.ts`              | The on-disk artifact protocol: `events.ndjson`, `output.md`, `output-N.md` snapshots, atomic writes via `*.tmp` + `renameSync`.                                                     |
+| `src/interactive-tmux.ts`      | Spawns `pi --session ...` in a tmux pane; provides `send_interactive_subagent_message` and the follow-up-turn machinery.                                                            |
+| `src/multiplexer*.ts`          | Pluggable multiplexer backend. tmux and zellij. The registry lets us detect the host's available backend at runtime.                                                                |
+| `src/subagent-artifact-cli.ts` | The tiny `cli.mjs` wrapper that the child shells out to. The protocol is: write `output.md`, then call `cli.mjs done N`.                                                            |
+| `src/workflow.ts`              | The `workflow` tool (v1, on `feat/workflow-tool` branch — see "Known quirks" below).                                                                                                |
+| `src/test-utils.ts`            | `importFresh` helper used by tests that need to reset module-level state (interactive sub-agent registry, mux mock, etc.).                                                          |
 
 ## Code conventions
 
@@ -54,7 +54,7 @@ These are non-obvious behaviors that have bitten people. Read them before touchi
 
 The `auto-done-fallback` synthesizes a completion event when a child ends a turn with `stopReason: "stop"` but never calls `cli.mjs done` (a common LLM failure mode). It is **time-bounded** by `AUTO_DONE_DEBOUNCE_MS` (10s default).
 
-**The guard is `readEvents(art).some(ev => isTerminal(ev))`, NOT `lastEvent(art)`.** This was a real bug: `tailReadSessionLog` runs immediately before the fallback and can append `tool_activity` rows to `events.ndjson` *after* the child's explicit `done`. `lastEvent` would then return a `tool_activity` and the guard would miss, causing a double-notify. See commit `01cd745` for the postmortem and the regression test. **Do not "simplify" this back to `lastEvent()`.**
+**The guard is `readEvents(art).some(ev => isTerminal(ev))`, NOT `lastEvent(art)`.** This was a real bug: `tailReadSessionLog` runs immediately before the fallback and can append `tool_activity` rows to `events.ndjson` _after_ the child's explicit `done`. `lastEvent` would then return a `tool_activity` and the guard would miss, causing a double-notify. See commit `01cd745` for the postmortem and the regression test. **Do not "simplify" this back to `lastEvent()`.**
 
 ### `lastDeliveredEventTs` is the only poller cursor
 
@@ -91,7 +91,7 @@ The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is
 ## Safety
 
 - **The published package is public.** Anything in `src/` is published to npm. No secrets, no personal data, no localhost URLs, no debug paths.
-- **User input is from an LLM.** Treat all tool params as adversarial: the parent agent that calls `subagent_with_context` is the trusted caller, but the *content* of `task`, `persona`, and the `args` of `workflow` are model-generated. Validate, bound, and quote carefully. The `MAX_TOTAL_AGENTS` and `MAX_ITEMS_PER_CALL` caps in `workflow.ts` are the shape of "bounded resource use" this codebase expects.
+- **User input is from an LLM.** Treat all tool params as adversarial: the parent agent that calls `subagent_with_context` is the trusted caller, but the _content_ of `task`, `persona`, and the `args` of `workflow` are model-generated. Validate, bound, and quote carefully. The `MAX_TOTAL_AGENTS` and `MAX_ITEMS_PER_CALL` caps in `workflow.ts` are the shape of "bounded resource use" this codebase expects.
 - **The `vm` sandbox in `workflow.ts` is not a security boundary.** It's a determinism aid. Do not extend it to less-trusted authors without first adding `codeGeneration: { strings: false }` and a thorough review.
 - **No `require`/`process` from inside the workflow sandbox** — that's the one Node-injection we genuinely do block, because `vm.runInNewContext` doesn't pass the `node` global into the sandbox by default. If you ever need to add a Node-side helper for the script, expose it as an injected global, not as a require.
 
