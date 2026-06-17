@@ -35,14 +35,32 @@ the end-to-end result.
 
 
 ```js
+// Self-contained example: pass `args` with the file list, declare the
+// schema inline so the script is copy-pasteable.
 export const meta = { name: "review", description: "review files in parallel", phases: [{ title: "scan" }] };
+
+const FINDINGS_SCHEMA = {
+  type: "object",
+  properties: {
+    severity: { type: "string", enum: ["low", "medium", "high"] },
+    description: { type: "string" },
+  },
+  required: ["severity", "description"],
+};
 
 phase("scan");
 const reviews = await parallel(
-  files.map((f) => () => agent(`Review ${f} for bugs`, { schema: FINDINGS_SCHEMA })),
+  args.files.map((f) => () => agent(`Review ${f} for bugs`, { schema: FINDINGS_SCHEMA })),
 );
 return reviews.filter(Boolean);
 ```
+
+Parent calls the tool with:
+
+```json
+{ "args": { "files": ["src/a.ts", "src/b.ts", "src/c.ts"] } }
+```
+
 
 Injected into the script:
 
