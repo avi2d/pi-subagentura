@@ -75,10 +75,8 @@ function setupExtension() {
     }
   }
 
-
   return { api, shutdownHandler };
 }
-
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
@@ -102,12 +100,12 @@ describe("session_shutdown handler", () => {
     // Stub the global timers. setInterval returns a fake handle with a
     // vi.fn() unref method; clearInterval is a no-op spy.
     fakeHandle = { unref: vi.fn() };
-    setIntervalSpy = (vi
+    setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockReturnValue(fakeHandle as any)) as any;
-    clearIntervalSpy = (vi
+      .mockReturnValue(fakeHandle as any) as any;
+    clearIntervalSpy = vi
       .spyOn(globalThis, "clearInterval")
-      .mockImplementation(() => {})) as any;
+      .mockImplementation(() => {}) as any;
 
     // Spy on cancelInteractiveSubagent + cancelInteractiveSubagentByState so the
     // handler's iteration logic can be observed without touching the filesystem
@@ -116,7 +114,10 @@ describe("session_shutdown handler", () => {
     cancelSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagent") as any;
     cancelSpy.mockImplementation(((id: string) =>
       interactiveTmux.interactiveSubagentRegistry.get(id)) as any);
-    cancelByStateSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagentByState") as any;
+    cancelByStateSpy = vi.spyOn(
+      interactiveTmux,
+      "cancelInteractiveSubagentByState",
+    ) as any;
     cancelByStateSpy.mockImplementation((() => undefined) as any);
   });
 
@@ -134,7 +135,6 @@ describe("session_shutdown handler", () => {
   // AC-A* tests create tmp artifact dirs; declared here (before any inner
   // afterEach that references it) per AGENTS.md "declare before" rule.
   let tmpRoot: string;
-
 
   it("unrefs the poller handle on extension registration", () => {
     setupExtension();
@@ -161,11 +161,12 @@ describe("session_shutdown handler", () => {
     expect(clearIntervalSpy).toHaveBeenCalledWith(handle);
     // The handler also nulls the global after clearing, so a re-invocation
     // would be a no-op (defensive: no double-clear).
-    expect((globalThis as any).__piSubagenturaInteractivePollerHandle).toBeUndefined();
+    expect(
+      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+    ).toBeUndefined();
   });
 
   it("cancels running sub-agents via cancelInteractiveSubagentByState (registry-bypass) and skips non-running", () => {
-
     const running = makeState("run-1", "running");
 
     const cancelled = makeState("canc-1", "cancelled");
@@ -178,17 +179,13 @@ describe("session_shutdown handler", () => {
 
     interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
 
-
-
     const { shutdownHandler } = setupExtension();
 
     shutdownHandler!();
 
-
-
     // The handler snapshots running states, clears the registry, then calls the
 
- // byState variant (which bypasses the registry lookup). The id-based
+    // byState variant (which bypasses the registry lookup). The id-based
 
     // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
 
@@ -197,7 +194,6 @@ describe("session_shutdown handler", () => {
     expect(cancelByStateSpy).toHaveBeenCalledWith(running);
 
     expect(cancelSpy).not.toHaveBeenCalled();
-
   });
 
   it("clears interactiveSubagentRegistry in session_shutdown", () => {
@@ -233,9 +229,6 @@ describe("session_shutdown handler", () => {
 
   // in-flight tick that survived clearInterval.
 
-
-
-
   function makeArtifactState(
     id: string,
     status: InteractiveSubagentState["status"],
@@ -248,7 +241,6 @@ describe("session_shutdown handler", () => {
   }
 
   it("AC-A1: setInterval tick after session_shutdown delivers zero notifications (race-reproducing)", () => {
-
     // Empty tmp artifact dir; no events written.
 
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a1-"));
@@ -259,33 +251,25 @@ describe("session_shutdown handler", () => {
 
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
 
-
-
     const { api, shutdownHandler } = setupExtension();
 
     (globalThis as any).__piSubagenturaPiRef = api;
-
-
 
     // Capture the actual setInterval callback. setupExtension() above
 
     // registered the poller, so setIntervalSpy.mock.calls[0][0] is the
 
- // production callback (`() => pollArtifactChanges(pi)`) we need to
+    // production callback (`() => pollArtifactChanges(pi)`) we need to
 
     // invoke to exercise the real code path — not a hand-written wrapper.
 
     const tick = setIntervalSpy.mock.calls[0][0] as () => void;
-
-
 
     // 1. Pre-shutdown tick: no artifact events, no notification.
 
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
-
-
 
     // 2. Shutdown handler runs. The order of operations inside
 
@@ -303,8 +287,6 @@ describe("session_shutdown handler", () => {
 
     shutdownHandler!();
 
-
-
     // 3. Post-shutdown tick (the in-flight one that survived clearInterval):
 
     //    must deliver zero notifications because the registry is empty.
@@ -312,11 +294,9 @@ describe("session_shutdown handler", () => {
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
-
   });
 
   it("AC-A2: setInterval tick after shutdown does not re-deliver a done event already in the artifact", () => {
-
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a2-"));
 
     const artifactDir = join(tmpRoot, "run-1");
@@ -333,19 +313,13 @@ describe("session_shutdown handler", () => {
 
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
 
-
-
     const { api, shutdownHandler } = setupExtension();
 
     (globalThis as any).__piSubagenturaPiRef = api;
 
-
-
     // Capture the actual setInterval callback for the real code path.
 
     const tick = setIntervalSpy.mock.calls[0][0] as () => void;
-
-
 
     // 1. Pre-shutdown tick: the done event (cursor=0, ts=1000) is
 
@@ -355,30 +329,29 @@ describe("session_shutdown handler", () => {
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
 
-
-
     // 2. Shutdown handler runs.
 
     shutdownHandler!();
-
-
 
     // 3. Post-shutdown tick (in-flight race survivor): the registry is
 
     // empty (snapshot-before-clear), so the tick does no work. Total
 
- // notification count stays at 1 — no duplicate delivered.
+    // notification count stays at 1 — no duplicate delivered.
 
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
-
   });
 
   afterEach(() => {
     // Clean up tmp artifact dirs created by the AC-A* tests.
     if (tmpRoot) {
-      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
     }
   });
 });

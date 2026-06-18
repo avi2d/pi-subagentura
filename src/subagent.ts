@@ -50,33 +50,40 @@ import {
   type NotifyOnComplete,
 } from "./helpers";
 import {
-	cancelInteractiveSubagent,
-	cancelInteractiveSubagentByState,
-	deriveInteractiveSubagentStatus,
-	formatInteractiveState,
-	interactiveSubagentRegistry,
-	isPaneAlive,
-	launchInteractiveSubagent,
-	sendCommandToPane,
-	pruneDeadInteractiveSubagents,
-	tmuxSetupHint,
-	type InteractiveSubagentState,
+  cancelInteractiveSubagent,
+  cancelInteractiveSubagentByState,
+  deriveInteractiveSubagentStatus,
+  formatInteractiveState,
+  interactiveSubagentRegistry,
+  isPaneAlive,
+  launchInteractiveSubagent,
+  sendCommandToPane,
+  pruneDeadInteractiveSubagents,
+  tmuxSetupHint,
+  type InteractiveSubagentState,
 } from "./interactive-tmux";
 import {
-	appendEvent,
-	artifactPath,
-	lastEvent,
-	listOutputTurns,
-	readEvents,
-	readOutput,
-	readOutputForTurn,
-	snapshotOutput,
-	type SubagentArtifact,
-	type SubagentEvent,
+  appendEvent,
+  artifactPath,
+  lastEvent,
+  listOutputTurns,
+  readEvents,
+  readOutput,
+  readOutputForTurn,
+  snapshotOutput,
+  type SubagentArtifact,
+  type SubagentEvent,
 } from "./artifact";
 import type { Usage } from "./helpers";
 
-import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -86,7 +93,13 @@ import ndjson from "ndjson";
 export type SubagentDetails =
   | { status: "started"; jobId: string; contextMessages: number }
   | { status: "running"; subagentStatus: SubagentLiveStatus; model?: string }
-  | { status: "done" | "error"; usage: Usage; model?: string; usageSummary?: string; contextMessages?: number }
+  | {
+      status: "done" | "error";
+      usage: Usage;
+      model?: string;
+      usageSummary?: string;
+      contextMessages?: number;
+    }
   | { status: "cancelled" | "not_found" }
   | { status: "invalid_id"; id: string };
 // ── Footer Status Key ─────────────────────────────────────────────────────────────────────
@@ -181,7 +194,8 @@ function renderSubagentResult(
   }
 
   if (isPartial) {
-    const runningDetails = result.details?.status === "running" ? result.details : undefined;
+    const runningDetails =
+      result.details?.status === "running" ? result.details : undefined;
     const status = runningDetails?.subagentStatus;
     const model = runningDetails?.model;
 
@@ -237,7 +251,8 @@ function renderSubagentResult(
     return new Text(theme.fg("error", text), 0, 0);
   }
 
-  const usageStr = (result.details as { usageSummary?: string } | undefined)?.usageSummary;
+  const usageStr = (result.details as { usageSummary?: string } | undefined)
+    ?.usageSummary;
 
   if (usageStr) {
     const header = theme.fg("success", "✓ ") + theme.fg("muted", usageStr);
@@ -348,13 +363,17 @@ const CancelParams = Type.Object({
 const InteractiveParams = Type.Object({
   name: Type.Optional(
     Type.String({
-      description: "Display name for the sub-agent session. Defaults to a task preview.",
+      description:
+        "Display name for the sub-agent session. Defaults to a task preview.",
     }),
   ),
-  task: Type.String({ description: "Task to start in the interactive sub-agent" }),
+  task: Type.String({
+    description: "Task to start in the interactive sub-agent",
+  }),
   persona: Type.Optional(
     Type.String({
-      description: "Optional persona / system prompt appended to the child Pi session",
+      description:
+        "Optional persona / system prompt appended to the child Pi session",
     }),
   ),
   model: Type.Optional(
@@ -375,7 +394,7 @@ const InteractiveParams = Type.Object({
     Type.Boolean({
       description:
         "Spawn the sub-agent in a detached named window (hidden from your mux layout) instead of a visible horizontal split. Default true. Pass background: false for a side-by-side split you can watch in real time.",
-    })
+    }),
   ),
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
@@ -384,15 +403,15 @@ const InteractiveParams = Type.Object({
     }),
   ),
   mux: Type.Optional(
-    Type.Union([Type.Literal("auto"), Type.Literal("tmux"), Type.Literal("zellij")], {
-      description:
-        'Which multiplexer backend to use. "auto" (default) picks based on environment: zellij if ZELLIJ_SESSION_NAME is set, tmux if TMUX is set, then whichever backend binary is available. "tmux" forces tmux. "zellij" forces zellij.',
-    }),
+    Type.Union(
+      [Type.Literal("auto"), Type.Literal("tmux"), Type.Literal("zellij")],
+      {
+        description:
+          'Which multiplexer backend to use. "auto" (default) picks based on environment: zellij if ZELLIJ_SESSION_NAME is set, tmux if TMUX is set, then whichever backend binary is available. "tmux" forces tmux. "zellij" forces zellij.',
+      },
+    ),
   ),
 });
-
-
-
 
 // ── Extension ────────────────────────────────────────────────────────
 
@@ -491,13 +510,12 @@ function deliverNotification(jobState: JobState, result: SubagentResult): void {
 
 /** True when the event should trigger a wakeup notification to the parent. */
 function shouldNotify(event: SubagentEvent): boolean {
-	return (
-		event.type === "done" ||
-		event.type === "error" ||
-		event.type === "cancelled"
-	);
+  return (
+    event.type === "done" ||
+    event.type === "error" ||
+    event.type === "cancelled"
+  );
 }
-
 
 /**
  * Poll the artifact directory of every running interactive sub-agent and fire a
@@ -508,152 +526,174 @@ function shouldNotify(event: SubagentEvent): boolean {
  * then advance the cursor. This naturally handles restart / backlog cases.
  */
 export function pollArtifactChanges(pi: ExtensionAPI): void {
-	const g2 = typeof global !== "undefined" ? global : globalThis;
-	const interactivePi = (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
-	if (!interactivePi) return;
+  const g2 = typeof global !== "undefined" ? global : globalThis;
+  const interactivePi =
+    (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
+  if (!interactivePi) return;
 
-	let runningCount = 0;
-	const widgetRows: string[] = [];
-	const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
+  let runningCount = 0;
+  const widgetRows: string[] = [];
+  const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
-	for (const state of interactiveSubagentRegistry.values()) {
-		// Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
-		// revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
-		// follow-up user message lands in the session log (auto-done case). To make that reachable,
-		// the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
-		// status-update block below may re-mark the state as "exited" (based on a stale synthesized
-		// error event in the artifact) but the revival, running later in the same poll via
-		// tailReadSessionLog, will reset it to "running" within this same tick.
-		if (state.status === "cancelled" || state.status === "unknown") continue;
+  for (const state of interactiveSubagentRegistry.values()) {
+    // Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
+    // revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
+    // follow-up user message lands in the session log (auto-done case). To make that reachable,
+    // the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
+    // status-update block below may re-mark the state as "exited" (based on a stale synthesized
+    // error event in the artifact) but the revival, running later in the same poll via
+    // tailReadSessionLog, will reset it to "running" within this same tick.
+    if (state.status === "cancelled" || state.status === "unknown") continue;
 
-		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
-		const last = lastEvent(art);
+    const art = artifactPath(
+      dirname(state.artifactDir),
+      basename(state.artifactDir),
+    );
+    const last = lastEvent(art);
 
-		// Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
-		// which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
-		// here and the inject path below will fire again.
-		const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
-		if (next !== state.status) {
-			state.status = next;
-			if (next === "exited" && last && last.type === "done" && last.exitCode !== undefined) {
-				state.exitCode = last.exitCode;
-			}
-		}
+    // Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
+    // which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
+    // here and the inject path below will fire again.
+    const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
+    if (next !== state.status) {
+      state.status = next;
+      if (
+        next === "exited" &&
+        last &&
+        last.type === "done" &&
+        last.exitCode !== undefined
+      ) {
+        state.exitCode = last.exitCode;
+      }
+    }
 
-		// Tail-read the child's session log and synthesize tool_activity events.
-		// TUI-widget only — the LLM never sees them.
-		tailReadSessionLog(state, art);
+    // Tail-read the child's session log and synthesize tool_activity events.
+    // TUI-widget only — the LLM never sees them.
+    tailReadSessionLog(state, art);
 
-		// Auto-done fallback: synthesize a completion event when the model ended its turn with
-		// stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
-		// event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
-		// guard so the events loop below will not re-notify.
-		maybeAutoDone(state, art, interactivePi, Date.now());
+    // Auto-done fallback: synthesize a completion event when the model ended its turn with
+    // stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
+    // event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
+    // guard so the events loop below will not re-notify.
+    maybeAutoDone(state, art, interactivePi, Date.now());
 
-		// Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
-		// so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
-		const cursor = state.lastDeliveredEventTs ?? 0;
-		const events = readEvents(art, cursor + 1);
+    // Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
+    // so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
+    const cursor = state.lastDeliveredEventTs ?? 0;
+    const events = readEvents(art, cursor + 1);
 
-		if (events.length > 0) {
-			let maxTs = cursor;
-			for (const ev of events) {
-				if (ev.ts > maxTs) maxTs = ev.ts;
-				if (!shouldNotify(ev)) continue;
-				// If auto-done already fired for this turn, skip any later explicit `done` events:
-				// they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
-				if (state.autoDoneForTurnAt !== undefined && ev.ts >= state.autoDoneForTurnAt && ev.type === "done") continue;
-				deliverArtifactNotification(interactivePi, state, ev);
-			}
-			state.lastDeliveredEventTs = maxTs;
-		}
+    if (events.length > 0) {
+      let maxTs = cursor;
+      for (const ev of events) {
+        if (ev.ts > maxTs) maxTs = ev.ts;
+        if (!shouldNotify(ev)) continue;
+        // If auto-done already fired for this turn, skip any later explicit `done` events:
+        // they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
+        if (
+          state.autoDoneForTurnAt !== undefined &&
+          ev.ts >= state.autoDoneForTurnAt &&
+          ev.type === "done"
+        )
+          continue;
+        deliverArtifactNotification(interactivePi, state, ev);
+      }
+      state.lastDeliveredEventTs = maxTs;
+    }
 
-		// Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
-		// history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
-		// so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
-		// `lastInjectedEventTs` would corrupt history in the default `notify` mode.
-		if (last && last.type === "done" && state.lastSnapshotEventTs !== last.ts) {
-			const allEvents = readEvents(art);
-			const turnNumber = allEvents.filter((e) => e.type === "done").length;
-			snapshotOutput(art, turnNumber);
-			state.lastSnapshotEventTs = last.ts;
-		}
+    // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
+    // history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
+    // so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
+    // `lastInjectedEventTs` would corrupt history in the default `notify` mode.
+    if (last && last.type === "done" && state.lastSnapshotEventTs !== last.ts) {
+      const allEvents = readEvents(art);
+      const turnNumber = allEvents.filter((e) => e.type === "done").length;
+      snapshotOutput(art, turnNumber);
+      state.lastSnapshotEventTs = last.ts;
+    }
 
-		// Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
-		// Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
-		// so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
-		if (last && last.type === "done" && state.notifyOnComplete === "inject" && state.lastInjectedEventTs !== last.ts) {
-			const output = readOutput(art);
-			if (output !== null) {
-				if (getInjectCount() >= MAX_INJECT) {
-					// Degrade silently: pointer notification was already delivered above,
-					// so the user still sees a hint. We just don't inject.
-					try {
-						interactivePi.sendMessage!(
-							{
-								customType: "subagent-notify",
-								content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
-								display: true,
-								details: { subagentId: state.id, mode: "notify" },
-							},
-							{ deliverAs: "followUp" },
-						);
-					} catch { /* pi stale */ }
-				} else {
-					incrementInjectCount();
-					try {
-						(interactivePi as any).sendUserMessage?.(
-							output || "(sub-agent produced no output)",
-							{ deliverAs: "followUp" },
-						);
-					} finally {
-						decrementInjectCount();
-					}
-				}
-			}
-			// Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
-			// turn has a fresh ts, so the comparison re-fires.
-			state.lastInjectedEventTs = last.ts;
-		}
+    // Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
+    // Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
+    // so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
+    if (
+      last &&
+      last.type === "done" &&
+      state.notifyOnComplete === "inject" &&
+      state.lastInjectedEventTs !== last.ts
+    ) {
+      const output = readOutput(art);
+      if (output !== null) {
+        if (getInjectCount() >= MAX_INJECT) {
+          // Degrade silently: pointer notification was already delivered above,
+          // so the user still sees a hint. We just don't inject.
+          try {
+            interactivePi.sendMessage!(
+              {
+                customType: "subagent-notify",
+                content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
+                display: true,
+                details: { subagentId: state.id, mode: "notify" },
+              },
+              { deliverAs: "followUp" },
+            );
+          } catch {
+            /* pi stale */
+          }
+        } else {
+          incrementInjectCount();
+          try {
+            (interactivePi as any).sendUserMessage?.(
+              output || "(sub-agent produced no output)",
+              { deliverAs: "followUp" },
+            );
+          } finally {
+            decrementInjectCount();
+          }
+        }
+      }
+      // Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
+      // turn has a fresh ts, so the comparison re-fires.
+      state.lastInjectedEventTs = last.ts;
+    }
 
+    // Only count sub-agents that are actively processing a turn as "running".
 
-		// Only count sub-agents that are actively processing a turn as "running".
+    // "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
 
-		// "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
+    // running count and widget even though the for-loop keeps tail-reading its
 
-		// running count and widget even though the for-loop keeps tail-reading its
+    // session log (for the user-role revival case in processSessionLogEntry).
 
-		// session log (for the user-role revival case in processSessionLogEntry).
+    // "idle" is between turns (REPL open, pane alive) — still a live sub-agent
 
-		// "idle" is between turns (REPL open, pane alive) — still a live sub-agent
+    // awaiting follow-up, so it stays in the count.
 
-		// awaiting follow-up, so it stays in the count.
+    if (state.status === "running" || state.status === "idle") {
+      runningCount++;
 
-		if (state.status === "running" || state.status === "idle") {
+      widgetRows.push(formatActivityRow(state));
+    }
+  }
 
-			runningCount++;
-
-			widgetRows.push(formatActivityRow(state));
-
-		}
-	}
-
-	// Paint footer + widget. Both are TUI-only — never reach the LLM.
-	if (ui) {
-		try {
-			ui.setStatus(
-				FOOTER_KEY,
-				runningCount > 0 ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running` : undefined,
-			);
-		} catch {
-			/* ui stale */
-		}
-		try {
-			ui.setWidget(WIDGET_KEY, widgetRows.length > 0 ? widgetRows : undefined, { placement: "belowEditor" });
-		} catch {
-			/* ui stale */
-		}
-	}
+  // Paint footer + widget. Both are TUI-only — never reach the LLM.
+  if (ui) {
+    try {
+      ui.setStatus(
+        FOOTER_KEY,
+        runningCount > 0
+          ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
+          : undefined,
+      );
+    } catch {
+      /* ui stale */
+    }
+    try {
+      ui.setWidget(WIDGET_KEY, widgetRows.length > 0 ? widgetRows : undefined, {
+        placement: "belowEditor",
+      });
+    } catch {
+      /* ui stale */
+    }
+  }
 }
 
 /**
@@ -691,177 +731,203 @@ const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
 const AUTO_DONE_DEBOUNCE_MS = 10_000;
 
 /** Get-or-create the per-state session parser and wire its 'data' event to the entry handler. */
-function getOrCreateSessionParser(state: InteractiveSubagentState): ReturnType<typeof ndjson.parse> {
-	const existing = sessionParsers.get(state.id);
-	if (existing) return existing;
-	// strict: false → malformed lines are silently dropped instead of triggering an 'error' event
-	// that would force us to recreate the parser mid-stream. Same best-effort delivery semantics as
-	// the old hand-rolled try/catch around JSON.parse.
-	const parser = ndjson.parse({ strict: false });
-	parser.on("data", (entry: unknown) => {
-		const art = artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
-		processSessionLogEntry(state, art, entry as any);
-	});
-	// In non-strict mode the parser does not emit 'error' for bad JSON, but we still attach a no-op
-	// handler so an unhandled error event can never crash the process.
-	parser.on("error", () => {
-		// Drop the broken parser so the next tick creates a fresh one. The cursor is reset in the
-		// truncation handler, so this only fires for pathological non-truncation errors.
-		sessionParsers.delete(state.id);
-	});
-	sessionParsers.set(state.id, parser);
-	return parser;
+function getOrCreateSessionParser(
+  state: InteractiveSubagentState,
+): ReturnType<typeof ndjson.parse> {
+  const existing = sessionParsers.get(state.id);
+  if (existing) return existing;
+  // strict: false → malformed lines are silently dropped instead of triggering an 'error' event
+  // that would force us to recreate the parser mid-stream. Same best-effort delivery semantics as
+  // the old hand-rolled try/catch around JSON.parse.
+  const parser = ndjson.parse({ strict: false });
+  parser.on("data", (entry: unknown) => {
+    const art = artifactPath(
+      dirname(state.artifactDir),
+      basename(state.artifactDir),
+    );
+    processSessionLogEntry(state, art, entry as any);
+  });
+  // In non-strict mode the parser does not emit 'error' for bad JSON, but we still attach a no-op
+  // handler so an unhandled error event can never crash the process.
+  parser.on("error", () => {
+    // Drop the broken parser so the next tick creates a fresh one. The cursor is reset in the
+    // truncation handler, so this only fires for pathological non-truncation errors.
+    sessionParsers.delete(state.id);
+  });
+  sessionParsers.set(state.id, parser);
+  return parser;
 }
 
 /** Destroy a state's parser (used on truncation and on state removal). */
 function destroySessionParser(state: InteractiveSubagentState): void {
-	const parser = sessionParsers.get(state.id);
-	if (!parser) return;
-	try {
-		parser.end();
-	} catch {
-		// ignore — we're tearing down
-	}
-	sessionParsers.delete(state.id);
+  const parser = sessionParsers.get(state.id);
+  if (!parser) return;
+  try {
+    parser.end();
+  } catch {
+    // ignore — we're tearing down
+  }
+  sessionParsers.delete(state.id);
 }
 
 /** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
  *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
-function tailReadSessionLog(state: InteractiveSubagentState, _art: SubagentArtifact): void {
-	const sessionFile = state.sessionFile;
-	if (!sessionFile) return;
+function tailReadSessionLog(
+  state: InteractiveSubagentState,
+  _art: SubagentArtifact,
+): void {
+  const sessionFile = state.sessionFile;
+  if (!sessionFile) return;
 
-	let size: number;
-	try {
-		size = statSync(sessionFile).size;
-	} catch {
-		return; // file not yet created by the child
-	}
+  let size: number;
+  try {
+    size = statSync(sessionFile).size;
+  } catch {
+    return; // file not yet created by the child
+  }
 
-	const initialCursor = state.lastDeliveredSessionByte ?? 0;
-	if (size < initialCursor) {
-		// File shrunk under us (truncation, rotation, manual edit). Reset cursor and parser and fall
-		// through to the read below so any content already written after the truncation is processed in
-		// the same tick (e.g. test does truncateSync → writeFileSync → poll). The parser is recreated so the
-		// buffered partial state is cleared. Any duplicate tool_activity events are acceptable — the
-		// artifact log is best-effort and the LLM never sees these (TUI-widget only).
-		state.lastDeliveredSessionByte = 0;
-		destroySessionParser(state);
-	}
-	const cursor = state.lastDeliveredSessionByte ?? 0;
-	if (size <= cursor) return;
+  const initialCursor = state.lastDeliveredSessionByte ?? 0;
+  if (size < initialCursor) {
+    // File shrunk under us (truncation, rotation, manual edit). Reset cursor and parser and fall
+    // through to the read below so any content already written after the truncation is processed in
+    // the same tick (e.g. test does truncateSync → writeFileSync → poll). The parser is recreated so the
+    // buffered partial state is cleared. Any duplicate tool_activity events are acceptable — the
+    // artifact log is best-effort and the LLM never sees these (TUI-widget only).
+    state.lastDeliveredSessionByte = 0;
+    destroySessionParser(state);
+  }
+  const cursor = state.lastDeliveredSessionByte ?? 0;
+  if (size <= cursor) return;
 
-	// Defensive cap on per-tick allocation. ndjson handles partial lines correctly across writes,
-	// so a single multi-MB line split across ticks works fine — no cursor pin.
-	const requested = size - cursor;
-	const toRead = Math.min(requested, MAX_SESSION_READ_BYTES);
-	if (toRead <= 0) return;
+  // Defensive cap on per-tick allocation. ndjson handles partial lines correctly across writes,
+  // so a single multi-MB line split across ticks works fine — no cursor pin.
+  const requested = size - cursor;
+  const toRead = Math.min(requested, MAX_SESSION_READ_BYTES);
+  if (toRead <= 0) return;
 
-	let fd: number;
-	try {
-		fd = openSync(sessionFile, "r");
-	} catch {
-		return;
-	}
-	try {
-		const buf = Buffer.alloc(toRead);
-		let bytesRead = 0;
-		while (bytesRead < toRead) {
-			const n = readSync(fd, buf, bytesRead, toRead - bytesRead, cursor + bytesRead);
-			if (n <= 0) break;
-			bytesRead += n;
-		}
-		if (bytesRead === 0) return;
-		const parser = getOrCreateSessionParser(state);
-		parser.write(buf.subarray(0, bytesRead));
-		// Always advance the cursor by the bytes we fed the parser. The parser buffers any partial
-		// trailing line internally and will emit the completed object on a later write. We do NOT
-		// rewind to the last newline the way the old code did — doing so would re-feed the same bytes
-		// to the parser and double-emit on the next tick.
-		state.lastDeliveredSessionByte = cursor + bytesRead;
-	} finally {
-		try {
-			closeSync(fd);
-		} catch {
-			/* fd already closed or never opened — ignore */
-		}
-	}
+  let fd: number;
+  try {
+    fd = openSync(sessionFile, "r");
+  } catch {
+    return;
+  }
+  try {
+    const buf = Buffer.alloc(toRead);
+    let bytesRead = 0;
+    while (bytesRead < toRead) {
+      const n = readSync(
+        fd,
+        buf,
+        bytesRead,
+        toRead - bytesRead,
+        cursor + bytesRead,
+      );
+      if (n <= 0) break;
+      bytesRead += n;
+    }
+    if (bytesRead === 0) return;
+    const parser = getOrCreateSessionParser(state);
+    parser.write(buf.subarray(0, bytesRead));
+    // Always advance the cursor by the bytes we fed the parser. The parser buffers any partial
+    // trailing line internally and will emit the completed object on a later write. We do NOT
+    // rewind to the last newline the way the old code did — doing so would re-feed the same bytes
+    // to the parser and double-emit on the next tick.
+    state.lastDeliveredSessionByte = cursor + bytesRead;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* fd already closed or never opened — ignore */
+    }
+  }
 }
 
 /** Process a single parsed JSONL entry from the session log; append tool_activity events. */
-function processSessionLogEntry(state: InteractiveSubagentState, art: SubagentArtifact, entry: Record<string, unknown>): void {
-	const e = entry as { type?: string; message?: Record<string, unknown> };
-	if (e.type !== "message") return;
-	const msg = e.message;
-	if (!msg) return;
+function processSessionLogEntry(
+  state: InteractiveSubagentState,
+  art: SubagentArtifact,
+  entry: Record<string, unknown>,
+): void {
+  const e = entry as { type?: string; message?: Record<string, unknown> };
+  if (e.type !== "message") return;
+  const msg = e.message;
+  if (!msg) return;
 
-	// New user-role message = a new turn. Clear the per-turn auto-done guard so the
-	// next `stopReason: "stop"` is treated as a fresh completion candidate. Without this, a
-	// user follow-up after a previous auto-done would not be allowed to fire again.
-	if (msg.role === "user") {
-		state.autoDoneForTurnAt = undefined;
-		// Reset the per-turn stop-capture so a new turn does not inherit stale data
-		// from the previous one. Without this, a turn that ends with stopReason:"stop"
-		// but no assistant text would fall back to the prior turn's `lastStopText` in
-		// the synthesized error message.
-		state.lastStopReason = undefined;
-		state.lastStopReasonAt = undefined;
-		state.lastStopText = undefined;
-		// If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn)
-		// OR "idle" (the natural post-turn state once follow-up work lands), revive it to "running"
-		// so the for-loop keeps tail-reading the session log. Without this, a user follow-up after
-		// a previous completion would be silently ignored and the next auto-done / done-event
-		// opportunity missed. Both paths share the same revival semantics: a user-role entry means
-		// a new turn is starting, regardless of how the previous turn ended.
-		if (state.status === "exited" || state.status === "idle") state.status = "running";
-		return;
-	}
+  // New user-role message = a new turn. Clear the per-turn auto-done guard so the
+  // next `stopReason: "stop"` is treated as a fresh completion candidate. Without this, a
+  // user follow-up after a previous auto-done would not be allowed to fire again.
+  if (msg.role === "user") {
+    state.autoDoneForTurnAt = undefined;
+    // Reset the per-turn stop-capture so a new turn does not inherit stale data
+    // from the previous one. Without this, a turn that ends with stopReason:"stop"
+    // but no assistant text would fall back to the prior turn's `lastStopText` in
+    // the synthesized error message.
+    state.lastStopReason = undefined;
+    state.lastStopReasonAt = undefined;
+    state.lastStopText = undefined;
+    // If the state was previously marked "exited" (e.g. by an auto-done fallback in a prior turn)
+    // OR "idle" (the natural post-turn state once follow-up work lands), revive it to "running"
+    // so the for-loop keeps tail-reading the session log. Without this, a user follow-up after
+    // a previous completion would be silently ignored and the next auto-done / done-event
+    // opportunity missed. Both paths share the same revival semantics: a user-role entry means
+    // a new turn is starting, regardless of how the previous turn ended.
+    if (state.status === "exited" || state.status === "idle")
+      state.status = "running";
+    return;
+  }
 
-	// Assistant message: extract toolCall blocks AND record stopReason for the auto-done fallback.
-	if (msg.role === "assistant" && Array.isArray(msg.content)) {
-		const ts = (msg.timestamp as number) ?? Date.now();
-		const stopReason = (msg as { stopReason?: string }).stopReason;
-		if (stopReason === "stop" || stopReason === "length" || stopReason === "error" || stopReason === "aborted") {
-			state.lastStopReason = stopReason;
-			state.lastStopReasonAt = ts;
-			// Capture the textual summary the model produced for the final turn. Used as fallback
-			// content when auto-synthesizing an `error` event for a child that stopped without writing output.md.
-			if (stopReason === "stop") {
-				const text = extractAssistantText(msg.content);
-				if (text) state.lastStopText = text;
-			}
-		}
-		for (const rawBlock of msg.content) {
-			const block = rawBlock as { type?: string; name?: string; arguments?: unknown } | undefined;
-			if (!block || block.type !== "toolCall") continue;
-			const summary = summarizeToolCall(block.name ?? "", block.arguments);
-			if (!summary) continue;
-			const ev: SubagentEvent = {
-				ts,
-				type: "tool_activity",
-				status: "running",
-				tool: block.name ?? "",
-				summary,
-			};
-			appendEvent(art, ev);
-			state.lastToolName = block.name ?? "";
-			state.lastToolSummary = summary;
-			state.lastActivityAt = ev.ts;
-		}
-	}
+  // Assistant message: extract toolCall blocks AND record stopReason for the auto-done fallback.
+  if (msg.role === "assistant" && Array.isArray(msg.content)) {
+    const ts = (msg.timestamp as number) ?? Date.now();
+    const stopReason = (msg as { stopReason?: string }).stopReason;
+    if (
+      stopReason === "stop" ||
+      stopReason === "length" ||
+      stopReason === "error" ||
+      stopReason === "aborted"
+    ) {
+      state.lastStopReason = stopReason;
+      state.lastStopReasonAt = ts;
+      // Capture the textual summary the model produced for the final turn. Used as fallback
+      // content when auto-synthesizing an `error` event for a child that stopped without writing output.md.
+      if (stopReason === "stop") {
+        const text = extractAssistantText(msg.content);
+        if (text) state.lastStopText = text;
+      }
+    }
+    for (const rawBlock of msg.content) {
+      const block = rawBlock as
+        | { type?: string; name?: string; arguments?: unknown }
+        | undefined;
+      if (!block || block.type !== "toolCall") continue;
+      const summary = summarizeToolCall(block.name ?? "", block.arguments);
+      if (!summary) continue;
+      const ev: SubagentEvent = {
+        ts,
+        type: "tool_activity",
+        status: "running",
+        tool: block.name ?? "",
+        summary,
+      };
+      appendEvent(art, ev);
+      state.lastToolName = block.name ?? "";
+      state.lastToolSummary = summary;
+      state.lastActivityAt = ev.ts;
+    }
+  }
 }
 
 /** Concatenate text blocks from an assistant message's content array. Empty string if none. */
 function extractAssistantText(content: unknown[]): string {
-	let out = "";
-	for (const block of content) {
-		const b = block as { type?: string; text?: string };
-		if (b?.type === "text" && typeof b.text === "string") {
-			if (out) out += "\n";
-			out += b.text;
-		}
-	}
-	return out;
+  let out = "";
+  for (const block of content) {
+    const b = block as { type?: string; text?: string };
+    if (b?.type === "text" && typeof b.text === "string") {
+      if (out) out += "\n";
+      out += b.text;
+    }
+  }
+  return out;
 }
 
 /**
@@ -879,169 +945,183 @@ function extractAssistantText(content: unknown[]): string {
  * last assistant text as a fallback message — most models inline a summary in chat even when the actual
  * result landed at a different path.
  */
-function maybeAutoDone(state: InteractiveSubagentState, art: SubagentArtifact, pi: ExtensionAPI, now: number): void {
-	if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
+function maybeAutoDone(
+  state: InteractiveSubagentState,
+  art: SubagentArtifact,
+  pi: ExtensionAPI,
+  now: number,
+): void {
+  if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
 
-	if (state.lastStopReason !== "stop") return;
+  if (state.lastStopReason !== "stop") return;
 
-	const stopAt = state.lastStopReasonAt ?? 0;
+  const stopAt = state.lastStopReasonAt ?? 0;
 
-	if (now - stopAt < AUTO_DONE_DEBOUNCE_MS) return;
+  if (now - stopAt < AUTO_DONE_DEBOUNCE_MS) return;
 
+  // Explicit signal still wins. If the wrapper already wrote done/error/cancelled, do not synthesize.
 
+  // NOTE: we scan ALL events, not just lastEvent(): tailReadSessionLog runs immediately before us
 
-	// Explicit signal still wins. If the wrapper already wrote done/error/cancelled, do not synthesize.
+  // and may have just appended a `tool_activity` row whose ts is from the session log (often EARLIER
 
-	// NOTE: we scan ALL events, not just lastEvent(): tailReadSessionLog runs immediately before us
+  // than the child's explicit done) — making `lastEvent` return a tool_activity and silently miss the
 
-	// and may have just appended a `tool_activity` row whose ts is from the session log (often EARLIER
+  // existing terminal event. That would synthesize a duplicate AND the events loop below would
 
-	// than the child's explicit done) — making `lastEvent` return a tool_activity and silently miss the
+  // re-deliver the original (its `ev.ts >= autoDoneForTurnAt` guard fails because the explicit done
 
-	// existing terminal event. That would synthesize a duplicate AND the events loop below would
+  // has a smaller ts than the synthesized one), causing a double-notify. See the regression test
 
-	// re-deliver the original (its `ev.ts >= autoDoneForTurnAt` guard fails because the explicit done
+  // `does NOT synthesize when an explicit done event is present AND a tool_activity was appended
 
-	// has a smaller ts than the synthesized one), causing a double-notify. See the regression test
+  // after it in the same poll` in subagent-auto-done.test.ts.
 
-	// `does NOT synthesize when an explicit done event is present AND a tool_activity was appended
+  const existingTerminal = readEvents(art).some(
+    (ev) =>
+      ev.type === "done" || ev.type === "error" || ev.type === "cancelled",
+  );
 
-	// after it in the same poll` in subagent-auto-done.test.ts.
+  if (existingTerminal) return;
 
-	const existingTerminal = readEvents(art).some(
+  // Detect output.md state. We want to synthesize `done` only when the model has actually produced a result.
+  const output = readOutput(art);
+  const hasOutput = output !== null && output.length > 0;
 
-		(ev) => ev.type === "done" || ev.type === "error" || ev.type === "cancelled",
+  const ts = now;
+  let ev: SubagentEvent;
+  if (hasOutput) {
+    ev = {
+      ts,
+      type: "done",
+      status: "done",
+      exitCode: 0,
+      summary: "auto-detected from session stopReason:stop",
+    };
+  } else {
+    const fallback = state.lastStopText;
+    const baseMessage = "sub-agent stopped without writing output.md";
+    const FALLBACK_SLICE = 500;
+    const message =
+      fallback && fallback.length > 0
+        ? fallback.length > FALLBACK_SLICE
+          ? `${baseMessage} — last assistant message: ${fallback.slice(0, FALLBACK_SLICE)}… (truncated)`
+          : `${baseMessage} — last assistant message: ${fallback}`
+        : baseMessage;
+    ev = { ts, type: "error", status: "error", message, exitCode: 1 };
+    state.exitCode = 1;
+  }
+  // NOTE: we deliberately do NOT set state.status="exited" here. The synthesized event is in the artifact,
+  // so the next poll's art-status check at the top of the for-loop will set it. Keeping status as "running"
+  // for this iteration lets the for-loop continue processing the state on subsequent polls — critical for
+  // the multi-turn case where the user attaches to the REPL and sends a follow-up; the new user message
+  // needs to be tail-read to clear the auto-done guard. The TUI widget does not show this state because the
+  // synthesized event was already delivered, and the next poll will transition status to "exited" after the
+  // follow-up turn completes.
+  appendEvent(art, ev);
+  state.autoDoneForTurnAt = ts;
+  state.lastDeliveredEventTs = ts;
+  // In inject mode, leave `injected` unset so the regular inject path at
+  // lines 547-585 picks up the synthesized `done` event on the next poll.
+  // For all other modes (notify, undefined), mark as injected here because
+  // the inject path will never fire — this prevents accidental re-inject
+  // if a late explicit `done` later matches the cursor.
+  state.injected = state.notifyOnComplete !== "inject";
 
-	);
-
-	if (existingTerminal) return;
-
-
-
-	// Detect output.md state. We want to synthesize `done` only when the model has actually produced a result.
-	const output = readOutput(art);
-	const hasOutput = output !== null && output.length > 0;
-
-	const ts = now;
-	let ev: SubagentEvent;
-	if (hasOutput) {
-		ev = { ts, type: "done", status: "done", exitCode: 0, summary: "auto-detected from session stopReason:stop" };
-	} else {
-		const fallback = state.lastStopText;
-		const baseMessage = "sub-agent stopped without writing output.md";
-		const FALLBACK_SLICE = 500;
-		const message = fallback && fallback.length > 0
-			? fallback.length > FALLBACK_SLICE
-				? `${baseMessage} — last assistant message: ${fallback.slice(0, FALLBACK_SLICE)}… (truncated)`
-				: `${baseMessage} — last assistant message: ${fallback}`
-			: baseMessage;
-		ev = { ts, type: "error", status: "error", message, exitCode: 1 };
-		state.exitCode = 1;
-	}
-	// NOTE: we deliberately do NOT set state.status="exited" here. The synthesized event is in the artifact,
-	// so the next poll's art-status check at the top of the for-loop will set it. Keeping status as "running"
-	// for this iteration lets the for-loop continue processing the state on subsequent polls — critical for
-	// the multi-turn case where the user attaches to the REPL and sends a follow-up; the new user message
-	// needs to be tail-read to clear the auto-done guard. The TUI widget does not show this state because the
-	// synthesized event was already delivered, and the next poll will transition status to "exited" after the
-	// follow-up turn completes.
-	appendEvent(art, ev);
-	state.autoDoneForTurnAt = ts;
-	state.lastDeliveredEventTs = ts;
-	// In inject mode, leave `injected` unset so the regular inject path at
-	// lines 547-585 picks up the synthesized `done` event on the next poll.
-	// For all other modes (notify, undefined), mark as injected here because
-	// the inject path will never fire — this prevents accidental re-inject
-	// if a late explicit `done` later matches the cursor.
-	state.injected = state.notifyOnComplete !== "inject";
-
-	// Fire the pointer notification immediately so the parent does not wait for the next 5s poll tick.
-	// Suppress here only — the regular `events` loop below uses the autoDoneForTurnAt guard.
-	if (pi) {
-		try {
-			deliverArtifactNotification(pi, state, ev);
-		} catch {
-			// pi may be stale; the event is on disk and will be picked up by the next tick anyway.
-		}
-	}
+  // Fire the pointer notification immediately so the parent does not wait for the next 5s poll tick.
+  // Suppress here only — the regular `events` loop below uses the autoDoneForTurnAt guard.
+  if (pi) {
+    try {
+      deliverArtifactNotification(pi, state, ev);
+    } catch {
+      // pi may be stale; the event is on disk and will be picked up by the next tick anyway.
+    }
+  }
 }
 
 /** Short, human-readable summary of a tool call. Returns null for uninteresting tools. */
 function summarizeToolCall(name: string, args: unknown): string | null {
-	if (!args || typeof args !== "object") return null;
-	const a = args as Record<string, unknown>;
-	switch (name) {
-		case "bash": {
-			const cmd = typeof a.command === "string" ? a.command : null;
-			if (!cmd) return null;
-			return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
-		}
-		case "write":
-		case "edit":
-		case "read": {
-			const p = typeof a.path === "string" ? a.path : null;
-			if (!p) return null;
-			return p;
-		}
-		default:
-			return null; // skip grep/find/ls etc. — too noisy for the widget
-	}
+  if (!args || typeof args !== "object") return null;
+  const a = args as Record<string, unknown>;
+  switch (name) {
+    case "bash": {
+      const cmd = typeof a.command === "string" ? a.command : null;
+      if (!cmd) return null;
+      return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
+    }
+    case "write":
+    case "edit":
+    case "read": {
+      const p = typeof a.path === "string" ? a.path : null;
+      if (!p) return null;
+      return p;
+    }
+    default:
+      return null; // skip grep/find/ls etc. — too noisy for the widget
+  }
 }
 
 /** Format a single TUI widget row for a running sub-agent. */
 function formatActivityRow(state: InteractiveSubagentState): string {
-	const ago = state.lastActivityAt ? ` (${agoStr(Date.now() - state.lastActivityAt)})` : "";
-	const summary = state.lastToolSummary ?? "starting…";
-	return `▶ ${state.name}: ${summary}${ago}`;
+  const ago = state.lastActivityAt
+    ? ` (${agoStr(Date.now() - state.lastActivityAt)})`
+    : "";
+  const summary = state.lastToolSummary ?? "starting…";
+  return `▶ ${state.name}: ${summary}${ago}`;
 }
 
 function agoStr(ms: number): string {
-	if (ms < 0) ms = 0;
-	if (ms < 1000) return "just now";
-	const s = Math.floor(ms / 1000);
-	if (s < 60) return `${s}s ago`;
-	const m = Math.floor(s / 60);
-	if (m < 60) return `${m}m ago`;
-	return `${Math.floor(m / 60)}h ago`;
+  if (ms < 0) ms = 0;
+  if (ms < 1000) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
 }
 
 /** Build the LLM-facing notification content. Pointer paths always; error body inlined. */
 
-function buildArtifactMessage(state: InteractiveSubagentState, event: SubagentEvent): string {
-	const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
-	const outputPath = join(state.artifactDir, "output.md");
-	const logPath = join(state.artifactDir, "events.ndjson");
-	const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;
-	let body = "";
-	if (event.type === "error") {
-		body = `\n${sanitizeOutput((event.message ?? "unknown error").slice(0, 500))}`;
+function buildArtifactMessage(
+  state: InteractiveSubagentState,
+  event: SubagentEvent,
+): string {
+  const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
+  const outputPath = join(state.artifactDir, "output.md");
+  const logPath = join(state.artifactDir, "events.ndjson");
+  const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;
+  let body = "";
+  if (event.type === "error") {
+    body = `\n${sanitizeOutput((event.message ?? "unknown error").slice(0, 500))}`;
+  }
 
-}
-
-	return `${header}${body}${pointer}`;
+  return `${header}${body}${pointer}`;
 }
 
 /** Send a single pointer-only notification for one artifact event. */
-function deliverArtifactNotification(pi: ExtensionAPI, state: InteractiveSubagentState, event: SubagentEvent): void {
-	try {
-		pi.sendMessage!(
-			{
-				customType: "subagent-notify",
-				content: buildArtifactMessage(state, event),
-				display: true,
-				details: { subagentId: state.id, event },
-
-			},
-			{ deliverAs: "followUp" },
-		);
-	} catch {
-		// pi may be stale after session replacement
-	}
+function deliverArtifactNotification(
+  pi: ExtensionAPI,
+  state: InteractiveSubagentState,
+  event: SubagentEvent,
+): void {
+  try {
+    pi.sendMessage!(
+      {
+        customType: "subagent-notify",
+        content: buildArtifactMessage(state, event),
+        display: true,
+        details: { subagentId: state.id, event },
+      },
+      { deliverAs: "followUp" },
+    );
+  } catch {
+    // pi may be stale after session replacement
+  }
 }
 
 /** Assert that a value is never (exhaustiveness checker). */
 function assertNever(value: never): never {
-	throw new Error(`Unexpected value: ${value}`);
+  throw new Error(`Unexpected value: ${value}`);
 }
 
 function iconFor(event: SubagentEvent): string {
@@ -1087,61 +1167,63 @@ function labelFor(event: SubagentEvent): string {
 import isPathInside from "is-path-inside";
 
 export function findArtifactById(id: string): SubagentArtifact | null {
-	// Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
-	// chars. Validate the id before joining it into a path so that an
-	// LLM-supplied id like "../../../etc" can't escape the artifact root
-	// (path.join normalises "..", so a malicious id would otherwise resolve
-	// to a sibling directory and get exfiltrated to the parent LLM via
-	// read_subagent_artifact).
-	if (!/^[a-f0-9]{8}$/.test(id)) return null;
+  // Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
+  // chars. Validate the id before joining it into a path so that an
+  // LLM-supplied id like "../../../etc" can't escape the artifact root
+  // (path.join normalises "..", so a malicious id would otherwise resolve
+  // to a sibling directory and get exfiltrated to the parent LLM via
+  // read_subagent_artifact).
+  if (!/^[a-f0-9]{8}$/.test(id)) return null;
 
-	const root = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
-	// Resolve the root once, with symlinks followed, so the containment check below
-	// is anchored on the real on-disk location. realpathSync throws if root doesn't
-	// exist; in that case there's nothing for us to find.
-	let realRoot: string;
-	try {
-		realRoot = realpathSync(root);
-	} catch {
-		return null;
-	}
-	let topLevel: string[];
-	try {
-		topLevel = readdirSync(root);
-	} catch {
-		return null;
-	}
-	for (const entry of topLevel) {
-		const candidate = join(root, entry, "artifacts", id);
-		try {
-			if (statSync(candidate).isDirectory()) {
-				// statSync follows symlinks, so a symlink at
-				// <root>/<cwd>/artifacts/<id> pointing outside the artifact root
-				// would otherwise be returned as a valid artifact. Resolve the
-				// candidate with realpath and verify it is still inside the
-				// resolved root. realpathSync is safe here because statSync
-				// above already confirmed candidate exists as a directory.
-				let realCandidate: string;
-				try {
-					realCandidate = realpathSync(candidate);
-				} catch {
-					continue;
-				}
-				if (!isPathInside(realCandidate, realRoot)) continue;
-				return artifactPath(join(root, entry, "artifacts"), id);
-			}
-		} catch {
-			/* not here */
-		}
-	}
-	return null;
+  const root =
+    process.env.PI_CODING_AGENT_SESSION_DIR ??
+    join(homedir(), ".pi", "agent", "sessions");
+  // Resolve the root once, with symlinks followed, so the containment check below
+  // is anchored on the real on-disk location. realpathSync throws if root doesn't
+  // exist; in that case there's nothing for us to find.
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    return null;
+  }
+  let topLevel: string[];
+  try {
+    topLevel = readdirSync(root);
+  } catch {
+    return null;
+  }
+  for (const entry of topLevel) {
+    const candidate = join(root, entry, "artifacts", id);
+    try {
+      if (statSync(candidate).isDirectory()) {
+        // statSync follows symlinks, so a symlink at
+        // <root>/<cwd>/artifacts/<id> pointing outside the artifact root
+        // would otherwise be returned as a valid artifact. Resolve the
+        // candidate with realpath and verify it is still inside the
+        // resolved root. realpathSync is safe here because statSync
+        // above already confirmed candidate exists as a directory.
+        let realCandidate: string;
+        try {
+          realCandidate = realpathSync(candidate);
+        } catch {
+          continue;
+        }
+        if (!isPathInside(realCandidate, realRoot)) continue;
+        return artifactPath(join(root, entry, "artifacts"), id);
+      }
+    } catch {
+      /* not here */
+    }
+  }
+  return null;
 }
 /** Sanitize a string by redacting common sensitive patterns (API keys, tokens, JWTs). */
 function sanitizeOutput(text: string): string {
-	return text.replace(
-		/(sk-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|-----BEGIN[\s\w]+KEY-----|AKIA[\w]{16}|ghp_[\w]{36}|gho_[\w]{36}|ghu_[\w]{36}|xox[abp]-[\w-]+|AIza[\w-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g,
-		"[REDACTED]",
-	);
+  return text.replace(
+    /(sk-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|-----BEGIN[\s\w]+KEY-----|AKIA[\w]{16}|ghp_[\w]{36}|gho_[\w]{36}|ghu_[\w]{36}|xox[abp]-[\w-]+|AIza[\w-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g,
+    "[REDACTED]",
+  );
 }
 
 function buildNotifySummary(jobId: string, result: SubagentResult): string {
@@ -1161,31 +1243,33 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
 }
 // ── Notification TUI Renderer ──────────────────────────────────
 function renderSubagentNotify(
-	message: { content?: string; details?: unknown },
-	options: { expanded?: boolean },
-	theme: Theme,
+  message: { content?: string; details?: unknown },
+  options: { expanded?: boolean },
+  theme: Theme,
 ): Text {
-	const details = message.details as { mode?: string; result?: SubagentResult } | undefined;
-	const isInject = details?.mode === "inject";
-	const isError = details?.result?.isError;
-	const text = message.content ?? "";
+  const details = message.details as
+    | { mode?: string; result?: SubagentResult }
+    | undefined;
+  const isInject = details?.mode === "inject";
+  const isError = details?.result?.isError;
+  const text = message.content ?? "";
 
-	let line: string;
-	if (!options.expanded) {
-		line = isError ? theme.fg("error", text) : theme.fg("accent", text);
-	} else {
-		const output = sanitizeOutput(
-			(details?.result?.output ?? "").slice(0, 500).replace(/\s+/g, " "),
-		);
-		const header = isInject
-			? theme.fg("accent", "⚡ Injected Sub-agent Result")
-			: isError
-				? theme.fg("error", "❌ Sub-agent Failed")
-				: theme.fg("success", "✅ Sub-agent Completed");
-		const body = theme.fg("dim", text);
-		line = `${header}\n${body}\n${output}`;
-	}
-	return new Text(line, 0, 0);
+  let line: string;
+  if (!options.expanded) {
+    line = isError ? theme.fg("error", text) : theme.fg("accent", text);
+  } else {
+    const output = sanitizeOutput(
+      (details?.result?.output ?? "").slice(0, 500).replace(/\s+/g, " "),
+    );
+    const header = isInject
+      ? theme.fg("accent", "⚡ Injected Sub-agent Result")
+      : isError
+        ? theme.fg("error", "❌ Sub-agent Failed")
+        : theme.fg("success", "✅ Sub-agent Completed");
+    const body = theme.fg("dim", text);
+    line = `${header}\n${body}\n${output}`;
+  }
+  return new Text(line, 0, 0);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1206,16 +1290,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Register notification renderer before any tools
-	// One global interval for the whole session. Each tick walks the artifact dir of
-	// every running interactive sub-agent and fires pointer notifications for new events.
-	// The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).
-	if (!g2.__piSubagenturaInteractivePollerHandle) {
-		const handle = setInterval(() => pollArtifactChanges(pi), 5000);
-		// Don't pin the event loop on a long-lived parent. unref() lets the process exit
-		// cleanly when nothing else is keeping it alive (no other ref'd handles).
-		handle.unref?.();
-		g2.__piSubagenturaInteractivePollerHandle = handle;
-	}
+  // One global interval for the whole session. Each tick walks the artifact dir of
+  // every running interactive sub-agent and fires pointer notifications for new events.
+  // The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).
+  if (!g2.__piSubagenturaInteractivePollerHandle) {
+    const handle = setInterval(() => pollArtifactChanges(pi), 5000);
+    // Don't pin the event loop on a long-lived parent. unref() lets the process exit
+    // cleanly when nothing else is keeping it alive (no other ref'd handles).
+    handle.unref?.();
+    g2.__piSubagenturaInteractivePollerHandle = handle;
+  }
   // ── Tool 1: inherits conversation history ────────────────────────
   pi.registerTool({
     name: "subagent_with_context",
@@ -1259,7 +1343,6 @@ export default function (pi: ExtensionAPI) {
         maxAge: params.maxAge ?? null,
       });
 
-
       // Gather conversation history
       const branch = ctx.sessionManager.getBranch();
       const messages = branch
@@ -1283,19 +1366,25 @@ export default function (pi: ExtensionAPI) {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
-          await startSubagentJob({
-            task: params.task,
-            persona: params.persona,
-            modelOverride: params.model,
-            cwd: targetCwd,
-            contextText: conversationText,
-            signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
-            onUpdate: undefined,
-            defaultModel: ctx.model,
-            maxAge: params.maxAge,
-            parentModelRegistry: ctx.modelRegistry,
-          });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+        } = await startSubagentJob({
+          task: params.task,
+          persona: params.persona,
+          modelOverride: params.model,
+          cwd: targetCwd,
+          contextText: conversationText,
+          signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
+          onUpdate: undefined,
+          defaultModel: ctx.model,
+          maxAge: params.maxAge,
+          parentModelRegistry: ctx.modelRegistry,
+        });
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -1391,7 +1480,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text:
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -1495,24 +1585,29 @@ export default function (pi: ExtensionAPI) {
         maxAge: params.maxAge ?? null,
       });
 
-
       // ── Async path ──
       if (params.async === true) {
         const targetCwd = params.cwd ?? ctx.cwd;
 
-        const { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning } =
-          await startSubagentJob({
-            task: params.task,
-            persona: params.persona,
-            modelOverride: params.model,
-            cwd: targetCwd,
-            contextText: null, // isolated — no context
-            signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
-            onUpdate: undefined,
-            defaultModel: ctx.model,
-            maxAge: params.maxAge,
-            parentModelRegistry: ctx.modelRegistry,
-          });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+        } = await startSubagentJob({
+          task: params.task,
+          persona: params.persona,
+          modelOverride: params.model,
+          cwd: targetCwd,
+          contextText: null, // isolated — no context
+          signal: undefined, // async: don't inherit parent signal (would abort subagent when tool returns)
+          onUpdate: undefined,
+          defaultModel: ctx.model,
+          maxAge: params.maxAge,
+          parentModelRegistry: ctx.modelRegistry,
+        });
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -1611,7 +1706,8 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+              text:
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -1669,7 +1765,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_subagent_status",
     label: "Get Subagent Status",
-    description: "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
+    description:
+      "Poll an async subagent job by jobId. Returns live preview of the subagent's current turn, active tool, and output.",
     parameters: StatusParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -1678,7 +1775,6 @@ export default function (pi: ExtensionAPI) {
         toolCallId: _toolCallId,
         jobId: params.jobId,
       });
-
 
       const job = jobRegistry.get(params.jobId);
 
@@ -1690,7 +1786,7 @@ export default function (pi: ExtensionAPI) {
               text: `Job ${params.jobId} not found. It may have been cancelled.`,
             },
           ],
-           details: { jobId: params.jobId, status: "not_found" },
+          details: { jobId: params.jobId, status: "not_found" },
           isError: true,
         };
       }
@@ -1762,8 +1858,6 @@ export default function (pi: ExtensionAPI) {
         toolCallId: _toolCallId,
         jobId: params.jobId,
       });
-
-
 
       if (!job) {
         return {
@@ -1865,8 +1959,6 @@ export default function (pi: ExtensionAPI) {
         jobId: params.jobId,
       });
 
-
-
       if (!job) {
         return {
           content: [{ type: "text", text: `Job ${params.jobId} not found.` }],
@@ -1947,7 +2039,9 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme, _context) {
-      const details = result.details as (SubagentDetails & { jobId?: string }) | undefined;
+      const details = result.details as
+        | (SubagentDetails & { jobId?: string })
+        | undefined;
       const jobId = String(details?.jobId ?? "unknown");
       const cancelled = details?.status === "cancelled";
       const firstContent = result.content?.[0];
@@ -1962,14 +2056,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-	// ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
+  // ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
   pi.registerTool({
     name: "subagent_interactive",
     label: "Interactive Subagent",
     description: [
-		"Spawn a separate Pi process in a tmux/zellij pane and return immediately.",
+      "Spawn a separate Pi process in a tmux/zellij pane and return immediately.",
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
-		"Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
+      "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
     ].join("\n"),
     parameters: InteractiveParams,
@@ -1999,31 +2093,31 @@ export default function (pi: ExtensionAPI) {
       const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
       const targetCwd = params.cwd ?? ctx.cwd;
 
-		try {
-			const state = launchInteractiveSubagent({
-				name,
-				task: params.task,
-				persona: params.persona,
-				model: params.model,
-				cwd: targetCwd,
-				contextText,
-				background: params.background, // defaults to true (hidden) inside the helper
-				notifyOnComplete: params.notifyOnComplete ?? "inject",
-				muxPreference: params.mux, // pass through user's mux preference
-			});
+      try {
+        const state = launchInteractiveSubagent({
+          name,
+          task: params.task,
+          persona: params.persona,
+          model: params.model,
+          cwd: targetCwd,
+          contextText,
+          background: params.background, // defaults to true (hidden) inside the helper
+          notifyOnComplete: params.notifyOnComplete ?? "inject",
+          muxPreference: params.mux, // pass through user's mux preference
+        });
 
-
-			const displayMode = state.windowName ? "background (new window/tab)" : "visible split";
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
-					},
-
-				],
-				details: { ...state, status: "started" },
-			};
+        const displayMode = state.windowName
+          ? "background (new window/tab)"
+          : "visible split";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+            },
+          ],
+          details: { ...state, status: "started" },
+        };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return {
@@ -2051,10 +2145,15 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme) {
-      const details = result.details as Partial<InteractiveSubagentState> | undefined;
+      const details = result.details as
+        | Partial<InteractiveSubagentState>
+        | undefined;
       if ((result as any).isError) {
         const first = result.content?.[0];
-        const text = first?.type === "text" ? first.text : "Failed to start interactive sub-agent";
+        const text =
+          first?.type === "text"
+            ? first.text
+            : "Failed to start interactive sub-agent";
         return new Text(theme.fg("error", text), 0, 0);
       }
       const id = details?.id ?? "unknown";
@@ -2077,7 +2176,10 @@ export default function (pi: ExtensionAPI) {
       "Inspect tmux-backed interactive subagents. Omit jobId to list all tracked sessions. Returns attach/select commands and session paths without capturing pane output.",
     parameters: Type.Object({
       jobId: Type.Optional(
-        Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+        Type.String({
+          description:
+            "Interactive sub-agent ID returned by subagent_interactive",
+        }),
       ),
     }),
 
@@ -2124,20 +2226,33 @@ export default function (pi: ExtensionAPI) {
     label: "Cancel Interactive Subagent",
     description: "Kill the tmux pane for an interactive sub-agent by ID.",
     parameters: Type.Object({
-      jobId: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
+      jobId: Type.String({
+        description:
+          "Interactive sub-agent ID returned by subagent_interactive",
+      }),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
       const state = cancelInteractiveSubagent(params.jobId);
       if (!state) {
         return {
-          content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} not found.` }],
+          content: [
+            {
+              type: "text",
+              text: `Interactive sub-agent ${params.jobId} not found.`,
+            },
+          ],
           details: { jobId: params.jobId, status: "not_found" },
           isError: true,
         };
       }
       return {
-        content: [{ type: "text", text: `Interactive sub-agent ${params.jobId} cancelled.` }],
+        content: [
+          {
+            type: "text",
+            text: `Interactive sub-agent ${params.jobId} cancelled.`,
+          },
+        ],
         details: { ...state },
       };
     },
@@ -2165,15 +2280,26 @@ export default function (pi: ExtensionAPI) {
       "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
     ].join("\n"),
     parameters: Type.Object({
-      id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
-      message: Type.String({ description: "The follow-up prompt text to send into the child's REPL (must be non-empty; max 64 KiB)" }),
+      id: Type.String({
+        description:
+          "Interactive sub-agent ID returned by subagent_interactive",
+      }),
+      message: Type.String({
+        description:
+          "The follow-up prompt text to send into the child's REPL (must be non-empty; max 64 KiB)",
+      }),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
       // Validate the id shape first for a precise error.
       if (!/^[a-f0-9]{8}$/.test(params.id)) {
         return {
-          content: [{ type: "text", text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.` }],
+          content: [
+            {
+              type: "text",
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+            },
+          ],
           details: { id: params.id, status: "invalid_id" },
           isError: true,
         };
@@ -2183,7 +2309,12 @@ export default function (pi: ExtensionAPI) {
       // is more than the child can usefully consume and risks blowing the REPL history.
       if (params.message.trim().length === 0) {
         return {
-          content: [{ type: "text", text: "Message is empty; send a non-empty follow-up prompt." }],
+          content: [
+            {
+              type: "text",
+              text: "Message is empty; send a non-empty follow-up prompt.",
+            },
+          ],
           details: { id: params.id, status: "empty_message", messageLength: 0 },
           isError: true,
         };
@@ -2191,45 +2322,85 @@ export default function (pi: ExtensionAPI) {
       const messageBytes = Buffer.byteLength(params.message, "utf8");
       if (messageBytes > MAX_FOLLOWUP_BYTES) {
         return {
-          content: [{ type: "text", text: `Message too large: ${messageBytes} bytes (max ${MAX_FOLLOWUP_BYTES}). Shorten the prompt and try again.` }],
-          details: { id: params.id, status: "message_too_large", messageLength: messageBytes, maxBytes: MAX_FOLLOWUP_BYTES },
+          content: [
+            {
+              type: "text",
+              text: `Message too large: ${messageBytes} bytes (max ${MAX_FOLLOWUP_BYTES}). Shorten the prompt and try again.`,
+            },
+          ],
+          details: {
+            id: params.id,
+            status: "message_too_large",
+            messageLength: messageBytes,
+            maxBytes: MAX_FOLLOWUP_BYTES,
+          },
           isError: true,
         };
       }
       const state = interactiveSubagentRegistry.get(params.id);
       if (!state) {
         return {
-          content: [{ type: "text", text: `Interactive sub-agent ${params.id} not found.` }],
+          content: [
+            {
+              type: "text",
+              text: `Interactive sub-agent ${params.id} not found.`,
+            },
+          ],
           details: { id: params.id, status: "not_found" },
           isError: true,
         };
       }
-		// Accept both "running" (mid-turn) and "idle" (REPL open, between turns) — that's the whole
-		// point of follow-up support. Mid-turn sends are safe: tmux send-keys just queues keystrokes
-		// in the REPL input buffer, which submits when the current turn finishes.
-		if (state.status !== "running" && state.status !== "idle") {
-			return {
-				content: [{ type: "text", text: `Interactive sub-agent ${params.id} is ${state.status}; follow-up messages can only be sent to running or idle sub-agents. Spawn a new one if needed.` }],
-				details: { id: params.id, status: state.status },
-				isError: true,
-			};
-		}
-		// sendCommandToPane uses send-keys + Enter; it throws synchronously if the
-		// pane is gone (e.g. the child exited between the status check and now).
-		// Wrap so the parent gets a structured error instead of an exception trace.
-		try {
-			sendCommandToPane(state, params.message);
+      // Accept both "running" (mid-turn) and "idle" (REPL open, between turns) — that's the whole
+      // point of follow-up support. Mid-turn sends are safe: tmux send-keys just queues keystrokes
+      // in the REPL input buffer, which submits when the current turn finishes.
+      if (state.status !== "running" && state.status !== "idle") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Interactive sub-agent ${params.id} is ${state.status}; follow-up messages can only be sent to running or idle sub-agents. Spawn a new one if needed.`,
+            },
+          ],
+          details: { id: params.id, status: state.status },
+          isError: true,
+        };
+      }
+      // sendCommandToPane uses send-keys + Enter; it throws synchronously if the
+      // pane is gone (e.g. the child exited between the status check and now).
+      // Wrap so the parent gets a structured error instead of an exception trace.
+      try {
+        sendCommandToPane(state, params.message);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Failed to send message to interactive sub-agent ${params.id}: ${msg}` }],
-          details: { id: params.id, status: "send_failed", paneId: state.paneId, error: msg },
+          content: [
+            {
+              type: "text",
+              text: `Failed to send message to interactive sub-agent ${params.id}: ${msg}`,
+            },
+          ],
+          details: {
+            id: params.id,
+            status: "send_failed",
+            paneId: state.paneId,
+            error: msg,
+          },
           isError: true,
         };
       }
       return {
-        content: [{ type: "text", text: `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.` }],
-        details: { id: params.id, paneId: state.paneId, messageLength: params.message.length, status: "sent" },
+        content: [
+          {
+            type: "text",
+            text: `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.`,
+          },
+        ],
+        details: {
+          id: params.id,
+          paneId: state.paneId,
+          messageLength: params.message.length,
+          status: "sent",
+        },
       };
     },
   });
@@ -2249,10 +2420,27 @@ export default function (pi: ExtensionAPI) {
       "specific historical turn's output-N.md instead of the latest output.md.",
     ].join("\n"),
     parameters: Type.Object({
-      id: Type.String({ description: "Interactive sub-agent ID returned by subagent_interactive" }),
-      since: Type.Optional(Type.Number({ description: "Only return events with ts >= this unix-ms timestamp" })),
-      includeOutput: Type.Optional(Type.Boolean({ description: "Include the output (default true). Set false to fetch only events." })),
-      turn: Type.Optional(Type.Number({ description: "Read a specific turn's output-N.md snapshot. Omit to read the latest output.md." })),
+      id: Type.String({
+        description:
+          "Interactive sub-agent ID returned by subagent_interactive",
+      }),
+      since: Type.Optional(
+        Type.Number({
+          description: "Only return events with ts >= this unix-ms timestamp",
+        }),
+      ),
+      includeOutput: Type.Optional(
+        Type.Boolean({
+          description:
+            "Include the output (default true). Set false to fetch only events.",
+        }),
+      ),
+      turn: Type.Optional(
+        Type.Number({
+          description:
+            "Read a specific turn's output-N.md snapshot. Omit to read the latest output.md.",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
@@ -2260,7 +2448,12 @@ export default function (pi: ExtensionAPI) {
       // instead of being collapsed into the generic "not found" message.
       if (!/^[a-f0-9]{8}$/.test(params.id)) {
         return {
-          content: [{ type: "text", text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.` }],
+          content: [
+            {
+              type: "text",
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+            },
+          ],
           details: { id: params.id, status: "invalid_id" },
           isError: true,
         };
@@ -2271,7 +2464,12 @@ export default function (pi: ExtensionAPI) {
         : findArtifactById(params.id);
       if (!art) {
         return {
-          content: [{ type: "text", text: `No artifact found for sub-agent ${params.id}.` }],
+          content: [
+            {
+              type: "text",
+              text: `No artifact found for sub-agent ${params.id}.`,
+            },
+          ],
           details: { id: params.id, status: "not_found" },
           isError: true,
         };
@@ -2279,8 +2477,13 @@ export default function (pi: ExtensionAPI) {
       const events = readEvents(art, params.since);
       // `turn` reads a specific output-N.md snapshot; otherwise read the latest output.md. The turn
       // param implies includeOutput (you can't read a turn without wanting its content).
-      const wantsOutput = params.includeOutput !== false || params.turn !== undefined;
-      const output = wantsOutput ? (params.turn !== undefined ? readOutputForTurn(art, params.turn) : readOutput(art)) : null;
+      const wantsOutput =
+        params.includeOutput !== false || params.turn !== undefined;
+      const output = wantsOutput
+        ? params.turn !== undefined
+          ? readOutputForTurn(art, params.turn)
+          : readOutput(art)
+        : null;
       const lastEvent = events.length > 0 ? events[events.length - 1] : null;
       // Distinguish three cases when output is missing/empty so the caller
       // doesn't see a misleading "not written yet" after the sub-agent has
@@ -2290,7 +2493,11 @@ export default function (pi: ExtensionAPI) {
         if (params.turn !== undefined) {
           outputText = `(no snapshot for turn ${params.turn} — the poller may not have run yet, or this turn number is past the history)`;
         } else {
-          const exited = lastEvent && (lastEvent.type === "done" || lastEvent.type === "error" || lastEvent.type === "cancelled");
+          const exited =
+            lastEvent &&
+            (lastEvent.type === "done" ||
+              lastEvent.type === "error" ||
+              lastEvent.type === "cancelled");
           outputText = exited
             ? `(sub-agent exited without writing output.md — last event: ${lastEvent.type} @ ${lastEvent.ts})`
             : `(${events.length} events, last: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"} — output.md not written yet)`;
@@ -2302,7 +2509,10 @@ export default function (pi: ExtensionAPI) {
       }
       // Available turns summary so the caller knows what history exists.
       const availableTurns = listOutputTurns(art);
-      const turnsLine = availableTurns.length > 0 ? `Available turns: [${availableTurns.join(", ")}]\n` : "";
+      const turnsLine =
+        availableTurns.length > 0
+          ? `Available turns: [${availableTurns.join(", ")}]\n`
+          : "";
       return {
         content: [
           {
@@ -2310,12 +2520,21 @@ export default function (pi: ExtensionAPI) {
             text:
               `Artifact for ${params.id} (${events.length} event${events.length === 1 ? "" : "s"}${params.since ? ` since ${params.since}` : ""}).\n` +
               `Last event: ${lastEvent ? `${lastEvent.type} @ ${lastEvent.ts}` : "(none)"}\n` +
-              (params.turn !== undefined ? `Reading turn: ${params.turn}\n` : "") +
+              (params.turn !== undefined
+                ? `Reading turn: ${params.turn}\n`
+                : "") +
               turnsLine +
               `Output: ${outputText}`,
           },
         ],
-        details: { id: params.id, artifactDir: art.dir, events, output, lastEvent, availableTurns },
+        details: {
+          id: params.id,
+          artifactDir: art.dir,
+          events,
+          output,
+          lastEvent,
+          availableTurns,
+        },
       };
     },
   });
@@ -2335,7 +2554,10 @@ export default function (pi: ExtensionAPI) {
       pruneDeadInteractiveSubagents();
       const states = [...interactiveSubagentRegistry.values()];
       const summary = states.map((s) => {
-        const art = artifactPath(dirname(s.artifactDir), basename(s.artifactDir));
+        const art = artifactPath(
+          dirname(s.artifactDir),
+          basename(s.artifactDir),
+        );
         const last = lastEvent(art);
         return {
           id: s.id,
@@ -2348,13 +2570,17 @@ export default function (pi: ExtensionAPI) {
       });
       if (summary.length === 0) {
         return {
-          content: [{ type: "text", text: "No interactive sub-agents are tracked." }],
+          content: [
+            { type: "text", text: "No interactive sub-agents are tracked." },
+          ],
           details: { count: 0, subagents: [] },
         };
       }
       const lines = summary.map((s) => {
         const ev = s.lastEvent;
-        const evStr = ev ? `last: ${ev.type}${ev.message ? ` (${ev.message.slice(0, 60)})` : ""}` : "no events yet";
+        const evStr = ev
+          ? `last: ${ev.type}${ev.message ? ` (${ev.message.slice(0, 60)})` : ""}`
+          : "no events yet";
         return `${s.id}  ${s.name}  ${s.status}  ${evStr}`;
       });
       return {
@@ -2396,7 +2622,6 @@ export default function (pi: ExtensionAPI) {
         authOnly: params.authOnly ?? true,
         filter: params.filter ?? null,
       });
-
 
       const models =
         params.authOnly !== false
@@ -2465,7 +2690,6 @@ export default function (pi: ExtensionAPI) {
         toolName: "prune_subagent_jobs",
       });
 
-
       const removed = pruneCompletedJobs();
       const after = jobRegistry.size;
 
@@ -2511,7 +2735,9 @@ export default function (pi: ExtensionAPI) {
     if (g2.__piSubagenturaInteractivePollerHandle) {
       try {
         clearInterval(g2.__piSubagenturaInteractivePollerHandle);
-      } catch { /* defensive */ }
+      } catch {
+        /* defensive */
+      }
       g2.__piSubagenturaInteractivePollerHandle = undefined;
     }
     // Snapshot running state objects BEFORE clearing, so we can kill their panes
@@ -2530,7 +2756,9 @@ export default function (pi: ExtensionAPI) {
     // the tick proceeds into the loop and finds nothing.
     try {
       interactiveSubagentRegistry.clear();
-    } catch { /* best effort */ }
+    } catch {
+      /* best effort */
+    }
 
     // Kill the panes using the snapshotted states. The poller is already safe
     // (registry empty). We use cancelInteractiveSubagentByState (not the
@@ -2538,9 +2766,10 @@ export default function (pi: ExtensionAPI) {
     for (const state of runningStates) {
       try {
         cancelInteractiveSubagentByState(state);
-      } catch { /* best effort */ }
+      } catch {
+        /* best effort */
+      }
     }
-
 
     // Abort all running subagent sessions before clearing
     for (const job of jobRegistry.values()) {
