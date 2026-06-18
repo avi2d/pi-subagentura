@@ -582,7 +582,25 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 /**
  * Kills a tmux pane and writes the .cancelled flag for an interactive sub-agent,
  * bypassing the registry. Used by the session_shutdown handler which snapshots
- * running states before clearing the registry.
+ * running states before clearing the registry (see subagent.ts session_shutdown
+ * handler — snapshot-before-clear pattern).
+ *
+ * Differs from `cancelInteractiveSubagent` in three intentional ways:
+ *   1. NO registry lookup: takes the full `InteractiveSubagentState` by value
+ *      instead of looking it up by id. This is required because the shutdown
+ *      handler clears the registry BEFORE killing panes (to prevent the
+ *      in-flight poll tick race), so `cancelInteractiveSubagent(id)` would
+ *      early-return `undefined` and the pane-kill would be skipped.
+ *   2. NO `state.status = "cancelled"` update: the state object is a snapshot
+ *      detached from the registry; mutating it would have no observable
+ *      effect (the registry is already cleared, no future poll will see it).
+ *   3. `mux.killPane` wrapped in try/catch: a synchronous `execFileSync` failure
+ *      (e.g. tmux already exited, session torn down) must not abort the
+ *      shutdown loop over remaining running states. The original function
+ *      relies on its caller to wrap in try/catch; this variant does it
+ *      internally so the shutdown handler is a clean loop.
+ *
+ * @param state - the snapshotted state of the sub-agent to cancel
  */
 export function cancelInteractiveSubagentByState(state: InteractiveSubagentState): void {
 	// 1. Write .cancelled flag (best-effort)
@@ -590,12 +608,12 @@ export function cancelInteractiveSubagentByState(state: InteractiveSubagentState
 		writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
 	} catch { /* best-effort */ }
 
-	// 2. Kill the pane if alive (best-effort)
+	// 2. Kill the pane if alive (best-effort; wrapped to keep the shutdown loop alive)
 	const mux = getMuxForState(state);
 	if (mux.isPaneAlive(state.paneId, state.muxSession)) {
 		try { mux.killPane(state.paneId, state.muxSession); } catch { /* best-effort */ }
 	}
-	// Does NOT update state.status — the registry is already cleared.
+	// Does NOT update state.status — see JSDoc point 2.
 }
 
 /**

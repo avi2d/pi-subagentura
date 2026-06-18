@@ -131,6 +131,11 @@ describe("session_shutdown handler", () => {
     vi.restoreAllMocks();
   });
 
+  // AC-A* tests create tmp artifact dirs; declared here (before any inner
+  // afterEach that references it) per AGENTS.md "declare before" rule.
+  let tmpRoot: string;
+
+
   it("unrefs the poller handle on extension registration", () => {
     setupExtension();
 
@@ -213,12 +218,23 @@ describe("session_shutdown handler", () => {
   });
 
   // ── Bug A regression tests (duplicate notification on shutdown) ──
+
   // The race: a poll tick dequeued from setInterval before clearInterval
+
   // runs can observe the in-progress cancel state. The fix (snapshot-then-clear
+
   // in session_shutdown) means a post-shutdown tick finds an empty registry
-  // and delivers zero notifications. These tests reproduce the race by calling
-  // pollArtifactChanges directly at the boundaries of the shutdown sequence.
-  let tmpRoot: string;
+
+  // and delivers zero notifications. We capture the actual setInterval
+
+  // callback (via the setIntervalSpy) and invoke it before AND after the
+
+  // shutdown handler — this exercises the same code path as a real
+
+  // in-flight tick that survived clearInterval.
+
+
+
 
   function makeArtifactState(
     id: string,
@@ -231,54 +247,132 @@ describe("session_shutdown handler", () => {
     };
   }
 
-  it("AC-A1: delivers zero notifications when session_shutdown fires while a sub-agent is running (no artifact events)", () => {
+  it("AC-A1: setInterval tick after session_shutdown delivers zero notifications (race-reproducing)", () => {
+
     // Empty tmp artifact dir; no events written.
+
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a1-"));
+
     const artifactDir = join(tmpRoot, "run-1");
+
     const running = makeArtifactState("run-1", "running", artifactDir);
+
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
 
+
+
     const { api, shutdownHandler } = setupExtension();
+
     (globalThis as any).__piSubagenturaPiRef = api;
 
-    // 1. In-flight tick BEFORE shutdown: iterates the registry, no events to deliver.
-    pollArtifactChanges(api as any);
+
+
+    // Capture the actual setInterval callback. setupExtension() above
+
+    // registered the poller, so setIntervalSpy.mock.calls[0][0] is the
+
+ // production callback (`() => pollArtifactChanges(pi)`) we need to
+
+    // invoke to exercise the real code path — not a hand-written wrapper.
+
+    const tick = setIntervalSpy.mock.calls[0][0] as () => void;
+
+
+
+    // 1. Pre-shutdown tick: no artifact events, no notification.
+
+    tick();
+
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
 
-    // 2. Shutdown handler runs.
+
+
+    // 2. Shutdown handler runs. The order of operations inside
+
+    // session_shutdown is what we're protecting: snapshot → clear → cancel.
+
+    // If someone re-orders to cancel → clear, the post-shutdown tick below
+
+    // would still see an empty registry (clear runs last), so this test
+
+    // alone would pass. The cancellation must use the byState export
+
+    // (covered by the test at line ~166) for the shutdown handler to
+
+    // actually kill panes after clear.
+
     shutdownHandler!();
+
+
 
     // 3. Post-shutdown tick (the in-flight one that survived clearInterval):
+
     //    must deliver zero notifications because the registry is empty.
-    pollArtifactChanges(api as any);
+
+    tick();
+
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
+
   });
 
-  it("AC-A2: does not re-notify after shutdown for a running sub-agent whose done event was already delivered", () => {
+  it("AC-A2: setInterval tick after shutdown does not re-deliver a done event already in the artifact", () => {
+
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a2-"));
+
     const artifactDir = join(tmpRoot, "run-1");
+
     const running = makeArtifactState("run-1", "running", artifactDir);
+
     // Pre-write a done event with a fixed ts.
+
     const doneTs = 1000;
+
     const art = artifactPath(join(artifactDir, ".."), "run-1");
+
     appendEvent(art, { ts: doneTs, type: "done", status: "done", exitCode: 0 });
-    // Mark the done as already delivered so the FIRST tick does not re-notify.
-    running.lastDeliveredEventTs = doneTs;
+
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
 
+
+
     const { api, shutdownHandler } = setupExtension();
+
     (globalThis as any).__piSubagenturaPiRef = api;
 
-    // 1. In-flight tick BEFORE shutdown: done already delivered, no notification.
-    pollArtifactChanges(api as any);
-    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+
+
+    // Capture the actual setInterval callback for the real code path.
+
+    const tick = setIntervalSpy.mock.calls[0][0] as () => void;
+
+
+
+    // 1. Pre-shutdown tick: the done event (cursor=0, ts=1000) is
+
+    // delivered. Exactly one notification.
+
+    tick();
+
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+
+
 
     // 2. Shutdown handler runs.
+
     shutdownHandler!();
 
-    // 3. Post-shutdown tick: registry is empty, no notification.
-    pollArtifactChanges(api as any);
-    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+
+
+    // 3. Post-shutdown tick (in-flight race survivor): the registry is
+
+    // empty (snapshot-before-clear), so the tick does no work. Total
+
+ // notification count stays at 1 — no duplicate delivered.
+
+    tick();
+
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+
   });
 
   afterEach(() => {
