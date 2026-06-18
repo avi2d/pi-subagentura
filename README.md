@@ -3,6 +3,8 @@
 [![npm](https://img.shields.io/npm/v/pi-subagentura?label=npm)](https://npmjs.com/package/pi-subagentura) [![GitHub](https://img.shields.io/github/v/tag/lmn451/pi-subagentura?label=github)](https://github.com/lmn451/pi-subagentura)
 
 > **Note:** The `docs/` folder is managed by the [`pi-docs`](https://github.com/lmn451/pi-docs) package.
+>
+> **Tags:** `pi-package` · `pi` · `subagent` · `agent` · `multi-agent` · `swarm` · `crew` · **`workflow`**
 
 A public [Pi](https://pi.dev) package that adds in-process and attachable sub-agent tools:
 

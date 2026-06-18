@@ -13,7 +13,8 @@
     "agent",
     "multi-agent",
     "swarm",
-    "crew"
+    "crew",
+    "workflow"
   ],
   "repository": {
     "type": "git",
