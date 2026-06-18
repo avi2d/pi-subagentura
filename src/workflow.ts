@@ -33,7 +33,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { startSubagentJob } from "./helpers";
+import { startSubagentJob, debugLog } from "./helpers";
 import type { SubagentResult, Usage } from "./helpers";
 import {
   launchInteractiveSubagent,
@@ -663,9 +663,24 @@ async function executeScript(
               throw new Error(
                 "parallel(): each item must be a thunk () => Promise.",
               );
+            if (engine.signal?.aborted) throw new Error("Workflow aborted.");
             return t();
           })
-          .catch(() => null),
+          .catch((err) => {
+            // Re-throw on abort so Promise.all rejects and the calling workflow
+            // sees the cancellation. Otherwise agents that aborted in-flight
+            // would silently land as nulls and the caller couldn't tell.
+            if (engine.signal?.aborted) {
+              debugLog("warn", "parallel_thunk_aborted", {
+                err: err instanceof Error ? err.message : String(err),
+              });
+              throw err;
+            }
+            debugLog("warn", "parallel_thunk_failed", {
+              err: err instanceof Error ? err.message : String(err),
+            });
+            return null;
+          }),
       ),
     );
   }
@@ -689,10 +704,25 @@ async function executeScript(
         let acc: unknown = item;
         try {
           for (const stage of fns) {
+            if (engine.signal?.aborted) throw new Error("Workflow aborted.");
             acc = await stage(acc, item, index);
           }
           return acc;
-        } catch {
+        } catch (err) {
+          // Re-throw on abort so Promise.all rejects and remaining stages / items
+          // are not invoked. Silently nulling here would hide cancellation from
+          // the caller and leave downstream stages running.
+          if (engine.signal?.aborted) {
+            debugLog("warn", "pipeline_stage_aborted", {
+              itemIndex: index,
+              err: err instanceof Error ? err.message : String(err),
+            });
+            throw err;
+          }
+          debugLog("warn", "pipeline_stage_failed", {
+            itemIndex: index,
+            err: err instanceof Error ? err.message : String(err),
+          });
           return null;
         }
       }),
@@ -875,6 +905,10 @@ export async function awaitInteractiveResult(
     }
     if (!alive) {
       deadTicks++;
+      debugLog("warn", "interactive_dead_pane", {
+        deadTicks,
+        graceLimit: INTERACTIVE_DEAD_GRACE_TICKS,
+      });
       if (deadTicks >= INTERACTIVE_DEAD_GRACE_TICKS) {
         const output = readOutput(art) ?? "(no output)";
         return {
@@ -941,12 +975,19 @@ export function startWorkflowJob(
     let evicted = false;
     for (const [id, st] of workflowJobRegistry) {
       if (st.status !== "running") {
+        debugLog("info", "workflow_job_evicted", { evictedId: id });
         workflowJobRegistry.delete(id);
         evicted = true;
         break;
       }
     }
-    if (!evicted) break;
+    if (!evicted) {
+      debugLog("warn", "workflow_job_cap_reached", {
+        registrySize: workflowJobRegistry.size,
+        cap: MAX_WORKFLOW_JOBS,
+      });
+      break;
+    }
   }
 
   const id = `wf_${randomBytes(5).toString("hex")}`;
@@ -994,6 +1035,7 @@ export function startWorkflowJob(
 // ── Tool registration ────────────────────────────────────────────────
 
 export function registerWorkflowTool(pi: ExtensionAPI): void {
+  debugLog("info", "workflow_registered", {});
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(ctx: any): WorkflowAgentRunner {
     return async ({ prompt, persona, model, signal, isolation, label }) => {
@@ -1012,6 +1054,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         } catch (err) {
           // tmux/zellij unavailable (or launch failed) — fall back to in-process, loudly.
           const msg = err instanceof Error ? err.message : String(err);
+          debugLog("warn", "isolation_process_fallback", { reason: msg });
           const { jobPromise } = await startSubagentJob({
             task: `[isolation:process unavailable — ran in-process; reason: ${msg}]\n\n${prompt}`,
             persona,

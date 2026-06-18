@@ -447,3 +447,67 @@ describe("awaitInteractiveResult", () => {
     expect((res as any).errorMessage).toMatch(/aborted/);
   });
 });
+
+describe("abort signal propagation", () => {
+  const meta = `export const meta = { name: "abort", description: "d" };\n`;
+
+  // Helper: a runAgent that aborts mid-flight if `signal` has fired.
+  function abortableRunAgent(delayMs = 10): WorkflowAgentRunner {
+    return async ({ signal }) => {
+      await new Promise((r) => setTimeout(r, delayMs));
+      if (signal?.aborted) throw new Error("Workflow aborted.");
+      return ok("done");
+    };
+  }
+
+  it("parallel() re-throws when the signal aborts mid-flight", async () => {
+    const ac = new AbortController();
+    const p = runWorkflow(
+      meta +
+        `const r = await parallel([() => agent("a"), () => agent("b")]); return r;`,
+      { runAgent: abortableRunAgent(10), signal: ac.signal },
+    );
+    setTimeout(() => ac.abort(), 2);
+    await expect(p).rejects.toThrow(/abort/i);
+  });
+
+  it("pipeline() re-throws when the signal aborts mid-flight", async () => {
+    const ac = new AbortController();
+    const p = runWorkflow(
+      meta +
+        `const stage = async (prev) => { await agent("s"); return prev; };
+         const r = await pipeline([1, 2], stage); return r;`,
+      { runAgent: abortableRunAgent(10), signal: ac.signal },
+    );
+    setTimeout(() => ac.abort(), 2);
+    await expect(p).rejects.toThrow(/abort/i);
+  });
+
+  it("parallel() pre-aborted (signal fires before invoke) re-throws without running agents", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    let calls = 0;
+    const runAgent: WorkflowAgentRunner = async () => {
+      calls++;
+      return ok("nope");
+    };
+    await expect(
+      runWorkflow(
+        meta + `return await parallel([() => agent("a"), () => agent("b")]);`,
+        { runAgent, signal: ac.signal },
+      ),
+    ).rejects.toThrow(/abort/i);
+    expect(calls).toBe(0); // agents never invoked — abort check fires first
+  });
+
+  it("non-abort failures in parallel() are still nulled (back-compat)", async () => {
+    const runAgent: WorkflowAgentRunner = async () => fail("boom");
+    const r = await runWorkflow(
+      meta +
+        `const r = await parallel([() => agent("a"), () => agent("b")]); return r;`,
+      { runAgent },
+    );
+    expect(r.result).toEqual([null, null]);
+    expect(r.errorCount).toBe(2);
+  });
+});
