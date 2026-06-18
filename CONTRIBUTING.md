@@ -42,3 +42,29 @@ Please include:
 - Pi version
 - package version
 - reproduction steps
+
+## Bundled workflows
+
+### Resync the `ralplan-consensus` workflow
+
+The script inlines role prompts from `pi-ralplan/pi/skills/ralplan/prompts/`; when those upstream files change the inlined copies drift.
+
+**Upstream sources:**
+
+- `../pi-ralplan/pi/skills/ralplan/prompts/planner.md` → `PLANNER_PERSONA`
+- `../pi-ralplan/pi/skills/ralplan/prompts/architect.md` → `ARCHITECT_PERSONA`
+- `../pi-ralplan/pi/skills/ralplan/prompts/critic.md` → `CRITIC_PERSONA`
+  (`ANALYST_PERSONA` is synthesized in-script — no upstream to resync.)
+
+**Procedure:**
+
+1. Compare each upstream file against the corresponding `PLANNER_PERSONA` / `ARCHITECT_PERSONA` / `CRITIC_PERSONA` template literal.
+2. If any changed: update the inlined literal and bump `last-synced:` in the header comment.
+3. Run `npm test -- src/workflow-ralplan.test.ts` — must stay green.
+4. If `DELIBERATE_SIGNALS` changed, update the AC-3 test list in `src/workflow-ralplan.test.ts`.
+
+**Install from parent agent:** `workflow("ralplan-consensus", ...)` (see `src/workflow.ts:442` for the save path).
+
+```js
+workflow("ralplan-consensus", { idea, workingDir, ... })
+```
