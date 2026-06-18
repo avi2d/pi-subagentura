@@ -20,7 +20,13 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -28,116 +34,133 @@ import { fileURLToPath } from "node:url";
 
 const REPO = resolve(fileURLToPath(import.meta.url), "..", "..");
 const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
-	name: string;
-	version: string;
-	files: string[];
+  name: string;
+  version: string;
+  files: string[];
 };
 
 interface PackResult {
-	tgz: string;
-	entries: string[];
-	pkgDir: string;
+  tgz: string;
+  entries: string[];
+  pkgDir: string;
 }
 
 function pack(work: string): PackResult {
-	const packed = spawnSync("npm", ["pack", "--pack-destination", work, "--silent"], {
-		cwd: REPO,
-		encoding: "utf8",
-	});
-	if (packed.status !== 0) {
-		throw new Error(`npm pack failed (exit ${packed.status}):\n${packed.stderr || packed.stdout}`);
-	}
-	const tgzName = readdirSync(work).find((f) => f.endsWith(".tgz"));
-	if (!tgzName) {
-		throw new Error(`npm pack produced no .tgz in ${work}\nstdout: ${packed.stdout}`);
-	}
-	const tgz = join(work, tgzName);
+  const packed = spawnSync(
+    "npm",
+    ["pack", "--pack-destination", work, "--silent"],
+    {
+      cwd: REPO,
+      encoding: "utf8",
+    },
+  );
+  if (packed.status !== 0) {
+    throw new Error(
+      `npm pack failed (exit ${packed.status}):\n${packed.stderr || packed.stdout}`,
+    );
+  }
+  const tgzName = readdirSync(work).find((f) => f.endsWith(".tgz"));
+  if (!tgzName) {
+    throw new Error(
+      `npm pack produced no .tgz in ${work}\nstdout: ${packed.stdout}`,
+    );
+  }
+  const tgz = join(work, tgzName);
 
-	const list = spawnSync("tar", ["-tzf", tgz], { encoding: "utf8" });
-	if (list.status !== 0) {
-		throw new Error(`tar -tzf failed (exit ${list.status}):\n${list.stderr}`);
-	}
-	const entries = list.stdout
-		.split("\n")
-		.map((s) => s.trim())
-		.filter(Boolean)
-		.map((e) => e.replace(/^package\//, ""));
+  const list = spawnSync("tar", ["-tzf", tgz], { encoding: "utf8" });
+  if (list.status !== 0) {
+    throw new Error(`tar -tzf failed (exit ${list.status}):\n${list.stderr}`);
+  }
+  const entries = list.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((e) => e.replace(/^package\//, ""));
 
-	const pkgDir = join(work, "pkg");
-	mkdirSync(pkgDir);
-	const extract = spawnSync("tar", ["-xzf", tgz, "-C", pkgDir], { encoding: "utf8" });
-	if (extract.status !== 0) {
-		throw new Error(`tar -xzf failed (exit ${extract.status}):\n${extract.stderr}`);
-	}
+  const pkgDir = join(work, "pkg");
+  mkdirSync(pkgDir);
+  const extract = spawnSync("tar", ["-xzf", tgz, "-C", pkgDir], {
+    encoding: "utf8",
+  });
+  if (extract.status !== 0) {
+    throw new Error(
+      `tar -xzf failed (exit ${extract.status}):\n${extract.stderr}`,
+    );
+  }
 
-	return { tgz, entries, pkgDir: join(pkgDir, "package") };
+  return { tgz, entries, pkgDir: join(pkgDir, "package") };
 }
 
 /** Returns the module specifier for every `from "./foo"` (or `./foo/bar`) in source. */
 function localImports(source: string): string[] {
-	const re = /from\s+["'](\.\/[^"']+)["']/g;
-	const out: string[] = [];
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(source)) !== null) out.push(m[1].slice(2)); // strip "./"
-	return out;
+  const re = /from\s+["'](\.\/[^"']+)["']/g;
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) out.push(m[1].slice(2)); // strip "./"
+  return out;
 }
 
 /** Local module `./foo` resolves to either `./foo.ts` or `./foo/index.ts`. */
 function resolvesInTarball(mod: string, entries: string[]): boolean {
-	return entries.includes(`src/${mod}.ts`) || entries.includes(`src/${mod}/index.ts`);
+  return (
+    entries.includes(`src/${mod}.ts`) || entries.includes(`src/${mod}/index.ts`)
+  );
 }
 
 describe("published tarball", () => {
-	const work = mkdtempSync(join(tmpdir(), "pi-subagentura-pubtest-"));
-	let entries: string[] = [];
-	let pkgDir = "";
+  const work = mkdtempSync(join(tmpdir(), "pi-subagentura-pubtest-"));
+  let entries: string[] = [];
+  let pkgDir = "";
 
-	beforeAll(() => {
-		const r = pack(work);
-		entries = r.entries;
-		pkgDir = r.pkgDir;
-	});
+  beforeAll(() => {
+    const r = pack(work);
+    entries = r.entries;
+    pkgDir = r.pkgDir;
+  });
 
-	afterAll(() => {
-		rmSync(work, { recursive: true, force: true });
-	});
+  afterAll(() => {
+    rmSync(work, { recursive: true, force: true });
+  });
 
-	it("npm pack produces a non-empty tarball", () => {
-		expect(entries.length, `tarball empty; working dir: ${work}`).toBeGreaterThan(0);
-	});
+  it("npm pack produces a non-empty tarball", () => {
+    expect(
+      entries.length,
+      `tarball empty; working dir: ${work}`,
+    ).toBeGreaterThan(0);
+  });
 
-	it("package.json `files` array matches the tarball contents", () => {
-		const missing = PKG.files.filter((f) => !entries.includes(f));
-		expect(
-			missing,
-			`tarball is missing files declared in package.json: ${missing.join(", ")}`
-		).toEqual([]);
-	});
+  it("package.json `files` array matches the tarball contents", () => {
+    const missing = PKG.files.filter((f) => !entries.includes(f));
+    expect(
+      missing,
+      `tarball is missing files declared in package.json: ${missing.join(", ")}`,
+    ).toEqual([]);
+  });
 
-	it("contains src/helpers.ts (regression test for the v2.0.0 publish bug)", () => {
-		expect(
-			entries,
-			"src/helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
-				"Re-add it to package.json `files`."
-		).toContain("src/helpers.ts");
-	});
+  it("contains src/helpers.ts (regression test for the v2.0.0 publish bug)", () => {
+    expect(
+      entries,
+      "src/helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
+        "Re-add it to package.json `files`.",
+    ).toContain("src/helpers.ts");
+  });
 
-	it("every local import in shipped .ts files resolves to a file in the tarball", () => {
-		const failures: string[] = [];
-		for (const entry of entries) {
-			if (!entry.endsWith(".ts")) continue;
-			const src = readFileSync(join(pkgDir, entry), "utf8");
-			for (const mod of localImports(src)) {
-				if (!resolvesInTarball(mod, entries)) {
-					failures.push(
-						`${entry} imports './${mod}' but no candidate (${mod}.ts, ${mod}/index.ts) is in the tarball`,
-					);
-				}
-			}
-		}
-		expect(
-			failures,
-			failures.length === 0 ? "" : `\n${failures.join("\n")}`,
-		).toEqual([]);
-	});
+  it("every local import in shipped .ts files resolves to a file in the tarball", () => {
+    const failures: string[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".ts")) continue;
+      const src = readFileSync(join(pkgDir, entry), "utf8");
+      for (const mod of localImports(src)) {
+        if (!resolvesInTarball(mod, entries)) {
+          failures.push(
+            `${entry} imports './${mod}' but no candidate (${mod}.ts, ${mod}/index.ts) is in the tarball`,
+          );
+        }
+      }
+    }
+    expect(
+      failures,
+      failures.length === 0 ? "" : `\n${failures.join("\n")}`,
+    ).toEqual([]);
+  });
 });

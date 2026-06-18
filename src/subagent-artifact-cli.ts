@@ -19,7 +19,6 @@
  * Exit codes: 0 on success, 2 on usage error (missing env var / unknown cmd).
  */
 
-
 /**
  * The body of the CLI as a string, written verbatim to
  * `$ARTIFACT_DIR/cli.mjs` by `writeLaunchScript`. The string is the literal
@@ -68,11 +67,10 @@ switch (cmd) {
 }
 `;
 
-
-
 /** Test-only helper: write the CLI to a file and chmod it. */
 export function writeCliScript(targetPath: string): void {
-	const { writeFileSync, chmodSync } = require("node:fs") as typeof import("node:fs");
-	writeFileSync(targetPath, CLI_SOURCE, { mode: 0o700 });
-	chmodSync(targetPath, 0o700);
+  const { writeFileSync, chmodSync } =
+    require("node:fs") as typeof import("node:fs");
+  writeFileSync(targetPath, CLI_SOURCE, { mode: 0o700 });
+  chmodSync(targetPath, 0o700);
 }

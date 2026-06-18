@@ -6,6 +6,6 @@ import { vi } from "vitest";
  * or that need to re-evaluate module-level state.
  */
 export async function importFresh<T = unknown>(specifier: string): Promise<T> {
-    vi.resetModules();
-    return import(specifier) as Promise<T>;
+  vi.resetModules();
+  return import(specifier) as Promise<T>;
 }

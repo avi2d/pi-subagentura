@@ -16,53 +16,80 @@
  * parent is down and the parent can catch up by reading the artifact later.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import ndjson from "ndjson";
-
 
 // ── Types ───────────────────────────────────────────────────────────
 
 export type SubagentStatus = "running" | "done" | "error" | "cancelled";
 
 export type SubagentEvent =
-	| { ts: number; type: "started"; status: "running"; message?: string }
-	| { ts: number; type: "tool_activity"; status: "running"; tool?: string; summary?: string; message?: string }
-	| { ts: number; type: "done"; status: "done"; exitCode?: number; message?: string; summary?: string }
-	| { ts: number; type: "error"; status: "error"; message?: string; exitCode?: number }
-	| { ts: number; type: "cancelled"; status: "cancelled"; message?: string };
-
+  | { ts: number; type: "started"; status: "running"; message?: string }
+  | {
+      ts: number;
+      type: "tool_activity";
+      status: "running";
+      tool?: string;
+      summary?: string;
+      message?: string;
+    }
+  | {
+      ts: number;
+      type: "done";
+      status: "done";
+      exitCode?: number;
+      message?: string;
+      summary?: string;
+    }
+  | {
+      ts: number;
+      type: "error";
+      status: "error";
+      message?: string;
+      exitCode?: number;
+    }
+  | { ts: number; type: "cancelled"; status: "cancelled"; message?: string };
 
 export interface SubagentArtifact {
-	id: string;
-	dir: string;
-	statusFile: string;
-	outputFile: string;
+  id: string;
+  dir: string;
+  statusFile: string;
+  outputFile: string;
 }
 
 // ── Paths ───────────────────────────────────────────────────────────
 
 export function artifactPath(rootDir: string, id: string): SubagentArtifact {
-	const dir = join(rootDir, id);
-	return {
-		id,
-		dir,
-		statusFile: join(dir, "events.ndjson"),
-		outputFile: join(dir, "output.md"),
-	};
+  const dir = join(rootDir, id);
+  return {
+    id,
+    dir,
+    statusFile: join(dir, "events.ndjson"),
+    outputFile: join(dir, "output.md"),
+  };
 }
 
 /** Create the artifact directory with owner-only perms. Idempotent. */
 export function ensureArtifactDir(art: SubagentArtifact): void {
-	mkdirSync(art.dir, { recursive: true, mode: 0o700 });
+  mkdirSync(art.dir, { recursive: true, mode: 0o700 });
 }
 
 // ── Writes ──────────────────────────────────────────────────────────
 
 /** Append one event to the NDJSON log. Creates the dir if needed. */
 export function appendEvent(art: SubagentArtifact, event: SubagentEvent): void {
-	ensureArtifactDir(art);
-	appendFileSync(art.statusFile, JSON.stringify(event) + "\n", { mode: 0o600 });
+  ensureArtifactDir(art);
+  appendFileSync(art.statusFile, JSON.stringify(event) + "\n", { mode: 0o600 });
 }
 
 /**
@@ -71,10 +98,10 @@ export function appendEvent(art: SubagentArtifact, event: SubagentEvent): void {
  * concurrent reader sees either the old content or the new — never partial.
  */
 export function writeOutput(art: SubagentArtifact, content: string): void {
-	ensureArtifactDir(art);
-	const tmp = art.outputFile + ".tmp";
-	writeFileSync(tmp, content, { mode: 0o600 });
-	renameSync(tmp, art.outputFile);
+  ensureArtifactDir(art);
+  const tmp = art.outputFile + ".tmp";
+  writeFileSync(tmp, content, { mode: 0o600 });
+  renameSync(tmp, art.outputFile);
 }
 
 /**
@@ -82,7 +109,7 @@ export function writeOutput(art: SubagentArtifact, content: string): void {
  * Exported so the poller (and tests) can name the file consistently.
  */
 export function outputPathForTurn(art: SubagentArtifact, turn: number): string {
-	return join(art.dir, `output-${turn}.md`);
+  return join(art.dir, `output-${turn}.md`);
 }
 
 /**
@@ -94,25 +121,28 @@ export function outputPathForTurn(art: SubagentArtifact, turn: number): string {
  * would compute the same N — but a guard inside would be brittle. Trust the caller.
  */
 export function snapshotOutput(art: SubagentArtifact, turn: number): void {
-	if (!existsSync(art.outputFile)) return;
-	const target = outputPathForTurn(art, turn);
-	const tmp = target + ".tmp";
-	const content = readFileSync(art.outputFile, "utf8");
-	writeFileSync(tmp, content, { mode: 0o600 });
-	renameSync(tmp, target);
+  if (!existsSync(art.outputFile)) return;
+  const target = outputPathForTurn(art, turn);
+  const tmp = target + ".tmp";
+  const content = readFileSync(art.outputFile, "utf8");
+  writeFileSync(tmp, content, { mode: 0o600 });
+  renameSync(tmp, target);
 }
 
 /**
  * Read a specific turn's snapshot (output-N.md). Returns null if the snapshot doesn't exist.
  */
-export function readOutputForTurn(art: SubagentArtifact, turn: number): string | null {
-	const target = outputPathForTurn(art, turn);
-	if (!existsSync(target)) return null;
-	try {
-		return readFileSync(target, "utf8");
-	} catch {
-		return null;
-	}
+export function readOutputForTurn(
+  art: SubagentArtifact,
+  turn: number,
+): string | null {
+  const target = outputPathForTurn(art, turn);
+  if (!existsSync(target)) return null;
+  try {
+    return readFileSync(target, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -120,20 +150,20 @@ export function readOutputForTurn(art: SubagentArtifact, turn: number): string |
  * to summarize the available history.
  */
 export function listOutputTurns(art: SubagentArtifact): number[] {
-	if (!existsSync(art.dir)) return [];
-	let entries: string[];
-	try {
-		entries = readdirSync(art.dir);
-	} catch {
-		return [];
-	}
-	const turns: number[] = [];
-	for (const name of entries) {
-		const m = /^output-(\d+)\.md$/.exec(name);
-		if (m) turns.push(Number(m[1]));
-	}
-	turns.sort((a, b) => a - b);
-	return turns;
+  if (!existsSync(art.dir)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(art.dir);
+  } catch {
+    return [];
+  }
+  const turns: number[] = [];
+  for (const name of entries) {
+    const m = /^output-(\d+)\.md$/.exec(name);
+    if (m) turns.push(Number(m[1]));
+  }
+  turns.sort((a, b) => a - b);
+  return turns;
 }
 
 // ── Reads ───────────────────────────────────────────────────────────
@@ -149,63 +179,65 @@ export function listOutputTurns(art: SubagentArtifact): number[] {
  * did not end with a newline) is buffered by the parser and dropped on `end()`; it is treated as a
  * in-progress write that the next reader will pick up once completed.
  */
-export function readEvents(art: SubagentArtifact, since?: number): SubagentEvent[] {
-	if (!existsSync(art.statusFile)) return [];
-	let content: string;
-	try {
-		content = readFileSync(art.statusFile, "utf8");
-	} catch {
-		return [];
-	}
-	const parser = ndjson.parse({ strict: false });
-	const events: SubagentEvent[] = [];
-	parser.on("data", (obj: unknown) => {
-		const ev = obj as SubagentEvent;
-		if (since === undefined || ev.ts >= since) events.push(ev);
-	});
-	// Non-strict mode never emits 'error' for bad JSON; attach a no-op so an unhandled error event
-	// can never crash the parent process.
-	parser.on("error", () => {});
-	parser.end(Buffer.from(content, "utf8"));
-	return events;
+export function readEvents(
+  art: SubagentArtifact,
+  since?: number,
+): SubagentEvent[] {
+  if (!existsSync(art.statusFile)) return [];
+  let content: string;
+  try {
+    content = readFileSync(art.statusFile, "utf8");
+  } catch {
+    return [];
+  }
+  const parser = ndjson.parse({ strict: false });
+  const events: SubagentEvent[] = [];
+  parser.on("data", (obj: unknown) => {
+    const ev = obj as SubagentEvent;
+    if (since === undefined || ev.ts >= since) events.push(ev);
+  });
+  // Non-strict mode never emits 'error' for bad JSON; attach a no-op so an unhandled error event
+  // can never crash the parent process.
+  parser.on("error", () => {});
+  parser.end(Buffer.from(content, "utf8"));
+  return events;
 }
 
 /** Returns output.md content, or null if it doesn't exist yet. */
 export function readOutput(art: SubagentArtifact): string | null {
-	if (!existsSync(art.outputFile)) return null;
-	try {
-		return readFileSync(art.outputFile, "utf8");
-	} catch {
-		return null;
-	}
+  if (!existsSync(art.outputFile)) return null;
+  try {
+    return readFileSync(art.outputFile, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /** List all sub-agent artifacts under `rootDir`. Ignores loose files. */
 export function listArtifacts(rootDir: string): SubagentArtifact[] {
-	if (!existsSync(rootDir)) return [];
-	let entries: string[];
-	try {
-		entries = readdirSync(rootDir);
-	} catch {
-		return [];
-	}
-	const out: SubagentArtifact[] = [];
-	for (const name of entries) {
-		const full = join(rootDir, name);
-		try {
-			if (statSync(full).isDirectory()) {
-				out.push(artifactPath(rootDir, name));
-			}
-		} catch {
-			// skip unreadable
-		}
-	}
-	return out;
+  if (!existsSync(rootDir)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(rootDir);
+  } catch {
+    return [];
+  }
+  const out: SubagentArtifact[] = [];
+  for (const name of entries) {
+    const full = join(rootDir, name);
+    try {
+      if (statSync(full).isDirectory()) {
+        out.push(artifactPath(rootDir, name));
+      }
+    } catch {
+      // skip unreadable
+    }
+  }
+  return out;
 }
 
 /** Most recent event, or null if no events yet. */
 export function lastEvent(art: SubagentArtifact): SubagentEvent | null {
-	const events = readEvents(art);
-	return events.length > 0 ? events[events.length - 1] : null;
+  const events = readEvents(art);
+  return events.length > 0 ? events[events.length - 1] : null;
 }
-

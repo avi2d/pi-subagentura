@@ -30,19 +30,27 @@ const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
   ? resolve(process.env.SUBAGENT_DEBUG_LOG_DIR)
   : undefined;
 
-export function debugLog(level: string, event: string, data: Record<string, unknown> = {}) {
+export function debugLog(
+  level: string,
+  event: string,
+  data: Record<string, unknown> = {},
+) {
   if (!DEBUG_LOG_DIR) return;
   try {
     if (!existsSync(DEBUG_LOG_DIR)) {
       mkdirSync(DEBUG_LOG_DIR, { recursive: true });
     }
-    const entry = JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level,
-      event,
-      ...data,
-    }) + "\n";
-    const fileName = resolve(DEBUG_LOG_DIR, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`);
+    const entry =
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level,
+        event,
+        ...data,
+      }) + "\n";
+    const fileName = resolve(
+      DEBUG_LOG_DIR,
+      `debug-${new Date().toISOString().slice(0, 10)}.jsonl`,
+    );
     appendFileSync(fileName, entry);
   } catch {
     // Silently fail to avoid polluting output
@@ -52,8 +60,12 @@ export function debugLog(level: string, event: string, data: Record<string, unkn
 export function extractTextFromContent(content: unknown): string {
   if (Array.isArray(content)) {
     return content
-      .filter((c): c is { type: "text"; text: string } =>
-        typeof c === "object" && c !== null && c.type === "text" && typeof c.text === "string"
+      .filter(
+        (c): c is { type: "text"; text: string } =>
+          typeof c === "object" &&
+          c !== null &&
+          c.type === "text" &&
+          typeof c.text === "string",
       )
       .map((c) => c.text)
       .join("\n");
@@ -94,7 +106,13 @@ export interface Usage {
 
 export type SubagentResult =
   | { isError: false; output: string; usage: Usage; model?: string }
-  | { isError: true; output: string; usage: Usage; model?: undefined; errorMessage: string };
+  | {
+      isError: true;
+      output: string;
+      usage: Usage;
+      model?: undefined;
+      errorMessage: string;
+    };
 
 export interface SubagentLiveStatus {
   turn: number;
@@ -153,11 +171,15 @@ export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 
 declare global {
   var __piSubagenturaRegistry: Map<string, JobState> | undefined;
-  var __piSubagenturaInteractiveRegistry: Map<string, InteractiveSubagentState> | undefined;
+  var __piSubagenturaInteractiveRegistry:
+    | Map<string, InteractiveSubagentState>
+    | undefined;
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
   var __piSubagenturaInjectCount: number | undefined;
-  var __piSubagenturaInteractivePollerHandle: ReturnType<typeof setInterval> | undefined;
+  var __piSubagenturaInteractivePollerHandle:
+    | ReturnType<typeof setInterval>
+    | undefined;
 }
 
 // Initialize the global pi ref
@@ -274,10 +296,7 @@ export function formatTokens(count: number): string {
   return `${(count / 1000000).toFixed(1)}M`;
 }
 
-export function formatUsage(
-  u: Usage,
-  model?: string,
-): string {
+export function formatUsage(u: Usage, model?: string): string {
   const parts: string[] = [];
   if (u.turns) parts.push(`${u.turns} turn${u.turns > 1 ? "s" : ""}`);
   if (u.input) parts.push(`↑${formatTokens(u.input)}`);
@@ -364,7 +383,11 @@ export async function startSubagentJob(
 
   // Resolve model: exact match only, fallback to default
   // Uses parent's modelRegistry to find extension-added models (e.g. minimax)
-  const targetModel = resolveModel(modelOverride, defaultModel, parentModelRegistry);
+  const targetModel = resolveModel(
+    modelOverride,
+    defaultModel,
+    parentModelRegistry,
+  );
   const modelLabel = targetModel
     ? `${targetModel.provider}/${targetModel.id}`
     : undefined;
@@ -446,7 +469,9 @@ export async function startSubagentJob(
   ).session;
   debugLog("info", "session_created", {
     jobId,
-    sessionModel: session.model ? `${session.model.provider}/${session.model.id}` : null,
+    sessionModel: session.model
+      ? `${session.model.provider}/${session.model.id}`
+      : null,
   });
 
   // Wire abort signal
@@ -486,7 +511,10 @@ export async function startSubagentJob(
         break;
       }
       case "tool_execution_end": {
-        debugLog("info", "tool_end", { jobId, toolName: liveStatus.activeTool?.name });
+        debugLog("info", "tool_end", {
+          jobId,
+          toolName: liveStatus.activeTool?.name,
+        });
         setActiveToolDebounced(undefined);
         break;
       }
@@ -514,8 +542,12 @@ export async function startSubagentJob(
             delta: evt.delta.slice(0, 200),
             outputLength: liveStatus.output.length,
           }),
-          ...(evt.type === "thinking_delta" && { delta: evt.delta.slice(0, 200) }),
-          ...(evt.type === "toolcall_delta" && { partial: String(evt.partial).slice(0, 200) }),
+          ...(evt.type === "thinking_delta" && {
+            delta: evt.delta.slice(0, 200),
+          }),
+          ...(evt.type === "toolcall_delta" && {
+            partial: String(evt.partial).slice(0, 200),
+          }),
           ...(evt.type === "toolcall_end" && { toolCallId: evt.toolCall?.id }),
         });
         if (evt.type === "text_delta") {
@@ -557,8 +589,11 @@ export async function startSubagentJob(
         jobId,
         messageCount: messages.length,
         messageRoles: messages.map((m) => m.role),
-        lastMessageContentType: typeof (messages[messages.length - 1] as any)?.content,
-        lastMessageContentIsArray: Array.isArray((messages[messages.length - 1] as any)?.content),
+        lastMessageContentType: typeof (messages[messages.length - 1] as any)
+          ?.content,
+        lastMessageContentIsArray: Array.isArray(
+          (messages[messages.length - 1] as any)?.content,
+        ),
       });
 
       let finalOutput = liveStatus.output;

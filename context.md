@@ -1,10 +1,7 @@
-
 ---
-
 ### 🧑 User (line 949)
 
 what if we want to add the zellij support?
-
 ---
 
 ### 🤖 Assistant (line 950)
@@ -14,6 +11,7 @@ Yes, makes sense. Zellij users exist and tmux lock-in is a friction point. Let m
 ## Current state: tmux-everywhere
 
 The codebase has zero abstraction. Every mux operation is hard-coded `tmux ...` in `src/interactive-tmux.ts`:
+
 - `execFileSync("tmux", ["new-window", ...])` / `split-window` (line 264)
 - `execFileSync("tmux", ["display-message", "-p", ...])` for `isPaneAlive` (line 417)
 - `execFileSync("tmux", ["send-keys", ...])` + `Enter` (line 281-282)
@@ -26,10 +24,14 @@ The codebase has zero abstraction. Every mux operation is hard-coded `tmux ...` 
 ```ts
 // src/multiplexer.ts
 export interface Multiplexer {
-  readonly name: 'tmux' | 'zellij';
+  readonly name: "tmux" | "zellij";
   isAvailable(): boolean;
-  createPane(opts: { name: string; cwd: string; background: boolean; parentPane?: string }):
-    { paneId: string; windowName?: string };
+  createPane(opts: {
+    name: string;
+    cwd: string;
+    background: boolean;
+    parentPane?: string;
+  }): { paneId: string; windowName?: string };
   isPaneAlive(paneId: string): boolean;
   sendKeys(paneId: string, command: string): void;
   killPane(paneId: string): void;
@@ -39,6 +41,7 @@ export interface Multiplexer {
 ```
 
 Plus a thin `getMux(opts?): Multiplexer` that resolves which to use:
+
 - `PI_SUBAGENT_MUX=tmux|zellij` env var → force
 - otherwise: prefer the mux already attached to this session (heuristic: parse `$ZELLIJ_SESSION_NAME` / `$TMUX` from `process.env`)
 - otherwise: prefer tmux (backward compat)
@@ -46,17 +49,17 @@ Plus a thin `getMux(opts?): Multiplexer` that resolves which to use:
 
 ## Zellij mapping (the rough edges)
 
-| Concept | tmux | zellij |
-|---|---|---|
-| New split pane | `tmux split-window -d -h -P -F '#{pane_id}' -t <parent>` | `zellij action new-pane --direction right --close-on-exit` (pane id in stdout) |
-| New detached window | `tmux new-window -d -n <name> -P -F '#{pane_id}' -c <cwd>` | `zellij action new-tab --name <name> --cwd <cwd>` (then create a pane inside) |
-| Pane id format | `%123` (string) | integer (need to stringify for `InteractiveSubagentState.paneId: string`) |
-| Send text + Enter | `send-keys -t <pane> -l <text>` + `send-keys -t <pane> Enter` | `zellij action write-chars <text>` + `zellij action write 13` |
-| Pane alive check | `tmux display-message -p -t <pane> '#{pane_id}'` (throws if dead) | `zellij action query-tab-info --tab-name <name>` (parse JSON; pane missing → dead) |
-| Kill pane | `tmux kill-pane -t <pane>` | `zellij action close-pane --pane-id <id>` or `zellij kill-session <sess>` |
-| Attach from outside | `tmux attach -t <sess>` | `zellij attach <sess>` |
-| Focus from inside | `tmux select-window -t <name>` | `zellij action go-to-tab-name <name>` |
-| Exit code of child | pane option `@pi-exit-code` (tmux-only trick) | **doesn't exist** — but we don't need it! The launch script's EXIT trap already writes `cli.mjs done <code>` to the artifact, which is the source of truth |
+| Concept             | tmux                                                              | zellij                                                                                                                                                     |
+| ------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| New split pane      | `tmux split-window -d -h -P -F '#{pane_id}' -t <parent>`          | `zellij action new-pane --direction right --close-on-exit` (pane id in stdout)                                                                             |
+| New detached window | `tmux new-window -d -n <name> -P -F '#{pane_id}' -c <cwd>`        | `zellij action new-tab --name <name> --cwd <cwd>` (then create a pane inside)                                                                              |
+| Pane id format      | `%123` (string)                                                   | integer (need to stringify for `InteractiveSubagentState.paneId: string`)                                                                                  |
+| Send text + Enter   | `send-keys -t <pane> -l <text>` + `send-keys -t <pane> Enter`     | `zellij action write-chars <text>` + `zellij action write 13`                                                                                              |
+| Pane alive check    | `tmux display-message -p -t <pane> '#{pane_id}'` (throws if dead) | `zellij action query-tab-info --tab-name <name>` (parse JSON; pane missing → dead)                                                                         |
+| Kill pane           | `tmux kill-pane -t <pane>`                                        | `zellij action close-pane --pane-id <id>` or `zellij kill-session <sess>`                                                                                  |
+| Attach from outside | `tmux attach -t <sess>`                                           | `zellij attach <sess>`                                                                                                                                     |
+| Focus from inside   | `tmux select-window -t <name>`                                    | `zellij action go-to-tab-name <name>`                                                                                                                      |
+| Exit code of child  | pane option `@pi-exit-code` (tmux-only trick)                     | **doesn't exist** — but we don't need it! The launch script's EXIT trap already writes `cli.mjs done <code>` to the artifact, which is the source of truth |
 
 The exit-code issue is the only true gotcha — and it's already solved by the launch script's trap. We just delete the `readPaneExitCode` helper and rely on the artifact.
 
@@ -82,7 +85,7 @@ The exit-code issue is the only true gotcha — and it's already solved by the l
 
 ## Trade-offs to call out
 
-1. **Mux mixing is messy.** A parent in tmux spawning a child in zellij (or vice versa) works mechanically but is weird for users. The resolver should pick *one* and stick with it for the session.
+1. **Mux mixing is messy.** A parent in tmux spawning a child in zellij (or vice versa) works mechanically but is weird for users. The resolver should pick _one_ and stick with it for the session.
 2. **Zellij pane id type.** tmux uses `%123` strings; zellij uses integers. We keep `paneId: string` everywhere and stringify zellij ids (`"42"`) — clean but a small abstraction cost.
 3. **Zellij attach UX.** Outside-tmux attach is `tmux attach -t <sess>` which always works. Outside-zellij attach needs the session name, and zellij session naming is more variable. The `attachCommand` string in `InteractiveSubagentState` will be mux-specific (already is).
 4. **CI testing.** Need a zellij install in CI, or mock the zellij CLI commands (like we mock tmux). The zellij tests would mirror the tmux tests structurally.
@@ -104,13 +107,14 @@ Let me think about what this would entail:
    - `zellij action write 13` (or similar) for Enter key
    - `zellij list-clients` to check if server is running
    - `zellij attach <session>` to attach
-   - `zellij action focus-pane <direction> <pane_id>` 
+   - `zellij action focus-pane <direction> <pane_id>`
 
 3. Zellij also has a JSON-RPC/WebSocket interface for programmatic control, but the CLI should work for our needs.
 
 4. The user is exploring a feature. This is a design discussion question, not a "do it now" request. Let me think about the design considerations and trade-offs.
 
 Things to think about:
+
 - Backward compatibility: tmux must still work (or we abstract the multiplexer)
 - User choice: which multiplexer to use (env var, config, per-spawn)
 - Code structure: refactor to a multiplexer abstraction layer
@@ -120,22 +124,26 @@ Things to think about:
 This is a significant refactor. Let me lay out the design:
 
 **Approach 1: Abstraction layer**
+
 - Define an `IMultiplexer` interface with methods: `isAvailable()`, `newPane()`, `sendKeys()`, `killPane()`, `isPaneAlive()`, `attachCommand()`, `selectPaneCommand()`
 - Two implementations: `TmuxMultiplexer` and `ZellijMultiplexer`
 - Choose at spawn time based on env var or default
 
 **Approach 2: Parallel implementations**
+
 - Keep tmux-specific code as-is
 - Add zellij-specific code alongside
 - Tool param selects which to use
 
 **Approach 3: Just delegate**
+
 - Add a `ZELLIJ_MODE` env var
 - If set, use zellij code paths; else use tmux
 
 I think Approach 1 is cleanest. Let me think about what the interface needs to support:
 
 Looking at the current code in `interactive-tmux.ts`:
+
 - `isTmuxAvailable()` — check if tmux is running
 - `buildChildSubagentProtocol(artifactDir)` — text prompt, not mux-specific
 - `readPaneExitCode(paneId)` — get exit code from pane
@@ -149,6 +157,7 @@ Looking at the current code in `interactive-tmux.ts`:
 - `launchInteractiveSubagent(params)` — creates pane, writes launch script, sends keys
 
 The tmux-specific parts:
+
 1. **Pane creation**: `tmux new-window -d -n <name> ...` or `tmux split-window -d -h ...`
 2. **Pane alive check**: `tmux display-message -p -t <pane_id> "#{pane_id}"`
 3. **Send keys**: `tmux send-keys -t <pane_id> -l <text>` + `tmux send-keys -t <pane_id> Enter`
@@ -157,6 +166,7 @@ The tmux-specific parts:
 6. **Exit code**: `tmux show-options -p -t <pane_id> @pi-exit-code`
 
 Zellij equivalents:
+
 1. **Pane creation**: `zellij action new-pane --direction right --close-on-exit` (creates split); or `zellij --new-session-with-layout <layout>` for new tab
 2. **Pane alive check**: `zellij action query-tab-info` (lists panes)
 3. **Send keys**: `zellij action write-chars <text>` + `zellij action write 13` (Enter)
@@ -172,22 +182,33 @@ OK so the design:
 
 ```ts
 interface IMultiplexer {
-  readonly name: 'tmux' | 'zellij';
+  readonly name: "tmux" | "zellij";
   isAvailable(): boolean;
-  createPane(opts: { name: string; cwd: string; background: boolean; tmuxPane?: string }): { paneId: string; windowName?: string };
+  createPane(opts: {
+    name: string;
+    cwd: string;
+    background: boolean;
+    tmuxPane?: string;
+  }): { paneId: string; windowName?: string };
   isPaneAlive(paneId: string): boolean;
   sendKeys(paneId: string, command: string): void;
   killPane(paneId: string): void;
-  attachCommand(opts: { sessionName?: string; windowName?: string; paneId: string }): string;
+  attachCommand(opts: {
+    sessionName?: string;
+    windowName?: string;
+    paneId: string;
+  }): string;
   selectPaneCommand(opts: { windowName?: string; paneId: string }): string;
 }
 ```
 
 Then:
+
 - `TmuxMultiplexer` (current logic, extracted)
 - `ZellijMultiplexer` (new)
 
 The launcher chooses the multiplexer:
+
 - If `PI_SUBAGENT_MUX=tmux` or unset + tmux available → tmux
 - If `PI_SUBAGENT_MUX=zellij` → zellij
 - Auto-detect: if only one is available, use it; if both, prefer tmux (backward compat); if neither, error
@@ -195,6 +216,7 @@ The launcher chooses the multiplexer:
 Actually thinking more, a simpler approach: detect on launch, store the mux choice on the state. That way each sub-agent has a known mux (could mix if user switches mid-session, though that's edge case).
 
 Let me also think about zellij-specific quirks:
+
 - Zellij's CLI is a bit awkward for automation. Some operations are interactive (the `zellij` command without args starts the session in current terminal).
 - The `zellij action` subcommand is for scripting.
 - Pane IDs in zellij are integers, not `%N` like tmux. The state would need a string field for paneId.
@@ -205,6 +227,7 @@ Let me also think about testing. The current tmux tests mock `node:child_process
 This is a substantial chunk of work. The user is asking "what if we want to add zellij support?" — they want to know if it makes sense, what the approach is, what's the scope.
 
 Let me give a structured answer:
+
 1. Yes, makes sense for users who prefer zellij
 2. Approach: abstraction layer with two impls
 3. Scope: significant refactor (~500-1000 lines + tests)
@@ -219,9 +242,10 @@ Actually, the user's tone is "what if we want to" — exploratory. They want a d
 
 > 🛠️ Tool call: **ask_user**
 > Arguments: ```json
-{
-  "question": "How do you want to scope the zellij work?",
-  "options": [
+> {
+> "question": "How do you want to scope the zellij work?",
+> "options": [
+
     {
       "title": "Single PR: refactor + zellij together",
       "description": "One PR: extract the Mux interface, ship the tmux implementation as the extracted layer (no behavior change), ship the zellij implementation, add the tool param + env var, update docs. ~850 lines, ~3 days. Bigger PR but atomic — review is one pass, merge is one event."
@@ -234,9 +258,11 @@ Actually, the user's tone is "what if we want to" — exploratory. They want a d
       "title": "Defer — explore a prototype first",
       "description": "Don't start the refactor yet. First write a 100-line zellij PoC against the current tmux-everywhere code (no interface extraction) to validate the zellij CLI calls and pin down the rough edges. If the PoC works, then commit to one of the two refactor plans."
     }
-  ]
+
+]
 }
-```
+
+````
 
 ---
 
@@ -275,7 +301,7 @@ The user wants to create a branch for the zellij support work. They want to star
 {
   "command": "cd /Users/applesucks/dev/pi-agents && git checkout -b feat/zellij-multiplexer-support 2>&1 | tail -3 && git --no-pager log --oneline -1"
 }
-```
+````
 
 ---
 
@@ -283,7 +309,6 @@ The user wants to create a branch for the zellij support work. They want to star
 
 Switched to a new branch 'feat/zellij-multiplexer-support'
 07d282b chore: bump version to 2.2.0
-
 
 ---
 
@@ -320,15 +345,18 @@ Let me use web search and fetch tools to gather current information.
 
 > 🛠️ Tool call: **web_search**
 > Arguments: ```json
-{
-  "queries": [
+> {
+> "queries": [
+
     "zellij latest version 2026 CLI action subcommand",
     "zellij action write-chars write 13 send keys CLI",
     "zellij action new-pane direction right syntax 2026",
     "zellij session attach go-to-tab-name pane id format"
-  ]
+
+]
 }
-```
+
+````
 
 ### [Web Search Results]
 
@@ -346,7 +374,7 @@ Summary based on the currently selected search results.
 {
   "url": "https://zellij.dev/documentation/cli-actions.html"
 }
-```
+````
 
 ---
 
@@ -360,7 +388,7 @@ Summary based on the currently selected search results.
 
 ## CLI Actions
 
-*A note about pane ids:*...
+_A note about pane ids:_...
 
 <details>
 <summary>💭 Thinking (line 963)</summary>
@@ -371,14 +399,17 @@ Excellent! I have very detailed information about the zellij CLI. Let me also ch
 
 > 🛠️ Tool call: **web_search**
 > Arguments: ```json
-{
-  "queries": [
+> {
+> "queries": [
+
     "tmux latest version 2026 release",
     "tmux 3.5 send-keys new features 2025 2026",
     "tmux display-message pane id format deprecated 2026"
-  ]
+
+]
 }
-```
+
+````
 
 ### [Web Search Results]
 
@@ -396,7 +427,7 @@ Summary based on the currently selected search results.
 {
   "url": "https://github.com/tmux/tmux/releases/tag/3.6b"
 }
-```
+````
 
 ---
 
@@ -410,14 +441,15 @@ Summary based on the currently selected search results.
 > Words: 61
 > Browser: chrome_145/windows
 
-/ **[tmux](https://github.com/t...
+/ \*\*[tmux](https://github.com/t...
 
 > 🛠️ Tool call: **web_fetch**
 > Arguments: ```json
-{
-  "url": "https://raw.githubusercontent.com/tmux/tmux/3.6b/CHANGES"
-}
-```
+> {
+> "url": "https://raw.githubusercontent.com/tmux/tmux/3.6b/CHANGES"
+> }
+
+````
 
 ---
 
@@ -446,7 +478,7 @@ Let me also verify zellij version info and check if there are any pitfalls.
 {
   "url": "https://github.com/zellij-org/zellij/releases"
 }
-```
+````
 
 ---
 
@@ -473,14 +505,17 @@ Let me also check on any zellij pane attach quirks and the env var for session d
 
 > 🛠️ Tool call: **web_search**
 > Arguments: ```json
-{
-  "queries": [
+> {
+> "queries": [
+
     "zellij ZELLIJ_SESSION_NAME env var attach from outside session",
     "zellij new-session --background detach hidden pane",
     "zellij dump-screen capture pane programmatically exit code"
-  ]
+
+]
 }
-```
+
+````
 
 ### [Web Search Results]
 
@@ -498,7 +533,7 @@ Summary based on the currently selected search results.
 {
   "url": "https://zellij.dev/documentation/integration"
 }
-```
+````
 
 ---
 
@@ -523,10 +558,11 @@ Now I have comprehensive info. Let me also check how the tmux vs zellij env var 
 
 > 🛠️ Tool call: **web_fetch**
 > Arguments: ```json
-{
-  "url": "https://zellij.dev/documentation/cli-recipes.html"
-}
-```
+> {
+> "url": "https://zellij.dev/documentation/cli-recipes.html"
+> }
+
+````
 
 ---
 
@@ -642,19 +678,20 @@ interface Multiplexer {
   attachCommand(opts: { paneId: string; windowName?: string; sessionName?: string }): string;
   focusCommand(opts: { paneId: string; windowName?: string }): string;
 }
-```
+````
 
 `sendKeys` is what the launch script uses (single chars at a time). `paste` is for `send_interactive_subagent_message` (potentially long messages). tmux's `paste` falls back to `sendKeys` (or could just always use sendKeys — paste is only an advantage for zellij).
 
 **Resolution for the Mux resolver:**
+
 ```ts
-function getMux(preference?: 'tmux' | 'zellij' | 'auto'): Multiplexer {
+function getMux(preference?: "tmux" | "zellij" | "auto"): Multiplexer {
   const tmux = new TmuxMultiplexer();
   const zellij = new ZellijMultiplexer();
 
   // Explicit preference wins.
-  if (preference === 'tmux') return tmux;
-  if (preference === 'zellij') return zellij;
+  if (preference === "tmux") return tmux;
+  if (preference === "zellij") return zellij;
 
   // Auto: prefer the mux already attached to this session.
   if (process.env.ZELLIJ_SESSION_NAME && zellij.isAvailable()) return zellij;
@@ -664,13 +701,16 @@ function getMux(preference?: 'tmux' | 'zellij' | 'auto'): Multiplexer {
   if (tmux.isAvailable()) return tmux;
   if (zellij.isAvailable()) return zellij;
 
-  throw new Error('No multiplexer available. Start pi inside tmux or zellij, or install one.');
+  throw new Error(
+    "No multiplexer available. Start pi inside tmux or zellij, or install one.",
+  );
 }
 ```
 
 **Resolution for the state field:**
+
 ```ts
-mux: 'tmux' | 'zellij'  // set at spawn time, never changes
+mux: "tmux" | "zellij"; // set at spawn time, never changes
 ```
 
 Stored alongside the existing `paneId`, `windowName`, etc. in `InteractiveSubagentState`.
@@ -681,16 +721,16 @@ Stored alongside the existing `paneId`, `windowName`, etc. in `InteractiveSubage
 
 With the actual zellij v0.44 API and the resolved design points:
 
-| Component | Lines | Notes |
-|---|---|---|
-| `src/multiplexer.ts` (interface + resolver) | ~120 | Pure type, no platform code |
-| `src/multiplexer-tmux.ts` (extracted) | ~250 | All current `interactive-tmux.ts` mux-specific code |
-| `src/multiplexer-zellij.ts` (new) | ~200 | New code, mirrors tmux structure |
-| `src/interactive-tmux.ts` (rewrite) | ~150 | Becomes a thin wrapper that picks a mux |
-| `src/subagent.ts` (tool surface) | ~30 | New `mux` param on `subagent_interactive`, field on state |
-| Tests | ~400 | Mirror the tmux test pattern for zellij |
-| README | ~50 | Add Zellij section, env var, `mux` param |
-| **Total** | **~1200** | Down from initial ~850 estimate (interface adds ~50%, but the extraction forces proper structure) |
+| Component                                   | Lines     | Notes                                                                                             |
+| ------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------- |
+| `src/multiplexer.ts` (interface + resolver) | ~120      | Pure type, no platform code                                                                       |
+| `src/multiplexer-tmux.ts` (extracted)       | ~250      | All current `interactive-tmux.ts` mux-specific code                                               |
+| `src/multiplexer-zellij.ts` (new)           | ~200      | New code, mirrors tmux structure                                                                  |
+| `src/interactive-tmux.ts` (rewrite)         | ~150      | Becomes a thin wrapper that picks a mux                                                           |
+| `src/subagent.ts` (tool surface)            | ~30       | New `mux` param on `subagent_interactive`, field on state                                         |
+| Tests                                       | ~400      | Mirror the tmux test pattern for zellij                                                           |
+| README                                      | ~50       | Add Zellij section, env var, `mux` param                                                          |
+| **Total**                                   | **~1200** | Down from initial ~850 estimate (interface adds ~50%, but the extraction forces proper structure) |
 
 **Realistic timeline:** 3-4 days. Single PR is feasible but review-heavy. Two PRs (refactor, then zellij) is cleaner.
 
@@ -699,6 +739,7 @@ With the actual zellij v0.44 API and the resolved design points:
 ### Recommendation: Two PRs (refactor first)
 
 **PR #1: `refactor: extract-multiplexer-interface`** (~600 lines)
+
 - Add `src/multiplexer.ts`, `src/multiplexer-tmux.ts`
 - Move all tmux code from `interactive-tmux.ts` into `multiplexer-tmux.ts`
 - Rewrite `interactive-tmux.ts` as a thin wrapper (`isTmuxAvailable` → `getMux().isAvailable()`)
@@ -706,6 +747,7 @@ With the actual zellij v0.44 API and the resolved design points:
 - Reviewer can diff side-by-side with the old code.
 
 **PR #2: `feat: zellij-multiplexer-backend`** (~600 lines, on top of PR #1)
+
 - Add `src/multiplexer-zellij.ts`
 - Add `mux` field to `InteractiveSubagentState`
 - Add `mux` param to `subagent_interactive` tool
@@ -725,6 +767,7 @@ Now I have comprehensive info. Let me write up a thorough research summary with 
 Key findings:
 
 **tmux 3.6b (May 2026) — current stable:**
+
 - `send-keys -l <text>` + `send-keys Enter` — still the canonical way
 - `display-message -p -t <pane> '#{pane_id}'` — pane liveness check
 - `new-window -d -n <name> -P -F '#{pane_id}'` — new detached window
@@ -736,6 +779,7 @@ Key findings:
 - `TMUX` env var set when inside a tmux session
 
 **zellij v0.44.3 (latest) — most current:**
+
 - `zellij action new-pane --direction right --close-on-exit -- bash ...` — new split; returns pane ID
 - `zellij action new-tab --name "X" --cwd /path` — new tab; returns tab ID
 - `zellij action write-chars <text>` + `zellij action write 13` — send chars + Enter
@@ -762,7 +806,7 @@ Key findings:
    - zellij: `zellij attach --create-background <name>` + `--session <name> action ...` for control
 
 3. **Session targeting from outside**:
-   - tmux: `attach -t <session>` 
+   - tmux: `attach -t <session>`
    - zellij: `attach <session>` or use `--session <name>` for actions
 
 4. **Pane alive check**:
@@ -804,6 +848,7 @@ Key findings:
 **Scope estimate revision:**
 
 With the actual zellij v0.44 capabilities, the work is cleaner than initially scoped:
+
 - `paste` is a perfect fit for follow-up messages (one call instead of two)
 - `subscribe` could replace `dump-screen` for real-time tailing (but we don't need that for the core feature)
 - `--block-until-exit-success` is interesting for the launch script's CLI (we could use it in tests, not production)
@@ -831,6 +876,7 @@ Good question. There are two interpretations:
 ## Stacked parallel (PR #2 branches off PR #1's branch — both branches live, work sequenced by deps not wall time)
 
 **Yes, this works cleanly.** The technical dependency chain is:
+
 - PR #2 needs the `Multiplexer` interface → defined in PR #1
 - PR #2 needs `TmuxMultiplexer` class → created in PR #1
 - PR #2 needs `getMux()` resolver → created in PR #1
@@ -854,12 +900,12 @@ master
 
 **Workplan:**
 
-| Phase | Branch | What happens |
-|---|---|---|
-| 1 | `feat/zellij-multiplexer-refactor` (off master) | Extract interface + tmux impl. Push. Open PR #1. All 261 tests pass unchanged. |
-| 2 | `feat/zellij-multiplexer-backend` (off PR #1) | Add zellij impl + `mux` param on tool + state field. Push. Open PR #2 (now pointing at PR #1's head). |
-| 3 | (you merge PR #1) | PR #2's base moves to master. |
-| 4 | (you merge PR #2) | Ship. |
+| Phase | Branch                                          | What happens                                                                                          |
+| ----- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1     | `feat/zellij-multiplexer-refactor` (off master) | Extract interface + tmux impl. Push. Open PR #1. All 261 tests pass unchanged.                        |
+| 2     | `feat/zellij-multiplexer-backend` (off PR #1)   | Add zellij impl + `mux` param on tool + state field. Push. Open PR #2 (now pointing at PR #1's head). |
+| 3     | (you merge PR #1)                               | PR #2's base moves to master.                                                                         |
+| 4     | (you merge PR #2)                               | Ship.                                                                                                 |
 
 The "parallel" benefit is real: I can have PR #1 reviewable within 1-2 days, and PR #2 ready-to-review within 2-3 days, even though the merged code lands on day 4-5. If PR #1 review needs revisions, the diff is small and PR #2 rebase is trivial.
 
@@ -871,12 +917,14 @@ Want me to start phase 1 (refactor)? I'll do that, push, and then move to phase 
 The user is asking if the two PRs can be worked on in parallel. Let me think about this:
 
 PR #1: refactor: extract-multiplexer-interface
+
 - Adds `src/multiplexer.ts` (interface)
 - Adds `src/multiplexer-tmux.ts` (extracts existing code)
 - Rewrites `src/interactive-tmux.ts` as thin wrapper
 - Zero behavior change
 
 PR #2: feat: zellij-multiplexer-backend
+
 - Adds `src/multiplexer-zellij.ts`
 - Adds `mux` field to `InteractiveSubagentState`
 - Adds `mux` param to `subagent_interactive` tool
@@ -886,6 +934,7 @@ PR #2: feat: zellij-multiplexer-backend
 Can they be worked on in parallel? Let me think about the dependencies:
 
 PR #2 depends on PR #1 because:
+
 1. It needs the `Multiplexer` interface defined in PR #1
 2. It needs the `TmuxMultiplexer` class to exist
 3. It needs the `getMux()` resolver to exist
@@ -894,15 +943,18 @@ PR #2 depends on PR #1 because:
 But could we structure them so PR #2 doesn't strictly need PR #1 merged first? Some options:
 
 Option A: PR #2 branches off PR #1's branch
+
 - Both work in parallel from the same base
 - PR #2 has PR #1 as its base
 - Merge order: PR #1 first, then PR #2
 
 Option B: PR #2 doesn't depend on PR #1, builds its own interface
+
 - More work, more divergence, harder to merge
 - Not recommended
 
 Option C: Sequence the work
+
 - PR #1 lands first
 - PR #2 starts when PR #1 is merged
 - Slower but cleaner
@@ -910,6 +962,7 @@ Option C: Sequence the work
 The user is asking about "in parallel" — they want speed. But the technical dependency is real: PR #2 needs PR #1's interface, classes, and the registry pattern.
 
 However, since both PRs would be on the same `feat/zellij-multiplexer-support` branch conceptually, we could:
+
 - Have PR #1 land first (refactor)
 - Then PR #2 on top (zellij)
 - Or: do the work serially on the same branch with a single PR (option A from before)
@@ -917,12 +970,14 @@ However, since both PRs would be on the same `feat/zellij-multiplexer-support` b
 The user chose "2 PRs" earlier. Now they're asking if parallel work is possible. The answer is:
 
 **They CAN be worked on in parallel IF:**
+
 - PR #2 branches off PR #1's branch (not master)
 - They share the same feature branch
 - Each PR is small and focused
 - A second developer/agent takes PR #2 while PR #1 is in review
 
 **They CANNOT be fully parallelized in the traditional sense because:**
+
 - PR #2 needs PR #1's interface
 - Both touch `src/interactive-tmux.ts` and `src/subagent.ts`
 - Merge conflicts are likely if they both modify the same files
@@ -930,12 +985,14 @@ The user chose "2 PRs" earlier. Now they're asking if parallel work is possible.
 The user mentioned "work on in parallel" — they're asking if I can do both at once. The answer is yes if I treat them as a sequential pipeline on the same branch. I can do PR #1 work, then PR #2 work, then commit them as two separate PRs.
 
 Wait, but I should think about this more carefully. If I commit them on the SAME branch as two commits, they become one PR. To have two PRs:
+
 - Branch 1: feat/zellij-refactor (PR #1)
 - Branch 2: feat/zellij-backend (PR #2, based on #1)
 
 I can do them sequentially on the same branch and then split via rebase. OR I can work on them as two separate branches with one stacked on the other.
 
-Best approach: 
+Best approach:
+
 1. Create `feat/zellij-refactor` branch (from master)
 2. Do PR #1 work, commit, push, mark ready
 3. Once PR #1 is merged (or while it's in review), create `feat/zellij-backend` from `feat/zellij-refactor`
@@ -944,6 +1001,7 @@ Best approach:
 For "parallel" work, I can do PR #1 work, then immediately start PR #2 on top of PR #1's branch (without waiting for merge). The two branches coexist.
 
 Actually since I'm an agent working solo, the most pragmatic approach is:
+
 - Do PR #1 work and commit on `feat/zellij-refactor`
 - Push and create PR #1
 - Then create `feat/zellij-backend` from `feat/zellij-refactor`
@@ -963,6 +1021,7 @@ Let me answer the user clearly:
 3. **Fully serial** (PR #1 merged, then PR #2 on master): **YES** but slower.
 
 Recommend option 2. I'll set up the work to be ready in this order:
+
 - Phase 1: `feat/zellij-refactor` — extract interface, ship tmux implementation, no behavior change
 - Phase 2: `feat/zellij-backend` — branches off phase 1, add zellij + tool param + tests
 
@@ -971,6 +1030,7 @@ Both branches can be on disk and pushed at the same time. A human reviewer can r
 Let me also think about what to commit on each:
 
 **Branch 1: `feat/zellij-multiplexer-refactor`**
+
 - New: `src/multiplexer.ts` (interface + resolver)
 - New: `src/multiplexer-tmux.ts` (extracted)
 - Modified: `src/interactive-tmux.ts` (thin wrapper)
@@ -978,6 +1038,7 @@ Let me also think about what to commit on each:
 - All 261 tests pass unchanged
 
 **Branch 2: `feat/zellij-multiplexer-backend`**
+
 - Branched from: `feat/zellij-multiplexer-refactor`
 - New: `src/multiplexer-zellij.ts`
 - Modified: `src/multiplexer.ts` (no changes; interface already in branch 1)
@@ -1005,7 +1066,7 @@ Good question — this is a real UX constraint that affects how the feature gets
 
 ## Current constraint
 
-The tool refuses to spawn unless pi is *already* running inside a tmux/zellij session. The check is at `interactive-tmux.ts:115`:
+The tool refuses to spawn unless pi is _already_ running inside a tmux/zellij session. The check is at `interactive-tmux.ts:115`:
 
 ```ts
 export function isTmuxAvailable(): boolean {
@@ -1016,6 +1077,7 @@ export function isTmuxAvailable(): boolean {
 The `process.env.TMUX` half is the restrictive part — it requires the **parent** to be in tmux. The reason: the spawn uses `$TMUX_PANE` (for splits) and `$TMUX` (for new windows) to know where to put the child. If those are unset, the spawn path falls over.
 
 **What this means for users today:**
+
 - `pi` started from a regular terminal → interactive sub-agents are disabled, tool errors with "Start pi inside tmux"
 - Workaround: `Ctrl-C` pi, then `tmux new -A -s pi 'pi'` to restart pi inside tmux
 
@@ -1027,10 +1089,10 @@ The right fix is: **the backend just needs the binary available, not the parent 
 
 This works on both backends:
 
-| Mode | Parent in mux | Parent NOT in mux |
-|---|---|---|
+| Mode                                | Parent in mux                   | Parent NOT in mux                  |
+| ----------------------------------- | ------------------------------- | ---------------------------------- |
 | `background: false` (visible split) | split-window in current session | **fallback: new detached session** |
-| `background: true` (new window) | new-window in current session | **fallback: new detached session** |
+| `background: true` (new window)     | new-window in current session   | **fallback: new detached session** |
 
 The fallback is the same in both rows: spawn a fresh detached session, put the child there, return the attach command. The user runs `tmux attach -t pi-subagent-<id>` (or `zellij attach pi-subagent-<id>`) to see it.
 
@@ -1042,7 +1104,7 @@ We **cannot** kill our own parent process to restart pi in tmux — that's a for
 
 1. **Document the one-liner** (`tmux new -A -s pi 'pi'`) in the README
 2. **Print a hint** when the user tries to spawn a sub-agent without being in tmux, telling them how to restart
-3. **Implement the auto-spawn-new-session fallback** (described above) so the user doesn't *need* to restart — they just attach to the new session afterwards
+3. **Implement the auto-spawn-new-session fallback** (described above) so the user doesn't _need_ to restart — they just attach to the new session afterwards
 
 Option 3 is the real fix. It makes the "restart pi in tmux" step **optional** — only useful if the user wants the sub-agent to share their current tmux session. For everyone else, the auto-spawn-new-session path Just Works.
 
@@ -1058,12 +1120,14 @@ It's strictly more permissive (a strict superset of the old behavior), so zero r
 ## What it looks like in practice
 
 **Today** (parent not in tmux):
+
 ```
 Tool: subagent_interactive
 → Error: Start pi inside tmux, for example: tmux new -A -s pi 'pi'
 ```
 
 **After PR #1** (parent not in tmux):
+
 ```
 Tool: subagent_interactive
 → Subagent abc12345 started in new tmux session "pi-subagent-abc12345".
@@ -1073,6 +1137,7 @@ Tool: subagent_interactive
 ```
 
 **After PR #1** (parent in tmux, same as today):
+
 ```
 Tool: subagent_interactive
 → Subagent abc12345 started in tmux pane %42 (background new window).
@@ -1085,14 +1150,14 @@ Three different UX paths, all driven by the same `mux` config, no user intervent
 
 ## Updated PR #1 scope
 
-| Component | Lines | What |
-|---|---|---|
-| `multiplexer.ts` (interface + resolver) | ~120 | 6 methods, `getMux()` with env-var auto-detect |
-| `multiplexer-tmux.ts` (extracted + relaxed) | ~280 | Includes the "create new session" fallback when parent not in tmux |
-| `interactive-tmux.ts` (rewrite) | ~150 | Thin wrapper |
-| `subagent.ts` (tool surface) | ~30 | Use `getMux()`, surface `attachCommand` from the chosen mux |
-| Tests | ~150 | New: spawn-without-parent-in-tmux fallback test |
-| **Total** | **~730** | Slight bump from initial 600 — the relaxed check is net new |
+| Component                                   | Lines    | What                                                               |
+| ------------------------------------------- | -------- | ------------------------------------------------------------------ |
+| `multiplexer.ts` (interface + resolver)     | ~120     | 6 methods, `getMux()` with env-var auto-detect                     |
+| `multiplexer-tmux.ts` (extracted + relaxed) | ~280     | Includes the "create new session" fallback when parent not in tmux |
+| `interactive-tmux.ts` (rewrite)             | ~150     | Thin wrapper                                                       |
+| `subagent.ts` (tool surface)                | ~30      | Use `getMux()`, surface `attachCommand` from the chosen mux        |
+| Tests                                       | ~150     | New: spawn-without-parent-in-tmux fallback test                    |
+| **Total**                                   | **~730** | Slight bump from initial 600 — the relaxed check is net new        |
 
 Want me to include the relaxed check in PR #1, or keep PR #1 minimal (just the refactor) and ship the relaxed check as a follow-up?
 
@@ -1108,7 +1173,9 @@ The user is asking a really important question about the workflow:
 This is a fundamental architectural question. Let me think through the current state and the implications.
 
 ### Current state
+
 The current code (`isTmuxAvailable` in `interactive-tmux.ts` line 115) checks:
+
 - `process.env.TMUX` is set (we're inside a tmux session)
 - `tmux` binary is on PATH
 
@@ -1117,16 +1184,17 @@ If either is false, the tool errors with "Start pi inside tmux, for example: tmu
 So the answer to (1) is currently **NO** — the sub-agent spawn fails if the main Pi session isn't inside tmux.
 
 ### Why is this a constraint?
+
 - `TMUX_PANE` env var tells us the parent pane, so we can do `split-window -t $TMUX_PANE` to get a side-by-side split, or `new-window -t $TMUX` to get a new window in the same session.
 - If we're not inside tmux, we don't have a session to put the new pane in.
 - We could create a brand-new detached tmux session, but then the user can't easily see/attach to it.
 
 ### The user's two questions
+
 1. **Start sub-agents in tmux/zellij when Pi isn't there?** — This is a UX question. Should we:
    - a) Refuse (current behavior)
    - b) Auto-create a new tmux session and put the child there
    - c) Auto-spawn the child in a detached tmux server (similar to background mode)
-   
 2. **Can we restart the Pi main session in tmux/zellij?** — This is a session-management question. Pi is the editor. Restarting it would lose all the conversation context. The user might be asking:
    - a) Can we launch a NEW pi inside tmux and migrate?
    - b) Can the user manually restart their pi inside tmux to enable the feature?
@@ -1135,6 +1203,7 @@ So the answer to (1) is currently **NO** — the sub-agent spawn fails if the ma
 Let me think about this more carefully. The user is asking BEFORE we start the implementation. They want to know what the constraint is and whether we can relax it.
 
 The honest answer:
+
 - **Current constraint:** Pi must be running inside tmux. This is a friction point.
 - **Workaround:** `tmux new -A -s pi 'pi'` (or zellij equivalent) — start a tmux session, then start pi inside it.
 - **Auto-create option:** We could detect "pi is not in a tmux session" and create one programmatically. This is doable but has UX implications:
@@ -1145,6 +1214,7 @@ The honest answer:
 ### The architectural decision
 
 Looking at the current code more carefully, the `isTmuxAvailable` check is:
+
 ```ts
 export function isTmuxAvailable(): boolean {
   return Boolean(process.env.TMUX && commandExists("tmux"));
@@ -1154,6 +1224,7 @@ export function isTmuxAvailable(): boolean {
 It checks `process.env.TMUX` — this is set ONLY when pi is running inside a tmux session. So the check is "is the parent in tmux?"
 
 But the code can spawn in two modes:
+
 - `split-window` (visible side-by-side) — needs `$TMUX_PANE` to know where to split
 - `new-window` (new window in same session) — needs `$TMUX` to know which session to add to
 
@@ -1164,12 +1235,14 @@ Both modes REQUIRE the parent to be in tmux. There's no "spawn in a different tm
 I think the user is asking: should we make the tool more permissive? Can the sub-agent work even if pi isn't currently in tmux?
 
 The answer is yes, and it's actually easy:
+
 - **Mode A: attachable from outside** — create a brand-new detached tmux session (different from the parent's), put the child there, return attach commands. Today the tool's `attachCommand` already supports `tmux attach -t <sess>` from outside, so this would Just Work if we relaxed the `isTmuxAvailable` check.
 - **Mode B: orphan** — same as A but the parent doesn't need to be in tmux.
 
 Both are achievable. The current code's "you must be in tmux" check is overly restrictive. The `subagent_interactive` tool could just create a new detached session and let the user attach.
 
 This is actually a meaningful improvement that can ship alongside zellij support. The flow would be:
+
 1. User runs `pi` (not in tmux)
 2. User invokes `subagent_interactive`
 3. Tool creates a new detached tmux session (e.g., named `pi-subagent-<id>`)
@@ -1178,6 +1251,7 @@ This is actually a meaningful improvement that can ship alongside zellij support
 6. The poller continues to work because the new session is independent of the parent's
 
 This is actually a BIG improvement. Let me think about the constraints:
+
 - Zellij has a similar pattern: `zellij attach --create-background <name>` (new in v0.44)
 - Both backends support creating a new detached session from outside
 - The artifact dir is still under the parent's `PI_CODING_AGENT_SESSION_DIR` so the parent can read it
@@ -1186,6 +1260,7 @@ This is actually a BIG improvement. Let me think about the constraints:
 ### Restart pi in tmux — viable?
 
 Restarting pi to put it in tmux is a real workflow:
+
 - User: `Ctrl-C` to stop the current pi
 - User: `tmux new -A -s pi 'pi'` to start a new tmux session with pi inside
 - User is now in a tmux session with pi
@@ -1211,6 +1286,7 @@ For the "background mode" (new-window -d), the child goes to a new window in the
 For the "visible split mode" (split-window -h), this REQUIRES the parent to be in tmux. If the parent isn't in tmux, we'd need to fall back to "new detached session" mode.
 
 So the new behavior:
+
 - If parent in tmux/zellij AND background=false → visible split (current)
 - If parent in tmux/zellij AND background=true → new window in same session (current)
 - If parent NOT in tmux/zellij AND background=false → create new detached session (new fallback)
@@ -1228,9 +1304,10 @@ OK let me draft a clear, focused answer.
 
 > 🛠️ Tool call: **ask_user**
 > Arguments: ```json
-{
-  "question": "Should PR #1 include the relaxed spawn check?",
-  "options": [
+> {
+> "question": "Should PR #1 include the relaxed spawn check?",
+> "options": [
+
     {
       "title": "Yes, bundle the relaxed check into PR #1",
       "description": "PR #1 ships the refactor AND the new fallback (auto-spawn in a fresh detached session when parent isn't in tmux/zellij). One PR, one merge, one user-visible improvement. PR #2 just adds zellij backend on top."
@@ -1239,9 +1316,11 @@ OK let me draft a clear, focused answer.
       "title": "Keep PR #1 minimal (refactor only)",
       "description": "PR #1 ships only the refactor with zero behavior change. The relaxed-spawn UX improvement goes into a separate small PR (call it #0 or #1.5) between #1 and #2. More PRs but each is tightly focused."
     }
-  ]
+
+]
 }
-```
+
+````
 
 ---
 
@@ -1277,7 +1356,7 @@ No, communication is unaffected. Let me show why by walking through the actual c
 ```bash
 trap 'if [ -f "${artifactDir}/.cancelled" ]; then "${cliPath}" cancelled; else "${cliPath}" done "$?"; fi;
        tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true' EXIT
-```
+````
 
 The `tmux set-option` line is the **only** place session env vars matter. And it already has `2>/dev/null || true` to fail silently. The `done <code>` write to the artifact happens BEFORE the set-option call and is the actual source of truth for the exit code.
 
@@ -1285,13 +1364,13 @@ For the zellij backend, we'd skip the set-option call entirely (zellij has no eq
 
 ## What this means concretely
 
-| Scenario | Today's behavior | After relaxed check |
-|---|---|---|
-| Parent in tmux, spawn child in same session | ✅ works | ✅ same |
-| Parent in tmux, spawn child in new detached session | ✅ works (background mode) | ✅ same |
-| Parent NOT in tmux, spawn child | ❌ error: "start pi inside tmux" | ✅ creates new detached session, returns attach cmd |
-| Child in new session, parent in different session | n/a | ✅ parent reads child's output.md normally |
-| Child in new session, parent exits (Ctrl-C pi) | n/a | ✅ child continues running in its session; user re-attaches later |
+| Scenario                                                                     | Today's behavior                 | After relaxed check                                                                   |
+| ---------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------- |
+| Parent in tmux, spawn child in same session                                  | ✅ works                         | ✅ same                                                                               |
+| Parent in tmux, spawn child in new detached session                          | ✅ works (background mode)       | ✅ same                                                                               |
+| Parent NOT in tmux, spawn child                                              | ❌ error: "start pi inside tmux" | ✅ creates new detached session, returns attach cmd                                   |
+| Child in new session, parent in different session                            | n/a                              | ✅ parent reads child's output.md normally                                            |
+| Child in new session, parent exits (Ctrl-C pi)                               | n/a                              | ✅ child continues running in its session; user re-attaches later                     |
 | Parent in tmux spawns child in new detached session, then detaches from tmux | n/a (parent had to stay in tmux) | ✅ parent can leave tmux, child continues, poller still reads artifact via filesystem |
 
 The last row is actually a **new capability** that falls out for free: the parent can now spawn-and-forget sub-agents that outlive the parent's terminal session. The child keeps working because it owns its own tmux/zellij server. The user can come back hours later, re-attach, and read the result.
@@ -1336,7 +1415,7 @@ Let me think carefully about the communication paths:
    - Actually, the launch script just runs bash in the pane. The pane exists because the spawn created it. The script doesn't care which session it spawned in.
 
 5. **The EXIT trap:**
-   - The trap calls `cli.mjs done <code>` 
+   - The trap calls `cli.mjs done <code>`
    - This writes to the artifact dir
    - Then `tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?"` — this is the ONLY place that uses the session env vars
    - In the new detached session, `$TMUX_PANE` is the child's pane
@@ -1348,6 +1427,7 @@ Wait, there's a subtle issue: the launch script uses `TMUX_PANE` to set the exit
 So communication is via filesystem (artifact dir), not via the session. The session is just a "where the child's terminal lives" thing. As long as the child can be created in any session (parent's or new), and the child writes to a shared artifact dir, communication works.
 
 Let me also think about edge cases:
+
 - What if the user closes the new detached session while the child is running? The child is killed, the artifact is partially written. Same as if the user killed the parent's tmux session. Not a new problem.
 - What if the user has two pi sessions running, one in tmux and one not, both spawning to the same artifact root? The artifact dir is per-spawn-id, so no conflict. The poller in each pi instance tracks its own spawns via the in-memory registry.
 - What if the parent dies (Ctrl-C the pi process) but the child is still running in the new detached session? The child continues until its own session is killed or the command finishes. The user can re-attach to see progress. This is actually a feature: child outlives parent.
@@ -1355,9 +1435,11 @@ Let me also think about edge cases:
 So no, the relaxed check does NOT affect communication. The artifact dir is the source of truth, and both parent and child can read/write it regardless of session membership.
 
 Let me also think about what specifically could break:
+
 - The `writeLaunchScript` writes a bash script. The script uses `TMUX_PANE` and `TMUX` for the exit-code trick. If neither is set (parent not in tmux), the `set-option` call would fail. We can guard it with `if [ -n "$TMUX" ]; then ... fi`.
 
 Actually, looking at the launch script:
+
 ```bash
 trap 'if [ -f "${artifactDir}/.cancelled" ]; then "${cliPath}" cancelled; else "${cliPath}" done "$?"; fi; tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true' EXIT
 ```
@@ -1376,5 +1458,4 @@ Let me write a clear answer with the specific communication paths.
 
 ### 🧑 User (line 988)
 
-sounds like a plan, lets do what we planned, lets understand how we can do the parallel work and use  freemodel/big-pickle for subagents
-
+sounds like a plan, lets do what we planned, lets understand how we can do the parallel work and use freemodel/big-pickle for subagents

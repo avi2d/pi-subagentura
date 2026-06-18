@@ -1,9 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, readFileSync, unlinkSync, mkdirSync, rmdirSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  unlinkSync,
+  mkdirSync,
+  rmdirSync,
+} from "node:fs";
 import { join } from "node:path";
 
 // Use dynamic import after setting env var
-const testDir = join(process.env.TEMP_DIR || "/tmp", `debug-log-test-${Date.now()}`);
+const testDir = join(
+  process.env.TEMP_DIR || "/tmp",
+  `debug-log-test-${Date.now()}`,
+);
 const currentLogFile = () =>
   join(testDir, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
@@ -60,7 +69,10 @@ describe("debugLog", () => {
     vi.resetModules();
     const { debugLog } = await import("./helpers");
 
-    debugLog("error", "subagent_error", { jobId: "test-job", error: "something broke" });
+    debugLog("error", "subagent_error", {
+      jobId: "test-job",
+      error: "something broke",
+    });
 
     const logFile = currentLogFile();
     const content = readFileSync(logFile, "utf-8");

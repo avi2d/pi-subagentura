@@ -54,4 +54,7 @@ console.log("detected:", detected || "TIMEOUT");
 const final = cancelInteractiveSubagent(state.id);
 console.log("cancelled:", final?.status);
 const all = [...interactiveSubagentRegistry.values()];
-console.log("registry:", all.map((s) => ({ id: s.id, status: s.status, pane: s.paneId })));
+console.log(
+  "registry:",
+  all.map((s) => ({ id: s.id, status: s.status, pane: s.paneId })),
+);

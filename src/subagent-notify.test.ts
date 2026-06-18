@@ -586,11 +586,7 @@ describe("notifyOnComplete", () => {
       const jobId = "status-override-model";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
-        mockJobResult(
-          jobId,
-          control.jobPromise,
-          "override/provider-model",
-        ),
+        mockJobResult(jobId, control.jobPromise, "override/provider-model"),
       );
 
       await isolatedToolDef.execute(
@@ -1050,7 +1046,9 @@ describe("read_subagent_artifact (invalid id)", () => {
       on: vi.fn(),
     };
     registerExtension(_api as any);
-    return _api.registerTool.mock.calls.find(([t]: any[]) => t.name === "read_subagent_artifact")?.[0];
+    return _api.registerTool.mock.calls.find(
+      ([t]: any[]) => t.name === "read_subagent_artifact",
+    )?.[0];
   }
 
   beforeEach(() => {
@@ -1066,7 +1064,13 @@ describe("read_subagent_artifact (invalid id)", () => {
     const toolDef = setupReadArtifactTool();
     expect(toolDef).toBeDefined();
 
-    const result = await toolDef.execute("call-malformed", { id: "not-a-hex-id" }, undefined, undefined, {} as any);
+    const result = await toolDef.execute(
+      "call-malformed",
+      { id: "not-a-hex-id" },
+      undefined,
+      undefined,
+      {} as any,
+    );
 
     expect(result.isError).toBe(true);
     expect(result.details.status).toBe("invalid_id");
@@ -1114,7 +1118,9 @@ describe("read_subagent_artifact (output reporting)", () => {
       on: vi.fn(),
     };
     (mod as any).default(_api as any);
-    return _api.registerTool.mock.calls.find(([t]: any[]) => t.name === "read_subagent_artifact")?.[0];
+    return _api.registerTool.mock.calls.find(
+      ([t]: any[]) => t.name === "read_subagent_artifact",
+    )?.[0];
   }
 
   beforeEach(() => {
@@ -1136,9 +1142,17 @@ describe("read_subagent_artifact (output reporting)", () => {
       const readTool = makeReadTool(mod);
       expect(readTool).toBeDefined();
 
-      const result = await readTool.execute("call-1", { id }, undefined, undefined, {} as any);
+      const result = await readTool.execute(
+        "call-1",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
       const text = result.content[0].text;
-      expect(text).toContain("Output: (sub-agent exited without writing output.md");
+      expect(text).toContain(
+        "Output: (sub-agent exited without writing output.md",
+      );
       expect(text).toContain("last event: done @ 2");
       expect(text).not.toContain("not written yet");
       expect(result.details.output).toBeNull();
@@ -1161,7 +1175,7 @@ describe("read_subagent_artifact (output reporting)", () => {
         cwd: "/tmp",
         startedAt: 1,
         status: "running",
-      mux: "tmux",
+        mux: "tmux",
         attachCommand: "tmux attach",
         selectPaneCommand: "tmux select-pane",
         launchScriptFile: "/tmp/launch.sh",
@@ -1169,13 +1183,25 @@ describe("read_subagent_artifact (output reporting)", () => {
       };
       const art = artifactPath(parent, id);
       appendEvent(art, { ts: 1, type: "started", status: "running" });
-      appendEvent(art, { ts: 2, type: "tool_activity", status: "running", tool: "bash", summary: "ls" });
+      appendEvent(art, {
+        ts: 2,
+        type: "tool_activity",
+        status: "running",
+        tool: "bash",
+        summary: "ls",
+      });
 
       const mod = await importFresh<typeof import("./subagent")>("./subagent");
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);
-      const result = await readTool.execute("call-2", { id }, undefined, undefined, {} as any);
+      const result = await readTool.execute(
+        "call-2",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
       const text = result.content[0].text;
       expect(text).toContain("Output: (2 events");
       expect(text).toContain("last: tool_activity @ 2");
@@ -1196,7 +1222,13 @@ describe("read_subagent_artifact (output reporting)", () => {
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);
-      const result = await readTool.execute("call-3", { id }, undefined, undefined, {} as any);
+      const result = await readTool.execute(
+        "call-3",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
       const text = result.content[0].text;
       expect(text).toContain("Output: (empty — 0 chars)");
       expect(result.details.output).toBe("");
@@ -1216,7 +1248,13 @@ describe("read_subagent_artifact (output reporting)", () => {
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);
-      const result = await readTool.execute("call-4", { id }, undefined, undefined, {} as any);
+      const result = await readTool.execute(
+        "call-4",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
       const text = result.content[0].text;
       expect(text).toContain("Output: 13 chars");
       expect(result.details.output).toBe("Hello, world!");
