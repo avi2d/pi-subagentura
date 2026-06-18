@@ -530,5 +530,147 @@ describe("pollArtifactChanges", () => {
 			expect(readFileSync(join(art.dir, "output-2.md"), "utf8")).toBe("answer v2 final");
 		});
 	});
-});
 
+	// ── Bug B regression tests (stale footer/widget for closed sub-agents) ──
+	// When a sub-agent is "exited" (terminal, pane dead) the for-loop at line
+	// ~518 of subagent.ts must still tail-read the session log (for user-role
+	// revival), but it must NOT contribute to the `runningCount` footer or
+	// the `widgetRows` list. `idle` sub-agents (between turns, REPL open) are
+	// still live and DO contribute to the running count.
+	describe("footer/widget (Bug B)", () => {
+		it("AC-B1: counts running + idle as 'running'; excludes exited from both footer and widget", async () => {
+			// Mock display-message to branch on paneId:
+			//   running-pane and idle-pane → alive (return success)
+			//   exited-pane              → dead (throw)
+			vi.resetModules();
+			vi.doMock("node:child_process", () => ({
+				execFileSync: (_file: string, args: string[]) => {
+					if (args[0] === "display-message") {
+						const paneId = args[3];
+						if (paneId === "%exited-pane") throw new Error("pane dead");
+						return Buffer.from("#99");
+					}
+					return "";
+				},
+			}));
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+
+			// Running sub-agent: no events in artifact; pane alive.
+			const running = makeState().state;
+			running.id = "running-1";
+			running.paneId = "%running-pane";
+			mod.interactiveSubagentRegistry.set(running.id, running);
+
+			// Idle sub-agent: done event, pane alive. artifactDir must be set so the
+			// poller reads from the same dir where we write the events.
+			const idle = makeState().state;
+			idle.id = "idle-1";
+			idle.paneId = "%idle-pane";
+			idle.lastDeliveredEventTs = 2;
+			idle.artifactDir = join(idle.artifactDir, "..", idle.id);
+			mod.interactiveSubagentRegistry.set(idle.id, idle);
+			const idleArt = artifactPath(join(idle.artifactDir, ".."), idle.id);
+			appendEvent(idleArt, { ts: 1, type: "started", status: "running" });
+			appendEvent(idleArt, { ts: 2, type: "done", status: "done", exitCode: 0 });
+
+			// Exited sub-agent: done event, pane dead.
+			const exited = makeState().state;
+			exited.id = "exited-1";
+			exited.paneId = "%exited-pane";
+			exited.lastDeliveredEventTs = 2;
+			exited.artifactDir = join(exited.artifactDir, "..", exited.id);
+			mod.interactiveSubagentRegistry.set(exited.id, exited);
+			const exitedArt = artifactPath(join(exited.artifactDir, ".."), exited.id);
+			appendEvent(exitedArt, { ts: 1, type: "started", status: "running" });
+			appendEvent(exitedArt, { ts: 2, type: "done", status: "done", exitCode: 0 });
+
+			const setStatus = vi.fn();
+			const setWidget = vi.fn();
+			(globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+
+			expect(setStatus).toHaveBeenCalledWith("subagentura-running", "⚡ 2 sub-agents running");
+			expect(setWidget).toHaveBeenCalledWith(
+				"subagentura-activity",
+				expect.any(Array),
+				{ placement: "belowEditor" },
+			);
+			const widgetArgs = setWidget.mock.calls[0];
+			expect(widgetArgs[1].length).toBe(2);
+
+			expect(exited.status).toBe("exited");
+			expect(idle.status).toBe("idle");
+			expect(running.status).toBe("running");
+
+			delete (globalThis as any).__piSubagenturaUi;
+		});
+
+		it("AC-B2: clears footer and widget when all sub-agents are exited", async () => {
+			vi.resetModules();
+			vi.doMock("node:child_process", () => ({
+				execFileSync: (_file: string, args: string[]) => {
+					if (args[0] === "-lc") return Buffer.from("");
+					throw new Error("pane dead");
+				},
+			}));
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+
+			const exited1 = makeState().state;
+			exited1.id = "exited-1";
+			exited1.lastDeliveredEventTs = 2;
+			exited1.artifactDir = join(exited1.artifactDir, "..", exited1.id);
+			mod.interactiveSubagentRegistry.set(exited1.id, exited1);
+			const exited1Art = artifactPath(join(exited1.artifactDir, ".."), exited1.id);
+			appendEvent(exited1Art, { ts: 1, type: "started", status: "running" });
+			appendEvent(exited1Art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+
+			const setStatus = vi.fn();
+			const setWidget = vi.fn();
+			(globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+
+			expect(setStatus).toHaveBeenCalledWith("subagentura-running", undefined);
+			expect(setWidget).toHaveBeenCalledWith(
+				"subagentura-activity",
+				undefined,
+				{ placement: "belowEditor" },
+			);
+
+			expect(exited1.status).toBe("exited");
+
+			delete (globalThis as any).__piSubagenturaUi;
+		});
+
+		it("AC-B3: all-running registry shows correct count (regression guard)", async () => {
+			vi.resetModules();
+			vi.doMock("node:child_process", () => ({
+				execFileSync: (_file: string, args: string[]) => {
+					if (args[0] === "display-message") return Buffer.from("#99");
+					return "";
+				},
+			}));
+			const mod = await importFresh<typeof import("./subagent")>("./subagent");
+
+			const a = makeState().state;
+			a.id = "a";
+			mod.interactiveSubagentRegistry.set(a.id, a);
+			const b = makeState().state;
+			b.id = "b";
+			mod.interactiveSubagentRegistry.set(b.id, b);
+
+			const setStatus = vi.fn();
+			const setWidget = vi.fn();
+			(globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+			mod.pollArtifactChanges({ sendMessage: vi.fn(), sendUserMessage: vi.fn() } as any);
+
+			expect(setStatus).toHaveBeenCalledWith("subagentura-running", "⚡ 2 sub-agents running");
+			const widgetArgs = setWidget.mock.calls[0];
+			expect(widgetArgs[1].length).toBe(2);
+
+			delete (globalThis as any).__piSubagenturaUi;
+		});
+	});
+});

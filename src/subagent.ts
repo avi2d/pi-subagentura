@@ -51,6 +51,7 @@ import {
 } from "./helpers";
 import {
 	cancelInteractiveSubagent,
+	cancelInteractiveSubagentByState,
 	deriveInteractiveSubagentStatus,
 	formatInteractiveState,
 	interactiveSubagentRegistry,
@@ -616,9 +617,25 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 		}
 
 
-		// TUI widget row: every iteration of the loop is a running sub-agent at this point.
-		runningCount++;
-		widgetRows.push(formatActivityRow(state));
+		// Only count sub-agents that are actively processing a turn as "running".
+
+		// "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
+
+		// running count and widget even though the for-loop keeps tail-reading its
+
+		// session log (for the user-role revival case in processSessionLogEntry).
+
+		// "idle" is between turns (REPL open, pane alive) — still a live sub-agent
+
+		// awaiting follow-up, so it stays in the count.
+
+		if (state.status === "running" || state.status === "idle") {
+
+			runningCount++;
+
+			widgetRows.push(formatActivityRow(state));
+
+		}
 	}
 
 	// Paint footer + widget. Both are TUI-only — never reach the LLM.
@@ -2497,26 +2514,33 @@ export default function (pi: ExtensionAPI) {
       } catch { /* defensive */ }
       g2.__piSubagenturaInteractivePollerHandle = undefined;
     }
+    // Snapshot running state objects BEFORE clearing, so we can kill their panes
+    // after the registry is empty. We can't call cancelInteractiveSubagent(id)
+    // after clear() because it looks up state from the registry (line 533 of
+    // interactive-tmux.ts) and returns undefined.
+    const runningStates: InteractiveSubagentState[] = [];
+    for (const state of interactiveSubagentRegistry.values()) {
+      if (state.status === "running") runningStates.push(state);
+    }
 
-    // Kill any tmux panes backing live interactive sub-agents. We can't leave them
-    // running — the parent process is shutting down. cancelInteractiveSubagent
-    // does the right thing (writes .cancelled, kills pane, lets trap record the event).
-    try {
-      for (const state of interactiveSubagentRegistry.values()) {
-        if (state.status === "running") {
-          try {
-            cancelInteractiveSubagent(state.id);
-          } catch { /* best effort */ }
-        }
-      }
-    } catch { /* best effort */ }
-
-    // Drop in-memory state for cancelled/exited interactive sub-agents. Without
-    // this, the Map grows unbounded across session_start/session_shutdown cycles
-    // and list_subagent_artifacts returns stale entries from previous sessions.
+    // Drop in-memory state FIRST. An in-flight poll tick (dequeued from
+    // setInterval before clearInterval ran) finds an empty registry and its
+    // for-loop iterates over zero entries — no work, no notification delivery.
+    // `__piSubagenturaPiRef` is still valid at this point (cleared later), so
+    // the tick proceeds into the loop and finds nothing.
     try {
       interactiveSubagentRegistry.clear();
     } catch { /* best effort */ }
+
+    // Kill the panes using the snapshotted states. The poller is already safe
+    // (registry empty). We use cancelInteractiveSubagentByState (not the
+    // id-based variant) because the registry is already cleared.
+    for (const state of runningStates) {
+      try {
+        cancelInteractiveSubagentByState(state);
+      } catch { /* best effort */ }
+    }
+
 
     // Abort all running subagent sessions before clearing
     for (const job of jobRegistry.values()) {

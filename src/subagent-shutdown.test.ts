@@ -12,12 +12,22 @@
  * These tests stub `setInterval` / `clearInterval` to capture the handle
  * and call args, and `vi.spyOn` the `cancelInteractiveSubagent` export
  * so we can assert which ids were cancelled without touching tmux.
+ *
+ * The two `AC-A*` tests at the bottom are regression tests for Bug A
+ * (duplicate notification on parent session close). They exercise the
+ * race between an in-flight poll tick and the shutdown handler by
+ * calling `pollArtifactChanges` directly at the boundaries of the
+ * shutdown sequence.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as interactiveTmux from "./interactive-tmux";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+import { appendEvent, artifactPath } from "./artifact";
 import { jobRegistry } from "./helpers";
-import registerExtension from "./subagent";
+import registerExtension, { pollArtifactChanges } from "./subagent";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -76,6 +86,7 @@ describe("session_shutdown handler", () => {
   let setIntervalSpy: ReturnType<typeof vi.spyOn>;
   let clearIntervalSpy: ReturnType<typeof vi.spyOn>;
   let cancelSpy: ReturnType<typeof vi.spyOn>;
+  let cancelByStateSpy: ReturnType<typeof vi.spyOn>;
   let fakeHandle: { unref: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
@@ -98,17 +109,22 @@ describe("session_shutdown handler", () => {
       .spyOn(globalThis, "clearInterval")
       .mockImplementation(() => {})) as any;
 
-    // Spy on cancelInteractiveSubagent so the handler's iteration logic
-    // can be observed without touching the filesystem or running tmux.
+    // Spy on cancelInteractiveSubagent + cancelInteractiveSubagentByState so the
+    // handler's iteration logic can be observed without touching the filesystem
+    // or running tmux. The shutdown handler now uses the byState variant
+    // (bypasses registry lookup) after snapshotting.
     cancelSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagent") as any;
     cancelSpy.mockImplementation(((id: string) =>
       interactiveTmux.interactiveSubagentRegistry.get(id)) as any);
+    cancelByStateSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagentByState") as any;
+    cancelByStateSpy.mockImplementation((() => undefined) as any);
   });
 
   afterEach(() => {
     setIntervalSpy.mockRestore();
     clearIntervalSpy.mockRestore();
     cancelSpy.mockRestore();
+    cancelByStateSpy.mockRestore();
     // The shutdown handler nulls the global handle; restore to undefined
     // so the next test starts from a clean slate.
     (globalThis as any).__piSubagenturaInteractivePollerHandle = undefined;
@@ -143,22 +159,40 @@ describe("session_shutdown handler", () => {
     expect((globalThis as any).__piSubagenturaInteractivePollerHandle).toBeUndefined();
   });
 
-  it("calls cancelInteractiveSubagent for running states but not non-running", () => {
+  it("cancels running sub-agents via cancelInteractiveSubagentByState (registry-bypass) and skips non-running", () => {
+
     const running = makeState("run-1", "running");
+
     const cancelled = makeState("canc-1", "cancelled");
+
     const exited = makeState("exit-1", "exited");
+
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+
     interactiveTmux.interactiveSubagentRegistry.set(cancelled.id, cancelled);
+
     interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
 
+
+
     const { shutdownHandler } = setupExtension();
+
     shutdownHandler!();
 
-    // The handler iterates values() and filters on status === "running".
-    expect(cancelSpy).toHaveBeenCalledTimes(1);
-    expect(cancelSpy).toHaveBeenCalledWith("run-1");
-    expect(cancelSpy).not.toHaveBeenCalledWith("canc-1");
-    expect(cancelSpy).not.toHaveBeenCalledWith("exit-1");
+
+
+    // The handler snapshots running states, clears the registry, then calls the
+
+ // byState variant (which bypasses the registry lookup). The id-based
+
+    // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
+
+    expect(cancelByStateSpy).toHaveBeenCalledTimes(1);
+
+    expect(cancelByStateSpy).toHaveBeenCalledWith(running);
+
+    expect(cancelSpy).not.toHaveBeenCalled();
+
   });
 
   it("clears interactiveSubagentRegistry in session_shutdown", () => {
@@ -176,5 +210,81 @@ describe("session_shutdown handler", () => {
     shutdownHandler!();
 
     expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
+  });
+
+  // ── Bug A regression tests (duplicate notification on shutdown) ──
+  // The race: a poll tick dequeued from setInterval before clearInterval
+  // runs can observe the in-progress cancel state. The fix (snapshot-then-clear
+  // in session_shutdown) means a post-shutdown tick finds an empty registry
+  // and delivers zero notifications. These tests reproduce the race by calling
+  // pollArtifactChanges directly at the boundaries of the shutdown sequence.
+  let tmpRoot: string;
+
+  function makeArtifactState(
+    id: string,
+    status: InteractiveSubagentState["status"],
+    artifactDir: string,
+  ): InteractiveSubagentState {
+    return {
+      ...makeState(id, status),
+      artifactDir,
+    };
+  }
+
+  it("AC-A1: delivers zero notifications when session_shutdown fires while a sub-agent is running (no artifact events)", () => {
+    // Empty tmp artifact dir; no events written.
+    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a1-"));
+    const artifactDir = join(tmpRoot, "run-1");
+    const running = makeArtifactState("run-1", "running", artifactDir);
+    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+
+    const { api, shutdownHandler } = setupExtension();
+    (globalThis as any).__piSubagenturaPiRef = api;
+
+    // 1. In-flight tick BEFORE shutdown: iterates the registry, no events to deliver.
+    pollArtifactChanges(api as any);
+    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+
+    // 2. Shutdown handler runs.
+    shutdownHandler!();
+
+    // 3. Post-shutdown tick (the in-flight one that survived clearInterval):
+    //    must deliver zero notifications because the registry is empty.
+    pollArtifactChanges(api as any);
+    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it("AC-A2: does not re-notify after shutdown for a running sub-agent whose done event was already delivered", () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a2-"));
+    const artifactDir = join(tmpRoot, "run-1");
+    const running = makeArtifactState("run-1", "running", artifactDir);
+    // Pre-write a done event with a fixed ts.
+    const doneTs = 1000;
+    const art = artifactPath(join(artifactDir, ".."), "run-1");
+    appendEvent(art, { ts: doneTs, type: "done", status: "done", exitCode: 0 });
+    // Mark the done as already delivered so the FIRST tick does not re-notify.
+    running.lastDeliveredEventTs = doneTs;
+    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+
+    const { api, shutdownHandler } = setupExtension();
+    (globalThis as any).__piSubagenturaPiRef = api;
+
+    // 1. In-flight tick BEFORE shutdown: done already delivered, no notification.
+    pollArtifactChanges(api as any);
+    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+
+    // 2. Shutdown handler runs.
+    shutdownHandler!();
+
+    // 3. Post-shutdown tick: registry is empty, no notification.
+    pollArtifactChanges(api as any);
+    expect(api.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  afterEach(() => {
+    // Clean up tmp artifact dirs created by the AC-A* tests.
+    if (tmpRoot) {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   });
 });

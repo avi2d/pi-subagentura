@@ -580,6 +580,25 @@ export function cancelInteractiveSubagent(id: string): InteractiveSubagentState 
 }
 
 /**
+ * Kills a tmux pane and writes the .cancelled flag for an interactive sub-agent,
+ * bypassing the registry. Used by the session_shutdown handler which snapshots
+ * running states before clearing the registry.
+ */
+export function cancelInteractiveSubagentByState(state: InteractiveSubagentState): void {
+	// 1. Write .cancelled flag (best-effort)
+	try {
+		writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
+	} catch { /* best-effort */ }
+
+	// 2. Kill the pane if alive (best-effort)
+	const mux = getMuxForState(state);
+	if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+		try { mux.killPane(state.paneId, state.muxSession); } catch { /* best-effort */ }
+	}
+	// Does NOT update state.status — the registry is already cleared.
+}
+
+/**
  * Pure status-decision matrix used by both `pruneDeadInteractiveSubagents` (here) and the
  * artifact poller in `subagent.ts`. Pulled out so the rules are testable without a live tmux.
  *
