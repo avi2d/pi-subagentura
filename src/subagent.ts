@@ -526,173 +526,191 @@ function shouldNotify(event: SubagentEvent): boolean {
  * then advance the cursor. This naturally handles restart / backlog cases.
  */
 export function pollArtifactChanges(pi: ExtensionAPI): void {
-  const g2 = typeof global !== "undefined" ? global : globalThis;
-  const interactivePi =
-    (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
-  if (!interactivePi) return;
+  // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
+  // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
+  // pi ctx) try again. The loader's assertActive stale-ctx check (thrown by sendUserMessage and a
+  // few other call sites below) is the most likely culprit after a session reload/replace.
+  try {
+    const g2 = typeof global !== "undefined" ? global : globalThis;
+    const interactivePi =
+      (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
+    if (!interactivePi) return;
 
-  let runningCount = 0;
-  const widgetRows: string[] = [];
-  const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
+    let runningCount = 0;
+    const widgetRows: string[] = [];
+    const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
-  for (const state of interactiveSubagentRegistry.values()) {
-    // Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
-    // revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
-    // follow-up user message lands in the session log (auto-done case). To make that reachable,
-    // the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
-    // status-update block below may re-mark the state as "exited" (based on a stale synthesized
-    // error event in the artifact) but the revival, running later in the same poll via
-    // tailReadSessionLog, will reset it to "running" within this same tick.
-    if (state.status === "cancelled" || state.status === "unknown") continue;
+    for (const state of interactiveSubagentRegistry.values()) {
+      // Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
+      // revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
+      // follow-up user message lands in the session log (auto-done case). To make that reachable,
+      // the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
+      // status-update block below may re-mark the state as "exited" (based on a stale synthesized
+      // error event in the artifact) but the revival, running later in the same poll via
+      // tailReadSessionLog, will reset it to "running" within this same tick.
+      if (state.status === "cancelled" || state.status === "unknown") continue;
 
-    const art = artifactPath(
-      dirname(state.artifactDir),
-      basename(state.artifactDir),
-    );
-    const last = lastEvent(art);
+      const art = artifactPath(
+        dirname(state.artifactDir),
+        basename(state.artifactDir),
+      );
+      const last = lastEvent(art);
 
-    // Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
-    // which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
-    // here and the inject path below will fire again.
-    const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
-    if (next !== state.status) {
-      state.status = next;
-      if (
-        next === "exited" &&
-        last &&
-        last.type === "done" &&
-        last.exitCode !== undefined
-      ) {
-        state.exitCode = last.exitCode;
-      }
-    }
-
-    // Tail-read the child's session log and synthesize tool_activity events.
-    // TUI-widget only — the LLM never sees them.
-    tailReadSessionLog(state, art);
-
-    // Auto-done fallback: synthesize a completion event when the model ended its turn with
-    // stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
-    // event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
-    // guard so the events loop below will not re-notify.
-    maybeAutoDone(state, art, interactivePi, Date.now());
-
-    // Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
-    // so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
-    const cursor = state.lastDeliveredEventTs ?? 0;
-    const events = readEvents(art, cursor + 1);
-
-    if (events.length > 0) {
-      let maxTs = cursor;
-      for (const ev of events) {
-        if (ev.ts > maxTs) maxTs = ev.ts;
-        if (!shouldNotify(ev)) continue;
-        // If auto-done already fired for this turn, skip any later explicit `done` events:
-        // they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
+      // Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
+      // which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
+      // here and the inject path below will fire again.
+      const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
+      if (next !== state.status) {
+        state.status = next;
         if (
-          state.autoDoneForTurnAt !== undefined &&
-          ev.ts >= state.autoDoneForTurnAt &&
-          ev.type === "done"
-        )
-          continue;
-        deliverArtifactNotification(interactivePi, state, ev);
-      }
-      state.lastDeliveredEventTs = maxTs;
-    }
-
-    // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
-    // history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
-    // so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
-    // `lastInjectedEventTs` would corrupt history in the default `notify` mode.
-    if (last && last.type === "done" && state.lastSnapshotEventTs !== last.ts) {
-      const allEvents = readEvents(art);
-      const turnNumber = allEvents.filter((e) => e.type === "done").length;
-      snapshotOutput(art, turnNumber);
-      state.lastSnapshotEventTs = last.ts;
-    }
-
-    // Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
-    // Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
-    // so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
-    if (
-      last &&
-      last.type === "done" &&
-      state.notifyOnComplete === "inject" &&
-      state.lastInjectedEventTs !== last.ts
-    ) {
-      const output = readOutput(art);
-      if (output !== null) {
-        if (getInjectCount() >= MAX_INJECT) {
-          // Degrade silently: pointer notification was already delivered above,
-          // so the user still sees a hint. We just don't inject.
-          try {
-            interactivePi.sendMessage!(
-              {
-                customType: "subagent-notify",
-                content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
-                display: true,
-                details: { subagentId: state.id, mode: "notify" },
-              },
-              { deliverAs: "followUp" },
-            );
-          } catch {
-            /* pi stale */
-          }
-        } else {
-          incrementInjectCount();
-          try {
-            (interactivePi as any).sendUserMessage?.(
-              output || "(sub-agent produced no output)",
-              { deliverAs: "followUp" },
-            );
-          } finally {
-            decrementInjectCount();
-          }
+          next === "exited" &&
+          last &&
+          last.type === "done" &&
+          last.exitCode !== undefined
+        ) {
+          state.exitCode = last.exitCode;
         }
       }
-      // Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
-      // turn has a fresh ts, so the comparison re-fires.
-      state.lastInjectedEventTs = last.ts;
+
+      // Tail-read the child's session log and synthesize tool_activity events.
+      // TUI-widget only — the LLM never sees them.
+      tailReadSessionLog(state, art);
+
+      // Auto-done fallback: synthesize a completion event when the model ended its turn with
+      // stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
+      // event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
+      // guard so the events loop below will not re-notify.
+      maybeAutoDone(state, art, interactivePi, Date.now());
+
+      // Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
+      // so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
+      const cursor = state.lastDeliveredEventTs ?? 0;
+      const events = readEvents(art, cursor + 1);
+
+      if (events.length > 0) {
+        let maxTs = cursor;
+        for (const ev of events) {
+          if (ev.ts > maxTs) maxTs = ev.ts;
+          if (!shouldNotify(ev)) continue;
+          // If auto-done already fired for this turn, skip any later explicit `done` events:
+          // they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
+          if (
+            state.autoDoneForTurnAt !== undefined &&
+            ev.ts >= state.autoDoneForTurnAt &&
+            ev.type === "done"
+          )
+            continue;
+          deliverArtifactNotification(interactivePi, state, ev);
+        }
+        state.lastDeliveredEventTs = maxTs;
+      }
+
+      // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
+      // history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
+      // so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
+      // `lastInjectedEventTs` would corrupt history in the default `notify` mode.
+      if (
+        last &&
+        last.type === "done" &&
+        state.lastSnapshotEventTs !== last.ts
+      ) {
+        const allEvents = readEvents(art);
+        const turnNumber = allEvents.filter((e) => e.type === "done").length;
+        snapshotOutput(art, turnNumber);
+        state.lastSnapshotEventTs = last.ts;
+      }
+
+      // Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
+      // Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
+      // so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
+      if (
+        last &&
+        last.type === "done" &&
+        state.notifyOnComplete === "inject" &&
+        state.lastInjectedEventTs !== last.ts
+      ) {
+        const output = readOutput(art);
+        if (output !== null) {
+          if (getInjectCount() >= MAX_INJECT) {
+            // Degrade silently: pointer notification was already delivered above,
+            // so the user still sees a hint. We just don't inject.
+            try {
+              interactivePi.sendMessage!(
+                {
+                  customType: "subagent-notify",
+                  content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
+                  display: true,
+                  details: { subagentId: state.id, mode: "notify" },
+                },
+                { deliverAs: "followUp" },
+              );
+            } catch {
+              /* pi stale */
+            }
+          } else {
+            incrementInjectCount();
+            try {
+              (interactivePi as any).sendUserMessage?.(
+                output || "(sub-agent produced no output)",
+                { deliverAs: "followUp" },
+              );
+            } catch {
+              /* pi stale — next poll tick will re-attempt with a refreshed ctx */
+            } finally {
+              decrementInjectCount();
+            }
+          }
+        }
+        // Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
+        // turn has a fresh ts, so the comparison re-fires.
+        state.lastInjectedEventTs = last.ts;
+      }
+
+      // Only count sub-agents that are actively processing a turn as "running".
+
+      // "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
+
+      // running count and widget even though the for-loop keeps tail-reading its
+
+      // session log (for the user-role revival case in processSessionLogEntry).
+
+      // "idle" is between turns (REPL open, pane alive) — still a live sub-agent
+
+      // awaiting follow-up, so it stays in the count.
+
+      if (state.status === "running" || state.status === "idle") {
+        runningCount++;
+
+        widgetRows.push(formatActivityRow(state));
+      }
     }
 
-    // Only count sub-agents that are actively processing a turn as "running".
-
-    // "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
-
-    // running count and widget even though the for-loop keeps tail-reading its
-
-    // session log (for the user-role revival case in processSessionLogEntry).
-
-    // "idle" is between turns (REPL open, pane alive) — still a live sub-agent
-
-    // awaiting follow-up, so it stays in the count.
-
-    if (state.status === "running" || state.status === "idle") {
-      runningCount++;
-
-      widgetRows.push(formatActivityRow(state));
+    // Paint footer + widget. Both are TUI-only — never reach the LLM.
+    if (ui) {
+      try {
+        ui.setStatus(
+          FOOTER_KEY,
+          runningCount > 0
+            ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
+            : undefined,
+        );
+      } catch {
+        /* ui stale */
+      }
+      try {
+        ui.setWidget(
+          WIDGET_KEY,
+          widgetRows.length > 0 ? widgetRows : undefined,
+          {
+            placement: "belowEditor",
+          },
+        );
+      } catch {
+        /* ui stale */
+      }
     }
-  }
-
-  // Paint footer + widget. Both are TUI-only — never reach the LLM.
-  if (ui) {
-    try {
-      ui.setStatus(
-        FOOTER_KEY,
-        runningCount > 0
-          ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
-          : undefined,
-      );
-    } catch {
-      /* ui stale */
-    }
-    try {
-      ui.setWidget(WIDGET_KEY, widgetRows.length > 0 ? widgetRows : undefined, {
-        placement: "belowEditor",
-      });
-    } catch {
-      /* ui stale */
-    }
+  } catch {
+    /* defensive: never let one bad poll tick crash the parent process */
   }
 }
 
