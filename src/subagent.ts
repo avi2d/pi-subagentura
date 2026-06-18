@@ -74,6 +74,7 @@ import {
 	type SubagentEvent,
 } from "./artifact";
 import type { Usage } from "./helpers";
+import { registerWorkflowTool } from "./workflow";
 
 import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1199,6 +1200,9 @@ export default function (pi: ExtensionAPI) {
 		handle.unref?.();
 		g2.__piSubagenturaInteractivePollerHandle = handle;
 	}
+  // ── Tool: workflow — deterministic JS orchestration of isolated sub-agents ──
+  registerWorkflowTool(pi);
+
   // ── Tool 1: inherits conversation history ────────────────────────
   pi.registerTool({
     name: "subagent_with_context",
