@@ -342,16 +342,41 @@ export function writeLaunchScript(path: string, command: string, artifactDir: st
 	// 2. Write the launch script. The script:
 	//    - exports ARTIFACT_DIR so the child inherits it;
 	//    - calls `cli.mjs start` to record the started event;
-	//    - traps EXIT to call `cli.mjs done <code>` (or `cancelled` if a .cancelled flag is present);
+	//    - traps EXIT to record a terminal event in events.ndjson. The trap is IDEMPOTENT:
+	//      it inspects the last line of events.ndjson and skips the write if a terminal type
+	//      (done / error / cancelled) is already present. Without this guard, a child that
+	//      obeyed the protocol and called `cli.mjs done 0` would, on REPL exit, produce a
+	//      SECOND `done` event — re-triggering the parent's pointer notification AND
+	//      re-injecting the same output as a user message. The trap's job is to record the
+	//      outcome ONLY when the child forgot; the parent and the wrapper always agree on
+	//      events.ndjson because that file is the single source of truth they both read;
 	//    - also writes the @pi-exit-code pane option for the readPaneExitCode fallback
 	//      (tmux-only; the `2>/dev/null || true` makes it a silent no-op on other muxes).
 	const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+	// The grep pattern is single-quoted (so bash's quoting preserves the JSON quotes), but a
+	// single-quoted string inside another single-quoted string (the trap body) terminates the outer one
+	// at trap-set time with `syntax error near unexpected token '('`. Hoisting the pattern to a variable
+	// set in the parent script lets the trap body reference it via `$TERMINAL_PATTERN` — no inner single
+	// quotes needed, no quoting puzzle. Expanded at trap-fire time, not at script-load time.
+	const idempotentTrap = [
+		`    last=$(tail -n1 "${artifactDir}/events.ndjson" 2>/dev/null || true)`,
+		`    if ! echo "$last" | grep -qE "$TERMINAL_PATTERN"; then`,
+		`        if [ -f "${artifactDir}/.cancelled" ]; then`,
+		`            "${cliPath}" cancelled`,
+		`        else`,
+		`            "${cliPath}" done "$?"`,
+		`        fi`,
+		`    fi`,
+		`    tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true`,
+	].join("\n");
 	const script = [
 		"#!/bin/bash",
 		"set -e",
 		`export ARTIFACT_DIR=${escape(artifactDir)}`,
+		// JSON pattern is single-quoted so bash's quote-removal preserves the literal `"` chars.
+		`readonly TERMINAL_PATTERN='\\"type\\":\\"(done|error|cancelled)\\"'`,
 		`"${cliPath}" start`,
-		`trap 'if [ -f "${artifactDir}/.cancelled" ]; then "${cliPath}" cancelled; else "${cliPath}" done "$?"; fi; tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true' EXIT`,
+		`trap '\n${idempotentTrap}\n' EXIT`,
 		command,
 		"",
 	].join("\n");
