@@ -799,8 +799,23 @@ async function executeScript(
       filename: `workflow:${meta.name}.js`,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Workflow "${meta.name}" failed: ${msg}`);
+    const anyErr = err as any;
+    // Errors thrown from vm.runInNewContext are instances of the SANDBOX's Error class,
+    // not the parent context's. `err instanceof Error` is therefore false; duck-type on .message.
+    const msg =
+      anyErr && typeof anyErr.message === "string"
+        ? anyErr.message
+        : String(err);
+    const outer = new Error(`Workflow "${meta.name}" failed: ${msg}`);
+    // Preserve custom properties the script attached (e.g. .verdicts, .draftPath, .iterations).
+    // Skip "message" and "stack" — outer already has its own wrapped message.
+    if (anyErr && typeof anyErr === "object") {
+      for (const k of Object.keys(anyErr)) {
+        if (k === "message" || k === "stack") continue;
+        (outer as any)[k] = anyErr[k];
+      }
+    }
+    throw outer;
   }
   return { meta, result };
 }

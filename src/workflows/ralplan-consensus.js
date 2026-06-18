@@ -28,9 +28,20 @@ export const meta = {
     "and want a written plan before implementation. Non-deliberate ideas run in SHORT mode by default; " +
     "DELIBERATE mode auto-detects from the idea text and forces pre-mortem + expanded test plan.",
   phases: [
-    { title: "Spec", detail: "Optional Analyst -> plans/spec.md (skipped when args.specPath is provided)" },
-    { title: "Planning", detail: "Planner / Architect / Critic loop, max args.maxIterations (default 5)" },
-    { title: "Finalize", detail: "Critic writes plans/<planName>.md on ACCEPT verdict" },
+    {
+      title: "Spec",
+      detail:
+        "Optional Analyst -> plans/spec.md (skipped when args.specPath is provided)",
+    },
+    {
+      title: "Planning",
+      detail:
+        "Planner / Architect / Critic loop, max args.maxIterations (default 5)",
+    },
+    {
+      title: "Finalize",
+      detail: "Critic writes plans/<planName>.md on ACCEPT verdict",
+    },
   ],
 };
 
@@ -352,13 +363,17 @@ If you have no open questions, write a single bullet "None."
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ARCH_VERDICT_RE = /\*\*VERDICT:\s*(APPROVE|REVISION\s+NEEDED)\*\*/i;
-const CRIT_VERDICT_RE = /\*\*VERDICT:\s*(REJECT|REVISE|ACCEPT-WITH-RESERVATIONS|ACCEPT)\*\*/i;
+const CRIT_VERDICT_RE =
+  /\*\*VERDICT:\s*(REJECT|REVISE|ACCEPT-WITH-RESERVATIONS|ACCEPT)\*\*/i;
 
 function parseVerdict(text, regex) {
+  // Canonical tokens: "APPROVE", "REVISION NEEDED" (space, per the source spec);
+  // "REJECT", "REVISE", "ACCEPT", "ACCEPT-WITH-RESERVATIONS" (hyphens as part of token).
+  // Normalize whitespace runs to single space; do NOT replace spaces with hyphens — the
+  // canonical ARCH_VERDICT_RE value is "REVISION NEEDED" with a literal space.
   const m = regex.exec(text || "");
   if (!m) return "UNPARSED";
-  const raw = m[1].toUpperCase().replace(/\s+/g, " ").trim();
-  return raw.replace(/ /g, "-");
+  return m[1].toUpperCase().replace(/\s+/g, " ").trim();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -366,12 +381,28 @@ function parseVerdict(text, regex) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DELIBERATE_SIGNALS = [
-  "security", "credential", "secret", "password", "token",
-  "migration", "schema", "database", "production",
-  "destroy", "delete",
-  "authentication", "authorization", "authorized", "authorize", "authorizing",
-  "compliance", "PII", "GDPR", "HIPAA",
-  "public api", "breaking change",
+  "security",
+  "credential",
+  "secret",
+  "password",
+  "token",
+  "migration",
+  "schema",
+  "database",
+  "production",
+  "destroy",
+  "delete",
+  "authentication",
+  "authorization",
+  "authorized",
+  "authorize",
+  "authorizing",
+  "compliance",
+  "pii",
+  "gdpr",
+  "hipaa",
+  "public api",
+  "breaking change",
 ];
 const WORD_BOUNDARY_SIGNALS = ["rm"];
 
@@ -400,7 +431,8 @@ function resolveMode(args) {
 function extractFeedbackSection(text, pattern, cap) {
   const capDefault = typeof cap === "number" ? cap : 2000;
   if (!text) return "";
-  const source = pattern && pattern.source ? pattern.source : String(pattern || "");
+  const source =
+    pattern && pattern.source ? pattern.source : String(pattern || "");
   const flags = pattern && pattern.flags ? pattern.flags : "";
   const re = new RegExp(source, flags + (flags.includes("g") ? "" : "g"));
   const firstMatch = re.exec(text);
@@ -419,18 +451,26 @@ function validateArgs(args) {
     throw new Error("RalplanConsensus: args is required.");
   }
   if (typeof args.idea !== "string" || args.idea.trim() === "") {
-    throw new Error("RalplanConsensus: args.idea is required and must be a non-empty string.");
+    throw new Error(
+      "RalplanConsensus: args.idea is required and must be a non-empty string.",
+    );
   }
   if (typeof args.workingDir !== "string" || args.workingDir === "") {
     throw new Error("RalplanConsensus: args.workingDir is required.");
   }
   // The node `path` module is not injected; do a string check instead.
-  const isAbs = args.workingDir.startsWith("/") || /^[A-Za-z]:[\\/]/.test(args.workingDir);
+  const isAbs =
+    args.workingDir.startsWith("/") || /^[A-Za-z]:[\\/]/.test(args.workingDir);
   if (!isAbs) {
-    throw new Error("RalplanConsensus: args.workingDir must be absolute, got: " + args.workingDir);
+    throw new Error(
+      "RalplanConsensus: args.workingDir must be absolute, got: " +
+        args.workingDir,
+    );
   }
   if (args.specPath != null && typeof args.specPath !== "string") {
-    throw new Error("RalplanConsensus: args.specPath must be a string when provided.");
+    throw new Error(
+      "RalplanConsensus: args.specPath must be a string when provided.",
+    );
   }
   if (args.specPath === "") {
     throw new Error("RalplanConsensus: args.specPath is empty.");
@@ -447,18 +487,41 @@ function safeIdea(args) {
 }
 
 function analystPromptBuilder(idea, specPath) {
-  return ANALYST_PERSONA + "\n\n## Task\nIdea: " + idea + "\nWrite the spec to: " + specPath + "\nEnd your reply with: SPEC_WRITTEN: " + specPath + "\n";
+  return (
+    ANALYST_PERSONA +
+    "\n\n## Task\nIdea: " +
+    idea +
+    "\nWrite the spec to: " +
+    specPath +
+    "\nEnd your reply with: SPEC_WRITTEN: " +
+    specPath +
+    "\n"
+  );
 }
 
-function plannerPromptBuilder(idea, specPath, draftPath, mode, iterNum, feedback) {
+function plannerPromptBuilder(
+  idea,
+  specPath,
+  draftPath,
+  mode,
+  iterNum,
+  feedback,
+) {
   let p = PLANNER_PERSONA;
   p += "\n\n## Task\n";
   p += "Read the spec at: " + specPath + "\n";
   p += "Write the plan draft to: " + draftPath + "\n";
   p += "Mode: " + mode + "\n\n";
-  p += "On this iteration (" + iterNum + "), produce a RALPLAN-DR summary block AT THE TOP of plan_draft.md\n";
-  p += 'with the Mode line set to "' + mode + '", Principles (3-5), Decision Drivers (top 3), and >=2 Viable Options.\n';
-  p += "If DELIBERATE: include Pre-Mortem (3 scenarios) and Expanded Test Plan.\n";
+  p +=
+    "On this iteration (" +
+    iterNum +
+    "), produce a RALPLAN-DR summary block AT THE TOP of plan_draft.md\n";
+  p +=
+    'with the Mode line set to "' +
+    mode +
+    '", Principles (3-5), Decision Drivers (top 3), and >=2 Viable Options.\n';
+  p +=
+    "If DELIBERATE: include Pre-Mortem (3 scenarios) and Expanded Test Plan.\n";
   p += "End with: **DRAFT_WRITTEN: " + draftPath + "**\n";
   if (feedback.length > 0) {
     p += "\n## Prior Iteration Feedback\n";
@@ -472,22 +535,43 @@ function plannerPromptBuilder(idea, specPath, draftPath, mode, iterNum, feedback
 }
 
 function architectPromptBuilder(draftPath, reviewPath) {
-  return ARCHITECT_PERSONA + "\n\n## Task\nRead: " + draftPath + "\nWrite your review to: " + reviewPath + "\nEnd with a single line: **VERDICT: APPROVE** or **VERDICT: REVISION NEEDED**\n";
+  return (
+    ARCHITECT_PERSONA +
+    "\n\n## Task\nRead: " +
+    draftPath +
+    "\nWrite your review to: " +
+    reviewPath +
+    "\nEnd with a single line: **VERDICT: APPROVE** or **VERDICT: REVISION NEEDED**\n"
+  );
 }
 
-function criticPromptBuilder(draftPath, archReviewPath, critReviewPath, finalPath, mode) {
+function criticPromptBuilder(
+  draftPath,
+  archReviewPath,
+  critReviewPath,
+  finalPath,
+  mode,
+) {
   let p = CRITIC_PERSONA;
   p += "\n\n## Task\n";
   p += "Read: " + draftPath + "\n";
   p += "Read: " + archReviewPath + "\n";
   p += "Write your review to: " + critReviewPath + "\n";
-  p += "End with a single line: **VERDICT: REJECT** | **REVISE** | **ACCEPT-WITH-RESERVATIONS** | **ACCEPT**\n\n";
-  p += "If and only if your verdict is ACCEPT or ACCEPT-WITH-RESERVATIONS, ALSO copy " + draftPath + " to " + finalPath + "\n";
+  p +=
+    "End with a single line: **VERDICT: REJECT** | **REVISE** | **ACCEPT-WITH-RESERVATIONS** | **ACCEPT**\n\n";
+  p +=
+    "If and only if your verdict is ACCEPT or ACCEPT-WITH-RESERVATIONS, ALSO copy " +
+    draftPath +
+    " to " +
+    finalPath +
+    "\n";
   p += "and prepend/append the ADR section per the persona.\n\n";
   p += "Mode for this run: " + mode + "\n";
-  p += "If mode is DELIBERATE, you MUST explicitly REJECT a missing or weak pre-mortem or missing/weak\n";
+  p +=
+    "If mode is DELIBERATE, you MUST explicitly REJECT a missing or weak pre-mortem or missing/weak\n";
   p += "expanded test plan.\n\n";
-  p += "When the plan is written, end with: **PLAN_WRITTEN: " + finalPath + "**\n";
+  p +=
+    "When the plan is written, end with: **PLAN_WRITTEN: " + finalPath + "**\n";
   return p;
 }
 
@@ -501,7 +585,7 @@ const safeIdeaStr = safeIdea(args);
 
 const PLAN_DIR = args.workingDir + "/plans";
 const DRAFT_DIR = PLAN_DIR + "/drafts";
-const SPEC_PATH = args.specPath || (PLAN_DIR + "/spec.md");
+const SPEC_PATH = args.specPath || PLAN_DIR + "/spec.md";
 const DRAFT_PATH = DRAFT_DIR + "/plan_draft.md";
 const ARCH_REVIEW_PATH = DRAFT_DIR + "/architect_review.md";
 const CRIT_REVIEW_PATH = DRAFT_DIR + "/critic_review.md";
@@ -509,19 +593,25 @@ const FINAL_PATH = PLAN_DIR + "/" + (args.planName || "plan") + ".md";
 
 const mode = resolveMode(args);
 
-const maxIterations = (typeof args.maxIterations === "number" && args.maxIterations > 0 && args.maxIterations <= 100)
-  ? Math.floor(args.maxIterations)
-  : 5;
+const maxIterations =
+  typeof args.maxIterations === "number" &&
+  args.maxIterations > 0 &&
+  args.maxIterations <= 100
+    ? Math.floor(args.maxIterations)
+    : 5;
 
 // Optional Analyst phase (only when no pre-existing specPath).
 if (!args.specPath) {
   phase("Analyst-spec");
-  const analystOut = await agent(
-    analystPromptBuilder(safeIdeaStr, SPEC_PATH),
-    { label: "ralplan-analyst-1", persona: ANALYST_PERSONA, phase: "Analyst-spec" },
-  );
+  const analystOut = await agent(analystPromptBuilder(safeIdeaStr, SPEC_PATH), {
+    label: "ralplan-analyst-1",
+    persona: ANALYST_PERSONA,
+    phase: "Analyst-spec",
+  });
   if (analystOut == null) {
-    throw new Error("RalplanConsensus: Analyst agent returned null at iteration 1");
+    throw new Error(
+      "RalplanConsensus: Analyst agent returned null at iteration 1",
+    );
   }
 }
 
@@ -542,34 +632,68 @@ for (; iterations < maxIterations; iterations++) {
 
   phase("Iteration " + iterNum + ": Planner");
   const draft = await agent(
-    plannerPromptBuilder(safeIdeaStr, SPEC_PATH, DRAFT_PATH, mode, iterNum, feedback),
-    { label: "ralplan-planner-" + iterNum, persona: PLANNER_PERSONA, phase: "Planning" },
+    plannerPromptBuilder(
+      safeIdeaStr,
+      SPEC_PATH,
+      DRAFT_PATH,
+      mode,
+      iterNum,
+      feedback,
+    ),
+    {
+      label: "ralplan-planner-" + iterNum,
+      persona: PLANNER_PERSONA,
+      phase: "Planning",
+    },
   );
   if (draft == null) {
-    throw new Error("RalplanConsensus: Planner returned null at iteration " + iterNum);
+    throw new Error(
+      "RalplanConsensus: Planner returned null at iteration " + iterNum,
+    );
   }
 
   phase("Iteration " + iterNum + ": Architect");
   const arch = await agent(
     architectPromptBuilder(DRAFT_PATH, ARCH_REVIEW_PATH),
-    { label: "ralplan-architect-" + iterNum, persona: ARCHITECT_PERSONA, phase: "Planning" },
+    {
+      label: "ralplan-architect-" + iterNum,
+      persona: ARCHITECT_PERSONA,
+      phase: "Planning",
+    },
   );
   if (arch == null) {
-    throw new Error("RalplanConsensus: Architect returned null at iteration " + iterNum);
+    throw new Error(
+      "RalplanConsensus: Architect returned null at iteration " + iterNum,
+    );
   }
   architectVerdict = parseVerdict(arch, ARCH_VERDICT_RE);
 
   phase("Iteration " + iterNum + ": Critic");
   const crit = await agent(
-    criticPromptBuilder(DRAFT_PATH, ARCH_REVIEW_PATH, CRIT_REVIEW_PATH, FINAL_PATH, mode),
-    { label: "ralplan-critic-" + iterNum, persona: CRITIC_PERSONA, phase: "Planning" },
+    criticPromptBuilder(
+      DRAFT_PATH,
+      ARCH_REVIEW_PATH,
+      CRIT_REVIEW_PATH,
+      FINAL_PATH,
+      mode,
+    ),
+    {
+      label: "ralplan-critic-" + iterNum,
+      persona: CRITIC_PERSONA,
+      phase: "Planning",
+    },
   );
   if (crit == null) {
-    throw new Error("RalplanConsensus: Critic returned null at iteration " + iterNum);
+    throw new Error(
+      "RalplanConsensus: Critic returned null at iteration " + iterNum,
+    );
   }
   criticVerdict = parseVerdict(crit, CRIT_VERDICT_RE);
 
-  if (architectVerdict === "APPROVE" && (criticVerdict === "ACCEPT" || criticVerdict === "ACCEPT-WITH-RESERVATIONS")) {
+  if (
+    architectVerdict === "APPROVE" &&
+    (criticVerdict === "ACCEPT" || criticVerdict === "ACCEPT-WITH-RESERVATIONS")
+  ) {
     iterations = iterNum; // 1-based; `break` leaves iterations set to the completed count (AC-4).
     break;
   }
@@ -577,15 +701,28 @@ for (; iterations < maxIterations; iterations++) {
   if (iterNum < maxIterations) {
     feedback.push({
       iteration: iterNum,
-      architect: extractFeedbackSection(arch, /Antithesis|Trade-off tension|Recommendations/i),
-      critic: extractFeedbackSection(crit, /Critical Findings|Major Findings|Verdict Justification/i),
+      architect: extractFeedbackSection(
+        arch,
+        /Antithesis|Trade-off tension|Recommendations/i,
+      ),
+      critic: extractFeedbackSection(
+        crit,
+        /Critical Findings|Major Findings|Verdict Justification/i,
+      ),
     });
   }
 }
 
-if (architectVerdict !== "APPROVE" || (criticVerdict !== "ACCEPT" && criticVerdict !== "ACCEPT-WITH-RESERVATIONS")) {
+if (
+  architectVerdict !== "APPROVE" ||
+  (criticVerdict !== "ACCEPT" && criticVerdict !== "ACCEPT-WITH-RESERVATIONS")
+) {
   // Spec §11 AC-5 — error must expose .verdicts / .draftPath / .iterations / .feedback / .mode.
-  const err = new Error("RalplanConsensus: failed to reach consensus after " + iterations + " iteration(s).");
+  const err = new Error(
+    "RalplanConsensus: failed to reach consensus after " +
+      iterations +
+      " iteration(s).",
+  );
   err.verdicts = { architect: architectVerdict, critic: criticVerdict };
   err.draftPath = DRAFT_PATH;
   err.iterations = iterations;
