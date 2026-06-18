@@ -37,7 +37,6 @@
 
 //     flow, not deterministic end-to-end results.
 
-
 import { runInNewContext } from "node:vm";
 import { cpus } from "node:os";
 import { startSubagentJob } from "./helpers";
@@ -647,7 +646,6 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     name: "workflow",
     label: "Workflow",
     description: [
-
       "Run an agent-authored JavaScript workflow that orchestrates ISOLATED sub-agents with",
 
       "deterministic control flow (parallel/pipeline/barrier semantics are exact, but",
