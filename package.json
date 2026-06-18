@@ -13,7 +13,8 @@
     "agent",
     "multi-agent",
     "swarm",
-    "crew"
+    "crew",
+    "workflow"
   ],
   "repository": {
     "type": "git",
@@ -33,7 +34,8 @@
     "src/multiplexer-tmux.ts",
     "src/multiplexer-zellij.ts",
     "src/subagent.ts",
-    "src/subagent-artifact-cli.ts"
+    "src/subagent-artifact-cli.ts",
+    "src/workflow.ts"
   ],
   "engines": {
     "node": ">=18.0.0"
