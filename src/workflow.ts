@@ -108,7 +108,9 @@ export interface WorkflowMeta {
 }
 
 export interface WorkflowProgress {
-  kind: "phase" | "log" | "agent";
+// "agent_start" fires the moment an agent is launched (counter is incremented), so UIs see
+// mid-run progress. "agent_done" fires after the agent finishes (success, error, or schema fail).
+kind: "phase" | "log" | "agent_start" | "agent_done";
   phase?: string;
   message?: string;
   label?: string;
@@ -604,6 +606,11 @@ async function executeScript(
       for (let attempt = 0; attempt < attempts; attempt++) {
         checkAbort();
         engine.counters.agentsSpawned++;
+        // Emit *before* awaiting runAgent so the snapshot reflects this agent the moment it is
+        // launched — process-isolated agents can take minutes, and UIs polling get_workflow_status
+        // must see activity before completion (regression test: workflow.test.ts →
+        // "snapshot reflects in-flight agents before they complete").
+        emit({ kind: "agent_start", label: agentOpts.label, phase: agentOpts.phase });
         const finalPrompt = hasSchema
           ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
           : prompt;
@@ -616,7 +623,7 @@ async function executeScript(
           label: agentOpts.label,
         });
         engine.counters.tokensSpent += res.usage?.output ?? 0;
-        emit({ kind: "agent", label: agentOpts.label, phase: agentOpts.phase });
+        emit({ kind: "agent_done", label: agentOpts.label, phase: agentOpts.phase });
 
         if (res.isError) {
           engine.counters.errorCount++;

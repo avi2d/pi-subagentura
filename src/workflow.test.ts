@@ -399,8 +399,34 @@ describe("background workflow jobs", () => {
     await expect(job.promise).rejects.toThrow(/aborted/);
     expect(job.status).toBe("cancelled");
   });
-});
 
+  it("snapshot reflects in-flight agents before they complete (regression: agent_start emit)", async () => {
+    // Pre-fix bug: the only "agent" emit fired AFTER `await runAgent` returned, so the snapshot's
+    // agentsSpawned stayed at 0 until every agent finished. Process-isolated agents can take minutes,
+    // making get_workflow_status look stuck. The fix emits "agent_start" right after the counter is
+    // incremented, so the snapshot reflects in-flight activity immediately.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const runAgent: WorkflowAgentRunner = async ({ prompt }) => {
+      await gate;
+      return ok(prompt);
+    };
+    const script = `export const meta = { name: "bgs", description: "d" };\nreturn await agent("x");`;
+    const job = startWorkflowJob("bgs", script, { runAgent });
+
+    // Yield enough microtasks for agent() to enter the loop, increment the counter, and emit
+    // "agent_start" before runAgent awaits the gate.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // While the agent is still blocked on `gate`, the snapshot must already show 1 spawned.
+    // This is the regression: pre-fix, this would be 0.
+    expect(job.snapshot.agentsSpawned).toBe(1);
+
+    release();
+    await job.promise;
+    expect(job.snapshot.agentsSpawned).toBe(1);
+  });
+});
 it("sets startedAt from the passed timestamp", () => {
   const script = `export const meta = { name: "ts", description: "d" };\nreturn 1;`;
   const startedAt = 1234567890;
