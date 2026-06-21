@@ -974,7 +974,7 @@ export function startWorkflowJob(
   startedAt?: number,
 ): WorkflowJobState {
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
-    // Evict the oldest terminal job; if none, allow slight overcap.
+    // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
     let evicted = false;
     for (const [id, st] of workflowJobRegistry) {
       if (st.status !== "running") {
@@ -985,11 +985,9 @@ export function startWorkflowJob(
       }
     }
     if (!evicted) {
-      debugLog("warn", "workflow_job_cap_reached", {
-        registrySize: workflowJobRegistry.size,
-        cap: MAX_WORKFLOW_JOBS,
-      });
-      break;
+      throw new Error(
+        `${MAX_WORKFLOW_JOBS} workflow jobs already running — cancel one with cancel_workflow before starting another.`,
+      );
     }
   }
 
@@ -1114,7 +1112,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> token accounting.",
       "",
       "Run a saved workflow by passing `name` instead of `script`. Pass `async: true` to run in the",
-      "background (returns a workflowId; poll get_workflow_status / get_workflow_result).",
+      "background (returns a workflowId; poll get_workflow_status / get_workflow_result). Up to 100 jobs; cancel with cancel_workflow.",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
@@ -1195,7 +1193,17 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           };
         }
         const jobStartedAt = Date.now();
-        const job = startWorkflowJob(meta.name, script, baseOpts, jobStartedAt);
+        let job: WorkflowJobState;
+        try {
+          job = startWorkflowJob(meta.name, script, baseOpts, jobStartedAt);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `Workflow not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
         return {
           content: [
             {

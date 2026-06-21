@@ -9,6 +9,7 @@ import {
   loadWorkflowScript,
   listSavedWorkflows,
   sanitizeWorkflowName,
+  MAX_WORKFLOW_JOBS,
   startWorkflowJob,
   workflowJobRegistry,
   awaitInteractiveResult,
@@ -418,6 +419,36 @@ it("defaults startedAt to Date.now() when not provided", () => {
   const job = startWorkflowJob("ts2", script, { runAgent: echoRunner() });
   expect(job.startedAt).toBeGreaterThanOrEqual(before);
   expect(job.startedAt).toBeLessThanOrEqual(Date.now());
+});
+
+it("throws when all 100 job slots are full and none can be evicted", () => {
+  const filled: string[] = [];
+  try {
+    for (let i = 0; i < MAX_WORKFLOW_JOBS; i++) {
+      const id = `cap-fill-${i}`;
+      workflowJobRegistry.set(id, {
+        id,
+        name: "filler",
+        status: "running",
+        startedAt: Date.now(),
+        promise: undefined as any,
+        abort: new AbortController(),
+        snapshot: {
+          agentsSpawned: 0,
+          errorCount: 0,
+          tokensSpent: 0,
+          phases: [],
+        },
+      });
+      filled.push(id);
+    }
+    const script = `export const meta = { name: "x", description: "d" };\nreturn "ok";`;
+    expect(() =>
+      startWorkflowJob("x", script, { runAgent: echoRunner() }),
+    ).toThrow(/100 workflow jobs already running/);
+  } finally {
+    for (const id of filled) workflowJobRegistry.delete(id);
+  }
 });
 
 describe("awaitInteractiveResult", () => {
