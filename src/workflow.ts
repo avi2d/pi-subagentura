@@ -971,6 +971,7 @@ export function startWorkflowJob(
   name: string,
   script: string,
   opts: Omit<RunWorkflowOptions, "signal" | "onProgress">,
+  startedAt?: number,
 ): WorkflowJobState {
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
     // Evict the oldest terminal job; if none, allow slight overcap.
@@ -998,7 +999,7 @@ export function startWorkflowJob(
     id,
     name,
     status: "running",
-    startedAt: 0,
+    startedAt: startedAt ?? Date.now(),
     promise: undefined as unknown as Promise<WorkflowRunResult>,
     abort,
     snapshot: { agentsSpawned: 0, errorCount: 0, tokensSpent: 0, phases: [] },
@@ -1193,7 +1194,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             isError: true,
           };
         }
-        const job = startWorkflowJob(meta.name, script, baseOpts);
+        const jobStartedAt = Date.now();
+        const job = startWorkflowJob(meta.name, script, baseOpts, jobStartedAt);
         return {
           content: [
             {
@@ -1292,6 +1294,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           status: st.status,
           workflowId: st.id,
           name: st.name,
+          elapsedMs: Date.now() - st.startedAt,
           ...st.snapshot,
         },
       };

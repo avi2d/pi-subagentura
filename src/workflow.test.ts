@@ -400,6 +400,26 @@ describe("background workflow jobs", () => {
   });
 });
 
+it("sets startedAt from the passed timestamp", () => {
+  const script = `export const meta = { name: "ts", description: "d" };\nreturn 1;`;
+  const startedAt = 1234567890;
+  const job = startWorkflowJob(
+    "ts",
+    script,
+    { runAgent: echoRunner() },
+    startedAt,
+  );
+  expect(job.startedAt).toBe(startedAt);
+});
+
+it("defaults startedAt to Date.now() when not provided", () => {
+  const before = Date.now();
+  const script = `export const meta = { name: "ts2", description: "d" };\nreturn 1;`;
+  const job = startWorkflowJob("ts2", script, { runAgent: echoRunner() });
+  expect(job.startedAt).toBeGreaterThanOrEqual(before);
+  expect(job.startedAt).toBeLessThanOrEqual(Date.now());
+});
+
 describe("awaitInteractiveResult", () => {
   function fakeState(dir: string) {
     return { id: "abcd1234", artifactDir: dir, model: "test/model" } as any;
