@@ -14,8 +14,8 @@ import {
   workflowJobRegistry,
   awaitInteractiveResult,
   type WorkflowAgentRunner,
-} from "./workflow";
-import type { SubagentResult } from "./helpers";
+} from "../src/workflow";
+import type { SubagentResult } from "../src/helpers";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

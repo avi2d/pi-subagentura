@@ -27,8 +27,8 @@ import { spawnSync } from "node:child_process";
 import {
   launchInteractiveSubagent,
   writeLaunchScript,
-} from "./interactive-tmux";
-import { stateFilePath, loadInteractiveStates } from "./artifact";
+} from "../src/interactive-tmux";
+import { stateFilePath, loadInteractiveStates } from "../src/artifact";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
@@ -213,10 +213,9 @@ describe("spawn-time state persistence", () => {
   });
 
   it("launchInteractiveSubagent with parentSessionId writes the state file", async () => {
-    const { launchInteractiveSubagent } =
-      await importFresh<typeof import("./interactive-tmux")>(
-        "./interactive-tmux",
-      );
+    const { launchInteractiveSubagent } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
     const state = launchInteractiveSubagent({
       name: "Demo",
       task: "t",
@@ -230,19 +229,17 @@ describe("spawn-time state persistence", () => {
   });
 
   it("launchInteractiveSubagent without parentSessionId does NOT write the state file", async () => {
-    const { launchInteractiveSubagent } =
-      await importFresh<typeof import("./interactive-tmux")>(
-        "./interactive-tmux",
-      );
+    const { launchInteractiveSubagent } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
     launchInteractiveSubagent({ name: "Demo", task: "t", cwd });
     expect(existsSync(stateFilePath(cwd))).toBe(false);
   });
 
   it("the persisted entry records windowName, mux, and artifactDir", async () => {
-    const { launchInteractiveSubagent } =
-      await importFresh<typeof import("./interactive-tmux")>(
-        "./interactive-tmux",
-      );
+    const { launchInteractiveSubagent } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
     const state = launchInteractiveSubagent({
       name: "Demo",
       task: "t",
@@ -258,10 +255,9 @@ describe("spawn-time state persistence", () => {
   });
 
   it("the state has parentSessionId populated for terminal cleanup", async () => {
-    const { launchInteractiveSubagent } =
-      await importFresh<typeof import("./interactive-tmux")>(
-        "./interactive-tmux",
-      );
+    const { launchInteractiveSubagent } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
     const state = launchInteractiveSubagent({
       name: "Demo",
       task: "t",

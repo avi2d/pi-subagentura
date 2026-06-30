@@ -12,15 +12,16 @@ const { mockLaunchInteractiveSubagent } = vi.hoisted(() => ({
   mockLaunchInteractiveSubagent: vi.fn(),
 }));
 
-vi.mock("./interactive-tmux", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./interactive-tmux")>();
+vi.mock("../src/interactive-tmux", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/interactive-tmux")>();
   return {
     ...actual,
     launchInteractiveSubagent: mockLaunchInteractiveSubagent,
   };
 });
 
-import registerExtension from "./subagent";
+import registerExtension from "../src/subagent";
 
 /** Minimal ctx for the tool's execute signature. */
 function mockCtx() {

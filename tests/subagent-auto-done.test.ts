@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { appendEvent, artifactPath, readEvents } from "./artifact";
-import type { InteractiveSubagentState } from "./interactive-tmux";
+import { appendEvent, artifactPath, readEvents } from "../src/artifact";
+import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
@@ -131,7 +131,8 @@ describe("auto-done fallback", () => {
   // ─── Core behavior ────────────────────────────────────────────────
 
   it("synthesizes a done event when stopReason is 'stop' and output.md exists, after the debounce", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "the result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -155,7 +156,8 @@ describe("auto-done fallback", () => {
   });
 
   it("synthesizes an error event (not done) when stopReason is 'stop' but output.md is missing", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: null });
     state.lastStopText =
       "Review complete. The findings file `/tmp/review-sec.md` contains 0 critical vulns.";
@@ -175,7 +177,8 @@ describe("auto-done fallback", () => {
   });
 
   it("synthesizes an error event with a generic message when output.md is missing AND no lastStopText", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: null });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -191,7 +194,8 @@ describe("auto-done fallback", () => {
   });
 
   it("does NOT synthesize for stopReason 'toolUse' (model is mid-turn, not finished)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     // Cast: the runtime value is intentionally outside the union so we can verify only
     // the four terminal stopReasons are accepted by the typecheck.
@@ -212,7 +216,8 @@ describe("auto-done fallback", () => {
   it.each(["length", "error", "aborted"] as const)(
     "does NOT auto-synthesize for stopReason '%s'",
     async (reason) => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState({ outputContent: "result" });
       state.lastStopReason = reason;
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -229,7 +234,8 @@ describe("auto-done fallback", () => {
   );
 
   it("does NOT synthesize before the debounce window elapses", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     state.lastStopReasonAt = Date.now() - 1_000; // 1s ago, well inside the 10s debounce
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -244,7 +250,8 @@ describe("auto-done fallback", () => {
   });
 
   it("does NOT synthesize when an explicit done event already exists in the artifact", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
     const { state, artifactDir } = makeState({ outputContent: "result" });
 
@@ -287,7 +294,8 @@ describe("auto-done fallback", () => {
   // pi-agents-5c91e6). The fix scans ALL events for a terminal type, not just lastEvent.
 
   it("regression: does NOT synthesize when an explicit done is present AND a tool_activity is appended after it in the same poll", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
     const { state, artifactDir } = makeState({ outputContent: "result" });
 
@@ -409,7 +417,8 @@ describe("auto-done fallback", () => {
   });
 
   it("does NOT synthesize twice (idempotent across repeated polls)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -424,7 +433,8 @@ describe("auto-done fallback", () => {
   });
 
   it("suppresses duplicate notification if an explicit done arrives after the auto-synthesis", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -447,7 +457,8 @@ describe("auto-done fallback", () => {
   });
 
   it("a new user message in the session log resets the auto-done guard for the next turn", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -469,7 +480,8 @@ describe("auto-done fallback", () => {
   });
 
   it("a new user message in the session log revives status from 'exited' to 'running' (auto-done case)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -495,7 +507,8 @@ describe("auto-done fallback", () => {
   });
 
   it("a new user message in the session log revives status from 'idle' to 'running' (follow-up case)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -526,7 +539,8 @@ describe("auto-done fallback", () => {
   });
 
   it("captures stopReason and lastStopText from real session JSONL tail-read", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -550,7 +564,8 @@ describe("auto-done fallback", () => {
   });
 
   it("does NOT capture lastStopText for non-'stop' stopReasons", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -572,7 +587,8 @@ describe("auto-done fallback", () => {
   });
 
   it("a user message in the session log clears the per-turn stop-capture (lastStopReason, lastStopReasonAt, lastStopText)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -607,7 +623,8 @@ describe("auto-done fallback", () => {
   });
 
   it("appends a '… (truncated)' marker to the synthesized error when lastStopText exceeds the slice length", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -629,7 +646,8 @@ describe("auto-done fallback", () => {
   });
 
   it("does NOT append a '… (truncated)' marker when lastStopText fits within the slice length", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -649,7 +667,8 @@ describe("auto-done fallback", () => {
   });
 
   it("auto-fallback does NOT mark state.injected when notifyOnComplete is 'inject' (so the regular inject path can fire next poll)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
     state.notifyOnComplete = "inject";
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -668,7 +687,8 @@ describe("auto-done fallback", () => {
   });
 
   it("auto-fallback DOES mark state.injected when notifyOnComplete is 'notify' (no inject path to defer to)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
     state.notifyOnComplete = "notify";
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -693,7 +713,8 @@ describe("auto-done fallback", () => {
   // After AUTO_DONE_DEBOUNCE_MS the parent must synthesize a recovery event.
 
   it("end-to-end (with output): silent sub-agent whose model wrote output.md but never called `cli.mjs done` → auto-done", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeFreshState({
       outputContent: "the review findings",
     });
@@ -744,7 +765,8 @@ describe("auto-done fallback", () => {
   });
 
   it("end-to-end (no output): silent sub-agent whose model wrote to /tmp not output.md → auto-error with lastStopText fallback", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeFreshState({ outputContent: null });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -858,7 +880,8 @@ describe("auto-done fallback", () => {
       }) + "\n",
     );
 
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     mod.interactiveSubagentRegistry.set(replayId, {
       id: replayId,
       name: "notdone.jsonl Replay",

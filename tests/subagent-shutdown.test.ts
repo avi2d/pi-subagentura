@@ -23,11 +23,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as interactiveTmux from "./interactive-tmux";
-import type { InteractiveSubagentState } from "./interactive-tmux";
-import { appendEvent, artifactPath } from "./artifact";
-import { jobRegistry } from "./helpers";
-import registerExtension, { pollArtifactChanges } from "./subagent";
+import * as interactiveTmux from "../src/interactive-tmux";
+import type { InteractiveSubagentState } from "../src/interactive-tmux";
+import { appendEvent, artifactPath } from "../src/artifact";
+import { jobRegistry } from "../src/helpers";
+import registerExtension, { pollArtifactChanges } from "../src/subagent";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 

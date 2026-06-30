@@ -13,7 +13,7 @@ import {
   artifactPath,
   loadInteractiveStates,
   writeOutput,
-} from "./artifact";
+} from "../src/artifact";
 import { importFresh } from "./test-utils";
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
@@ -22,11 +22,11 @@ function makeTmp(): string {
 function makeState(): {
   id: string;
   artifactDir: string;
-  state: import("./interactive-tmux").InteractiveSubagentState;
+  state: import("../src/interactive-tmux").InteractiveSubagentState;
 } {
   const id = "id-" + Math.random().toString(36).slice(2, 8);
   const artifactDir = join(makeTmp(), id);
-  const state: import("./interactive-tmux").InteractiveSubagentState = {
+  const state: import("../src/interactive-tmux").InteractiveSubagentState = {
     id,
     name: "Test",
     task: "t",
@@ -56,14 +56,16 @@ describe("pollArtifactChanges", () => {
   });
 
   it("does nothing when registry is empty", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const sendMessage = vi.fn();
     mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it("fires a pointer notification on done. Started is silent.", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -87,7 +89,8 @@ describe("pollArtifactChanges", () => {
   });
 
   it("does NOT fire on tool_activity/started", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -110,7 +113,8 @@ describe("pollArtifactChanges", () => {
   });
 
   it("fires on error and cancelled too", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -132,7 +136,8 @@ describe("pollArtifactChanges", () => {
   });
 
   it("is at-most-once per event (cursor advances)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -151,7 +156,8 @@ describe("pollArtifactChanges", () => {
   });
 
   it("delivers only events newer than lastDeliveredEventTs (backlog catch-up)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     // Simulate a sub-agent that finished while the parent was down — events
     // were already on disk before this poller started.
@@ -186,7 +192,8 @@ describe("pollArtifactChanges", () => {
         return "";
       },
     }));
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -207,7 +214,8 @@ describe("pollArtifactChanges", () => {
         throw new Error("can't find pane: %99");
       },
     }));
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -220,7 +228,8 @@ describe("pollArtifactChanges", () => {
   });
 
   it("marks the sub-agent as cancelled when a cancelled event is seen", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -240,7 +249,8 @@ describe("pollArtifactChanges", () => {
     // 'idle' is between-turns, not terminal — must always be processed for follow-up support.
     for (const terminal of ["cancelled", "unknown"] as const) {
       vi.resetModules();
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.status = terminal;
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -268,7 +278,8 @@ describe("pollArtifactChanges", () => {
         return "";
       },
     }));
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     state.status = "idle"; // simulate "already between turns"
     state.lastDeliveredEventTs = 2; // first turn's `done` was already delivered
@@ -297,7 +308,8 @@ describe("pollArtifactChanges", () => {
     });
 
     it("calls sendUserMessage with output.md on done when state.notifyOnComplete === 'inject'", async () => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "inject";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -322,7 +334,8 @@ describe("pollArtifactChanges", () => {
     });
 
     it("does NOT call sendUserMessage when state.notifyOnComplete is unset (default: notify)", async () => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       mod.interactiveSubagentRegistry.set(state.id, state);
       const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -341,7 +354,8 @@ describe("pollArtifactChanges", () => {
     });
 
     it("does NOT call sendUserMessage when state.notifyOnComplete === 'notify' (explicit)", async () => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "notify";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -359,7 +373,8 @@ describe("pollArtifactChanges", () => {
     });
 
     it("is at-most-once: a second poll does NOT re-inject (state.injected guard)", async () => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "inject";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -392,7 +407,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "inject";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -425,7 +441,8 @@ describe("pollArtifactChanges", () => {
     });
 
     it("does not call sendUserMessage when output.md is missing", async () => {
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "inject";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -458,7 +475,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       state.notifyOnComplete = "inject";
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -500,7 +518,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       // notifyOnComplete left undefined.
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -529,7 +548,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
       // notifyOnComplete left undefined (default 'notify') — the broken path.
       mod.interactiveSubagentRegistry.set(state.id, state);
@@ -598,7 +618,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
       // Running sub-agent: no events in artifact; pane alive.
       const running = makeState().state;
@@ -675,7 +696,8 @@ describe("pollArtifactChanges", () => {
           throw new Error("pane dead");
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
       const exited1 = makeState().state;
       exited1.id = "exited-1";
@@ -723,7 +745,8 @@ describe("pollArtifactChanges", () => {
           return "";
         },
       }));
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
       const a = makeState().state;
       a.id = "a";
@@ -765,11 +788,11 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   function makePersistedState(): {
     id: string;
     cwd: string;
-    state: import("./interactive-tmux").InteractiveSubagentState;
+    state: import("../src/interactive-tmux").InteractiveSubagentState;
   } {
     const cwd = makeTmp();
     const id = "id-" + Math.random().toString(36).slice(2, 8);
-    const state: import("./interactive-tmux").InteractiveSubagentState = {
+    const state: import("../src/interactive-tmux").InteractiveSubagentState = {
       id,
       name: "Test",
       task: "t",
@@ -803,7 +826,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
         throw new Error("can't find pane: %99");
       },
     }));
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -824,7 +848,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
         return "";
       },
     }));
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -838,7 +863,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     expect(state.status).toBe("idle");
   });
   it("removes the state.json entry after delivering an error event", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -856,7 +882,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("removes the state.json entry after delivering a cancelled event", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -869,7 +896,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("keeps the state.json entry and cursor when notification delivery fails", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -892,7 +920,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("does NOT remove the state.json entry on tool_activity events (only terminals)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);
@@ -911,9 +940,10 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("does NOT throw if state has no parentSessionId (no-op guard)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const id = "id-" + Math.random().toString(36).slice(2, 8);
-    const state: import("./interactive-tmux").InteractiveSubagentState = {
+    const state: import("../src/interactive-tmux").InteractiveSubagentState = {
       id,
       name: "Test",
       task: "t",
@@ -938,7 +968,8 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("advances lastDeliveredEventTs before removing the state entry (crash-safe ordering)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { id, state } = makePersistedState();
     mod.interactiveSubagentRegistry.set(id, state);
     const art = artifactPath(join(state.artifactDir, ".."), id);

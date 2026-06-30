@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { CLI_SOURCE, writeCliScript } from "./subagent-artifact-cli";
+import { CLI_SOURCE, writeCliScript } from "../src/subagent-artifact-cli";
 
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-cli-"));

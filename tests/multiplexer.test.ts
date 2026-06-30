@@ -50,7 +50,9 @@ describe("getMux relaxed-spawn resolution", () => {
     );
 
     const { getMux, __resetMuxInstances } =
-      await importFresh<typeof import("./multiplexer")>("./multiplexer");
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
     __resetMuxInstances();
 
     // Act
@@ -81,7 +83,9 @@ describe("getMux relaxed-spawn resolution", () => {
     );
 
     const { getMux, __resetMuxInstances } =
-      await importFresh<typeof import("./multiplexer")>("./multiplexer");
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
     __resetMuxInstances();
 
     const mux = getMux({ preference: "auto" });
@@ -101,7 +105,9 @@ describe("getMux relaxed-spawn resolution", () => {
     );
 
     const { getMux, __resetMuxInstances } =
-      await importFresh<typeof import("./multiplexer")>("./multiplexer");
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
     __resetMuxInstances();
 
     // Act & Assert
@@ -125,7 +131,9 @@ describe("getMux relaxed-spawn resolution", () => {
     );
 
     const { getMux, __resetMuxInstances } =
-      await importFresh<typeof import("./multiplexer")>("./multiplexer");
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
     __resetMuxInstances();
 
     const mux = getMux({ preference: "tmux" });

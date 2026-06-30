@@ -2,24 +2,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEvent, artifactPath, writeOutput } from "./artifact";
+import { appendEvent, artifactPath, writeOutput } from "../src/artifact";
 import { importFresh } from "./test-utils";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { SubagentResult } from "./helpers";
+import type { SubagentResult } from "../src/helpers";
 
 // ── Hoisted mock: startSubagentJob must be mocked before any imports ──────
 const { mockStartSubagentJob } = vi.hoisted(() => ({
   mockStartSubagentJob: vi.fn(),
 }));
 
-vi.mock("./helpers", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./helpers")>();
+vi.mock("../src/helpers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/helpers")>();
   return { ...actual, startSubagentJob: mockStartSubagentJob };
 });
 
 // ── Imports (resolved after hoisted mock) ─────────────────────────────────
-import registerExtension, { getInjectCount, MAX_INJECT } from "./subagent";
-import { jobRegistry } from "./helpers";
+import registerExtension, { getInjectCount, MAX_INJECT } from "../src/subagent";
+import { jobRegistry } from "../src/helpers";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -1088,7 +1088,7 @@ describe("read_subagent_artifact (output reporting)", () => {
 
   function makeArtifactWithDone(id: string, parentDir: string) {
     const dir = join(parentDir, id);
-    const state: import("./interactive-tmux").InteractiveSubagentState = {
+    const state: import("../src/interactive-tmux").InteractiveSubagentState = {
       id,
       name: "Test",
       task: "t",
@@ -1137,7 +1137,8 @@ describe("read_subagent_artifact (output reporting)", () => {
     const parent = tmp();
     try {
       const { state } = makeArtifactWithDone(id, parent);
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       mod.interactiveSubagentRegistry.set(id, state);
       const readTool = makeReadTool(mod);
       expect(readTool).toBeDefined();
@@ -1166,21 +1167,22 @@ describe("read_subagent_artifact (output reporting)", () => {
     const parent = tmp();
     try {
       const dir = join(parent, id);
-      const state: import("./interactive-tmux").InteractiveSubagentState = {
-        id,
-        name: "Test",
-        task: "t",
-        paneId: "%99",
-        sessionFile: "/tmp/sess.jsonl",
-        cwd: "/tmp",
-        startedAt: 1,
-        status: "running",
-        mux: "tmux",
-        attachCommand: "tmux attach",
-        selectPaneCommand: "tmux select-pane",
-        launchScriptFile: "/tmp/launch.sh",
-        artifactDir: dir,
-      };
+      const state: import("../src/interactive-tmux").InteractiveSubagentState =
+        {
+          id,
+          name: "Test",
+          task: "t",
+          paneId: "%99",
+          sessionFile: "/tmp/sess.jsonl",
+          cwd: "/tmp",
+          startedAt: 1,
+          status: "running",
+          mux: "tmux",
+          attachCommand: "tmux attach",
+          selectPaneCommand: "tmux select-pane",
+          launchScriptFile: "/tmp/launch.sh",
+          artifactDir: dir,
+        };
       const art = artifactPath(parent, id);
       appendEvent(art, { ts: 1, type: "started", status: "running" });
       appendEvent(art, {
@@ -1191,7 +1193,8 @@ describe("read_subagent_artifact (output reporting)", () => {
         summary: "ls",
       });
 
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);
@@ -1218,7 +1221,8 @@ describe("read_subagent_artifact (output reporting)", () => {
       const { state, art } = makeArtifactWithDone(id, parent);
       writeOutput(art, "");
 
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);
@@ -1244,7 +1248,8 @@ describe("read_subagent_artifact (output reporting)", () => {
       const { state, art } = makeArtifactWithDone(id, parent);
       writeOutput(art, "Hello, world!");
 
-      const mod = await importFresh<typeof import("./subagent")>("./subagent");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
       mod.interactiveSubagentRegistry.set(id, state);
 
       const readTool = makeReadTool(mod);

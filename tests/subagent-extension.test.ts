@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import registerExtension from "./subagent";
+import registerExtension from "../src/subagent";
 
 describe("extension registration", () => {
   describe("extension registration", () => {

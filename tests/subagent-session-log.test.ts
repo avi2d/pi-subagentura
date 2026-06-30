@@ -21,8 +21,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEvent, artifactPath, readEvents } from "./artifact";
-import type { InteractiveSubagentState } from "./interactive-tmux";
+import { appendEvent, artifactPath, readEvents } from "../src/artifact";
+import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
@@ -83,7 +83,8 @@ describe("session-log tail-read", () => {
   });
 
   it("appends a tool_activity event for a bash tool call", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -141,7 +142,8 @@ describe("session-log tail-read", () => {
   });
 
   it("appends tool_activity for write, edit, read with file paths", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -189,7 +191,8 @@ describe("session-log tail-read", () => {
   });
 
   it("skips tools with no summary (grep, find, ls, custom)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -230,7 +233,8 @@ describe("session-log tail-read", () => {
   });
 
   it("truncates long bash commands to 80 chars", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -263,7 +267,8 @@ describe("session-log tail-read", () => {
   });
 
   it("cursor advances — second poll with no new lines does not duplicate", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -297,7 +302,8 @@ describe("session-log tail-read", () => {
   });
 
   it("picks up new lines written between polls", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -350,7 +356,8 @@ describe("session-log tail-read", () => {
   });
 
   it("tolerates a partial trailing line without crashing", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -390,7 +397,8 @@ describe("session-log tail-read", () => {
   });
 
   it("re-reads a partial line once it is completed on a later poll", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -438,7 +446,8 @@ describe("session-log tail-read", () => {
   });
 
   it("does nothing when the session file does not exist yet", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({
       sessionFile: "/tmp/does-not-exist-" + Math.random() + ".jsonl",
     });
@@ -449,7 +458,8 @@ describe("session-log tail-read", () => {
   });
 
   it("updates state.lastToolSummary and lastActivityAt for the widget", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -478,7 +488,8 @@ describe("session-log tail-read", () => {
   });
 
   it("paints the TUI widget when ui ref is set", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -520,7 +531,8 @@ describe("session-log tail-read", () => {
   });
 
   it("clears the widget and footer when no sub-agents are running", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     // Empty registry.
     const setStatus = vi.fn();
     const setWidget = vi.fn();
@@ -535,7 +547,8 @@ describe("session-log tail-read", () => {
   });
 
   it("inlines the error message in the LLM notification but uses pointers on success", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
 
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -570,7 +583,8 @@ describe("session-log tail-read", () => {
   });
 
   it("truncates the inline error message to 500 chars", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
 
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -596,7 +610,8 @@ describe("session-log tail-read", () => {
   });
 
   it("resets the cursor when the session log is truncated below it", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
     // write 1KB of content, poll to advance cursor
@@ -610,7 +625,8 @@ describe("session-log tail-read", () => {
     expect(state.lastDeliveredSessionByte).toBe(4);
   });
   it("resets the cursor when the session log is truncated below it", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
     // write 1KB of content, poll to advance cursor
@@ -629,7 +645,8 @@ describe("session-log tail-read", () => {
   // the `ndjson` library which buffers partial lines internally across polls.
 
   it("processes a single JSONL line larger than 1 MiB (the original cap)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -704,7 +721,8 @@ describe("session-log tail-read", () => {
   });
 
   it("resets the cursor and parser on file truncation", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
     // Build a 1 KB initial log, write to the file, poll once.
     const { state, artifactDir } = makeState({});
@@ -770,7 +788,8 @@ describe("session-log tail-read", () => {
   });
 
   it("skips a malformed line and continues processing subsequent valid lines", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
     mod.interactiveSubagentRegistry.set(state.id, state);
 
@@ -828,7 +847,8 @@ describe("session-log tail-read", () => {
   });
 
   it("keeps parser state per sub-agent (two parallel sub-agents see only their own events)", async () => {
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const a = makeState({});
     const b = makeState({});
     mod.interactiveSubagentRegistry.set(a.state.id, a.state);

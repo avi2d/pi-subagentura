@@ -18,8 +18,9 @@ const { mockSendCommandToPane, mockGet } = vi.hoisted(() => ({
 }));
 
 // Mock interactive-tmux so we get a stub registry + controllable send-keys helper.
-vi.mock("./interactive-tmux", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./interactive-tmux")>();
+vi.mock("../src/interactive-tmux", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/interactive-tmux")>();
   return {
     ...actual,
     sendCommandToPane: mockSendCommandToPane,
@@ -29,7 +30,7 @@ vi.mock("./interactive-tmux", async (importOriginal) => {
   };
 });
 
-import registerExtension from "./subagent";
+import registerExtension from "../src/subagent";
 
 function setupExtension() {
   const api = {

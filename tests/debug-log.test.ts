@@ -34,7 +34,7 @@ describe("debugLog", () => {
 
     // Need to re-import after setting env var since DEBUG_LOG_DIR is cached at load
     vi.resetModules();
-    const { debugLog } = await import("./helpers");
+    const { debugLog } = await import("../src/helpers");
 
     debugLog("info", "test_event", { foo: "bar", num: 42 });
 
@@ -57,7 +57,7 @@ describe("debugLog", () => {
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
 
     vi.resetModules();
-    const { debugLog } = await import("./helpers");
+    const { debugLog } = await import("../src/helpers");
 
     // Should not throw
     expect(() => debugLog("info", "test", {})).not.toThrow();
@@ -67,7 +67,7 @@ describe("debugLog", () => {
     process.env.SUBAGENT_DEBUG_LOG_DIR = testDir;
 
     vi.resetModules();
-    const { debugLog } = await import("./helpers");
+    const { debugLog } = await import("../src/helpers");
 
     debugLog("error", "subagent_error", {
       jobId: "test-job",
@@ -90,7 +90,7 @@ describe("debugLog", () => {
     process.env.SUBAGENT_DEBUG_LOG_DIR = testDir;
 
     vi.resetModules();
-    const { debugLog } = await import("./helpers");
+    const { debugLog } = await import("../src/helpers");
 
     const toolArgs = { command: "rg TODO src/", timeout: 5000 };
     debugLog("info", "tool_start", {

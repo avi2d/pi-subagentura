@@ -16,7 +16,7 @@ import {
   JOB_CLEANUP_TTL_MS,
   type JobState,
   type JobStatus,
-} from "./helpers";
+} from "../src/helpers";
 
 // ── Simulation helpers ────────────────────────────────────────────────
 // These simulate live status behavior for turn handling tests.

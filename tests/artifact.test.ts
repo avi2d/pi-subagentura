@@ -32,7 +32,7 @@ import {
   writeOutput,
   type InteractiveSubagentPersistedStateV1,
   type SubagentEvent,
-} from "./artifact";
+} from "../src/artifact";
 
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-artifact-"));

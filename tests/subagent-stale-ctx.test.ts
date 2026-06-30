@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEvent, artifactPath, writeOutput } from "./artifact";
+import { appendEvent, artifactPath, writeOutput } from "../src/artifact";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
@@ -28,11 +28,11 @@ function makeTmp(): string {
 function makeState(): {
   id: string;
   artifactDir: string;
-  state: import("./interactive-tmux").InteractiveSubagentState;
+  state: import("../src/interactive-tmux").InteractiveSubagentState;
 } {
   const id = "id-" + Math.random().toString(36).slice(2, 8);
   const artifactDir = join(makeTmp(), id);
-  const state: import("./interactive-tmux").InteractiveSubagentState = {
+  const state: import("../src/interactive-tmux").InteractiveSubagentState = {
     id,
     name: "Test",
     task: "t",
@@ -96,7 +96,8 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     };
     (globalThis as any).__piSubagenturaPiRef = brokenPi;
 
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     state.notifyOnComplete = "inject";
     mod.interactiveSubagentRegistry.set(state.id, state);
@@ -132,7 +133,8 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     };
     (globalThis as any).__piSubagenturaPiRef = brokenPi;
 
-    const mod = await importFresh<typeof import("./subagent")>("./subagent");
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     // Default notify mode — the pointer path runs, the inject path doesn't.
     mod.interactiveSubagentRegistry.set(state.id, state);

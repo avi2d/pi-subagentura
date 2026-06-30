@@ -44,8 +44,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isAvailable()).toBe(true);
   });
@@ -63,8 +63,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isAvailable()).toBe(true);
   });
@@ -77,8 +77,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isAvailable()).toBe(false);
   });
@@ -104,8 +104,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const result = mux.createPane({
       name: "Demo",
@@ -149,8 +149,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const result = mux.createPane({
       name: "Demo",
@@ -188,8 +188,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     mux.createPane({
       name: "Demo",
@@ -230,8 +230,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const result = mux.createPane({
       name: "Demo",
@@ -273,8 +273,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isPaneAlive("42")).toBe(true);
   });
@@ -289,8 +289,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isPaneAlive("99")).toBe(false);
   });
@@ -302,8 +302,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isPaneAlive("42")).toBe(false);
   });
@@ -322,8 +322,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     mux.sendKeys("42", "echo hello");
 
@@ -344,8 +344,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     mux.sendEnter("42");
 
@@ -372,8 +372,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     mux.killPane("42");
 
@@ -390,8 +390,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(() => mux.killPane("42")).not.toThrow();
   });
@@ -405,8 +405,8 @@ describe("multiplexer-zellij", () => {
     process.env.ZELLIJ_SESSION_NAME = "main";
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const cmds = mux.buildAttachCommands({ paneId: "42", windowName: "demo" });
 
@@ -423,8 +423,8 @@ describe("multiplexer-zellij", () => {
     process.env.ZELLIJ_SESSION_NAME = "main";
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const cmds = mux.buildAttachCommands({ paneId: "42" });
 
@@ -438,8 +438,8 @@ describe("multiplexer-zellij", () => {
     process.env.ZELLIJ_SESSION_NAME = "main";
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const cmds = mux.buildAttachCommands({ paneId: "terminal_42" });
     expect(cmds.focusCommand).toBe("zellij action focus-pane-id 42");
@@ -450,8 +450,8 @@ describe("multiplexer-zellij", () => {
     process.env.ZELLIJ_SESSION_NAME = "main";
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const cmds = mux.buildAttachCommands({ paneId: "42" });
 
@@ -470,8 +470,8 @@ describe("multiplexer-zellij", () => {
     delete process.env.ZELLIJ_SESSION_NAME;
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
 
     const cmds = mux.buildAttachCommands({
@@ -497,8 +497,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     const sess = "pi-subagent-xyz";
 
@@ -529,8 +529,8 @@ describe("multiplexer-zellij", () => {
     });
 
     const { ZellijMultiplexer } = await importFresh<
-      typeof import("./multiplexer-zellij")
-    >("./multiplexer-zellij");
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     expect(mux.isPaneAlive("42")).toBe(false);
   });
