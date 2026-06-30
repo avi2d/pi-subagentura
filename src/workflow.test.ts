@@ -414,9 +414,10 @@ describe("background workflow jobs", () => {
     const script = `export const meta = { name: "bgs", description: "d" };\nreturn await agent("x");`;
     const job = startWorkflowJob("bgs", script, { runAgent });
 
-    // Yield enough microtasks for agent() to enter the loop, increment the counter, and emit
-    // "agent_start" before runAgent awaits the gate.
-    for (let i = 0; i < 10; i++) await Promise.resolve();
+    // Worker-backed workflows cross a thread boundary before the parent emits agent_start.
+    // Wait briefly for that handoff, but assert while runAgent is still blocked on gate.
+    for (let i = 0; i < 50 && job.snapshot.agentsSpawned === 0; i++)
+      await tick();
 
     // While the agent is still blocked on `gate`, the snapshot must already show 1 spawned.
     // This is the regression: pre-fix, this would be 0.
@@ -575,6 +576,16 @@ describe("abort signal propagation", () => {
       ),
     ).rejects.toThrow(/abort/i);
     expect(calls).toBe(0); // agents never invoked — abort check fires first
+  });
+
+  it("abort terminates a workflow stuck in synchronous script code", async () => {
+    const ac = new AbortController();
+    const p = runWorkflow(meta + `while (true) {}`, {
+      runAgent: echoRunner(),
+      signal: ac.signal,
+    });
+    setTimeout(() => ac.abort(), 20);
+    await expect(p).rejects.toThrow(/abort/i);
   });
 
   it("non-abort failures in parallel() are still nulled (back-compat)", async () => {
