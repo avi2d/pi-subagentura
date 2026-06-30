@@ -50,6 +50,7 @@ import {
   type NotifyOnComplete,
 } from "./helpers";
 import {
+  buildAttachCommandsForState,
   cancelInteractiveSubagent,
   cancelInteractiveSubagentByState,
   deriveInteractiveSubagentStatus,
@@ -65,15 +66,19 @@ import {
 import {
   appendEvent,
   artifactPath,
+  deleteInteractiveStatesFile,
   lastEvent,
   listOutputTurns,
+  loadInteractiveStates,
   readEvents,
   readOutput,
   readOutputForTurn,
+  removeInteractiveState,
   snapshotOutput,
   type SubagentArtifact,
   type SubagentEvent,
 } from "./artifact";
+
 import type { Usage } from "./helpers";
 import { registerWorkflowTool } from "./workflow";
 
@@ -85,6 +90,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
+
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -560,7 +566,8 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       // Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
       // which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
       // here and the inject path below will fire again.
-      const next = deriveInteractiveSubagentStatus(last, isPaneAlive(state));
+      const paneAlive = isPaneAlive(state);
+      const next = deriveInteractiveSubagentStatus(last, paneAlive);
       if (next !== state.status) {
         state.status = next;
         if (
@@ -572,6 +579,23 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           state.exitCode = last.exitCode;
         }
       }
+      // Early removal from persisted state: if a `done` event is already delivered for a dead
+      // pane, the state entry is no longer needed on disk. This avoids keeping zombie entries
+      // around for cleanly-exited sub-agents whose pane died after delivery.
+      if (
+        state.parentSessionId &&
+        last &&
+        shouldNotify(last) &&
+        last.type === "done" &&
+        !paneAlive &&
+        (state.lastDeliveredEventTs ?? 0) >= last.ts
+      ) {
+        try {
+          removeInteractiveState(state.cwd, state.id);
+        } catch {
+          /* best effort — disk full, permission denied, etc. */
+        }
+      }
 
       // Tail-read the child's session log and synthesize tool_activity events.
       // TUI-widget only — the LLM never sees them.
@@ -579,9 +603,9 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
 
       // Auto-done fallback: synthesize a completion event when the model ended its turn with
       // stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
-      // event is part of the same poll's read-back. Sets lastDeliveredEventTs and the autoDoneForTurnAt
-      // guard so the events loop below will not re-notify.
-      maybeAutoDone(state, art, interactivePi, Date.now());
+      // event is part of the same poll's read-back. The normal event loop still owns delivery/cursor
+      // advancement so stale Pi contexts can retry on the next tick.
+      maybeAutoDone(state, art, Date.now());
 
       // Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
       // so on the first poll we deliver the whole log. Subsequent polls advance the cursor.
@@ -589,21 +613,49 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       const events = readEvents(art, cursor + 1);
 
       if (events.length > 0) {
-        let maxTs = cursor;
+        let nextCursor = cursor;
+        let shouldRemovePersistedState = false;
         for (const ev of events) {
-          if (ev.ts > maxTs) maxTs = ev.ts;
-          if (!shouldNotify(ev)) continue;
+          if (!shouldNotify(ev)) {
+            if (ev.ts > nextCursor) nextCursor = ev.ts;
+            continue;
+          }
           // If auto-done already fired for this turn, skip any later explicit `done` events:
           // they would be duplicates. Errors and cancelled still flow through (the explicit signal is more accurate).
           if (
             state.autoDoneForTurnAt !== undefined &&
-            ev.ts >= state.autoDoneForTurnAt &&
+            ev.ts > state.autoDoneForTurnAt &&
             ev.type === "done"
-          )
+          ) {
+            if (ev.ts > nextCursor) nextCursor = ev.ts;
             continue;
-          deliverArtifactNotification(interactivePi, state, ev);
+          }
+          const delivered = deliverArtifactNotification(
+            interactivePi,
+            state,
+            ev,
+          );
+          if (!delivered) break;
+          if (ev.ts > nextCursor) nextCursor = ev.ts;
+          // Keep done+alive entries persisted: the child REPL is idle and can
+          // accept follow-ups, so a later parent reload still needs rehydrate.
+          if (ev.type === "error" || ev.type === "cancelled") {
+            shouldRemovePersistedState = true;
+          } else if (ev.type === "done" && !paneAlive) {
+            shouldRemovePersistedState = true;
+          }
         }
-        state.lastDeliveredEventTs = maxTs;
+        state.lastDeliveredEventTs = nextCursor;
+        // Drop the on-disk entry only after confirmed delivery, and only for
+        // truly terminal states. A failed delivery leaves the cursor before
+        // the event so the next poll/reload can retry.
+        if (shouldRemovePersistedState && state.parentSessionId) {
+          try {
+            removeInteractiveState(state.cwd, state.id);
+          } catch {
+            /* best effort — disk full, permission denied, etc. */
+          }
+        }
       }
 
       // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
@@ -967,7 +1019,6 @@ function extractAssistantText(content: unknown[]): string {
 function maybeAutoDone(
   state: InteractiveSubagentState,
   art: SubagentArtifact,
-  pi: ExtensionAPI,
   now: number,
 ): void {
   if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
@@ -1039,23 +1090,13 @@ function maybeAutoDone(
   // follow-up turn completes.
   appendEvent(art, ev);
   state.autoDoneForTurnAt = ts;
-  state.lastDeliveredEventTs = ts;
+  // state.lastDeliveredEventTs = ts; // removed — the event loop owns cursor advancement
   // In inject mode, leave `injected` unset so the regular inject path at
   // lines 547-585 picks up the synthesized `done` event on the next poll.
   // For all other modes (notify, undefined), mark as injected here because
   // the inject path will never fire — this prevents accidental re-inject
   // if a late explicit `done` later matches the cursor.
   state.injected = state.notifyOnComplete !== "inject";
-
-  // Fire the pointer notification immediately so the parent does not wait for the next 5s poll tick.
-  // Suppress here only — the regular `events` loop below uses the autoDoneForTurnAt guard.
-  if (pi) {
-    try {
-      deliverArtifactNotification(pi, state, ev);
-    } catch {
-      // pi may be stale; the event is on disk and will be picked up by the next tick anyway.
-    }
-  }
 }
 
 /** Short, human-readable summary of a tool call. Returns null for uninteresting tools. */
@@ -1117,12 +1158,13 @@ function buildArtifactMessage(
   return `${header}${body}${pointer}`;
 }
 
-/** Send a single pointer-only notification for one artifact event. */
+/** Send a single pointer-only notification for one artifact event.
+ * Returns true if the notification was sent, false on failure (stale pi context). */
 function deliverArtifactNotification(
   pi: ExtensionAPI,
   state: InteractiveSubagentState,
   event: SubagentEvent,
-): void {
+): boolean {
   try {
     pi.sendMessage!(
       {
@@ -1133,8 +1175,10 @@ function deliverArtifactNotification(
       },
       { deliverAs: "followUp" },
     );
+    return true;
   } catch {
     // pi may be stale after session replacement
+    return false;
   }
 }
 
@@ -1237,7 +1281,121 @@ export function findArtifactById(id: string): SubagentArtifact | null {
   }
   return null;
 }
-/** Sanitize a string by redacting common sensitive patterns (API keys, tokens, JWTs). */
+
+/**
+ * Rehydrate orphan interactive sub-agents from the on-disk state file.
+ *
+ * Reads <cwd>/.pi/subagentura-state.json, reconstructs each
+ * InteractiveSubagentState, sets its status via the existing
+ * deriveInteractiveSubagentStatus matrix (lastEvent + isPaneAlive), registers
+ * it, and resets runtime cursors so the existing poller backlog-catch-up path
+ * replays any events that landed during downtime.
+ *
+ * Idempotent — skips ids already in the registry. Designed to be called from
+ * the session_start handler. The first poll tick after this returns sees
+ * the rehydrated states and replays any backlog.
+ */
+export function rehydrateInteractiveSubagents(
+  cwd: string,
+  currentSessionId?: string,
+): {
+  total: number;
+  alive: number;
+  terminal: number;
+} {
+  const payload = loadInteractiveStates(cwd);
+  if (!payload) return { total: 0, alive: 0, terminal: 0 };
+  let alive = 0;
+  let terminal = 0;
+  for (const entry of Object.values(payload.states) as Array<
+    import("./artifact").InteractiveSubagentPersistedStateV1
+  >) {
+    if (currentSessionId && entry.parentSessionId !== currentSessionId) {
+      continue;
+    }
+    if (interactiveSubagentRegistry.has(entry.id)) continue;
+    // ── Recover display fields from on-disk files ──
+    // Recovery is best-effort and must never throw; on missing files we
+    // fall back to placeholder values (entry.id for name, 0 for startedAt).
+    const art = artifactPath(
+      dirname(entry.artifactDir),
+      basename(entry.artifactDir),
+    );
+
+    let recoveredName: string;
+    try {
+      const files = readdirSync(entry.artifactDir);
+      const promptFile = files.find((f) => f.endsWith("-prompt.md"));
+      recoveredName = promptFile
+        ? promptFile.slice(0, -"-prompt.md".length)
+        : entry.id;
+    } catch {
+      recoveredName = entry.id;
+    }
+
+    let startedAt: number;
+    try {
+      const events = readEvents(art);
+      startedAt = events.length > 0 ? events[0].ts : 0;
+    } catch {
+      startedAt = 0;
+    }
+
+    const attach = (() => {
+      try {
+        return buildAttachCommandsForState(entry);
+      } catch {
+        return { attachCommand: "", focusCommand: "" };
+      }
+    })();
+
+    const rehydrated: InteractiveSubagentState = {
+      id: entry.id,
+      name: recoveredName,
+      task: "",
+      paneId: entry.paneId,
+      windowName: entry.windowName,
+      mux: entry.mux,
+      muxSession: entry.muxSession,
+      sessionFile: entry.sessionFile,
+      cwd,
+      startedAt,
+      status: "running",
+      attachCommand: attach.attachCommand,
+      selectPaneCommand: attach.focusCommand,
+      launchScriptFile: "",
+      artifactDir: entry.artifactDir,
+      notifyOnComplete: entry.notifyOnComplete,
+      parentSessionId: entry.parentSessionId ?? "pi",
+      // All runtime cursors reset (replay-all semantics).
+      lastDeliveredEventTs: 0,
+      lastDeliveredSessionByte: 0,
+      lastInjectedEventTs: undefined,
+      lastSnapshotEventTs: undefined,
+      injected: undefined,
+      autoDoneForTurnAt: undefined,
+      lastStopReason: undefined,
+      lastStopReasonAt: undefined,
+      lastStopText: undefined,
+    };
+    const last = lastEvent(art);
+    const paneAlive = isPaneAlive(rehydrated);
+    const next = deriveInteractiveSubagentStatus(last, paneAlive);
+    rehydrated.status = next;
+    // Deliberately do NOT suppress re-injection here. The inject-mode path
+    // fires on every NEW `done` event (line 682, `lastInjectedEventTs !== last.ts`).
+    // On rehydrate, cursors are reset to 0 and lastInjectedEventTs starts as undefined,
+    // so the first poll will re-inject the latest terminal event for inject-mode orphans.
+    // This means exactly one extra inject per sub-agent on parent reload, which is
+    // acceptable — it's better than silently dropping a result that completed during
+    // the reload downtime (the pre-fix behavior).
+    if (next === "exited" || next === "cancelled") terminal++;
+    else if (next === "running" || next === "idle") alive++;
+    interactiveSubagentRegistry.set(entry.id, rehydrated);
+  }
+  return { total: Object.keys(payload.states).length, alive, terminal };
+}
+
 function sanitizeOutput(text: string): string {
   return text.replace(
     /(sk-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|-----BEGIN[\s\w]+KEY-----|AKIA[\w]{16}|ghp_[\w]{36}|gho_[\w]{36}|ghu_[\w]{36}|xox[abp]-[\w-]+|AIza[\w-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g,
@@ -1300,9 +1458,27 @@ export default function (pi: ExtensionAPI) {
   // Capture ctx.ui for the artifact poller (it runs from a setInterval and has no ctx).
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     g2.__piSubagenturaUi = ctx.ui;
+    // Rehydrate on startup (resumed session after quit), reload, and resume.
+    // The session ID filter ensures only subagents created in this specific session
+    // are rehydrated. On 'new' and 'fork' we skip — those are explicit fresh starts.
+    const shouldRehydrate =
+      event.reason === "startup" ||
+      event.reason === "reload" ||
+      event.reason === "resume";
+    if (shouldRehydrate) {
+      try {
+        rehydrateInteractiveSubagents(
+          ctx.cwd,
+          ctx.sessionManager?.getSessionId?.(),
+        );
+      } catch {
+        /* best effort — rehydrate is a recovery path; failures fall back to empty registry */
+      }
+    }
   });
+
   pi.on("session_shutdown", () => {
     // Don't null the ui ref here — the poller may still fire one last tick on shutdown,
     // and stale ctx errors are already caught at the call sites.
@@ -2126,6 +2302,8 @@ export default function (pi: ExtensionAPI) {
           background: params.background, // defaults to true (hidden) inside the helper
           notifyOnComplete: params.notifyOnComplete ?? "inject",
           muxPreference: params.mux, // pass through user's mux preference
+          parentCwd: ctx.cwd,
+          parentSessionId: ctx.sessionManager.getSessionId(),
         });
 
         const displayMode = state.windowName
@@ -2749,65 +2927,82 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Session shutdown: abort all jobs, kill tmux panes, stop the poller ─
-  (pi as any).on?.("session_shutdown", () => {
-    const g2 = typeof global !== "undefined" ? global : globalThis;
+  (pi as any).on?.(
+    "session_shutdown",
+    (
+      event: { reason?: string },
+      ctx: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
+    ) => {
+      const g2 = typeof global !== "undefined" ? global : globalThis;
 
-    // Stop the global poller so it doesn't fire after we're gone. Without
-    // clearInterval the handle would keep the event loop alive across restarts.
-    if (g2.__piSubagenturaInteractivePollerHandle) {
-      try {
-        clearInterval(g2.__piSubagenturaInteractivePollerHandle);
-      } catch {
-        /* defensive */
+      // Stop the global poller so it doesn't fire after we're gone. Without
+      // clearInterval the handle would keep the event loop alive across restarts.
+      if (g2.__piSubagenturaInteractivePollerHandle) {
+        try {
+          clearInterval(g2.__piSubagenturaInteractivePollerHandle);
+        } catch {
+          /* defensive */
+        }
+        g2.__piSubagenturaInteractivePollerHandle = undefined;
       }
-      g2.__piSubagenturaInteractivePollerHandle = undefined;
-    }
-    // Snapshot running state objects BEFORE clearing, so we can kill their panes
-    // after the registry is empty. We can't call cancelInteractiveSubagent(id)
-    // after clear() because it looks up state from the registry (line 533 of
-    // interactive-tmux.ts) and returns undefined.
-    const runningStates: InteractiveSubagentState[] = [];
-    for (const state of interactiveSubagentRegistry.values()) {
-      if (state.status === "running") runningStates.push(state);
-    }
+      // Snapshot running state objects BEFORE clearing. On /new and quit we
+      // kill their panes after the registry is empty. On reload/resume we
+      // intentionally preserve panes so the next session_start can rehydrate
+      // them from the state file.
+      const runningStates: InteractiveSubagentState[] = [];
+      for (const state of interactiveSubagentRegistry.values()) {
+        if (state.status === "running") runningStates.push(state);
+      }
 
-    // Drop in-memory state FIRST. An in-flight poll tick (dequeued from
-    // setInterval before clearInterval ran) finds an empty registry and its
-    // for-loop iterates over zero entries — no work, no notification delivery.
-    // `__piSubagenturaPiRef` is still valid at this point (cleared later), so
-    // the tick proceeds into the loop and finds nothing.
-    try {
-      interactiveSubagentRegistry.clear();
-    } catch {
-      /* best effort */
-    }
-
-    // Kill the panes using the snapshotted states. The poller is already safe
-    // (registry empty). We use cancelInteractiveSubagentByState (not the
-    // id-based variant) because the registry is already cleared.
-    for (const state of runningStates) {
+      // Drop in-memory state FIRST. An in-flight poll tick (dequeued from
+      // setInterval before clearInterval ran) finds an empty registry and its
+      // for-loop iterates over zero entries — no work, no notification delivery.
       try {
-        cancelInteractiveSubagentByState(state);
+        interactiveSubagentRegistry.clear();
       } catch {
         /* best effort */
       }
-    }
 
-    // Abort all running subagent sessions before clearing
-    for (const job of jobRegistry.values()) {
-      if (job.status === "running") {
-        try {
-          job.session.abort().catch(() => {});
-        } catch {
-          /* session may already be disposed */
+      const preserveInteractivePanes =
+        event?.reason === "reload" ||
+        event?.reason === "resume" ||
+        event?.reason === "quit";
+      if (!preserveInteractivePanes) {
+        // Kill the panes using the already-snapshotted states.
+        // cancelInteractiveSubagentByState is used (not the id-based variant)
+        // because the registry was already cleared above.
+        for (const state of runningStates) {
+          try {
+            cancelInteractiveSubagentByState(state);
+          } catch {
+            /* best effort */
+          }
         }
       }
-    }
-
-    jobRegistry.clear();
-    g2.__piSubagenturaPiRef = undefined;
-    g2.__piSubagenturaInjectCount = 0;
-  });
+      // Abort all running subagent sessions before clearing
+      for (const job of jobRegistry.values()) {
+        if (job.status === "running") {
+          try {
+            job.session.abort().catch(() => {});
+          } catch {
+            /* session may already be disposed */
+          }
+        }
+      }
+      jobRegistry.clear();
+      g2.__piSubagenturaPiRef = undefined;
+      g2.__piSubagenturaInjectCount = 0;
+      // Clean-slate the state file on /new. On quit/reload/resume we KEEP the file so the
+      // next session_start can rehydrate the sub-agents (their panes survive).
+      if (event?.reason === "new" && ctx?.cwd) {
+        try {
+          deleteInteractiveStatesFile(ctx.cwd);
+        } catch {
+          /* best effort */
+        }
+      }
+    },
+  );
 }
 
 // ── Re-exports ───────────────────────────────────────────────────────

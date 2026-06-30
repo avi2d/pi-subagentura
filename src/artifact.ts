@@ -24,10 +24,13 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import ndjson from "ndjson";
+import { debugLog } from "./helpers";
+import type { MuxName } from "./multiplexer";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -240,4 +243,185 @@ export function listArtifacts(rootDir: string): SubagentArtifact[] {
 export function lastEvent(art: SubagentArtifact): SubagentEvent | null {
   const events = readEvents(art);
   return events.length > 0 ? events[events.length - 1] : null;
+}
+
+// ── Persisted interactive state (project-local, per parent session) ───────────
+
+/**
+
+ * Per-entry shape. The minimum to drive sendCommandToPane (src/interactive-tmux.ts:533),
+
+ * isPaneAlive (:525), cancelInteractiveSubagent (:557), and the poller's tailReadSessionLog
+
+ * (:714). Fields like task/model/startedAt are intentionally not persisted — they're
+
+ * recoverable from the launch script + prompt file on demand, or not needed for live ops.
+
+ */
+
+export interface InteractiveSubagentPersistedStateV1 {
+  id: string;
+
+  paneId: string;
+
+  windowName?: string;
+
+  mux: MuxName;
+
+  muxSession?: string;
+
+  artifactDir: string;
+
+  sessionFile: string;
+
+  notifyOnComplete?: "notify" | "inject";
+
+  /** Parent pi session id; only rehydrated when the current session matches. */
+  parentSessionId?: string;
+}
+
+export interface InteractiveSubagentStateFile {
+  schemaVersion: 1;
+
+  /** Parent pi session id; redundant with the filename but kept for verification/debugging. */
+
+  parent: string;
+
+  states: { [id: string]: InteractiveSubagentPersistedStateV1 };
+}
+
+/** File path for the project-local state file under .pi/. */
+
+export function stateFilePath(cwd: string): string {
+  return join(cwd, ".pi", "subagentura-state.json");
+}
+/**
+ * Read the state file. Returns null on missing file, malformed
+ * JSON, or schemaVersion mismatch. Never throws — defensive readers for untrusted input
+ * (the file could be hand-edited or partial from a crash mid-rename).
+ */
+
+export function loadInteractiveStates(
+  cwd: string,
+): InteractiveSubagentStateFile | null {
+  const file = stateFilePath(cwd);
+
+  let content: string;
+
+  try {
+    content = readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const obj = parsed as Record<string, unknown>;
+
+  if (obj.schemaVersion !== 1) {
+    debugLog("warn", "state-file-unknown-schema", {
+      schemaVersion: obj.schemaVersion as number,
+    });
+    return null;
+  }
+
+  if (!obj.states || typeof obj.states !== "object") {
+    return {
+      schemaVersion: 1,
+      parent: String(obj.parent ?? "pi"),
+      states: {},
+    };
+  }
+
+  return {
+    schemaVersion: 1,
+
+    parent: String(obj.parent ?? "pi"),
+
+    states: obj.states as { [id: string]: InteractiveSubagentPersistedStateV1 },
+  };
+}
+/**
+ * Atomically write the state file. Creates .pi/ if needed.
+ * Mode 0o700 on .pi/, mode 0o600 on the file. Atomic via *.tmp + rename.
+ */
+export function saveInteractiveStates(
+  cwd: string,
+  payload: InteractiveSubagentStateFile,
+): void {
+  if (payload.schemaVersion !== 1) {
+    throw new Error(`unsupported schemaVersion: ${payload.schemaVersion}`);
+  }
+
+  const file = stateFilePath(cwd);
+
+  mkdirSync(join(cwd, ".pi"), { recursive: true, mode: 0o700 });
+
+  const tmp = file + ".tmp";
+
+  writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+
+  renameSync(tmp, file);
+}
+// SAFETY: load-modify-write is not atomic across concurrent callers.
+// Safe today only because a pi session is single-event-loop and never
+// calls this re-entrantly. Do NOT call from parallel async paths without
+// adding a write lock.
+/**
+ * Convenience: load (or create fresh) + add/overwrite entry by id + save.
+ * Called from hot paths (spawn) where a write failure must not break the parent.
+ */
+export function appendInteractiveState(
+  cwd: string,
+  entry: InteractiveSubagentPersistedStateV1,
+): void {
+  const current = loadInteractiveStates(cwd) ?? {
+    schemaVersion: 1,
+
+    parent: "pi",
+
+    states: {},
+  };
+
+  current.states[entry.id] = entry;
+
+  saveInteractiveStates(cwd, current);
+}
+
+// SAFETY: load-modify-write is not atomic across concurrent callers.
+// Safe today only because a pi session is single-event-loop and never
+// calls this re-entrantly. Do NOT call from parallel async paths without
+// adding a write lock.
+/**
+ * Convenience: load + drop entry by id + save. No-op if absent or file missing.
+ */
+export function removeInteractiveState(cwd: string, id: string): void {
+  const current = loadInteractiveStates(cwd);
+
+  if (!current) return;
+
+  if (!(id in current.states)) return;
+
+  delete current.states[id];
+
+  saveInteractiveStates(cwd, current);
+}
+/**
+ * Delete the state file outright. Used on session_shutdown(reason="new") to
+ * give the next session a clean slate. No-op if the file doesn't exist.
+ */
+export function deleteInteractiveStatesFile(cwd: string): void {
+  try {
+    unlinkSync(stateFilePath(cwd));
+  } catch {
+    /* best effort — file may not exist */
+  }
 }

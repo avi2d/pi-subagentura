@@ -25,14 +25,15 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
 import {
+  appendInteractiveState,
   artifactPath,
   lastEvent,
-  type SubagentArtifact,
   type SubagentEvent,
+  removeInteractiveState,
 } from "./artifact";
 import {
   getMux,
@@ -40,13 +41,13 @@ import {
   type MuxName,
   type Multiplexer,
 } from "./multiplexer";
-import { TmuxMultiplexer } from "./multiplexer-tmux";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
 // (it's a no-op on non-tmux systems thanks to `2>/dev/null || true`); this
 // helper is the only place that reads it back. The artifact's `done`
 // event is the source of truth in production.
+import { TmuxMultiplexer } from "./multiplexer-tmux";
 export { readPaneExitCode } from "./multiplexer-tmux";
 
 /**
@@ -140,6 +141,13 @@ export interface InteractiveSubagentState {
   muxSession?: string;
   sessionFile: string;
   cwd: string;
+  /**
+   * Parent pi session id. Used as the per-session key for the on-disk state file
+   * (see src/artifact.ts: stateFilePath). Required for terminal-event cleanup to
+   * remove the entry from the file; rehydrate rebuilds it from the file on
+   * session_start. Optional for tests that don't care about reload semantics.
+   */
+  parentSessionId?: string;
   model?: string;
   startedAt: number;
   /**
@@ -436,9 +444,21 @@ export function launchInteractiveSubagent(params: {
   notifyOnComplete?: "notify" | "inject";
   /** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
   muxPreference?: "auto" | "tmux" | "zellij";
+  /**
+   * Parent pi session id. Used as the per-session key for the on-disk state file
+   * so a parent reload can rehydrate the sub-agent. If omitted, persistence is
+   * skipped (used by tests that don't care about reload).
+   */
+  parentSessionId?: string;
+  /**
+   * The parent session's working directory, used for the state file location.
+   * If omitted, falls back to `cwd` (backward-compatible for tests).
+   */
+  parentCwd?: string;
 }): InteractiveSubagentState {
   const id = randomBytes(4).toString("hex");
   const cwd = resolve(params.cwd);
+  const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
   const background = params.background !== false; // default true (hidden)
   const paths = createInteractiveSubagentPaths({ id, name: params.name, cwd });
   const prompt = buildInteractivePrompt({
@@ -507,6 +527,27 @@ export function launchInteractiveSubagent(params: {
     windowName: safeSegment(params.name),
     id,
   });
+  let persistedState = false;
+  // Persist as soon as the pane is addressable. A crash after this point is
+  // recoverable on reload. The catch path below removes it on launch failure.
+  if (params.parentSessionId) {
+    try {
+      appendInteractiveState(stateCwd, {
+        id,
+        paneId,
+        windowName,
+        mux: mux.name,
+        muxSession,
+        artifactDir: paths.artifactDir,
+        sessionFile: paths.sessionFile,
+        notifyOnComplete: params.notifyOnComplete,
+        parentSessionId: params.parentSessionId,
+      });
+      persistedState = true;
+    } catch {
+      /* best effort — disk full, permission denied, etc. In-memory still works. */
+    }
+  }
   try {
     const command = buildPiInteractiveCommand({
       sessionFile: paths.sessionFile,
@@ -523,7 +564,14 @@ export function launchInteractiveSubagent(params: {
   } catch (err) {
     // Orphan-pane guard. If writeLaunchScript or sendKeys throws after
     // the pane was created, kill the pane before rethrowing so we don't
-    // leak it into the user's mux server.
+    // leak it into the user's mux server. Also clean up persisted state.
+    if (persistedState && params.parentSessionId) {
+      try {
+        removeInteractiveState(stateCwd, id);
+      } catch {
+        /* best effort — the pane kill below is the important cleanup */
+      }
+    }
     mux.killPane(paneId, muxSession);
     throw err;
   }
@@ -542,7 +590,7 @@ export function launchInteractiveSubagent(params: {
     mux: mux.name,
     muxSession,
     sessionFile: paths.sessionFile,
-    cwd,
+    cwd: stateCwd,
     model: params.model,
     startedAt: Date.now(),
     status: "running",
@@ -551,8 +599,8 @@ export function launchInteractiveSubagent(params: {
     launchScriptFile: paths.launchScriptFile,
     artifactDir: paths.artifactDir,
     notifyOnComplete: params.notifyOnComplete,
+    parentSessionId: params.parentSessionId,
   };
-
   interactiveSubagentRegistry.set(id, state);
   return state;
 }
@@ -588,6 +636,24 @@ export function sendCommandToPane(
   mux.sendEnter(state.paneId, state.muxSession);
 }
 
+/** Rebuild attach/focus commands for a persisted or rehydrated state. */
+export function buildAttachCommandsForState(
+  state: Pick<
+    InteractiveSubagentState,
+    "paneId" | "windowName" | "mux" | "muxSession"
+  >,
+): { attachCommand: string; focusCommand: string } {
+  return getMuxForState(state as InteractiveSubagentState).buildAttachCommands({
+    paneId: state.paneId,
+    windowName: state.windowName,
+    session: state.muxSession,
+  });
+}
+
+/**
+ * Probe a tmux pane. Kept as a thin helper for the existing call sites in
+ * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
+ */
 /**
  * Probe a tmux pane. Kept as a thin helper for the existing call sites in
  * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
@@ -629,6 +695,12 @@ export function cancelInteractiveSubagent(
   const mux = getMuxForState(state);
   if (mux.isPaneAlive(state.paneId, state.muxSession)) {
     mux.killPane(state.paneId, state.muxSession);
+  }
+  // 4. Clean up the persisted state entry so it doesn't litter the state file.
+  try {
+    removeInteractiveState(state.cwd, state.id);
+  } catch {
+    /* best-effort */
   }
   return state;
 }
@@ -674,6 +746,12 @@ export function cancelInteractiveSubagentByState(
     } catch {
       /* best-effort */
     }
+  }
+  // 3. Clean up the persisted state entry so it doesn't litter the state file.
+  try {
+    removeInteractiveState(state.cwd, state.id);
+  } catch {
+    /* best-effort — stale entry is harmless, just clutter */
   }
   // Does NOT update state.status — see JSDoc point 2.
 }

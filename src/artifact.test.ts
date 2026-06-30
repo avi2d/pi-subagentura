@@ -13,17 +13,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendEvent,
+  appendInteractiveState,
   artifactPath,
+  deleteInteractiveStatesFile,
   ensureArtifactDir,
   lastEvent,
   listArtifacts,
   listOutputTurns,
+  loadInteractiveStates,
   outputPathForTurn,
   readEvents,
   readOutput,
   readOutputForTurn,
+  removeInteractiveState,
+  saveInteractiveStates,
   snapshotOutput,
+  stateFilePath,
   writeOutput,
+  type InteractiveSubagentPersistedStateV1,
   type SubagentEvent,
 } from "./artifact";
 
@@ -280,5 +287,220 @@ describe("artifact", () => {
       const art = artifactPath(root, "snap6-nonexistent");
       expect(listOutputTurns(art)).toEqual([]);
     });
+  });
+
+  it("listOutputTurns returns [] when the artifact dir doesn't exist", () => {
+    const art = artifactPath(root, "snap6-nonexistent");
+    expect(listOutputTurns(art)).toEqual([]);
+  });
+});
+
+describe("persisted interactive state helpers", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = makeTmp();
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const SAMPLE: InteractiveSubagentPersistedStateV1 = {
+    id: "abc12345",
+
+    paneId: "%42",
+
+    windowName: "demo",
+
+    mux: "tmux",
+
+    artifactDir: "/tmp/artifacts/abc12345",
+
+    sessionFile: "/tmp/session.jsonl",
+
+    notifyOnComplete: "inject",
+  };
+
+  it("stateFilePath returns <cwd>/.pi/subagentura-state.json", () => {
+    expect(stateFilePath(root)).toBe(
+      join(root, ".pi", "subagentura-state.json"),
+    );
+  });
+
+  it("saveInteractiveStates + loadInteractiveStates round-trips a state file", () => {
+    saveInteractiveStates(root, {
+      schemaVersion: 1,
+      parent: "pi",
+      states: { abc12345: SAMPLE },
+    });
+
+    const loaded = loadInteractiveStates(root);
+
+    expect(loaded).toEqual({
+      schemaVersion: 1,
+      parent: "pi",
+      states: { abc12345: SAMPLE },
+    });
+  });
+
+  it("loadInteractiveStates returns null when the file is missing", () => {
+    expect(loadInteractiveStates(root)).toBeNull();
+  });
+
+  it("loadInteractiveStates returns null when the JSON is malformed", () => {
+    const file = stateFilePath(root);
+
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+
+    writeFileSync(file, "not-json{", { mode: 0o600 });
+
+    expect(loadInteractiveStates(root)).toBeNull();
+  });
+
+  it("loadInteractiveStates returns null when schemaVersion is not 1", () => {
+    const file = stateFilePath(root);
+
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+
+    writeFileSync(
+      file,
+      JSON.stringify({ schemaVersion: 99, parent: "pi", states: {} }),
+      { mode: 0o600 },
+    );
+
+    expect(loadInteractiveStates(root)).toBeNull();
+  });
+
+  it("loadInteractiveStates returns empty states when the file exists but has no states key", () => {
+    const file = stateFilePath(root);
+
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+
+    writeFileSync(file, JSON.stringify({ schemaVersion: 1, parent: "pi" }), {
+      mode: 0o600,
+    });
+
+    const loaded = loadInteractiveStates(root);
+
+    expect(loaded).toEqual({ schemaVersion: 1, parent: "pi", states: {} });
+  });
+
+  it("saveInteractiveStates creates the .pi/ directory if missing (mode 0o700)", () => {
+    expect(existsSync(join(root, ".pi"))).toBe(false);
+
+    saveInteractiveStates(root, {
+      schemaVersion: 1,
+      parent: "pi",
+      states: {},
+    });
+
+    expect(existsSync(join(root, ".pi"))).toBe(true);
+
+    if (process.platform !== "win32") {
+      expect(statSync(join(root, ".pi")).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it("saveInteractiveStates writes atomically (no torn writes)", () => {
+    saveInteractiveStates(root, {
+      schemaVersion: 1,
+      parent: "pi",
+      states: { abc12345: SAMPLE },
+    });
+
+    expect(existsSync(stateFilePath(root) + ".tmp")).toBe(false);
+
+    expect(existsSync(stateFilePath(root))).toBe(true);
+  });
+
+  it("saveInteractiveStates rejects schemaVersion !== 1", () => {
+    expect(() =>
+      saveInteractiveStates(root, {
+        schemaVersion: 2 as any,
+        parent: "pi",
+        states: {},
+      }),
+    ).toThrow(/unsupported schemaVersion/);
+  });
+
+  it("appendInteractiveState adds a new entry to an existing file", () => {
+    saveInteractiveStates(root, {
+      schemaVersion: 1,
+      parent: "pi",
+      states: {},
+    });
+
+    appendInteractiveState(root, SAMPLE);
+
+    expect(loadInteractiveStates(root)?.states["abc12345"]).toEqual(SAMPLE);
+  });
+
+  it("appendInteractiveState creates a fresh file if none exists", () => {
+    expect(existsSync(stateFilePath(root))).toBe(false);
+
+    appendInteractiveState(root, SAMPLE);
+
+    const loaded = loadInteractiveStates(root);
+
+    expect(loaded?.parent).toBe("pi");
+
+    expect(loaded?.states["abc12345"]).toEqual(SAMPLE);
+  });
+
+  it("appendInteractiveState overwrites an entry with the same id", () => {
+    appendInteractiveState(root, SAMPLE);
+
+    const updated = { ...SAMPLE, paneId: "%99" };
+
+    appendInteractiveState(root, updated);
+
+    expect(loadInteractiveStates(root)?.states["abc12345"]?.paneId).toBe("%99");
+  });
+
+  it("removeInteractiveState drops the entry by id", () => {
+    appendInteractiveState(root, SAMPLE);
+
+    appendInteractiveState(root, { ...SAMPLE, id: "def67890" });
+
+    removeInteractiveState(root, "abc12345");
+
+    const loaded = loadInteractiveStates(root);
+
+    expect(loaded?.states["abc12345"]).toBeUndefined();
+
+    expect(loaded?.states["def67890"]).toBeDefined();
+  });
+
+  it("removeInteractiveState is a no-op when the entry is absent", () => {
+    appendInteractiveState(root, SAMPLE);
+
+    removeInteractiveState(root, "nonexistent");
+
+    expect(loadInteractiveStates(root)?.states["abc12345"]).toEqual(SAMPLE);
+  });
+
+  it("removeInteractiveState on a missing file does not throw", () => {
+    expect(() => removeInteractiveState(root, "abc12345")).not.toThrow();
+  });
+
+  it("the saved file mode is 0o600 (best-effort on POSIX)", () => {
+    appendInteractiveState(root, SAMPLE);
+
+    if (process.platform !== "win32") {
+      expect(statSync(stateFilePath(root)).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  it("deleteInteractiveStatesFile removes the file", () => {
+    appendInteractiveState(root, SAMPLE);
+
+    deleteInteractiveStatesFile(root);
+
+    expect(existsSync(stateFilePath(root))).toBe(false);
+  });
+
+  it("deleteInteractiveStatesFile is a no-op when the file is absent", () => {
+    expect(() => deleteInteractiveStatesFile(root)).not.toThrow();
   });
 });

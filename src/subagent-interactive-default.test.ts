@@ -27,7 +27,10 @@ function mockCtx() {
   return {
     cwd: "/tmp",
     ui: { setStatus: vi.fn() },
-    sessionManager: { getBranch: vi.fn().mockReturnValue([]) },
+    sessionManager: {
+      getBranch: vi.fn().mockReturnValue([]),
+      getSessionId: vi.fn().mockReturnValue("test-session-id"),
+    },
   };
 }
 
