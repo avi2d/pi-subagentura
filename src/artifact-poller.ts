@@ -32,6 +32,7 @@ import {
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
+import { debugLog } from "./helpers";
 import { formatActivityRow } from "./rendering";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -223,7 +224,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         /* ui stale */
       }
     }
-  } catch {
+  } catch (err) {
+    debugLog("error", "poller_error", {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      registryIds: [...interactiveSubagentRegistry.keys()],
+    });
     /* defensive: never let one bad poll tick crash the parent process */
   }
 }

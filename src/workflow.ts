@@ -811,7 +811,7 @@ function skipString(src, start) {
   let i = start + 1;
   while (i < src.length) {
     const c = src[i];
-    if (c === "\\\\") {
+    if (c === "\\") {
       i += 2;
       continue;
     }

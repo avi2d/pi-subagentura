@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,6 +75,7 @@ describe("pollArtifactChanges", () => {
 
   afterEach(() => {
     (globalThis as any).__piSubagenturaParentStreaming = false;
+    delete process.env.SUBAGENT_DEBUG_LOG_DIR;
     vi.doUnmock("node:child_process");
   });
 
@@ -83,6 +85,38 @@ describe("pollArtifactChanges", () => {
     const sendMessage = installDeliverySpies();
     mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("logs unexpected top-level poller errors to the debug log", async () => {
+    const logDir = makeTmp();
+    process.env.SUBAGENT_DEBUG_LOG_DIR = logDir;
+    vi.resetModules();
+
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    mod.interactiveSubagentRegistry.set("bad-state", {
+      id: "bad-state",
+      status: "running",
+      artifactDir: undefined,
+    } as any);
+
+    expect(() =>
+      mod.pollArtifactChanges({
+        sendMessage: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any),
+    ).not.toThrow();
+
+    const logFile = join(
+      logDir,
+      `debug-${new Date().toISOString().slice(0, 10)}.jsonl`,
+    );
+    expect(existsSync(logFile)).toBe(true);
+    const content = readFileSync(logFile, "utf8");
+    expect(content).toContain('"event":"poller_error"');
+    expect(content).toContain("bad-state");
+
+    rmSync(logDir, { recursive: true, force: true });
   });
 
   it("acknowledges parent cancellation before killing the pane without injecting it", async () => {
