@@ -120,6 +120,8 @@ export interface WorkflowProgress {
   agentsSpawned: number;
   errorCount: number;
   tokensSpent: number;
+  runningCount: number;
+  model?: string;
 }
 
 export interface WorkflowRunResult {
@@ -522,7 +524,12 @@ interface Engine {
   loadWorkflow?: (name: string) => string | null;
   budgetTotal: number | null;
   workflowTimeoutMs: number;
-  counters: { agentsSpawned: number; errorCount: number; tokensSpent: number };
+  counters: {
+    agentsSpawned: number;
+    errorCount: number;
+    tokensSpent: number;
+    runningCount: number;
+  };
   phases: string[];
 }
 
@@ -540,7 +547,12 @@ export async function runWorkflow(
     ),
     loadWorkflow: opts.loadWorkflow,
     budgetTotal: opts.budgetTotal ?? null,
-    counters: { agentsSpawned: 0, errorCount: 0, tokensSpent: 0 },
+    counters: {
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      runningCount: 0,
+    },
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
   };
@@ -863,7 +875,10 @@ async function executeScript(
   _depth: number,
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
   const emit = (
-    p: Omit<WorkflowProgress, "agentsSpawned" | "errorCount" | "tokensSpent">,
+    p: Omit<
+      WorkflowProgress,
+      "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
+    >,
   ) => {
     if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
     engine.onProgress?.({
@@ -871,6 +886,7 @@ async function executeScript(
       agentsSpawned: engine.counters.agentsSpawned,
       errorCount: engine.counters.errorCount,
       tokensSpent: engine.counters.tokensSpent,
+      runningCount: engine.counters.runningCount,
     });
   };
 
@@ -907,11 +923,13 @@ async function executeScript(
           );
         }
         engine.counters.agentsSpawned++;
+        engine.counters.runningCount++;
         // Emit *before* awaiting runAgent so status polling sees in-flight process agents.
         emit({
           kind: "agent_start",
           label: agentOpts.label,
           phase: agentOpts.phase,
+          model: agentOpts.model,
         });
         const finalPrompt = hasSchema
           ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
@@ -927,10 +945,12 @@ async function executeScript(
         const outTokens = res.usage?.output ?? 0;
         tokensDelta += outTokens;
         engine.counters.tokensSpent += outTokens;
+        engine.counters.runningCount--;
         emit({
           kind: "agent_done",
           label: agentOpts.label,
           phase: agentOpts.phase,
+          model: agentOpts.model,
         });
 
         if (res.isError) {
@@ -1251,6 +1271,7 @@ export interface WorkflowJobState {
     phases: string[];
     lastMessage?: string;
     currentPhase?: string;
+    runningCount?: number;
   };
   result?: WorkflowRunResult;
   error?: string;
@@ -1305,7 +1326,13 @@ export function startWorkflowJob(
     startedAt: startedAt ?? Date.now(),
     promise: undefined as unknown as Promise<WorkflowRunResult>,
     abort,
-    snapshot: { agentsSpawned: 0, errorCount: 0, tokensSpent: 0, phases: [] },
+    snapshot: {
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      phases: [],
+      runningCount: 0,
+    },
   };
   state.promise = runWorkflow(script, {
     ...opts,
@@ -1314,6 +1341,7 @@ export function startWorkflowJob(
       state.snapshot.agentsSpawned = p.agentsSpawned;
       state.snapshot.errorCount = p.errorCount;
       state.snapshot.tokensSpent = p.tokensSpent;
+      state.snapshot.runningCount = p.runningCount;
       if (p.kind === "phase" && p.phase) {
         state.snapshot.currentPhase = p.phase;
         state.snapshot.phases.push(p.phase);
@@ -1532,6 +1560,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
                 details: {
                   status: "running",
                   agentsSpawned: p.agentsSpawned,
+                  runningCount: p.runningCount,
                   errorCount: p.errorCount,
                   tokensSpent: p.tokensSpent,
                 },
@@ -1595,8 +1624,11 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           {
             type: "text",
             text:
-              `Workflow "${st.name}" [${st.status}] — ${st.snapshot.agentsSpawned} agent(s), ` +
-              `${st.snapshot.errorCount} error(s), ${st.snapshot.tokensSpent} tokens` +
+              `Workflow "${st.name}" [${st.status}] — ${st.snapshot.agentsSpawned} agent(s)` +
+              (st.snapshot.runningCount && st.snapshot.runningCount > 0
+                ? `, ${st.snapshot.runningCount} running`
+                : "") +
+              `, ${st.snapshot.errorCount} error(s), ${st.snapshot.tokensSpent} tokens` +
               (st.snapshot.currentPhase
                 ? `, phase: ${st.snapshot.currentPhase}`
                 : "") +
@@ -1760,8 +1792,20 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
 }
 
 function renderProgress(p: WorkflowProgress): string {
-  const head = `● workflow — ${p.agentsSpawned} agent(s), ${p.errorCount} error(s)`;
-  if (p.kind === "phase") return `${head}\n  phase: ${p.phase}`;
+  const parts = [`● workflow — ${p.agentsSpawned} agent(s)`];
+  if (p.runningCount > 0) parts.push(`⚡ ${p.runningCount} running`);
+  if (p.errorCount > 0) parts.push(`⚠ ${p.errorCount} error(s)`);
+  parts.push(`${p.tokensSpent} tokens`);
+  const head = parts.join(", ");
+  if (p.kind === "phase") return `${head}\n  ◆ phase: ${p.phase}`;
   if (p.kind === "log") return `${head}\n  ${p.message}`;
-  return `${head}${p.label ? `\n  → ${p.label}` : ""}`;
+  if (p.kind === "agent_start") {
+    const tag = p.model ? ` @${p.model}` : "";
+    return `${head}\n  → started${p.label ? ` ${p.label}` : ""}${tag}`;
+  }
+  if (p.kind === "agent_done") {
+    const tag = p.model ? ` @${p.model}` : "";
+    return `${head}\n  → done${p.label ? ` ${p.label}` : ""}${tag}`;
+  }
+  return head;
 }
