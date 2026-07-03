@@ -109,7 +109,6 @@ export function rehydrateInteractiveSubagents(
       lastDeliveredSessionByte: 0,
       lastInjectedEventTs: undefined,
       lastSnapshotEventTs: undefined,
-      injected: undefined,
       autoDoneForTurnAt: undefined,
       lastStopReason: undefined,
       lastStopReasonAt: undefined,

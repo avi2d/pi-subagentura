@@ -39,6 +39,7 @@ import {
   MAX_INJECT,
   shouldNotify,
 } from "./notifications";
+import { debugLog } from "./helpers";
 import { formatActivityRow } from "./rendering";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -188,7 +189,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
       // history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
       // so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
-      // `lastInjectedEventTs` would corrupt history in the default `notify` mode.
+      // `lastInjectedEventTs` would corrupt history in notify-compatible legacy/UI-only mode.
       if (
         last &&
         last.type === "done" &&
@@ -289,7 +290,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         /* ui stale */
       }
     }
-  } catch {
+  } catch (err) {
+    debugLog("error", "poller_error", {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      registryIds: [...interactiveSubagentRegistry.keys()],
+    });
     /* defensive: never let one bad poll tick crash the parent process */
   }
 }
@@ -543,9 +549,9 @@ function extractAssistantText(content: unknown[]): string {
  *   3. No explicit done/error/cancelled event is in the artifact log yet, AND
  *   4. We have not already synthesized one for this turn.
  *
- * The synthesized event is appended to events.ndjson so the regular poller path picks it up; we also
- * advance the cursor and the `injected` flag so a late-arriving explicit `done` (or a duplicate poller pass)
- * does not double-notify. When output.md is missing, we synthesize `error` instead and include the child's
+ * The synthesized event is appended to events.ndjson so the regular poller path picks it up; the
+ * `autoDoneForTurnAt` guard skips any later explicit `done` for the same turn so duplicate events
+ * do not double-notify. When output.md is missing, we synthesize `error` instead and include the child's
  * last assistant text as a fallback message — most models inline a summary in chat even when the actual
  * result landed at a different path.
  */
@@ -622,13 +628,9 @@ function maybeAutoDone(
   // follow-up turn completes.
   appendEvent(art, ev);
   state.autoDoneForTurnAt = ts;
-  // state.lastDeliveredEventTs = ts; // removed — the event loop owns cursor advancement
-  // In inject mode, leave `injected` unset so the regular inject path at
-  // lines 547-585 picks up the synthesized `done` event on the next poll.
-  // For all other modes (notify, undefined), mark as injected here because
-  // the inject path will never fire — this prevents accidental re-inject
-  // if a late explicit `done` later matches the cursor.
-  state.injected = state.notifyOnComplete !== "inject";
+  // state.lastDeliveredEventTs = ts; // removed — the event loop owns cursor advancement.
+  // state.lastInjectedEventTs is also left untouched: inject mode should process this synthesized
+  // `done` through the normal per-event inject path on the next poll.
 }
 
 // ── Misc helpers ──────────────────────────────────────────────────────

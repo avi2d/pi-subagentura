@@ -210,8 +210,8 @@ export interface InteractiveSubagentState {
   lastStopText?: string;
   /**
    * Notification delivery mode requested by spawner's notifyOnComplete param.
-   * "notify" (default) emits a UI hint on completion. "inject" also injects
-   * output.md as a user message so the parent LLM processes it in its next turn.
+   * The public subagent_interactive tool passes "inject" by default. Lower-level
+   * undefined state is treated as notify-compatible legacy/UI-only behavior by the poller.
    */
   notifyOnComplete?: "notify" | "inject";
   /**
@@ -224,17 +224,10 @@ export interface InteractiveSubagentState {
    * At-most-once guard for the per-turn `output-N.md` snapshot. Compared against the current `done`
    * event's `ts` so each NEW turn snapshots exactly once. Distinct from `lastInjectedEventTs`, which is
    * only set in `inject` mode — snapshots run in every notifyOnComplete mode, so they need their own
-   * cursor or the default `notify` mode would re-snapshot every poll tick and could overwrite an
+   * cursor or notify-compatible legacy/UI-only mode would re-snapshot every poll tick and could overwrite an
    * earlier turn's snapshot with a later turn's in-progress output.md.
    */
   lastSnapshotEventTs?: number;
-  /**
-   * Auto-fallback "already notified" flag (PR #11). Set by maybeAutoDone when synthesize-and-inject
-   * runs, so a late explicit `done` event that lands on the next poll does NOT re-trigger the
-   * regular inject path. Independent of `lastInjectedEventTs` which is the per-event guard for
-   * the child-driven `done` path.
-   */
-  injected?: boolean;
 }
 
 declare global {
@@ -437,9 +430,9 @@ export function launchInteractiveSubagent(params: {
   /** Spawn in a detached named window (invisible) instead of a visible split. */
   background?: boolean;
   /**
-   * Notification delivery mode requested by the spawner. "notify" (default)
-   * emits a UI hint on completion. "inject" also injects output.md as a user
-   * message so the parent LLM processes it in its next turn.
+   * Notification delivery mode requested by the spawner. The public tool passes
+   * "inject" by default. Lower-level undefined state is treated as notify-compatible
+   * legacy/UI-only behavior by the poller.
    */
   notifyOnComplete?: "notify" | "inject";
   /** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
@@ -529,7 +522,8 @@ export function launchInteractiveSubagent(params: {
   });
   let persistedState = false;
   // Persist as soon as the pane is addressable. A crash after this point is
-  // recoverable on reload. The catch path below removes it on launch failure.
+  // recoverable on reload. If persistence itself fails, abort and kill the
+  // pane; otherwise the child would be invisible to rehydrate after a restart.
   if (params.parentSessionId) {
     try {
       appendInteractiveState(stateCwd, {
@@ -544,8 +538,13 @@ export function launchInteractiveSubagent(params: {
         parentSessionId: params.parentSessionId,
       });
       persistedState = true;
-    } catch {
-      /* best effort — disk full, permission denied, etc. In-memory still works. */
+    } catch (err) {
+      try {
+        mux.killPane(paneId, muxSession);
+      } catch {
+        /* best effort — preserve the original persistence error */
+      }
+      throw err;
     }
   }
   try {

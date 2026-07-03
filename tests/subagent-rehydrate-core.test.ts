@@ -149,7 +149,6 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated.lastDeliveredSessionByte).toBe(0);
     expect(rehydrated.lastInjectedEventTs).toBeUndefined();
     expect(rehydrated.lastSnapshotEventTs).toBeUndefined();
-    expect(rehydrated.injected).toBeUndefined();
     expect(rehydrated.autoDoneForTurnAt).toBeUndefined();
   });
 
