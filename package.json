@@ -25,6 +25,7 @@
   },
   "files": [
     "LICENSE",
+    "skills/orchestrator/SKILL.md",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
@@ -55,6 +56,9 @@
   "pi": {
     "extensions": [
       "./src/subagent.ts"
+    ],
+    "skills": [
+      "./skills/orchestrator"
     ]
   },
   "scripts": {
