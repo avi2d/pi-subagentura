@@ -136,7 +136,7 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
-    // Default notify mode — the pointer path runs, the inject path doesn't.
+    // Notify-compatible legacy state — the pointer path runs, the inject path doesn't.
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
     appendEvent(art, { ts: 1, type: "started", status: "running" });

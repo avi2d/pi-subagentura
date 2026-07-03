@@ -141,10 +141,11 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "",
       "Examples:",
       '  - task: "Review this PR for security issues", persona: "You are a senior security auditor"',
-      '  - task: "Continue debugging while we plan next steps", async: true, notifyOnComplete: "notify"',
+      '  - task: "Continue debugging while we plan next steps", async: true',
       '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
       "",
       "For async (background) execution, the main agent continues immediately.",
+      'Async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
       "Use async only if user asked to do so or is willing to continue the conversation.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
       "Set triggerTurnOnComplete: true to make notify-mode completions wake the parent LLM.",
@@ -270,7 +271,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — the result will be injected on completion unless notifyOnComplete: "notify" was requested. Poll or collect manually only when needed.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -461,7 +462,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — the result will be injected on completion unless notifyOnComplete: "notify" was requested. Poll or collect manually only when needed.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
