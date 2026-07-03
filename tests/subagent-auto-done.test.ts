@@ -152,7 +152,6 @@ describe("auto-done fallback", () => {
     );
     expect(sendMessage).toHaveBeenCalled();
     expect(state.status).toBe("running"); // stays running so for-loop keeps tail-reading
-    expect(state.injected).toBe(true);
   });
 
   it("synthesizes an error event (not done) when stopReason is 'stop' but output.md is missing", async () => {
@@ -666,7 +665,7 @@ describe("auto-done fallback", () => {
     expect(msg).toContain(shortText);
   });
 
-  it("auto-fallback does NOT mark state.injected when notifyOnComplete is 'inject' (so the regular inject path can fire next poll)", async () => {
+  it("auto-fallback synthesized done injects exactly once on the next poll in inject mode", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
@@ -676,17 +675,22 @@ describe("auto-done fallback", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
 
-    mod.pollArtifactChanges({} as any);
+    const sendMessage = vi.fn();
+    const sendUserMessage = vi.fn();
+    mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+    expect(sendUserMessage).not.toHaveBeenCalled();
 
-    // W1 fix: in inject mode, leave state.injected unset so the regular
-    // inject path at lines 547-585 picks up the synthesized `done` event
-    // on the next poll. With the old behavior (state.injected = true
-    // unconditionally), inject mode would silently degrade to pointer-only.
-    const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
-    expect(after.injected).not.toBe(true);
+    mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(sendUserMessage.mock.calls[0][0]).toBe("final result");
+    expect(state.lastInjectedEventTs).toBeDefined();
+
+    sendUserMessage.mockClear();
+    mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+    expect(sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("auto-fallback DOES mark state.injected when notifyOnComplete is 'notify' (no inject path to defer to)", async () => {
+  it("auto-fallback synthesized done does not inject in notify mode", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
@@ -696,13 +700,10 @@ describe("auto-done fallback", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
 
-    mod.pollArtifactChanges({} as any);
-
-    // For non-inject modes, the inject path at lines 547-585 will never
-    // fire (gated on notifyOnComplete === "inject"). Marking injected
-    // here is a no-op-defensive; what matters is no regression.
-    const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
-    expect(after.injected).toBe(true);
+    const sendUserMessage = vi.fn();
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    expect(sendUserMessage).not.toHaveBeenCalled();
   });
 
   // ─── End-to-end: real session JSONL is the only input ────────────

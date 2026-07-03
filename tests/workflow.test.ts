@@ -79,6 +79,16 @@ describe("parseWorkflow", () => {
     expect(body).toContain('log("hi");');
   });
 
+  it("worker parser handles escaped quotes before braces in meta string values", async () => {
+    const script = String.raw`export const meta = { name: "f", description: "escaped quote: \" } still inside string" };
+return 42;`;
+
+    const r = await runWorkflow(script, { runAgent: echoRunner() });
+
+    expect(r.meta.description).toBe('escaped quote: " } still inside string');
+    expect(r.result).toBe(42);
+  });
+
   it("rejects a meta literal that references a helper (not pure)", () => {
     expect(() =>
       parseWorkflow(`export const meta = { name: agent, description: "x" };\n`),

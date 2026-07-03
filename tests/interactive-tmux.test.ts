@@ -47,6 +47,8 @@ describe("interactive-tmux", () => {
   afterEach(() => {
     rmSync(makeTmp(), { recursive: true, force: true });
     vi.doUnmock("node:child_process");
+    vi.doUnmock("node:fs");
+    vi.doUnmock("../src/artifact");
   });
 
   it("is unavailable when tmux binary is not on PATH", async () => {
@@ -213,6 +215,57 @@ describe("interactive-tmux", () => {
     expect(killedPane).toBe(true);
 
     // Registry should not have the failed sub-agent.
+    expect(mod.interactiveSubagentRegistry.size).toBe(0);
+  });
+
+  it("kills the pane and aborts launch if persisted state cannot be written", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.TMUX = makeArgs().TMUX;
+    process.env.TMUX_PANE = "%9";
+
+    const calls: string[][] = [];
+    installMockExec((_f, args) => {
+      calls.push(args);
+      if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      if (args[0] === "show-options") return "0\n";
+      return "";
+    });
+
+    vi.doMock("../src/artifact", async () => {
+      const real =
+        await vi.importActual<typeof import("../src/artifact")>(
+          "../src/artifact",
+        );
+      return {
+        ...real,
+        appendInteractiveState: () => {
+          throw new Error("state write failed");
+        },
+      };
+    });
+
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Demo",
+        task: "Run tests",
+        cwd: tmp,
+        parentSessionId: "parent-session",
+      }),
+    ).toThrow(/state write failed/);
+
+    const killedPane = calls.some(
+      (args) =>
+        args[0] === "kill-pane" &&
+        args.includes("-t") &&
+        args.includes(MOCK_PANE_ID),
+    );
+    expect(killedPane).toBe(true);
+    expect(calls.some((args) => args[0] === "send-keys")).toBe(false);
     expect(mod.interactiveSubagentRegistry.size).toBe(0);
   });
 

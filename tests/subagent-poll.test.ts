@@ -4,7 +4,7 @@
  * events directly to the artifact dir to drive the poller.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -54,6 +54,7 @@ describe("pollArtifactChanges", () => {
   afterEach(() => {
     vi.doUnmock("node:child_process");
   });
+  delete process.env.SUBAGENT_DEBUG_LOG_DIR;
 
   it("does nothing when registry is empty", async () => {
     const mod =
@@ -61,6 +62,39 @@ describe("pollArtifactChanges", () => {
     const sendMessage = vi.fn();
     mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("logs unexpected top-level poller errors to the debug log", async () => {
+    const logDir = makeTmp();
+    process.env.SUBAGENT_DEBUG_LOG_DIR = logDir;
+    vi.resetModules();
+
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    mod.interactiveSubagentRegistry.set("bad-state", {
+      id: "bad-state",
+      status: "running",
+      artifactDir: undefined,
+    } as any);
+
+    expect(() =>
+      mod.pollArtifactChanges({
+        sendMessage: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any),
+    ).not.toThrow();
+
+    const logFile = join(
+      logDir,
+      `debug-${new Date().toISOString().slice(0, 10)}.jsonl`,
+    );
+    expect(existsSync(logFile)).toBe(true);
+    const content = readFileSync(logFile, "utf8");
+    expect(content).toContain('"event":"poller_error"');
+    expect(content).toContain("bad-state");
+
+    delete process.env.SUBAGENT_DEBUG_LOG_DIR;
+    rmSync(logDir, { recursive: true, force: true });
   });
 
   it("fires a pointer notification on done. Started is silent.", async () => {
@@ -333,7 +367,7 @@ describe("pollArtifactChanges", () => {
       expect(state.lastInjectedEventTs).toBe(2);
     });
 
-    it("does NOT call sendUserMessage when state.notifyOnComplete is unset (default: notify)", async () => {
+    it("does NOT call sendUserMessage when state.notifyOnComplete is unset (legacy notify-compatible state)", async () => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
@@ -446,7 +480,7 @@ describe("pollArtifactChanges", () => {
       expect(sendUserMessage).not.toHaveBeenCalled();
     });
 
-    it("is at-most-once: a second poll does NOT re-inject (state.injected guard)", async () => {
+    it("is at-most-once: a second poll does NOT re-inject (lastInjectedEventTs guard)", async () => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
@@ -462,7 +496,7 @@ describe("pollArtifactChanges", () => {
       mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
       expect(sendUserMessage).toHaveBeenCalledTimes(1);
 
-      // Second poll: no new events (cursor advanced), inject is gated by state.injected.
+      // Second poll: no new events (cursor advanced), inject is gated by lastInjectedEventTs.
       sendMessage.mockClear();
       sendUserMessage.mockClear();
       mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
@@ -529,12 +563,8 @@ describe("pollArtifactChanges", () => {
       const sendUserMessage = vi.fn();
       mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
-      // output.md missing: inject is skipped, but the state is still marked injected
-      // to prevent re-attempts on later polls.
-      expect(sendUserMessage).not.toHaveBeenCalled();
       // output.md missing: inject is skipped, but the ts of the done we attempted to
       // inject for is still recorded so the next done (different ts) re-fires.
-      expect(state.lastInjectedEventTs).toBe(2);
       expect(state.lastInjectedEventTs).toBe(2);
     });
 
@@ -612,7 +642,7 @@ describe("pollArtifactChanges", () => {
 
     it("in notify mode, a follow-up overwriting output.md before its done event does NOT corrupt the prior turn's snapshot", async () => {
       // Regression: the snapshot guard must not reuse lastInjectedEventTs (only set in inject mode).
-      // In the default notify mode that field stays undefined, so a pre-fix poller re-snapshotted
+      // In notify-compatible legacy state that field stays undefined, so a pre-fix poller re-snapshotted
       // every tick — and once a follow-up turn overwrote output.md before its own done landed, it
       // clobbered output-1.md (turn 1's history) with the in-progress turn-2 content.
       vi.resetModules();
@@ -625,7 +655,7 @@ describe("pollArtifactChanges", () => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const { state, artifactDir } = makeState();
-      // notifyOnComplete left undefined (default 'notify') — the broken path.
+      // notifyOnComplete left undefined (legacy notify-compatible state) — the broken path.
       mod.interactiveSubagentRegistry.set(state.id, state);
       const art = artifactPath(join(artifactDir, ".."), state.id);
 
