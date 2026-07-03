@@ -1,0 +1,871 @@
+/**
+ * Tests for src/rendering.ts — TUI rendering helpers.
+ *
+ * Covers every code path in:
+ *   - renderSubagentCall
+ *   - renderSubagentResult (async spawn, partial, final — error/success/usage,
+ *     collapsed/expanded)
+ *   - renderSubagentNotify (inject/error/success, collapsed/expanded)
+ *   - formatActivityRow (with/without lastActivityAt, with/without lastToolSummary)
+ *   - renderAsyncSpawn
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// ── Hoisted mocks ────────────────────────────────────────
+
+const { Text: MockText, truncateToWidthMock } = vi.hoisted(() => {
+  class Text {
+    text: string;
+    paddingX: number;
+    paddingY: number;
+    constructor(text = "", paddingX = 1, paddingY = 1) {
+      this.text = text;
+      this.paddingX = paddingX;
+      this.paddingY = paddingY;
+    }
+  }
+  return {
+    Text,
+    truncateToWidthMock: vi.fn((s: string, _w: number) => s),
+  };
+});
+
+const { formatUsageMock, sanitizeOutputMock } = vi.hoisted(() => ({
+  formatUsageMock: vi.fn(() => ""),
+  sanitizeOutputMock: vi.fn((s: string) => s),
+}));
+
+// ── Module mocks ─────────────────────────────────────────
+
+vi.mock("@earendil-works/pi-tui", () => ({
+  Text: MockText,
+  truncateToWidth: truncateToWidthMock,
+}));
+
+vi.mock("../src/helpers", () => ({
+  formatUsage: formatUsageMock,
+}));
+
+vi.mock("../src/notifications", () => ({
+  sanitizeOutput: sanitizeOutputMock,
+}));
+
+// ── Imports after mocks ──────────────────────────────────
+
+import type { Text } from "@earendil-works/pi-tui";
+import {
+  renderSubagentCall,
+  renderSubagentResult,
+  renderAsyncSpawn,
+  renderSubagentNotify,
+  formatActivityRow,
+} from "../src/rendering";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+
+// ── Helpers ──────────────────────────────────────────────
+
+/**
+ * Extract the rendered text from a Text object.
+ * The real `Text` class declares `text` as private, but our mock
+ * exposes it as a public property. This cast lets tests assert on it.
+ */
+function t(t: Text): string {
+  return (t as unknown as { text: string }).text;
+}
+
+// ── Theme mock ───────────────────────────────────────────
+// Identity functions: fg and bold return the text as-is so we
+// can assert on the composed string without ANSI noise.
+
+const testTheme: Theme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+} as unknown as Theme;
+
+// ── Shared fixtures ──────────────────────────────────────
+
+const sampleUsage = {
+  input: 100,
+  output: 50,
+  cacheRead: 10,
+  cacheWrite: 5,
+  cost: 0.002,
+  turns: 1,
+};
+
+// ── Tests ────────────────────────────────────────────────
+
+describe("renderSubagentCall", () => {
+  it("renders a basic call with task label and task preview", () => {
+    const result = renderSubagentCall(
+      { task: "Hello world" },
+      testTheme,
+      "subagent_with_context",
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("subagent_with_context Hello world");
+  });
+
+  it("truncates the task preview when longer than 60 chars", () => {
+    const longTask = "a".repeat(70);
+    const result = renderSubagentCall(
+      { task: longTask },
+      testTheme,
+      "subagent_isolated",
+    );
+    expect(t(result)).toBe("subagent_isolated " + "a".repeat(57) + "\u2026");
+  });
+
+  it("appends the model tag when args.model is set", () => {
+    const result = renderSubagentCall(
+      { task: "analyze", model: "anthropic/claude-sonnet-4-5" },
+      testTheme,
+      "subagent_with_context",
+    );
+    expect(t(result)).toBe(
+      "subagent_with_context analyze @anthropic/claude-sonnet-4-5",
+    );
+  });
+
+  it("appends the [async] badge when args.async is truthy", () => {
+    const result = renderSubagentCall(
+      { task: "analyze", async: true },
+      testTheme,
+      "subagent_with_context",
+    );
+    expect(t(result)).toBe("subagent_with_context analyze [async]");
+  });
+
+  it("renders model tag and async badge simultaneously", () => {
+    const result = renderSubagentCall(
+      { task: "deep research", model: "openai/o3", async: true },
+      testTheme,
+      "subagent_isolated",
+    );
+    expect(t(result)).toBe(
+      "subagent_isolated deep research @openai/o3 [async]",
+    );
+  });
+
+  it("handles missing task gracefully", () => {
+    const result = renderSubagentCall(
+      {} as Record<string, unknown>,
+      testTheme,
+      "subagent_with_context",
+    );
+    expect(t(result)).toBe("subagent_with_context ");
+  });
+});
+
+describe("renderSubagentResult", () => {
+  beforeEach(() => {
+    formatUsageMock.mockReturnValue("");
+    truncateToWidthMock.mockImplementation((s: string) => s);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // ── Async spawn ───────────────────────────────────────
+
+  it("renders async spawn result when details.status === 'started'", () => {
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "started" as const,
+          jobId: "job-42",
+          contextMessages: 5,
+        },
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toMatch(/⚡ Sub-agent started — job job-42/);
+    expect(t(result)).toMatch(/get_subagent_status/);
+  });
+
+  // ── Partial / running ─────────────────────────────────
+
+  it("renders partial result with turn, active tool, usage, and output", () => {
+    formatUsageMock.mockReturnValue("~1.0K tokens");
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          model: "gpt-4",
+          subagentStatus: {
+            turn: 3,
+            activeTool: { name: "read", args: { path: "foo.ts" } },
+            output: "some progress output here",
+            usage: sampleUsage,
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    // Title
+    expect(t(result)).toContain("\u25cf");
+    expect(t(result)).toContain("Sub-agent working");
+    // Turn
+    expect(t(result)).toContain("\u2014 turn 3");
+    // Active tool
+    expect(t(result)).toContain("\u2192");
+    expect(t(result)).toContain("read");
+    expect(t(result)).toContain('{"path":"foo.ts"}');
+    // Usage
+    expect(t(result)).toContain("~1.0K tokens");
+    // Output preview
+    expect(t(result)).toContain("some progress output here");
+    // Model was forwarded to formatUsage
+    expect(formatUsageMock).toHaveBeenCalledWith(sampleUsage, "gpt-4");
+    // truncateToWidth was called for the output preview
+    expect(truncateToWidthMock).toHaveBeenCalledWith(
+      "some progress output here",
+      120,
+    );
+  });
+
+  it("renders partial result with active tool and unserializable args (circular)", () => {
+    const circular: Record<string, unknown> = { a: 1 };
+    circular.self = circular;
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          subagentStatus: {
+            turn: 1,
+            activeTool: { name: "crashy", args: circular },
+            output: "",
+            usage: sampleUsage,
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    // Circular args fall back to "{…}"
+    expect(t(result)).toContain("{…}");
+    expect(t(result)).not.toContain("self");
+  });
+
+  it("renders partial result without activeTool (only turn and output)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          subagentStatus: {
+            turn: 2,
+            output: "interim",
+            usage: sampleUsage,
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u2014 turn 2");
+    expect(t(result)).toContain("interim");
+    // No tool arrow
+    expect(t(result)).not.toContain("\u2192");
+  });
+
+  it("renders partial result without formatUsage return value", () => {
+    formatUsageMock.mockReturnValue("");
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          subagentStatus: {
+            turn: 1,
+            output: "data",
+            usage: sampleUsage,
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    // Usage string is empty, so no usage line
+    expect(t(result)).not.toMatch(/tokens|cache|cost/i);
+  });
+
+  it("renders partial result without status details (falls back to …)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: { status: "running" as const },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u25cf");
+    expect(t(result)).toContain("Sub-agent working");
+    expect(t(result)).toContain("\u2026");
+  });
+
+  it("renders partial result with empty output preview (output line skipped)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          subagentStatus: {
+            turn: 1,
+            activeTool: { name: "compute", args: {} },
+            output: "",
+            usage: sampleUsage,
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u2014 turn 1");
+    expect(t(result)).toContain("\u2192");
+    expect(t(result)).toContain("compute");
+    // Empty output should not append a separate output line after tool args
+    expect(t(result)).toMatch(/\{\}$/);
+  });
+
+  // ── Final result: error ───────────────────────────────
+
+  it("renders final error result collapsed (truncated preview)", () => {
+    const errorText = "Something went wrong: ".repeat(10);
+    truncateToWidthMock.mockReturnValue("truncated-error");
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: errorText }],
+        details: undefined as unknown as Record<string, unknown>,
+        isError: true,
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("truncated-error");
+    expect(truncateToWidthMock).toHaveBeenCalledWith(
+      errorText.replace(/\s+/g, " "),
+      120,
+    );
+  });
+
+  it("renders final error result expanded (full text)", () => {
+    const errorText = "Fatal: authentication failed";
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: errorText }],
+        details: undefined as unknown as Record<string, unknown>,
+        isError: true,
+      },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe(errorText);
+  });
+
+  // ── Final result: success with usageStr ───────────────
+
+  it("renders final success result with usage collapsed (header only)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "This is the full output." }],
+        details: { usageSummary: "~1.5K tokens" },
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    // Only the header (✓ + usage) — no output body
+    expect(t(result)).toBe("\u2713 ~1.5K tokens");
+  });
+
+  it("renders final success result with usage expanded (header + full text)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Full output here.\nLine 2." }],
+        details: { usageSummary: "~2.0K tokens" },
+      },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("\u2713 ~2.0K tokens\nFull output here.\nLine 2.");
+  });
+
+  // ── Final result: success without usageStr ────────────
+
+  it("renders final success result without usage collapsed (dimmed preview)", () => {
+    truncateToWidthMock.mockReturnValue("preview-text");
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Some long final output" }],
+        details: {} as Record<string, unknown>,
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("preview-text");
+    expect(truncateToWidthMock).toHaveBeenCalledWith(
+      "Some long final output".replace(/\s+/g, " "),
+      120,
+    );
+  });
+
+  it("renders final success result without usage expanded (full text)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "Full output body" }],
+        details: {} as Record<string, unknown>,
+      },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("Full output body");
+  });
+
+  // ── Edge cases ────────────────────────────────────────
+
+  it("handles empty text content (no text-type items)", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "image", text: "img.png" }] as any,
+        details: {} as Record<string, unknown>,
+      },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("");
+  });
+
+  it("handles empty content array", () => {
+    const result = renderSubagentResult(
+      { content: [], details: {} as Record<string, unknown> },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("");
+  });
+
+  it("renders final error with empty text", () => {
+    truncateToWidthMock.mockReturnValue("");
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: undefined as unknown as Record<string, unknown>,
+        isError: true,
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("");
+  });
+
+  it("renders final success with usage and empty text expanded", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: { usageSummary: "~0 tokens" },
+      },
+      { expanded: true, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("\u2713 ~0 tokens\n");
+  });
+});
+
+describe("renderAsyncSpawn", () => {
+  it("renders the compact async spawn display with job id and hint", () => {
+    const result = renderAsyncSpawn(
+      { status: "started", jobId: "abc12345", contextMessages: 3 },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toMatch(/⚡ Sub-agent started — job abc12345/);
+    expect(t(result)).toMatch(/get_subagent_status/);
+  });
+});
+
+describe("renderSubagentNotify", () => {
+  beforeEach(() => {
+    sanitizeOutputMock.mockImplementation((s: string) => s);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // ── Collapsed ─────────────────────────────────────────
+
+  it("renders collapsed inject mode notification", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "Sub-agent completed",
+        details: {
+          mode: "inject",
+          result: { isError: false, output: "" },
+        },
+      },
+      { expanded: false },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("Sub-agent completed");
+  });
+
+  it("renders collapsed error notification in error color", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "Something failed",
+        details: {
+          mode: "notify",
+          result: { isError: true, output: "error details" },
+        },
+      },
+      { expanded: false },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("Something failed");
+  });
+
+  it("renders collapsed success notification in accent color", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "All done",
+        details: {
+          mode: "notify",
+          result: { isError: false },
+        },
+      },
+      { expanded: false },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("All done");
+  });
+
+  it("renders collapsed notification when details is undefined", () => {
+    const result = renderSubagentNotify(
+      { content: "Just a message" },
+      { expanded: false },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toBe("Just a message");
+  });
+
+  // ── Expanded ──────────────────────────────────────────
+
+  it("renders expanded inject notification with header, body, and sanitized output", () => {
+    sanitizeOutputMock.mockReturnValue("sk-...[REDACTED]");
+    const result = renderSubagentNotify(
+      {
+        content: "Result injected above",
+        details: {
+          mode: "inject",
+          result: { isError: false, output: "sk-abc123def456" },
+        },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u26a1 Injected Sub-agent Result");
+    expect(t(result)).toContain("Result injected above");
+    expect(t(result)).toContain("sk-...[REDACTED]");
+    expect(sanitizeOutputMock).toHaveBeenCalledWith("sk-abc123def456");
+  });
+
+  it("renders expanded error notification with error header", () => {
+    sanitizeOutputMock.mockReturnValue("error trace");
+    const result = renderSubagentNotify(
+      {
+        content: "Task crashed",
+        details: {
+          mode: "notify",
+          result: { isError: true, output: "error trace" },
+        },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u274c Sub-agent Failed");
+    expect(t(result)).toContain("Task crashed");
+    expect(t(result)).toContain("error trace");
+  });
+
+  it("renders expanded success notification with success header", () => {
+    sanitizeOutputMock.mockReturnValue("all good");
+    const result = renderSubagentNotify(
+      {
+        content: "Completed",
+        details: {
+          mode: "notify",
+          result: { isError: false, output: "all good" },
+        },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u2705 Sub-agent Completed");
+    expect(t(result)).toContain("Completed");
+    expect(t(result)).toContain("all good");
+  });
+
+  it("renders expanded notification with missing output (falls back to empty)", () => {
+    sanitizeOutputMock.mockReturnValue("");
+    const result = renderSubagentNotify(
+      {
+        content: "Done",
+        details: {
+          mode: "notify",
+          result: { isError: false },
+        },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    expect(t(result)).toContain("\u2705 Sub-agent Completed");
+    expect(t(result)).toContain("Done");
+    // Output is empty string; the expanded template ends with a trailing newline
+    expect(t(result)).toMatch(/\n$/);
+  });
+
+  it("renders expanded notification when details is undefined", () => {
+    const result = renderSubagentNotify(
+      { content: "Bare notification" },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    // details is undefined → isInject=false, isError=undefined (falsy)
+    // → success header, body is text, output is sanitizeOutput("") = ""
+    expect(t(result)).toContain("\u2705 Sub-agent Completed");
+    expect(t(result)).toContain("Bare notification");
+  });
+});
+
+describe("formatActivityRow", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("formats row with lastActivityAt and lastToolSummary", () => {
+    vi.setSystemTime(5000);
+    // ago = Date.now() - lastActivityAt = 5000 - 3000 = 2000ms (2s)
+    const result = formatActivityRow({
+      lastActivityAt: 3000,
+      lastToolSummary: "reading main.ts",
+      name: "helper-1",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("\u25b6 helper-1: reading main.ts (2s ago)");
+  });
+
+  it("formats row without lastActivityAt (no ago suffix)", () => {
+    const result = formatActivityRow({
+      name: "helper-2",
+      lastToolSummary: "searching",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("\u25b6 helper-2: searching");
+  });
+
+  it("formats row without lastToolSummary (falls back to starting\u2026)", () => {
+    vi.setSystemTime(10000);
+    const result = formatActivityRow({
+      lastActivityAt: 8000,
+      name: "helper-3",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("\u25b6 helper-3: starting\u2026 (2s ago)");
+  });
+
+  it("formats row without lastActivityAt and without lastToolSummary", () => {
+    const result = formatActivityRow({
+      name: "helper-4",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("\u25b6 helper-4: starting\u2026");
+  });
+
+  it("renders ago as 'just now' for sub-second ages", () => {
+    vi.setSystemTime(1000);
+    const result = formatActivityRow({
+      lastActivityAt: 999,
+      lastToolSummary: "last tick",
+      name: "fast",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("\u25b6 fast: last tick (just now)");
+  });
+
+  it("renders ago as 'Xm ago' for minute-range ages", () => {
+    vi.setSystemTime(180_000);
+    const result = formatActivityRow({
+      lastActivityAt: 120_000,
+      lastToolSummary: "minute work",
+      name: "long-run",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    // diff = 60000ms = 60s = 1m
+    expect(result).toBe("\u25b6 long-run: minute work (1m ago)");
+  });
+
+  it("renders ago as 'Xh ago' for hour-range ages", () => {
+    vi.setSystemTime(7_200_000);
+    const result = formatActivityRow({
+      lastActivityAt: 3_600_000,
+      lastToolSummary: "hour work",
+      name: "endurance",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    // diff = 3600000ms = 3600s = 60m = 1h
+    expect(result).toBe("\u25b6 endurance: hour work (1h ago)");
+  });
+
+  it("handles negative time difference (clamped to 0 \u2192 'just now')", () => {
+    vi.setSystemTime(100);
+    const result = formatActivityRow({
+      lastActivityAt: 500,
+      lastToolSummary: "future",
+      name: "time-travel",
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "running",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    // Date.now() - 500 = -400, clamped to 0 \u2192 "just now"
+    expect(result).toBe("\u25b6 time-travel: future (just now)");
+  });
+});
