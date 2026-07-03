@@ -40,7 +40,9 @@ import {
 
 interface Engine {
   runAgent: WorkflowAgentRunner;
-  signal?: AbortSignal;
+  abort: AbortController;
+  signal: AbortSignal;
+  closed: boolean;
   onProgress?: (p: WorkflowProgress) => void;
   sem: Semaphore;
   processSem: Semaphore;
@@ -60,9 +62,18 @@ export async function runWorkflow(
   script: string,
   opts: RunWorkflowOptions,
 ): Promise<WorkflowRunResult> {
+  const abort = new AbortController();
+  const forwardAbort = () => abort.abort();
+  if (opts.signal?.aborted) {
+    abort.abort();
+  } else {
+    opts.signal?.addEventListener("abort", forwardAbort, { once: true });
+  }
   const engine: Engine = {
     runAgent: opts.runAgent,
-    signal: opts.signal,
+    abort,
+    signal: abort.signal,
+    closed: false,
     onProgress: opts.onProgress,
     sem: createSemaphore(opts.concurrency ?? defaultConcurrency()),
     processSem: createSemaphore(
@@ -79,15 +90,19 @@ export async function runWorkflow(
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
   };
-  const { meta, result } = await executeScript(script, engine, opts.args, 0);
-  return {
-    meta,
-    result,
-    agentsSpawned: engine.counters.agentsSpawned,
-    errorCount: engine.counters.errorCount,
-    tokensSpent: engine.counters.tokensSpent,
-    phases: engine.phases,
-  };
+  try {
+    const { meta, result } = await executeScript(script, engine, opts.args, 0);
+    return {
+      meta,
+      result,
+      agentsSpawned: engine.counters.agentsSpawned,
+      errorCount: engine.counters.errorCount,
+      tokensSpent: engine.counters.tokensSpent,
+      phases: engine.phases,
+    };
+  } finally {
+    opts.signal?.removeEventListener("abort", forwardAbort);
+  }
 }
 
 const WORKFLOW_WORKER_SOURCE = String.raw`
@@ -403,6 +418,7 @@ async function executeScript(
       "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
     >,
   ) => {
+    if (engine.closed) return;
     if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
     engine.onProgress?.({
       ...p,
@@ -551,6 +567,7 @@ function runWorkflowWorker(
     const fail = (err: unknown) => {
       if (settled) return;
       settled = true;
+      engine.closed = true;
       cleanup();
       worker.terminate().catch(() => {});
       reject(err instanceof Error ? err : new Error(String(err)));
@@ -558,23 +575,22 @@ function runWorkflowWorker(
     const done = (value: { meta: WorkflowMeta; result: unknown }) => {
       if (settled) return;
       settled = true;
+      engine.closed = true;
       cleanup();
       worker.terminate().catch(() => {});
       resolve(value);
     };
     const onAbort = () => fail(new Error("Workflow aborted."));
-    const timeout = setTimeout(
-      () =>
-        fail(
-          new Error(
-            `Workflow timed out after ${engine.workflowTimeoutMs}ms; the worker was terminated.`,
-          ),
-        ),
-      engine.workflowTimeoutMs,
-    );
+    const timeout = setTimeout(() => {
+      const err = new Error(
+        `Workflow timed out after ${engine.workflowTimeoutMs}ms; the worker was terminated.`,
+      );
+      fail(err);
+      engine.abort.abort(err);
+    }, engine.workflowTimeoutMs);
     const cleanup = () => {
       clearTimeout(timeout);
-      engine.signal?.removeEventListener("abort", onAbort);
+      engine.signal.removeEventListener("abort", onAbort);
       worker.removeAllListeners();
     };
 

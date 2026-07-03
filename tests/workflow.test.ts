@@ -425,9 +425,9 @@ describe("background workflow jobs", () => {
     const job = startWorkflowJob("bgs", script, { runAgent });
 
     // Worker-backed workflows cross a thread boundary before the parent emits agent_start.
-    // Wait briefly for that handoff, but assert while runAgent is still blocked on gate.
-    for (let i = 0; i < 50 && job.snapshot.agentsSpawned === 0; i++)
-      await tick();
+    // Wait for that handoff, but assert while runAgent is still blocked on gate.
+    for (let i = 0; i < 500 && job.snapshot.agentsSpawned === 0; i++)
+      await new Promise((r) => setTimeout(r, 10));
 
     // While the agent is still blocked on `gate`, the snapshot must already show 1 spawned.
     // This is the regression: pre-fix, this would be 0.
@@ -436,7 +436,7 @@ describe("background workflow jobs", () => {
     release();
     await job.promise;
     expect(job.snapshot.agentsSpawned).toBe(1);
-  });
+  }, 10_000);
 
   it("clears runningCount when runAgent throws", async () => {
     const runAgent: WorkflowAgentRunner = () => {
@@ -609,6 +609,41 @@ describe("abort signal propagation", () => {
     setTimeout(() => ac.abort(), 20);
     await expect(p).rejects.toThrow(/abort/i);
   });
+
+  it("workflow timeout aborts in-flight agent work and suppresses late progress", async () => {
+    let abortSeen = false;
+    let resolveLate!: () => void;
+    const lateDone = new Promise<void>((resolve) => (resolveLate = resolve));
+    const progress: string[] = [];
+    const runAgent: WorkflowAgentRunner = async ({ signal }) => {
+      signal?.addEventListener(
+        "abort",
+        () => {
+          abortSeen = true;
+        },
+        { once: true },
+      );
+      await new Promise((r) => setTimeout(r, 2500));
+      resolveLate();
+      return ok("late");
+    };
+
+    const p = runWorkflow(meta + `return await agent("slow");`, {
+      runAgent,
+      workflowTimeoutMs: 2000,
+      onProgress: (ev) => {
+        progress.push(`${ev.kind}:${ev.runningCount}:${ev.agentsSpawned}`);
+      },
+    });
+
+    await expect(p).rejects.toThrow(/timed out/i);
+    expect(abortSeen).toBe(true);
+    const progressAtFailure = [...progress];
+
+    await lateDone;
+    await tick();
+    expect(progress).toEqual(progressAtFailure);
+  }, 10_000);
 
   it("non-abort failures in parallel() are still nulled (back-compat)", async () => {
     const runAgent: WorkflowAgentRunner = async () => fail("boom");
