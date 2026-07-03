@@ -345,6 +345,38 @@ describe("notifyOnComplete", () => {
           expect(msgOpts).toMatchObject({ deliverAs: "followUp" });
         });
 
+        it("defaults to inject mode when notifyOnComplete is omitted", async () => {
+          const toolDef = getToolDef();
+          const jobId = `both-default-inject-${label}`;
+          const control = createJobControl();
+          mockStartSubagentJob.mockImplementationOnce(() =>
+            mockJobResult(jobId, control.jobPromise),
+          );
+
+          await toolDef.execute(
+            "call-default-inject",
+            { async: true, task: "test" },
+            undefined,
+            undefined,
+            getCtx(),
+          );
+
+          control.resolve(SUCCESS_RESULT);
+
+          await vi.waitFor(() => {
+            expect(api.sendUserMessage).toHaveBeenCalledTimes(1);
+            expect(api.sendMessage).toHaveBeenCalledTimes(1);
+          });
+
+          const [userContent, userOpts] = api.sendUserMessage.mock.calls[0];
+          expect(userContent).toBe(SUCCESS_RESULT.output);
+          expect(userOpts).toMatchObject({ deliverAs: "followUp" });
+          expect(sentMessageAt(api, 0)).toMatchObject({
+            customType: "subagent-notify",
+            details: { jobId, mode: "inject" },
+          });
+        });
+
         it("delivers notification when job promise rejects", async () => {
           const toolDef = getToolDef();
           const jobId = `both-reject-${label}`;
@@ -799,10 +831,10 @@ describe("notifyOnComplete", () => {
     });
   });
 
-  // ── Backward compatibility ────────────────────────────────────────
-  describe("backward compatibility", () => {
-    it("does NOT fire any notification when notifyOnComplete is omitted", async () => {
-      const jobId = "no-notify";
+  // ── Async defaults ─────────────────────────────────────────────────
+  describe("async defaults", () => {
+    it("defaults to inject mode when notifyOnComplete is omitted", async () => {
+      const jobId = "default-inject";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
@@ -818,13 +850,17 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      await vi.waitFor(
-        () => {
-          expect(api.sendMessage).toHaveBeenCalledTimes(0);
-          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-        },
-        { timeout: 50 },
+      await vi.waitFor(() => {
+        expect(api.sendUserMessage).toHaveBeenCalledTimes(1);
+      });
+
+      expect(api.sendUserMessage).toHaveBeenCalledWith(
+        SUCCESS_RESULT.output,
+        expect.objectContaining({ deliverAs: "followUp" }),
       );
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      const msg = api.sendMessage.mock.calls[0][0];
+      expect(msg.details).toMatchObject({ jobId, mode: "inject" });
     });
   });
 

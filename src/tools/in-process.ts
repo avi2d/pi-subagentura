@@ -141,12 +141,13 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "",
       "Examples:",
       '  - task: "Review this PR for security issues", persona: "You are a senior security auditor"',
-      '  - task: "Continue debugging while we plan next steps", async: true, notifyOnComplete: "notify"',
+      '  - task: "Continue debugging while we plan next steps", async: true',
       '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
       "",
       "For async (background) execution, the main agent continues immediately.",
+      'Async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
       "Use async only if user asked to do so or is willing to continue the conversation.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Poll with get_subagent_status or collect with get_subagent_result only when requested or when manual follow-up is needed.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -212,11 +213,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+            params.notifyOnComplete === "notify" ? "notify" : "inject",
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -267,7 +264,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — the result will be injected on completion unless notifyOnComplete: "notify" was requested. Poll or collect manually only when needed.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -353,7 +350,8 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       '  - task: "Analyze this code without context contamination", async: true, notifyOnComplete: "inject"',
       "",
       "For async (background) execution, the main agent continues immediately.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      'Async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
+      "Poll with get_subagent_status or collect with get_subagent_result only when requested or when manual follow-up is needed.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -400,11 +398,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+            params.notifyOnComplete === "notify" ? "notify" : "inject",
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -455,7 +449,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — the result will be injected on completion unless notifyOnComplete: "notify" was requested. Poll or collect manually only when needed.` +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
