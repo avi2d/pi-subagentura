@@ -31,6 +31,7 @@ Interactive sub-agents support **follow-up turns**: the parent can push a new pr
 - Poll, collect, or cancel background jobs on demand
 - Get live previews of running sub-agents (current turn, active tool, usage)
 - Attach to interactive sub-agent sessions for direct follow-ups and debugging
+- Use bundled orchestration defaults for scout/plan, oracle checks, parallel review, and review loops
 
 ![Sub-agent demo](working.png)
 
@@ -59,6 +60,20 @@ You can also install directly from GitHub:
 ```bash
 pi install git:github.com/lmn451/pi-subagentura
 ```
+
+## Bundled orchestration defaults
+
+The package also ships a parent-only `orchestrator` skill for common multi-agent workflows. It is a static Markdown skill loaded by Pi from the package manifest — no runtime prompt injection or user-facing prompt templates are required.
+
+The skill gives the parent agent reasonable default behavior when the user asks for things like:
+
+- “review this codebase” — inspect first, then run fresh-context reviewers with focused angles
+- “review my changes” — use read-only reviewers, synthesize findings, and only edit when authorized
+- “plan this work” — scout relevant files, then produce a concrete implementation plan
+- “check my approach” — run a context-aware oracle to challenge assumptions and drift
+- “implement and review” — use one writer, parallel reviewers, and capped fix/review rounds
+
+The defaults prefer async `subagent_isolated` for fresh scouts/reviewers, `subagent_with_context` for oracle checks, injected completions instead of polling, and one writer at a time for implementation. For cheap fanout, they suggest validating model availability before using optional model overrides.
 
 ## Tools
 
@@ -108,7 +123,7 @@ Best for:
 
 ### Async Workflow Tools
 
-When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Use these tools to manage async jobs:
+When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Async jobs inject their result into the parent conversation by default when they complete, so you usually do not need to poll. Use these tools only when the user asks for status/collection, when a job appears stuck, or when manual follow-up is needed:
 
 #### `get_subagent_status`
 
@@ -210,7 +225,7 @@ The child's system prompt embeds the **literal absolute path** of the artifact d
 
 #### Completion notifications: notify vs inject
 
-Interactive sub-agents deliver their completion to the parent through one of two modes (selected via `notifyOnComplete`):
+In-process async and interactive sub-agents deliver completion through one of two modes (selected via `notifyOnComplete`):
 
 - `"inject"` (**default** for `subagent_interactive`) — the sub-agent's `output.md` is pushed into the parent LLM's conversation as a new user message. The parent LLM gets a turn and can summarize, chain into the next step, or call more tools. Use this when the sub-agent's output is part of a multi-step pipeline.
 - `"notify"` — only a completion notification/pointer is sent by default. The parent LLM is **not** woken up unless `triggerTurnOnComplete: true` is also set. Use plain notify for spawn-and-forget side-quests; add `triggerTurnOnComplete` when the parent should react to the pointer without injecting the full output.
@@ -279,6 +294,19 @@ npm install
 npm test
 npm run pack:check
 ```
+
+### Branch preview releases
+
+Maintainers can create a non-npm preview release from any branch through the **Branch Preview Release** GitHub Action. It verifies the branch, moves a `branch-<sanitized-branch>` tag to that commit, creates/updates a prerelease, and uploads the `npm pack` tarball plus checksums for inspection.
+
+Pi consumes the preview through the git tag:
+
+```bash
+pi install git:github.com/lmn451/pi-subagentura@branch-feat-example
+pi -e git:github.com/lmn451/pi-subagentura@branch-feat-example
+```
+
+The attached release tarball is for manual download/auditing; Pi installs the package from the git ref.
 
 ### Debug logging
 
