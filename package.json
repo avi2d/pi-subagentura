@@ -43,7 +43,12 @@
     "src/session-handlers.ts",
     "src/subagent.ts",
     "src/subagent-artifact-cli.ts",
-    "src/workflow.ts"
+    "src/workflow.ts",
+    "src/workflow-core.ts",
+    "src/workflow-worker.ts",
+    "src/workflow-jobs.ts",
+    "src/workflow-ui.ts",
+    "src/workflow-tool.ts"
   ],
   "engines": {
     "node": ">=18.0.0"

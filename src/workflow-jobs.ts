@@ -1,0 +1,121 @@
+import { randomBytes } from "node:crypto";
+import { debugLog } from "./helpers";
+import { runWorkflow } from "./workflow-worker";
+import {
+  type RunWorkflowOptions,
+  type WorkflowRunResult,
+} from "./workflow-core";
+
+// ── Background workflow-job registry ─────────────────────────────────
+// ── Background workflow-job registry ─────────────────────────────────
+
+export type WorkflowJobStatus = "running" | "done" | "error" | "cancelled";
+
+export interface WorkflowJobState {
+  id: string;
+  name: string;
+  status: WorkflowJobStatus;
+  startedAt: number;
+  promise: Promise<WorkflowRunResult>;
+  abort: AbortController;
+  snapshot: {
+    agentsSpawned: number;
+    errorCount: number;
+    tokensSpent: number;
+    phases: string[];
+    lastMessage?: string;
+    currentPhase?: string;
+    runningCount?: number;
+  };
+  result?: WorkflowRunResult;
+  error?: string;
+}
+
+const g = typeof global !== "undefined" ? global : globalThis;
+declare global {
+  // eslint-disable-next-line no-var
+  var __piSubagenturaWorkflowJobs: Map<string, WorkflowJobState> | undefined;
+}
+if (!g.__piSubagenturaWorkflowJobs) {
+  g.__piSubagenturaWorkflowJobs = new Map<string, WorkflowJobState>();
+}
+export const workflowJobRegistry = g.__piSubagenturaWorkflowJobs as Map<
+  string,
+  WorkflowJobState
+>;
+
+export const MAX_WORKFLOW_JOBS = 100;
+
+/** Start a workflow running in the background. Returns the job id immediately. */
+export function startWorkflowJob(
+  name: string,
+  script: string,
+  opts: Omit<RunWorkflowOptions, "signal" | "onProgress">,
+  startedAt?: number,
+): WorkflowJobState {
+  while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
+    // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
+    let evicted = false;
+    for (const [id, st] of workflowJobRegistry) {
+      if (st.status !== "running") {
+        debugLog("info", "workflow_job_evicted", { evictedId: id });
+        workflowJobRegistry.delete(id);
+        evicted = true;
+        break;
+      }
+    }
+    if (!evicted) {
+      throw new Error(
+        `${MAX_WORKFLOW_JOBS} workflow jobs already running — cancel one with cancel_workflow before starting another.`,
+      );
+    }
+  }
+
+  const id = `wf_${randomBytes(5).toString("hex")}`;
+  const abort = new AbortController();
+  const state: WorkflowJobState = {
+    id,
+    name,
+    status: "running",
+    startedAt: startedAt ?? Date.now(),
+    promise: undefined as unknown as Promise<WorkflowRunResult>,
+    abort,
+    snapshot: {
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      phases: [],
+      runningCount: 0,
+    },
+  };
+  state.promise = runWorkflow(script, {
+    ...opts,
+    signal: abort.signal,
+    onProgress: (p) => {
+      state.snapshot.agentsSpawned = p.agentsSpawned;
+      state.snapshot.errorCount = p.errorCount;
+      state.snapshot.tokensSpent = p.tokensSpent;
+      state.snapshot.runningCount = p.runningCount;
+      if (p.kind === "phase" && p.phase) {
+        state.snapshot.currentPhase = p.phase;
+        state.snapshot.phases.push(p.phase);
+      }
+      if (p.kind === "log" && p.message) state.snapshot.lastMessage = p.message;
+    },
+  })
+    .then((r) => {
+      if (state.status === "running") state.status = "done";
+      state.result = r;
+      return r;
+    })
+    .catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      state.status = abort.signal.aborted ? "cancelled" : "error";
+      state.error = msg;
+      throw err;
+    });
+  // Don't crash the process on an unobserved rejection before get_workflow_result is called.
+  state.promise.catch(() => {});
+  workflowJobRegistry.set(id, state);
+  return state;
+}
