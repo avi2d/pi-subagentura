@@ -437,6 +437,18 @@ describe("background workflow jobs", () => {
     await job.promise;
     expect(job.snapshot.agentsSpawned).toBe(1);
   });
+
+  it("clears runningCount when runAgent throws", async () => {
+    const runAgent: WorkflowAgentRunner = () => {
+      throw new Error("boom");
+    };
+    const script = `export const meta = { name: "bgr", description: "d" };\nreturn await agent("x");`;
+    const job = startWorkflowJob("bgr", script, { runAgent });
+
+    await expect(job.promise).rejects.toThrow("boom");
+    expect(job.status).toBe("error");
+    expect(job.snapshot.runningCount).toBe(0);
+  });
 });
 it("sets startedAt from the passed timestamp", () => {
   const script = `export const meta = { name: "ts", description: "d" };\nreturn 1;`;

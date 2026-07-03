@@ -924,55 +924,59 @@ async function executeScript(
         }
         engine.counters.agentsSpawned++;
         engine.counters.runningCount++;
-        // Emit *before* awaiting runAgent so status polling sees in-flight process agents.
-        emit({
-          kind: "agent_start",
-          label: agentOpts.label,
-          phase: agentOpts.phase,
-          model: agentOpts.model,
-        });
-        const finalPrompt = hasSchema
-          ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
-          : prompt;
-        const res = await engine.runAgent({
-          prompt: finalPrompt,
-          persona: agentOpts.persona,
-          model: agentOpts.model,
-          signal: engine.signal,
-          isolation: agentOpts.isolation,
-          label: agentOpts.label,
-        });
-        const outTokens = res.usage?.output ?? 0;
-        tokensDelta += outTokens;
-        engine.counters.tokensSpent += outTokens;
-        engine.counters.runningCount--;
-        emit({
-          kind: "agent_done",
-          label: agentOpts.label,
-          phase: agentOpts.phase,
-          model: agentOpts.model,
-        });
+        try {
+          // Emit *before* awaiting runAgent so status polling sees in-flight process agents.
+          emit({
+            kind: "agent_start",
+            label: agentOpts.label,
+            phase: agentOpts.phase,
+            model: agentOpts.model,
+          });
+          const finalPrompt = hasSchema
+            ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
+            : prompt;
+          const res = await engine.runAgent({
+            prompt: finalPrompt,
+            persona: agentOpts.persona,
+            model: agentOpts.model,
+            signal: engine.signal,
+            isolation: agentOpts.isolation,
+            label: agentOpts.label,
+          });
+          const outTokens = res.usage?.output ?? 0;
+          tokensDelta += outTokens;
+          engine.counters.tokensSpent += outTokens;
 
-        if (res.isError) {
-          engine.counters.errorCount++;
-          return { value: null, tokensDelta };
-        }
-        if (!hasSchema) return { value: res.output, tokensDelta };
-
-        const raw = extractJson(res.output);
-        if (raw != null) {
-          try {
-            const parsed = JSON.parse(raw);
-            const verrs = validateSchema(parsed, agentOpts.schema);
-            if (verrs.length === 0) return { value: parsed, tokensDelta };
-            lastErr = verrs.slice(0, 5).join("; ");
-          } catch (e) {
-            lastErr = `JSON parse error: ${e instanceof Error ? e.message : String(e)}`;
+          if (res.isError) {
+            engine.counters.errorCount++;
+            return { value: null, tokensDelta };
           }
-        } else {
-          lastErr = "no JSON object/array found in output";
+          if (!hasSchema) return { value: res.output, tokensDelta };
+
+          const raw = extractJson(res.output);
+          if (raw != null) {
+            try {
+              const parsed = JSON.parse(raw);
+              const verrs = validateSchema(parsed, agentOpts.schema);
+              if (verrs.length === 0) return { value: parsed, tokensDelta };
+              lastErr = verrs.slice(0, 5).join("; ");
+            } catch (e) {
+              lastErr = `JSON parse error: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          } else {
+            lastErr = "no JSON object/array found in output";
+          }
+        } finally {
+          engine.counters.runningCount--;
+          emit({
+            kind: "agent_done",
+            label: agentOpts.label,
+            phase: agentOpts.phase,
+            model: agentOpts.model,
+          });
         }
       }
+
       engine.counters.errorCount++;
       emit({
         kind: "log",
