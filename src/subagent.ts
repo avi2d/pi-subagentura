@@ -74,8 +74,8 @@ export default function (pi: ExtensionAPI) {
     );
   }
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  registerSessionHandlers(pi);
   registerOrchestratorPrompt(pi);
+  registerSessionHandlers(pi);
   registerWorkflowTool(pi);
   registerInProcessSubagentTools(pi);
   registerInteractiveSubagentTools(pi);
