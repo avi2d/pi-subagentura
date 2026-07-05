@@ -33,6 +33,7 @@
     "src/artifact.ts",
     "src/artifact-poller.ts",
     "src/helpers.ts",
+    "src/orchestrator.ts",
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
     "src/interactive-tmux.ts",
@@ -63,9 +64,6 @@
   "pi": {
     "extensions": [
       "./src/subagent.ts"
-    ],
-    "skills": [
-      "./skills/orchestrator"
     ]
   },
   "scripts": {
