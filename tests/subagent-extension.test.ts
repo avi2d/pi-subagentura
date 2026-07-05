@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/subagent";
+import { ORCHESTRATOR_STATUS_KEY } from "../src/orchestrator";
 
 function mockApi(overrides: Record<string, any> = {}) {
   return {
@@ -10,6 +11,10 @@ function mockApi(overrides: Record<string, any> = {}) {
     on: vi.fn(),
     ...overrides,
   };
+}
+
+function mockCtx() {
+  return { ui: { setStatus: vi.fn() } };
 }
 
 afterEach(() => {
@@ -65,13 +70,22 @@ describe("extension registration", () => {
     expect(handler).toBeDefined();
 
     const event = { systemPrompt: "base prompt" };
-    expect(handler(event)).toBeUndefined();
+    const ctx = mockCtx();
+    expect(handler(event, ctx)).toBeUndefined();
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      ORCHESTRATOR_STATUS_KEY,
+      undefined,
+    );
 
     api.getFlag.mockReturnValue(true);
-    const enabled = handler(event);
+    const enabled = handler(event, ctx);
     expect(enabled.systemPrompt).toContain("base prompt");
     expect(enabled.systemPrompt).toContain("# Orchestrator");
     expect(enabled.systemPrompt).toContain("parent agent only");
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      ORCHESTRATOR_STATUS_KEY,
+      "🧭 orchestrator",
+    );
   });
 
   it("enables orchestrator guidance with PI_ORCHESTRATOR", () => {
@@ -82,8 +96,13 @@ describe("extension registration", () => {
       ([eventName]: any[]) => eventName === "before_agent_start",
     )?.[1];
 
-    expect(handler({ systemPrompt: "base" }).systemPrompt).toContain(
+    const ctx = mockCtx();
+    expect(handler({ systemPrompt: "base" }, ctx).systemPrompt).toContain(
       "# Orchestrator",
+    );
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      ORCHESTRATOR_STATUS_KEY,
+      "🧭 orchestrator",
     );
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   parseWorkflow,
   runWorkflow,
@@ -13,7 +13,10 @@ import {
   startWorkflowJob,
   workflowJobRegistry,
   awaitInteractiveResult,
+  renderProgress,
+  registerWorkflowTool,
   type WorkflowAgentRunner,
+  type WorkflowProgress,
 } from "../src/workflow";
 import type { SubagentResult } from "../src/helpers";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -654,5 +657,203 @@ describe("abort signal propagation", () => {
     );
     expect(r.result).toEqual([null, null]);
     expect(r.errorCount).toBe(2);
+  });
+});
+
+describe("renderProgress", () => {
+  it("formats a phase progress update", () => {
+    const p: WorkflowProgress = {
+      kind: "phase",
+      phase: "Scanning",
+      agentsSpawned: 2,
+      errorCount: 0,
+      tokensSpent: 100,
+      runningCount: 1,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("● workflow — 2 agent(s)");
+    expect(result).toContain("⚡ 1 running");
+    expect(result).toContain("100 tokens");
+    expect(result).toContain("◆ phase: Scanning");
+  });
+
+  it("formats a log progress update", () => {
+    const p: WorkflowProgress = {
+      kind: "log",
+      message: "hello",
+      agentsSpawned: 3,
+      errorCount: 0,
+      tokensSpent: 50,
+      runningCount: 0,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("● workflow — 3 agent(s)");
+    expect(result).not.toContain("⚡");
+    expect(result).toContain("50 tokens");
+    expect(result).toContain("hello");
+  });
+
+  it("formats an agent_start update without label or model", () => {
+    const p: WorkflowProgress = {
+      kind: "agent_start",
+      agentsSpawned: 1,
+      errorCount: 0,
+      tokensSpent: 0,
+      runningCount: 1,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("→ started");
+    expect(result).not.toMatch(/started @/);
+  });
+
+  it("formats an agent_start update with label and model", () => {
+    const p: WorkflowProgress = {
+      kind: "agent_start",
+      label: "scout",
+      model: "gpt-4",
+      agentsSpawned: 1,
+      errorCount: 0,
+      tokensSpent: 0,
+      runningCount: 1,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("→ started scout @gpt-4");
+  });
+
+  it("formats an agent_done update without label or model", () => {
+    const p: WorkflowProgress = {
+      kind: "agent_done",
+      agentsSpawned: 1,
+      errorCount: 0,
+      tokensSpent: 100,
+      runningCount: 0,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("→ done");
+    expect(result).not.toMatch(/done @/);
+  });
+
+  it("formats an agent_done update with label and model", () => {
+    const p: WorkflowProgress = {
+      kind: "agent_done",
+      label: "scout",
+      model: "gpt-4",
+      agentsSpawned: 1,
+      errorCount: 1,
+      tokensSpent: 100,
+      runningCount: 0,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("→ done scout @gpt-4");
+    expect(result).toContain("⚠ 1 error(s)");
+  });
+
+  it("falls back to just the head line for unknown kinds", () => {
+    const p = {
+      kind: "unknown" as const,
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      runningCount: 0,
+    };
+    const result = renderProgress(p as unknown as WorkflowProgress);
+    expect(result).toBe("● workflow — 0 agent(s), 0 tokens");
+  });
+
+  it("omits running count when runningCount is 0", () => {
+    const p: WorkflowProgress = {
+      kind: "phase",
+      phase: "done",
+      agentsSpawned: 5,
+      errorCount: 0,
+      tokensSpent: 200,
+      runningCount: 0,
+    };
+    const result = renderProgress(p);
+    expect(result).not.toContain("⚡");
+    expect(result).toContain("5 agent(s)");
+  });
+
+  it("omits error count when errorCount is 0", () => {
+    const p: WorkflowProgress = {
+      kind: "phase",
+      phase: "done",
+      agentsSpawned: 5,
+      errorCount: 0,
+      tokensSpent: 200,
+      runningCount: 2,
+    };
+    const result = renderProgress(p);
+    expect(result).not.toContain("⚠");
+  });
+
+  it("shows both running count and error count when both are non-zero", () => {
+    const p: WorkflowProgress = {
+      kind: "phase",
+      phase: "working",
+      agentsSpawned: 10,
+      errorCount: 3,
+      tokensSpent: 500,
+      runningCount: 2,
+    };
+    const result = renderProgress(p);
+    expect(result).toContain("⚡ 2 running");
+    expect(result).toContain("⚠ 3 error(s)");
+    expect(result).toContain("10 agent(s)");
+    expect(result).toContain("500 tokens");
+  });
+});
+
+describe("registerWorkflowTool", () => {
+  it("registers 6 tools with the Pi SDK", () => {
+    const tools: Array<{ name: string }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    expect(tools).toHaveLength(6);
+    expect(tools.map((t) => t.name)).toEqual([
+      "workflow",
+      "get_workflow_status",
+      "get_workflow_result",
+      "cancel_workflow",
+      "save_workflow",
+      "list_workflows",
+    ]);
+  });
+
+  it("workflow tool has the expected description and parameters", () => {
+    const tools: Array<{ name: string; description: string; parameters: any }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const wf = tools.find((t) => t.name === "workflow")!;
+    expect(wf.description).toContain("agent(prompt, opts?)");
+    expect(wf.description).toContain("workflow(name, args?)");
+    expect(wf.parameters).toBeDefined();
+    expect(wf.parameters.properties).toBeDefined();
+    expect(Object.keys(wf.parameters.properties)).toContain("script");
+    expect(Object.keys(wf.parameters.properties)).toContain("name");
+    expect(Object.keys(wf.parameters.properties)).toContain("async");
+  });
+
+  it("save_workflow tool validates the script before persisting", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const save = tools.find((t) => t.name === "save_workflow")!;
+    // Bad script (missing meta) should fail
+    const result = await save.execute("", { name: "bad", script: "return 1;" }, undefined, undefined, {});
+    expect(result.content[0].text).toContain("Could not save workflow");
+    expect(result.isError).toBe(true);
   });
 });
