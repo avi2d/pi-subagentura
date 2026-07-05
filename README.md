@@ -18,7 +18,8 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `send_interactive_subagent_message` — send a follow-up into a live sub-agent's REPL (preserves child context)
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
-  The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
+
+The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background and inject their result by default when complete — poll or collect manually only when needed. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
 Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
 
@@ -36,6 +37,8 @@ Interactive sub-agents support **follow-up turns**: the parent can push a new pr
 ![Sub-agent demo](working.png)
 
 ## Installation
+
+See [CHANGELOG.md](./CHANGELOG.md) for breaking changes between major versions.
 
 Install globally:
 
