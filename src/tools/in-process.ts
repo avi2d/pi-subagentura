@@ -831,13 +831,17 @@ function registerListAvailableModelsTool(pi: ExtensionAPI): void {
         params.authOnly !== false
           ? `${filtered.length} model${filtered.length === 1 ? "" : "s"} with auth configured`
           : `${filtered.length} model${filtered.length === 1 ? "" : "s"} total`;
+      const headerLines = [summary];
+      if (params.filter) {
+        headerLines.push(`Search pattern: ${params.filter}`);
+      }
 
       return {
         content: [
           {
             type: "text",
             text:
-              `${summary}\n\n` +
+              `${headerLines.join("\n")}\n\n` +
               lines.map((l) => `  ${l}`).join("\n") +
               (filtered.length === 0 ? "\n(no models match)" : ""),
           },

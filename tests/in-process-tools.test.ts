@@ -970,6 +970,23 @@ describe("list_available_models tool", () => {
     expect(text).toContain("(no models match)");
   });
 
+  it("shows the search pattern when a filter is provided", async () => {
+    const getAvailable = vi.fn().mockReturnValue(baseModels);
+    const ctx = mockCtx({
+      modelRegistry: { getAvailable, getAll: vi.fn(), find: vi.fn() },
+    });
+
+    const result = await toolDef.execute(
+      "call-1",
+      { filter: "big-pickle" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.content[0].text).toContain("Search pattern: big-pickle");
+  });
+
   it("handles empty model registry gracefully", async () => {
     const getAvailable = vi.fn().mockReturnValue([]);
     const ctx = mockCtx({
