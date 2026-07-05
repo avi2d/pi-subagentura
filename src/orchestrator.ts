@@ -1,10 +1,14 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 const ORCHESTRATOR_PROMPT_PATH = fileURLToPath(
   new URL("../skills/orchestrator/SKILL.md", import.meta.url),
 );
+export const ORCHESTRATOR_STATUS_KEY = "subagentura-orchestrator";
 
 let cachedPrompt: string | null = null;
 
@@ -28,6 +32,22 @@ export function readOrchestratorPrompt(): string {
   return cachedPrompt;
 }
 
+function updateOrchestratorStatus(
+  pi: Pick<ExtensionAPI, "getFlag">,
+  ctx: ExtensionContext,
+): boolean {
+  const enabled = isOrchestratorEnabled(pi);
+  try {
+    ctx.ui.setStatus(
+      ORCHESTRATOR_STATUS_KEY,
+      enabled ? "🧭 orchestrator" : undefined,
+    );
+  } catch {
+    /* UI context may be stale or unavailable during lifecycle transitions. */
+  }
+  return enabled;
+}
+
 export function registerOrchestratorPrompt(pi: ExtensionAPI): void {
   pi.registerFlag("orchestrator", {
     description:
@@ -36,8 +56,12 @@ export function registerOrchestratorPrompt(pi: ExtensionAPI): void {
     default: false,
   });
 
-  pi.on("before_agent_start", (event) => {
-    if (!isOrchestratorEnabled(pi)) return undefined;
+  pi.on("session_start", (_event, ctx) => {
+    updateOrchestratorStatus(pi, ctx);
+  });
+
+  pi.on("before_agent_start", (event, ctx) => {
+    if (!updateOrchestratorStatus(pi, ctx)) return undefined;
     return {
       systemPrompt: `${event.systemPrompt}\n\n${readOrchestratorPrompt()}`,
     };

@@ -62,8 +62,8 @@ export type SubagentDetails =
   | { status: "invalid_id"; id: string };
 
 export default function (pi: ExtensionAPI) {
-  registerSessionHandlers(pi);
   registerOrchestratorPrompt(pi);
+  registerSessionHandlers(pi);
   registerWorkflowTool(pi);
   registerInProcessSubagentTools(pi);
   registerInteractiveSubagentTools(pi);
