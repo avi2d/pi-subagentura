@@ -1,4 +1,3 @@
-import { runInNewContext } from "node:vm";
 import { Worker } from "node:worker_threads";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,7 +17,6 @@ import {
   defaultConcurrency,
   defaultProcessConcurrency,
   extractJson,
-  parseWorkflow,
   validateSchema,
   type RunWorkflowOptions,
   type Semaphore,
@@ -29,13 +27,13 @@ import {
   type WorkflowRunResult,
   zeroUsage,
 } from "./workflow-core";
+import { workflowStringify } from "./workflow-script";
 import {
   cancelInteractiveSubagent,
   isPaneAlive,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 
-// ── Engine (shared across nested workflows) ──────────────────────────
 // ── Engine (shared across nested workflows) ──────────────────────────
 
 interface Engine {
@@ -104,299 +102,6 @@ export async function runWorkflow(
     opts.signal?.removeEventListener("abort", forwardAbort);
   }
 }
-
-const WORKFLOW_WORKER_SOURCE = String.raw`
-const { parentPort } = require("node:worker_threads");
-const { runInNewContext } = require("node:vm");
-
-let nextRpcId = 1;
-const pending = new Map();
-let aborted = false;
-let workerConfig = {
-  syncTimeoutMs: 30000,
-  maxItemsPerCall: 4096,
-  maxWorkflowDepth: 1,
-  budgetTotal: null,
-};
-let tokensSpent = 0;
-
-function rpc(method, payload) {
-  if (aborted) return Promise.reject(new Error("Workflow aborted."));
-  return new Promise((resolve, reject) => {
-    const id = nextRpcId++;
-    pending.set(id, { resolve, reject });
-    parentPort.postMessage({ id, method, payload });
-  });
-}
-
-parentPort.on("message", (msg) => {
-  if (!msg || typeof msg !== "object") return;
-  if (msg.type === "abort") {
-    aborted = true;
-    for (const { reject } of pending.values()) reject(new Error("Workflow aborted."));
-    pending.clear();
-    return;
-  }
-  if (msg.type === "init") {
-    workerConfig = {
-      syncTimeoutMs: msg.syncTimeoutMs,
-      maxItemsPerCall: msg.maxItemsPerCall,
-      maxWorkflowDepth: msg.maxWorkflowDepth,
-      budgetTotal: msg.budgetTotal,
-    };
-    executeScript(msg.script, msg.args, 0)
-      .then((value) => parentPort.postMessage({ type: "result", value }))
-      .catch((err) =>
-        parentPort.postMessage({
-          type: "error",
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
-    return;
-  }
-  if (typeof msg.id === "number" && pending.has(msg.id)) {
-    const waiter = pending.get(msg.id);
-    pending.delete(msg.id);
-    if (msg.ok) waiter.resolve(msg.value);
-    else waiter.reject(new Error(String(msg.error || "Workflow RPC failed.")));
-  }
-});
-
-async function executeScript(script, args, depth) {
-  const parsed = parseWorkflow(script);
-  const result = await executeBody(parsed.meta, parsed.body, args, depth);
-  return { meta: parsed.meta, result };
-}
-
-async function executeBody(meta, body, args, depth) {
-  function checkAbort() {
-    if (aborted) throw new Error("Workflow aborted.");
-  }
-  async function agent(prompt, opts = {}) {
-    checkAbort();
-    if (typeof prompt !== "string" || prompt.trim() === "") {
-      throw new Error("agent(prompt): prompt must be a non-empty string.");
-    }
-    if (workerConfig.budgetTotal != null && budgetRemaining() <= 0) {
-      throw new Error("Workflow token budget exhausted.");
-    }
-    const res = await rpc("agent", { prompt, opts });
-    tokensSpent += res && typeof res.tokensDelta === "number" ? res.tokensDelta : 0;
-    return res ? res.value : null;
-  }
-  async function parallel(thunks) {
-    if (!Array.isArray(thunks)) throw new Error("parallel(thunks): expected an array of functions.");
-    if (thunks.length > workerConfig.maxItemsPerCall) {
-      throw new Error("parallel(): " + thunks.length + " thunks exceeds the " + workerConfig.maxItemsPerCall + " cap.");
-    }
-    return Promise.all(
-      thunks.map((t) =>
-        Promise.resolve()
-          .then(() => {
-            if (typeof t !== "function") throw new Error("parallel(): each item must be a thunk () => Promise.");
-            checkAbort();
-            return t();
-          })
-          .catch((err) => {
-            if (aborted) throw err;
-            return null;
-          }),
-      ),
-    );
-  }
-  async function pipeline(items, ...stages) {
-    if (!Array.isArray(items)) throw new Error("pipeline(items, ...stages): items must be an array.");
-    if (items.length > workerConfig.maxItemsPerCall) {
-      throw new Error("pipeline(): " + items.length + " items exceeds the " + workerConfig.maxItemsPerCall + " cap.");
-    }
-    const fns = stages.filter((s) => typeof s === "function");
-    return Promise.all(
-      items.map(async (item, index) => {
-        let acc = item;
-        try {
-          for (const stage of fns) {
-            checkAbort();
-            acc = await stage(acc, item, index);
-          }
-          return acc;
-        } catch (err) {
-          if (aborted) throw err;
-          return null;
-        }
-      }),
-    );
-  }
-  function phase(title) {
-    const t = String(title ?? "");
-    parentPort.postMessage({ type: "progress", payload: { kind: "phase", phase: t } });
-  }
-  function log(message) {
-    parentPort.postMessage({
-      type: "progress",
-      payload: { kind: "log", message: String(message ?? "") },
-    });
-  }
-  async function workflow(nameOrRef, childArgs) {
-    checkAbort();
-    if (depth >= workerConfig.maxWorkflowDepth) {
-      throw new Error("workflow() composition is one level deep only.");
-    }
-    const childScript = await rpc("loadWorkflow", nameOrRef);
-    const child = await executeScript(childScript, childArgs, depth + 1);
-    return child.result;
-  }
-  const budget = {
-    total: workerConfig.budgetTotal,
-    spent: () => tokensSpent,
-    remaining: () => budgetRemaining(),
-  };
-  const sandbox = {
-    agent,
-    parallel,
-    pipeline,
-    phase,
-    log,
-    workflow,
-    args,
-    budget,
-    console: {
-      log: (...a) => log(a.map((x) => stringify(x)).join(" ")),
-      error: (...a) => log(a.map((x) => stringify(x)).join(" ")),
-      warn: (...a) => log(a.map((x) => stringify(x)).join(" ")),
-    },
-    Date: makeGuardedDate(),
-    Math: makeGuardedMath(),
-  };
-  try {
-    return await runInNewContext("(async () => {\n" + body + "\n})()", sandbox, {
-      filename: "workflow:" + meta.name + ".js",
-      timeout: workerConfig.syncTimeoutMs,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error("Workflow \"" + meta.name + "\" failed: " + msg);
-  }
-}
-
-function budgetRemaining() {
-  return workerConfig.budgetTotal == null
-    ? Infinity
-    : Math.max(0, workerConfig.budgetTotal - tokensSpent);
-}
-
-function parseWorkflow(script) {
-  const metaRe = /(^|\n)\s*export\s+const\s+meta\s*=\s*/;
-  const m = metaRe.exec(script);
-  if (!m) {
-    throw new Error("Workflow script must declare \`export const meta = { name, description }\` as a pure literal.");
-  }
-  const braceStart = script.indexOf("{", m.index + m[0].length);
-  if (braceStart === -1) throw new Error("\`export const meta\` must be assigned an object literal \`{ ... }\`.");
-  const braceEnd = matchBrace(script, braceStart);
-  const metaText = script.slice(braceStart, braceEnd + 1);
-  let meta;
-  try {
-    meta = runInNewContext("(" + metaText + ")", {
-      Date: makeGuardedDate(),
-      Math: makeGuardedMath(),
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error("Workflow \`meta\` must be a pure literal (no variables/calls). Eval failed: " + msg);
-  }
-  if (!meta || typeof meta !== "object") throw new Error("Workflow \`meta\` did not evaluate to an object.");
-  if (typeof meta.name !== "string" || !meta.name) throw new Error("Workflow \`meta.name\` must be a non-empty string.");
-  if (typeof meta.description !== "string" || !meta.description) throw new Error("Workflow \`meta.description\` must be a non-empty string.");
-  let trailing = braceEnd + 1;
-  if (script[trailing] === ";") trailing++;
-  const body = (script.slice(0, m.index) + script.slice(trailing))
-    .replace(/(^|\n)\s*export\s+default\s+/g, "$1")
-    .replace(/(^|\n)\s*export\s+/g, "$1");
-  return { meta, body };
-}
-
-function matchBrace(src, openIdx) {
-  let depth = 0;
-  let i = openIdx;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === '"' || c === "'" || c === "\`") {
-      i = skipString(src, i);
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "/") {
-      const nl = src.indexOf("\n", i);
-      i = nl === -1 ? src.length : nl;
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      const end = src.indexOf("*/", i + 2);
-      i = end === -1 ? src.length : end + 2;
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return i;
-    }
-    i++;
-  }
-  throw new Error("Unbalanced braces in \`export const meta\` literal.");
-}
-
-function skipString(src, start) {
-  const quote = src[start];
-  let i = start + 1;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "\\") {
-      i += 2;
-      continue;
-    }
-    if (c === quote) return i + 1;
-    i++;
-  }
-  return src.length;
-}
-
-function makeGuardedDate() {
-  const Guard = function (...a) {
-    if (a.length === 0) {
-      throw new Error("\`new Date()\` with no args is non-deterministic and unavailable in workflows. Pass a timestamp via \`args\`.");
-    }
-    return new Date(...a);
-  };
-  Guard.now = () => {
-    throw new Error("\`Date.now()\` is non-deterministic and unavailable in workflows. Pass a timestamp via \`args\`.");
-  };
-  Guard.parse = Date.parse;
-  Guard.UTC = Date.UTC;
-  Guard.prototype = Date.prototype;
-  return Guard;
-}
-
-function makeGuardedMath() {
-  return new Proxy(Math, {
-    get(target, prop, recv) {
-      if (prop === "random") {
-        return () => {
-          throw new Error("\`Math.random()\` is non-deterministic and unavailable in workflows. Vary by index instead.");
-        };
-      }
-      return Reflect.get(target, prop, recv);
-    },
-  });
-}
-
-function stringify(x) {
-  if (typeof x === "string") return x;
-  try {
-    return JSON.stringify(x);
-  } catch {
-    return String(x);
-  }
-}
-`;
 
 type WorkerRpcRequest = { id: number; method: string; payload: any };
 type WorkerRpcResponse = {
@@ -563,13 +268,23 @@ function runWorkflowWorker(
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const worker = new Worker(WORKFLOW_WORKER_SOURCE, { eval: true });
+    const worker = new Worker(
+      new URL("./workflow-worker-thread.mjs", import.meta.url),
+    );
+    const terminateWorker = () => {
+      try {
+        worker.postMessage({ type: "abort" });
+      } catch {
+        /* worker may already be dead */
+      }
+      worker.terminate().catch(() => {});
+    };
     const fail = (err: unknown) => {
       if (settled) return;
       settled = true;
       engine.closed = true;
       cleanup();
-      worker.terminate().catch(() => {});
+      terminateWorker();
       reject(err instanceof Error ? err : new Error(String(err)));
     };
     const done = (value: { meta: WorkflowMeta; result: unknown }) => {
@@ -577,7 +292,7 @@ function runWorkflowWorker(
       settled = true;
       engine.closed = true;
       cleanup();
-      worker.terminate().catch(() => {});
+      terminateWorker();
       resolve(value);
     };
     const onAbort = () => fail(new Error("Workflow aborted."));
@@ -676,12 +391,7 @@ function postWorkerResponse(worker: Worker, msg: WorkerRpcResponse): void {
 }
 
 export function stringify(x: unknown): string {
-  if (typeof x === "string") return x;
-  try {
-    return JSON.stringify(x);
-  } catch {
-    return String(x);
-  }
+  return workflowStringify(x);
 }
 
 function buildSchemaPrompt(

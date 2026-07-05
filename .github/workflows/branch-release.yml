@@ -50,6 +50,15 @@ jobs:
           ref: ${{ steps.release_ref.outputs.ref }}
           fetch-depth: 0
 
+      - name: Resolve checked-out commit
+        id: release_sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha::7}" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -76,7 +85,7 @@ jobs:
 
           mkdir -p dist
           packed=$(npm pack --pack-destination dist --silent | tail -n 1)
-          short_sha=${GITHUB_SHA::7}
+          short_sha="${{ steps.release_sha.outputs.short_sha }}"
           asset="pi-subagentura-${{ steps.release_ref.outputs.safe_ref }}-$short_sha.tgz"
 
           mv "dist/$packed" "dist/$asset"
@@ -93,7 +102,7 @@ jobs:
           tag="${{ steps.release_ref.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$tag" "$GITHUB_SHA"
+          git tag -f "$tag" "${{ steps.release_sha.outputs.sha }}"
           git push --force origin "refs/tags/$tag"
 
       - name: Create or update GitHub release
@@ -110,7 +119,7 @@ jobs:
           notes=$(mktemp)
 
           cat > "$notes" <<EOF
-          Branch preview for \`$raw_ref\` at \`$GITHUB_SHA\`.
+          Branch preview for \`$raw_ref\` at \`${{ steps.release_sha.outputs.sha }}\`.
 
           Pi consumes this preview through the git tag, not the attached tarball:
 

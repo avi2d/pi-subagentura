@@ -7,7 +7,6 @@ import {
 } from "./workflow-core";
 
 // ── Background workflow-job registry ─────────────────────────────────
-// ── Background workflow-job registry ─────────────────────────────────
 
 export type WorkflowJobStatus = "running" | "done" | "error" | "cancelled";
 

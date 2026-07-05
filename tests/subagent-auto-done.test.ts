@@ -4,10 +4,21 @@
  * completion event from the session log alone.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { appendEvent, artifactPath, readEvents } from "../src/artifact";
+import {
+  appendEvent,
+  artifactPath,
+  outputPathForTurn,
+  readEvents,
+} from "../src/artifact";
 import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { importFresh } from "./test-utils";
 
@@ -453,6 +464,46 @@ describe("auto-done fallback", () => {
     sendMessage.mockClear();
     mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("suppresses duplicate inject and snapshot if an explicit done arrives after auto-synthesis", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({ outputContent: "result" });
+    state.notifyOnComplete = "inject";
+    mod.interactiveSubagentRegistry.set(state.id, state);
+
+    const sendUserMessage = vi.fn();
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+
+    const art = artifactPath(dirname(artifactDir), state.id);
+    expect(existsSync(outputPathForTurn(art, 1))).toBe(true);
+    appendEvent(art, {
+      ts: Date.now(),
+      type: "done",
+      status: "done",
+      exitCode: 0,
+    });
+
+    sendUserMessage.mockClear();
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(existsSync(outputPathForTurn(art, 2))).toBe(false);
+
+    const userMsg = {
+      type: "message",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "thanks" }],
+        timestamp: Date.now(),
+      },
+    };
+    writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
+    mod.pollArtifactChanges({ sendUserMessage } as any);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(existsSync(outputPathForTurn(art, 2))).toBe(false);
   });
 
   it("a new user message in the session log resets the auto-done guard for the next turn", async () => {

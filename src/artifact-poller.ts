@@ -186,6 +186,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         }
       }
 
+      const isLateAutoDoneDuplicate =
+        last &&
+        last.type === "done" &&
+        state.autoDoneForTurnAt !== undefined &&
+        last.ts > state.autoDoneForTurnAt;
+
       // Per-turn snapshot: on a NEW `done` event, copy the latest output.md into output-N.md so turn
       // history survives the child overwriting output.md each turn. Runs in every notifyOnComplete mode,
       // so it needs its own cursor (`lastSnapshotEventTs`) — see the field doc for why reusing
@@ -195,55 +201,60 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         last.type === "done" &&
         state.lastSnapshotEventTs !== last.ts
       ) {
-        const allEvents = readEvents(art);
-        const turnNumber = allEvents.filter((e) => e.type === "done").length;
-        snapshotOutput(art, turnNumber);
+        if (!isLateAutoDoneDuplicate) {
+          const allEvents = readEvents(art);
+          const turnNumber = allEvents.filter((e) => e.type === "done").length;
+          snapshotOutput(art, turnNumber);
+        }
         state.lastSnapshotEventTs = last.ts;
       }
 
       // Inject-mode delivery: on a NEW `done` event, push output.md into the parent LLM's next turn.
       // Per-turn (not per-sub-agent) — `lastInjectedEventTs` is compared against the current `done`'s `ts`
       // so each follow-up turn re-injects. Mirrors deliverNotification's MAX_INJECT cap.
+      // Skip late explicit `done` after auto-synthesis — symmetric with the notify-loop guard above.
       if (
         last &&
         last.type === "done" &&
         state.notifyOnComplete === "inject" &&
         state.lastInjectedEventTs !== last.ts
       ) {
-        const output = readOutput(art);
-        if (output !== null) {
-          if (getInjectCount() >= MAX_INJECT) {
-            // Degrade silently: pointer notification was already delivered above,
-            // so the user still sees a hint. We just don't inject.
-            try {
-              interactivePi.sendMessage!(
-                {
-                  customType: "subagent-notify",
-                  content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
-                  display: true,
-                  details: { subagentId: state.id, mode: "notify" },
-                },
-                { deliverAs: "followUp" },
-              );
-            } catch {
-              /* pi stale */
-            }
-          } else {
-            incrementInjectCount();
-            try {
-              (interactivePi as any).sendUserMessage?.(
-                output || "(sub-agent produced no output)",
-                { deliverAs: "followUp" },
-              );
-            } catch {
-              /* pi stale — next poll tick will re-attempt with a refreshed ctx */
-            } finally {
-              decrementInjectCount();
+        if (!isLateAutoDoneDuplicate) {
+          const output = readOutput(art);
+          if (output !== null) {
+            if (getInjectCount() >= MAX_INJECT) {
+              // Degrade silently: pointer notification was already delivered above,
+              // so the user still sees a hint. We just don't inject.
+              try {
+                interactivePi.sendMessage!(
+                  {
+                    customType: "subagent-notify",
+                    content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
+                    display: true,
+                    details: { subagentId: state.id, mode: "notify" },
+                  },
+                  { deliverAs: "followUp" },
+                );
+              } catch {
+                /* pi stale */
+              }
+            } else {
+              incrementInjectCount();
+              try {
+                (interactivePi as any).sendUserMessage?.(
+                  output || "(sub-agent produced no output)",
+                  { deliverAs: "followUp" },
+                );
+              } catch {
+                /* pi stale — next poll tick will re-attempt with a refreshed ctx */
+              } finally {
+                decrementInjectCount();
+              }
             }
           }
         }
-        // Record the ts of the done we just (attempted to) inject for. The next `done` from a follow-up
-        // turn has a fresh ts, so the comparison re-fires.
+        // Record the ts of the done we just (attempted to) inject for, or skipped as
+        // a duplicate of an auto-synthesized turn. A later follow-up turn has a fresh ts.
         state.lastInjectedEventTs = last.ts;
       }
 
