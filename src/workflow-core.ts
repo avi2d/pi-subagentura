@@ -1,4 +1,3 @@
-import { runInNewContext } from "node:vm";
 import { cpus, homedir } from "node:os";
 import {
   existsSync,
@@ -10,7 +9,6 @@ import {
 import { join } from "node:path";
 import type { SubagentResult, Usage } from "./helpers";
 
-// ── Limits ───────────────────────────────────────────────────────────
 // ── Limits ───────────────────────────────────────────────────────────
 export const MAX_TOTAL_AGENTS = 1000;
 export const MAX_ITEMS_PER_CALL = 4096;
@@ -112,148 +110,8 @@ export interface RunWorkflowOptions {
 
 // ── Script parsing ───────────────────────────────────────────────────
 
-/**
- * Split a workflow script into its static `meta` literal and the executable body.
- * `meta` must be a pure literal — it is evaluated in a helperless context, so a literal that
- * references `agent`/etc. throws.
- */
-export function parseWorkflow(script: string): {
-  meta: WorkflowMeta;
-  body: string;
-} {
-  const metaRe = /(^|\n)\s*export\s+const\s+meta\s*=\s*/;
-  const m = metaRe.exec(script);
-  if (!m) {
-    throw new Error(
-      "Workflow script must declare `export const meta = { name, description }` as a pure literal.",
-    );
-  }
-  const braceStart = script.indexOf("{", m.index + m[0].length);
-  if (braceStart === -1) {
-    throw new Error(
-      "`export const meta` must be assigned an object literal `{ ... }`.",
-    );
-  }
-  const braceEnd = matchBrace(script, braceStart);
-  const metaText = script.slice(braceStart, braceEnd + 1);
-
-  let meta: WorkflowMeta;
-  try {
-    // Evaluate in a helperless context with determinism guards present — a pure literal needs none
-    // of them, so any reference (to a helper, or to Date/Math) throws and is reported clearly.
-    meta = runInNewContext(`(${metaText})`, {
-      Date: makeGuardedDate(),
-      Math: makeGuardedMath(),
-    }) as WorkflowMeta;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Workflow \`meta\` must be a pure literal (no variables/calls). Eval failed: ${msg}`,
-    );
-  }
-  if (!meta || typeof meta !== "object") {
-    throw new Error("Workflow `meta` did not evaluate to an object.");
-  }
-  if (typeof meta.name !== "string" || !meta.name) {
-    throw new Error("Workflow `meta.name` must be a non-empty string.");
-  }
-  if (typeof meta.description !== "string" || !meta.description) {
-    throw new Error("Workflow `meta.description` must be a non-empty string.");
-  }
-
-  // Remove the whole `export const meta = {...};` span from the body, then defensively strip any
-  // remaining line-anchored `export`/`export default` tokens (workflow bodies are top-level code).
-  let trailing = braceEnd + 1;
-  if (script[trailing] === ";") trailing++;
-  const body = (script.slice(0, m.index) + script.slice(trailing))
-    .replace(/(^|\n)\s*export\s+default\s+/g, "$1")
-    .replace(/(^|\n)\s*export\s+/g, "$1");
-  return { meta, body };
-}
-
-/** Brace-match starting at `openIdx` (which must point at `{`), skipping strings and comments. */
-function matchBrace(src: string, openIdx: number): number {
-  let depth = 0;
-  let i = openIdx;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === '"' || c === "'" || c === "`") {
-      i = skipString(src, i);
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "/") {
-      const nl = src.indexOf("\n", i);
-      i = nl === -1 ? src.length : nl;
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      const end = src.indexOf("*/", i + 2);
-      i = end === -1 ? src.length : end + 2;
-      continue;
-    }
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return i;
-    }
-    i++;
-  }
-  throw new Error("Unbalanced braces in `export const meta` literal.");
-}
-
-/** Given index of a quote char, return index just past the closing quote. */
-function skipString(src: string, start: number): number {
-  const quote = src[start];
-  let i = start + 1;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "\\") {
-      i += 2;
-      continue;
-    }
-    if (c === quote) return i + 1;
-    i++;
-  }
-  return src.length;
-}
-
-// ── Determinism guards ───────────────────────────────────────────────
-
-function makeGuardedDate(): typeof Date {
-  const Guard = function (this: unknown, ...a: unknown[]) {
-    if (a.length === 0) {
-      throw new Error(
-        "`new Date()` with no args is non-deterministic and unavailable in workflows. Pass a timestamp via `args`.",
-      );
-    }
-    // @ts-expect-error spread into Date constructor
-    return new Date(...a);
-  } as any;
-  Guard.now = () => {
-    throw new Error(
-      "`Date.now()` is non-deterministic and unavailable in workflows. Pass a timestamp via `args`.",
-    );
-  };
-  Guard.parse = Date.parse;
-  Guard.UTC = Date.UTC;
-  Guard.prototype = Date.prototype;
-  return Guard as typeof Date;
-}
-
-function makeGuardedMath(): Math {
-  return new Proxy(Math, {
-    get(target, prop, recv) {
-      if (prop === "random") {
-        return () => {
-          throw new Error(
-            "`Math.random()` is non-deterministic and unavailable in workflows. Vary by index instead.",
-          );
-        };
-      }
-      return Reflect.get(target, prop, recv);
-    },
-  });
-}
+import { parseWorkflow } from "./workflow-script";
+export { parseWorkflow };
 
 // ── Minimal JSON-Schema validation (dependency-free) ─────────────────
 

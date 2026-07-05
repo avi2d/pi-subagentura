@@ -1,6 +1,6 @@
 {
   "name": "pi-subagentura",
-  "version": "2.4.1",
+  "version": "3.0.0",
   "description": "Public Pi package that adds in-process sub-agents via the SDK",
   "author": "lmn451",
   "license": "MIT",
@@ -47,7 +47,11 @@
     "src/subagent-artifact-cli.ts",
     "src/workflow.ts",
     "src/workflow-core.ts",
+    "src/workflow-script.ts",
+    "src/workflow-script.mjs",
+    "src/workflow-script.d.mts",
     "src/workflow-worker.ts",
+    "src/workflow-worker-thread.mjs",
     "src/workflow-jobs.ts",
     "src/workflow-ui.ts",
     "src/workflow-tool.ts"

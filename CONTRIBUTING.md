@@ -31,7 +31,7 @@ no `NPM_TOKEN` secret exists or should exist.
 
 ### Pre-release verification
 
-Before cutting a release, run the full verification suite:
+Before cutting a release, update [CHANGELOG.md](./CHANGELOG.md) and run the full verification suite:
 
 ```bash
 npm run typecheck

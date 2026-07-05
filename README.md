@@ -27,7 +27,7 @@ Available tools:
 - `cancel_interactive_subagent` — kill an attachable interactive sub-agent pane
 - `send_interactive_subagent_message` — send a follow-up into a live child REPL without losing context
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
-- `list_subagent_artifacts` — list known interactive sub-agents and artifact locations
+- `list_subagent_artifacts` — list all known interactive sub-agents and artifact locations
 
 For quick delegated work, in-process sub-agents stream progress in the current
 Pi process. With `async: true`, they run in the background while the main agent
@@ -51,6 +51,8 @@ preserve model context, and each completion maps its Pi `turnId` to an immutable
 ![Sub-agent demo](working.png)
 
 ## Installation
+
+See [CHANGELOG.md](./CHANGELOG.md) for breaking changes between major versions.
 
 Install globally:
 
