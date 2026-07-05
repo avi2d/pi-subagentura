@@ -209,6 +209,8 @@ describe("notifyOnComplete", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
@@ -1120,6 +1122,8 @@ describe("read_subagent_artifact (invalid id)", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
@@ -1192,6 +1196,8 @@ describe("read_subagent_artifact (output reporting)", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
