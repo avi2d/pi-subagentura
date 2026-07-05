@@ -204,11 +204,11 @@ describe("published tarball", () => {
     expect(mod.jobRegistry).toBeDefined();
   });
 
-  it("declares the packaged orchestrator skill without user-facing prompt templates", () => {
+  it("ships orchestrator prompt without auto-registering a skill or prompt template", () => {
     const pkgJson = JSON.parse(
       readFileSync(join(NM_SMOKE_DIR, "package.json"), "utf-8"),
     );
-    expect(pkgJson.pi?.skills).toContain("./skills/orchestrator");
+    expect(pkgJson.pi?.skills).toBeUndefined();
     expect(pkgJson.pi?.prompts).toBeUndefined();
 
     expect(entries).toContain("skills/orchestrator/SKILL.md");

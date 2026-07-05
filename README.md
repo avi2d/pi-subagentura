@@ -80,9 +80,14 @@ pi install git:github.com/lmn451/pi-subagentura
 
 ## Bundled orchestration defaults
 
-The package also ships a parent-only `orchestrator` skill for common multi-agent workflows. It is a static Markdown skill loaded by Pi from the package manifest — no runtime prompt injection or user-facing prompt templates are required.
+The package also ships parent-only orchestration guidance for common multi-agent workflows. It is kept in `skills/orchestrator/SKILL.md` for readability, but it is **not** auto-registered as a Pi skill and does not create a `/skill:orchestrator` command. Enable it explicitly with either:
 
-The skill gives the parent agent reasonable default behavior when the user asks for things like:
+```bash
+pi --orchestrator
+PI_ORCHESTRATOR=1 pi
+```
+
+When enabled, the extension appends the orchestrator guidance to the system prompt. It gives the parent agent reasonable default behavior when the user asks for things like:
 
 - “review this codebase” — inspect first, then run fresh-context reviewers with focused angles
 - “review my changes” — use read-only reviewers, synthesize findings, and only edit when authorized
