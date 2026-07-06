@@ -186,6 +186,7 @@ async function executeScript(
             signal: engine.signal,
             isolation: agentOpts.isolation,
             label: agentOpts.label,
+            onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
           });
           const outTokens = res.usage?.output ?? 0;
           tokensDelta += outTokens;

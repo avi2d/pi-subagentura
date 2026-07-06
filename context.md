@@ -102,6 +102,7 @@ Let me think about what this would entail:
 1. The current code is heavily tmux-specific. Functions like `launchInteractiveSubagent`, `isTmuxPaneAlive`, `sendCommandToTmuxPane`, etc.
 
 2. Zellij has a different command-line interface:
+
    - `zellij --layout <name>` or `zellij action new-tab --name <name>` to create new panes
    - `zellij action write-chars "<text>"` to send text
    - `zellij action write 13` (or similar) for Enter key
@@ -802,41 +803,50 @@ Key findings:
 1. **Pane ID handling** — tmux uses `%N`, zellij uses `terminal_N` or integer. We can store as `string` everywhere; stringify zellij's integer when storing.
 
 2. **Background mode** — Both have it:
+
    - tmux: `new-window -d` (detached)
    - zellij: `zellij attach --create-background <name>` + `--session <name> action ...` for control
 
 3. **Session targeting from outside**:
+
    - tmux: `attach -t <session>`
    - zellij: `attach <session>` or use `--session <name>` for actions
 
 4. **Pane alive check**:
+
    - tmux: `display-message -p -t <pane> '#{pane_id}'` throws if dead
    - zellij: parse `zellij action list-panes --json` and look for pane id; if absent → dead
 
 5. **Send keys**:
+
    - tmux: `send-keys -l <text>` + `send-keys Enter` (2 calls)
    - zellij: `write-chars <text>` + `write 13` (2 calls) OR `paste <text>` + `send-keys Enter` (paste is faster for long messages, uses bracketed paste mode)
    - Zellij's `paste` is actually preferred for our send-follow-up-message use case (long text) — it's atomic.
 
 6. **Env var detection**:
+
    - tmux: `process.env.TMUX` is set inside tmux
    - zellij: `process.env.ZELLIJ === '0'` inside zellij; `process.env.ZELLIJ_SESSION_NAME` for session name
 
 7. **Mux resolution strategy**:
+
    - If `PI_SUBAGENT_MUX=tmux|zellij` env var set → force
    - Otherwise: if `ZELLIJ_SESSION_NAME` set → zellij; else if `TMUX` set → tmux; else default to tmux (backward compat)
    - The "which mux to use" decision is made once per spawn and stored on the state
 
 8. **State field addition**:
+
    - `InteractiveSubagentState.mux: 'tmux' | 'zellij'` — which mux this sub-agent was spawned under
    - `paneId: string` — already string, but the format differs (%N vs terminal_N); just stringify
 
 9. **Exit code**:
+
    - tmux: trick with `@pi-exit-code` pane option, OR rely on the launch script trap (which already writes done <code>)
    - zellij: no pane option trick, but `dump-screen` + parse is hacky; better to rely on the launch trap (which we already do)
    - Decision: delete the pane-option trick, rely on launch trap (works for both)
 
 10. **Testing approach**:
+
     - Mirror the current tmux mock pattern
     - Use `vi.doMock("node:child_process", ...)` to intercept `zellij` invocations
     - Tests can run without a real zellij server
@@ -1391,23 +1401,27 @@ The user is asking whether the relaxed spawn check (auto-creating a detached ses
 Let me think carefully about the communication paths:
 
 1. **Parent reads child's output:**
+
    - Parent reads `output.md` from the artifact dir → this is filesystem-based, no session needed
    - Parent reads `events.ndjson` from the artifact dir → filesystem
    - The poller reads these files in a `setInterval` loop → works regardless of session
    - The inject path pushes `output.md` to the parent LLM via `pi.sendUserMessage` → that's a Pi SDK call, not a tmux operation
 
 2. **Parent sends follow-up to child:**
+
    - `send_interactive_subagent_message` uses `sendCommandToTmuxPane` → uses the child's pane ID
    - The child's pane ID is stored in the state from the spawn
    - Whether the child is in the same session as the parent OR in a new detached session, the `tmux send-keys -t <pane-id>` works the same way
    - The pane ID is just a target — it doesn't matter if the parent's `$TMUX_PANE` is the same session or not
 
 3. **Child writes back to parent:**
+
    - Child writes `output.md` and calls `cli.mjs done` → these are filesystem operations
    - The artifact dir is the bridge, not the session
    - The launch script's EXIT trap writes the exit code → filesystem
 
 4. **The launch script:**
+
    - The child is launched via `bash $ARTIFACT_DIR/<launch-script>.sh`
    - This script runs in the child's pane (whatever session that pane is in)
    - It calls `cli.mjs start` to write the start event, then runs the command

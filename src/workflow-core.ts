@@ -61,6 +61,16 @@ export type WorkflowAgentRunner = (req: {
   signal?: AbortSignal;
   isolation?: string;
   label?: string;
+  /**
+   * Optional callback for emitting progress events from inside the runner.
+   * Used to surface fallback warnings and forward mid-agent live status.
+   */
+  onProgress?: (event: {
+    kind: "log" | "phase";
+    message?: string;
+    phase?: string;
+    label?: string;
+  }) => void;
 }) => Promise<SubagentResult>;
 
 export interface WorkflowMeta {

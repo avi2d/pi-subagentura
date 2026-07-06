@@ -221,3 +221,133 @@ Pi package source
 - Retrofit `_parseArgs()` into the two hand-crafted workflows.
 - Ship the converters as a `pi-package` extension (`pi install npm:pi-subagentura-workflows`).
 - Investigate whether `validateSchema` should support `additionalProperties` natively.
+
+## Workflow visibility and scaling
+
+The `workflow` tool runs scripts inside a [`Worker` thread](../src/workflow-worker-thread.mjs) that communicates progress events back to the parent via an RPC protocol. This section documents what the user sees during execution and where the gaps are.
+
+### What the TUI shows (sync mode)
+
+Every `agent()`, `phase()`, and `log()` call emits a progress event. The parent pipes these through `renderProgress()` and streams them as `onUpdate` calls:
+
+```
+● workflow — 4 agent(s), ⚡ 3 running, 0 tokens
+  → started verify:status-token-wrong-company
+  → done verify:status-token-wrong-company
+  → started verify:cached-status-token
+◆ phase: Sweep
+● workflow — 4 agent(s), 0 running, 0 tokens
+  → started sweep:ui-agents
+  → started sweep:backend
+  → done sweep:backend
+```
+
+**Two update modes:**
+
+| Mode                      | How progress flows                                                     | TUI effect                                                                               |
+| ------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **Sync** (`script: ...`)  | `onProgress` → `onUpdate` per event                                    | Live stream in the reply; each `agent()`, `phase()`, `log()` call fires an inline update |
+| **Async** (`async: true`) | Written to `WorkflowJobState.snapshot`; `get_workflow_status` reads it | Nothing in the TUI until you poll                                                        |
+
+### Visibility gaps
+
+#### 1. No mid-agent live preview
+
+Between `→ started verify:claim-x` and `→ done verify:claim-x` there is **no visibility** into what the sub-agent is doing — which tool it's running, what file it read, how much progress it made. The underlying `subagent_isolated` / `subagent_with_context` _do_ produce live status (turn, activeTool, output preview) but the workflow progress stream does not relay it.
+
+To fix this, the `agent()` progress handler in `workflow-worker.ts` would need to forward per-agent `onUpdate` frames as progress events. This is roughly 20 lines of wiring.
+
+#### 2. No workflow TUI footer
+
+Interactive sub-agents show `⚡ N sub-agent(s) running` in the pi TUI footer via the artifact poller. Workflows have no equivalent — an async workflow runs silently. The only way to detect it is to call `get_workflow_status`.
+
+There is no `⚡ N workflow(s) running` badge. Adding one would require wiring `WorkflowJobState.snapshot` to a TUI status key, similar to the interactive sub-agent poller's `FOOTER_KEY`.
+
+#### 3. No attach for in-process agents
+
+Default `agent()` calls (no `isolation: "process"`) run in-process. If an agent hangs or the user wants to debug what it's doing, there is no tmux pane to attach to. The only recourse is to abort the workflow.
+
+With `isolation: "process"` the agent runs in a tmux/zellij pane — see [Process isolation below](#process-isolation).
+
+### Process isolation
+
+Pass `isolation: "process"` to spawn each agent as a separate `pi` process inside tmux or zellij:
+
+```js
+await agent(prompt, { isolation: "process", label: "verify:claim-x" });
+```
+
+#### How it works
+
+1. `launchInteractiveSubagent()` creates a pane via the multiplexer backend
+2. By default (`background: true`) the pane is a detached named window — invisible in the tmux bar
+3. A launch script boots `pi` in that pane with a child-specific system prompt + protocol
+4. The parent polls the artifact directory (`events.ndjson` + `output.md`) awaiting completion
+5. The artifact poller tails the child session log and shows tool activity in a TUI widget
+
+#### TUI widget rows
+
+Running process-backed agents appear below the editor:
+
+```
+▶ verify:claim-x: read src/api/agents.js (12s ago)
+▶ sweep:backend: grep webapp/rest/themis_token.py (5s ago)
+```
+
+**⚠ No row cap.** With 50 running agents the widget would show 50 lines, potentially pushing other TUI content off-screen. The `formatActivityRow()` renderer in `src/rendering.ts` has no truncation or grouping logic.
+
+#### Attaching to a process agent
+
+Use `get_interactive_subagent_status` to get attach/focus commands:
+
+```bash
+get_interactive_subagent_status(id="a1b2c3d4")
+→ Pane: %42, Session: pi-subagent-a1b2c3d4
+→ Attach: tmux attach -t pi-subagent-a1b2c3d4
+→ Focus:  tmux select-window -t verify-claim-x-a1b2c3d4
+```
+
+The `list_subagent_artifacts` tool lists all known sub-agents (including past ones whose artifacts are still on disk). `read_subagent_artifact` reads output or events.
+
+#### Backend support
+
+| Backend    | `createPane` behavior                                                                  | Available outside mux?                                           |
+| ---------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **tmux**   | Detached named window (`background: true`) or side-by-side split (`background: false`) | ✅ Creates a new detached session if `process.env.TMUX` is unset |
+| **zellij** | Detached named tab                                                                     | ❌ Requires existing zellij session                              |
+| **none**   | Throws `NoMultiplexerAvailableError` with setup hint                                   | N/A — falls back to in-process                                   |
+
+### Scaling
+
+#### Concurrency
+
+| Agent type                              | Default max concurrent          | Cap                                  |
+| --------------------------------------- | ------------------------------- | ------------------------------------ |
+| In-process (`isolation` unset)          | `max(1, min(16, cpuCores - 2))` | `MAX_TOTAL_AGENTS = 1000` (lifetime) |
+| Process-backed (`isolation: "process"`) | `max(1, min(4, cpuCores - 2))`  | Same                                 |
+
+For a typical machine (8–16 cores): ~6–14 in-process, ~2–4 process-backed agents run in parallel. The rest queue on the semaphore. This prevents CPU/memory exhaustion.
+
+#### Progress event flood
+
+`parallel()` with many thunks (`Promise.all`) fires `agent_start` for all of them nearly simultaneously. Each fires an `onUpdate` call. The `try/catch` around `onUpdate` at `workflow-tool.ts:224` prevents crashes but does **not** throttle or coalesce events.
+
+At ~20+ rapid starts the TUI may visibly stutter. The events are cheap (small strings), so the practical limit is higher — but there is no rate limiter.
+
+#### Widget row limit
+
+As noted above, the interactive sub-agent widget has no cap. For workflows with many process-backed agents, consider:
+
+- Setting a short TTL on completed agents so they clean up quickly
+- Running agents with `background: true` (the default) so they don't clutter the tmux bar
+- Polling `prune_subagent_artifacts` after a workflow completes
+
+### Recommendations summary
+
+| What                                                | Effort                                    | Impact                                      |
+| --------------------------------------------------- | ----------------------------------------- | ------------------------------------------- |
+| Workflow TUI footer (`⚡ N running`)                | Small (~30 lines + poller interval)       | High — async workflows become discoverable  |
+| Forward live status through progress stream         | Small (~20 lines in `workflow-worker.ts`) | High — mid-agent visibility                 |
+| Widget row cap on `formatActivityRow`               | Trivial (slice at ~10 rows)               | Medium — prevents UI overflow               |
+| Rate-limit progress events                          | Small (debounce `onUpdate`)               | Low-medium — only matters at 50+ agents     |
+| `onUpdate` in async mode (stream to snapshot → TUI) | Medium (new poller or event bus)          | High — closes the sync/async visibility gap |

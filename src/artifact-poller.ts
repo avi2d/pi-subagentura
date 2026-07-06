@@ -38,11 +38,15 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
 
+import { getRunningWorkflowCount } from "./workflow-jobs";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
 const WIDGET_KEY = "subagentura-activity";
+const WORKFLOW_FOOTER_KEY = "subagentura-workflows";
 
+/** Maximum widget rows before truncation with "… and N more". */
+const MAX_WIDGET_ROWS = 10;
 // ── Poller ─────────────────────────────────────────────────────────────
 
 /**
@@ -200,6 +204,13 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       }
     }
 
+    // Cap widget rows to prevent TUI overflow.
+    if (widgetRows.length > MAX_WIDGET_ROWS) {
+      const extra = widgetRows.length - MAX_WIDGET_ROWS;
+      widgetRows.length = MAX_WIDGET_ROWS;
+      widgetRows.push(`… and ${extra} more`);
+    }
+
     // Paint footer + widget. Both are TUI-only — never reach the LLM.
     if (ui) {
       try {
@@ -219,6 +230,18 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           {
             placement: "belowEditor",
           },
+        );
+      } catch {
+        /* ui stale */
+      }
+      // Workflow TUI footer: show running async workflows.
+      try {
+        const wfCount = getRunningWorkflowCount();
+        ui.setStatus(
+          WORKFLOW_FOOTER_KEY,
+          wfCount > 0
+            ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
+            : undefined,
         );
       } catch {
         /* ui stale */

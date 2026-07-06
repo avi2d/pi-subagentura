@@ -118,3 +118,12 @@ export function startWorkflowJob(
   workflowJobRegistry.set(id, state);
   return state;
 }
+
+/** Count running workflow jobs (status === "running"). */
+export function getRunningWorkflowCount(): number {
+  let count = 0;
+  for (const st of workflowJobRegistry.values()) {
+    if (st.status === "running") count++;
+  }
+  return count;
+}
