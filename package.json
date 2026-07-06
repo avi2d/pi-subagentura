@@ -25,7 +25,6 @@
   },
   "files": [
     "LICENSE",
-    "skills/orchestrator/SKILL.md",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
@@ -33,7 +32,6 @@
     "src/artifact.ts",
     "src/artifact-poller.ts",
     "src/helpers.ts",
-    "src/orchestrator.ts",
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
     "src/interactive-tmux.ts",
