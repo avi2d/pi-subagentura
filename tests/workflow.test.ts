@@ -825,7 +825,8 @@ describe("registerWorkflowTool", () => {
   });
 
   it("workflow tool has the expected description and parameters", () => {
-    const tools: Array<{ name: string; description: string; parameters: any }> = [];
+    const tools: Array<{ name: string; description: string; parameters: any }> =
+      [];
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
       registerFlag: vi.fn(),
@@ -852,7 +853,13 @@ describe("registerWorkflowTool", () => {
     registerWorkflowTool(pi as any);
     const save = tools.find((t) => t.name === "save_workflow")!;
     // Bad script (missing meta) should fail
-    const result = await save.execute("", { name: "bad", script: "return 1;" }, undefined, undefined, {});
+    const result = await save.execute(
+      "",
+      { name: "bad", script: "return 1;" },
+      undefined,
+      undefined,
+      {},
+    );
     expect(result.content[0].text).toContain("Could not save workflow");
     expect(result.isError).toBe(true);
   });

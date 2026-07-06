@@ -28,7 +28,28 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
   debugLog("info", "workflow_registered", {});
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(ctx: any): WorkflowAgentRunner {
-    return async ({ prompt, persona, model, signal, isolation, label }) => {
+    return async ({
+      prompt,
+      persona,
+      model,
+      signal,
+      isolation,
+      label,
+      onProgress,
+    }) => {
+      // Track last update time per agent label to throttle mid-agent previews
+      const lastUpdateKey = `wf_update_${label ?? ""}`;
+      let lastUpdateTs = 0;
+      const THROTTLE_MS = 2000;
+
+      const maybeEmitUpdate = (msg: string) => {
+        const now = Date.now();
+        if (now - lastUpdateTs >= THROTTLE_MS) {
+          lastUpdateTs = now;
+          onProgress?.({ kind: "log", message: msg, label });
+        }
+      };
+
       if (isolation === "process") {
         try {
           const state = launchInteractiveSubagent({
@@ -40,11 +61,17 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             contextText: null,
             background: true,
           });
-          return await awaitInteractiveResult(state, signal);
+          const result = await awaitInteractiveResult(state, signal);
+          return result;
         } catch (err) {
-          // tmux/zellij unavailable (or launch failed) — fall back to in-process, loudly.
+          // tmux/zellij unavailable — fall back to in-process, with visible warning.
           const msg = err instanceof Error ? err.message : String(err);
           debugLog("warn", "isolation_process_fallback", { reason: msg });
+          onProgress?.({
+            kind: "log",
+            message: `⚠ isolation:process unavailable — ${msg}. Falling back to in-process.`,
+            label,
+          });
           const { jobPromise } = await startSubagentJob({
             task: `[isolation:process unavailable — ran in-process; reason: ${msg}]\n\n${prompt}`,
             persona,
@@ -52,7 +79,18 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             cwd: ctx.cwd,
             contextText: null,
             signal,
-            onUpdate: undefined,
+            onUpdate: (partial) => {
+              const status = partial.details?.subagentStatus;
+              if (status?.activeTool) {
+                maybeEmitUpdate(`⚙ ${status.activeTool.name}`);
+              } else if (status?.output) {
+                const preview = (status.output || "")
+                  .slice(0, 60)
+                  .replace(/\s+/g, " ")
+                  .trim();
+                if (preview) maybeEmitUpdate(`💭 ${preview}`);
+              }
+            },
             defaultModel: ctx.model,
             parentModelRegistry: ctx.modelRegistry,
           });
@@ -66,7 +104,18 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         cwd: ctx.cwd,
         contextText: null,
         signal,
-        onUpdate: undefined,
+        onUpdate: (partial) => {
+          const status = partial.details?.subagentStatus;
+          if (status?.activeTool) {
+            maybeEmitUpdate(`⚙ ${status.activeTool.name}`);
+          } else if (status?.output) {
+            const preview = (status.output || "")
+              .slice(0, 60)
+              .replace(/\s+/g, " ")
+              .trim();
+            if (preview) maybeEmitUpdate(`💭 ${preview}`);
+          }
+        },
         defaultModel: ctx.model,
         parentModelRegistry: ctx.modelRegistry,
       });

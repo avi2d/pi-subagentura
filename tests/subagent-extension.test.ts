@@ -12,7 +12,6 @@ function mockApi(overrides: Record<string, any> = {}) {
   };
 }
 
-
 describe("extension registration", () => {
   it("registers the expected tools without throwing", () => {
     const api = mockApi();
@@ -46,6 +45,5 @@ describe("extension registration", () => {
         "workflow",
       ].sort(),
     );
-
   });
 });
