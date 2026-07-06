@@ -204,7 +204,6 @@ describe("published tarball", () => {
     expect(mod.jobRegistry).toBeDefined();
   });
 
-
   describe("package.json `files` array", () => {
     it("includes every local import of every shipped .ts file (static check)", () => {
       const tsFiles = PKG.files.filter((f) => f.endsWith(".ts"));
