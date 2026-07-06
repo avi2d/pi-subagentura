@@ -34,7 +34,6 @@ import {
 } from "./tools/in-process";
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
-import { registerOrchestratorPrompt } from "./orchestrator";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
 /**
@@ -62,7 +61,6 @@ export type SubagentDetails =
   | { status: "invalid_id"; id: string };
 
 export default function (pi: ExtensionAPI) {
-  registerOrchestratorPrompt(pi);
   registerSessionHandlers(pi);
   registerWorkflowTool(pi);
   registerInProcessSubagentTools(pi);

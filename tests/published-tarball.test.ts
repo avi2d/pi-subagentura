@@ -204,19 +204,6 @@ describe("published tarball", () => {
     expect(mod.jobRegistry).toBeDefined();
   });
 
-  it("ships orchestrator prompt without auto-registering a skill or prompt template", () => {
-    const pkgJson = JSON.parse(
-      readFileSync(join(NM_SMOKE_DIR, "package.json"), "utf-8"),
-    );
-    expect(pkgJson.pi?.skills).toBeUndefined();
-    expect(pkgJson.pi?.prompts).toBeUndefined();
-
-    expect(entries).toContain("skills/orchestrator/SKILL.md");
-    expect(existsSync(join(NM_SMOKE_DIR, "skills/orchestrator/SKILL.md"))).toBe(
-      true,
-    );
-    expect(entries.some((entry) => entry.startsWith("prompts/"))).toBe(false);
-  });
 
   describe("package.json `files` array", () => {
     it("includes every local import of every shipped .ts file (static check)", () => {
