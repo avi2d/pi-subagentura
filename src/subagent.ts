@@ -35,7 +35,6 @@ import {
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
 import { registerChildProtocol } from "./child-protocol";
-import { registerOrchestratorPrompt } from "./orchestrator";
 import { renderSubagentNotify } from "./rendering";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
@@ -74,7 +73,6 @@ export default function (pi: ExtensionAPI) {
     );
   }
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  registerOrchestratorPrompt(pi);
   registerSessionHandlers(pi);
   registerWorkflowTool(pi);
   registerInProcessSubagentTools(pi);
