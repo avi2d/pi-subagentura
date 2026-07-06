@@ -810,6 +810,7 @@ describe("registerWorkflowTool", () => {
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
       registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);
@@ -830,6 +831,7 @@ describe("registerWorkflowTool", () => {
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
       registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);
@@ -848,6 +850,7 @@ describe("registerWorkflowTool", () => {
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
       registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);

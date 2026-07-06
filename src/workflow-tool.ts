@@ -22,7 +22,10 @@ import {
   runWorkflow,
   stringify,
 } from "./workflow-worker";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 
 export function registerWorkflowTool(pi: ExtensionAPI): void {
   debugLog("info", "workflow_registered", {});
@@ -50,7 +53,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         }
       };
 
-      if (isolation === "process") {
+      const tryProcess = isolation !== "in-process";
+      if (tryProcess) {
         try {
           const state = launchInteractiveSubagent({
             name: (label || "wf-agent").slice(0, 40),
@@ -72,31 +76,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             message: `⚠ isolation:process unavailable — ${msg}. Falling back to in-process.`,
             label,
           });
-          const { jobPromise } = await startSubagentJob({
-            task: `[isolation:process unavailable — ran in-process; reason: ${msg}]\n\n${prompt}`,
-            persona,
-            modelOverride: model,
-            cwd: ctx.cwd,
-            contextText: null,
-            signal,
-            onUpdate: (partial) => {
-              const status = partial.details?.subagentStatus;
-              if (status?.activeTool) {
-                maybeEmitUpdate(`⚙ ${status.activeTool.name}`);
-              } else if (status?.output) {
-                const preview = (status.output || "")
-                  .slice(0, 60)
-                  .replace(/\s+/g, " ")
-                  .trim();
-                if (preview) maybeEmitUpdate(`💭 ${preview}`);
-              }
-            },
-            defaultModel: ctx.model,
-            parentModelRegistry: ctx.modelRegistry,
-          });
-          return jobPromise;
+          // fall through to in-process path below
         }
       }
+      // In-process path: explicit isolation:"in-process" or fallback from failed process isolation
       const { jobPromise } = await startSubagentJob({
         task: prompt,
         persona,
@@ -149,8 +132,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  workflow(name, args?)  -> run a saved workflow inline (one level deep).",
       "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> token accounting.",
       "",
-      "Run a saved workflow by passing `name` instead of `script`. Pass `async: true` to run in the",
-      "background (returns a workflowId; poll get_workflow_status / get_workflow_result). Up to 100 jobs; cancel with cancel_workflow.",
+      "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
+      "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
@@ -217,8 +200,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         loadWorkflow: (n: string) => loadWorkflowScript(n),
       };
 
-      // ── Async (background) path ──
-      if (params.async === true) {
+      // ── Async (background) path — default ──
+      if (params.async !== false) {
         let meta: WorkflowMeta;
         try {
           meta = parseWorkflow(script).meta;
@@ -494,4 +477,52 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       };
     },
   });
+
+  // ── /workflows user command (guarded) ──
+  if (typeof pi.registerCommand === "function") {
+    pi.registerCommand("workflows", {
+      description:
+        "List running and completed workflows with status, agent counts, tokens, and elapsed time.",
+      handler: async (_args: string, ctx: ExtensionCommandContext) => {
+        const lines: string[] = [];
+        const now = Date.now();
+        let count = 0;
+        for (const st of workflowJobRegistry.values()) {
+          count++;
+          const elapsed = formatElapsed(now - st.startedAt);
+          const s = st.snapshot;
+          const parts: string[] = [
+            `**${st.name}** [${st.status}]`,
+            `${s.agentsSpawned} agent(s)`,
+          ];
+          if (s.runningCount && s.runningCount > 0) {
+            parts.push(`⚡ ${s.runningCount} running`);
+          }
+          if (s.errorCount > 0) parts.push(`⚠ ${s.errorCount} error(s)`);
+          parts.push(`${s.tokensSpent} tokens`);
+          parts.push(elapsed);
+          if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
+          if (st.error) parts.push(`error: ${st.error}`);
+          lines.push(`- ${parts.join(" · ")}`);
+          if (s.lastMessage && count <= 20)
+            lines.push(`  last: ${s.lastMessage}`);
+        }
+        const text =
+          count === 0
+            ? "No workflow jobs."
+            : `**Workflows (${count})**\n` + lines.join("\n");
+        ctx.ui.notify("📋 Workflows listed.");
+        pi.sendUserMessage(text, { deliverAs: "followUp" });
+      },
+    });
+  }
+  function formatElapsed(ms: number): string {
+    if (ms < 0) return "0s";
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+  }
 }
