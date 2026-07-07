@@ -152,7 +152,8 @@ async function executeScript(
     }
 
     const hasSchema = agentOpts.schema != null;
-    const isProcess = agentOpts.isolation === "process";
+    const isolation = agentOpts.isolation ?? "process";
+    const isProcess = isolation !== "in-process";
     const sem = isProcess ? engine.processSem : engine.sem;
     await sem.acquire();
     let tokensDelta = 0;
@@ -184,7 +185,7 @@ async function executeScript(
             persona: agentOpts.persona,
             model: agentOpts.model,
             signal: engine.signal,
-            isolation: agentOpts.isolation,
+            isolation,
             label: agentOpts.label,
             onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
           });

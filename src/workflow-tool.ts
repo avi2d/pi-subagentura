@@ -125,8 +125,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "                            model?, persona?, isolation? }. Without schema returns the final text;",
       "                            with schema (a JSON Schema) returns a validated object, or null after",
       "                            retries. Returns null on error (filter with Boolean).",
-      "                            isolation:'process' spawns a tmux/zellij Pi process (real isolation,",
-      "                            attachable); falls back to in-process if no multiplexer is available.",
+      "                            Defaults to tmux/zellij process isolation (attachable);",
+      "                            falls back to in-process if no multiplexer is available.",
       "  parallel(thunks)       -> run `() => Promise` thunks concurrently (barrier); failures -> null.",
       "  pipeline(items, ...st) -> stream each item through stages, no barrier between stages.",
       "  workflow(name, args?)  -> run a saved workflow inline (one level deep).",
@@ -478,44 +478,253 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     },
   });
 
-  // ── /workflows user command (guarded) ──
+  // ── Workflow user commands (guarded) ──
   if (typeof pi.registerCommand === "function") {
-    pi.registerCommand("workflows", {
-      description:
-        "List running and completed workflows with status, agent counts, tokens, and elapsed time.",
-      handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        const lines: string[] = [];
-        const now = Date.now();
-        let count = 0;
-        for (const st of workflowJobRegistry.values()) {
-          count++;
-          const elapsed = formatElapsed(now - st.startedAt);
-          const s = st.snapshot;
-          const parts: string[] = [
-            `**${st.name}** [${st.status}]`,
-            `${s.agentsSpawned} agent(s)`,
-          ];
-          if (s.runningCount && s.runningCount > 0) {
-            parts.push(`⚡ ${s.runningCount} running`);
-          }
-          if (s.errorCount > 0) parts.push(`⚠ ${s.errorCount} error(s)`);
-          parts.push(`${s.tokensSpent} tokens`);
-          parts.push(elapsed);
-          if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
-          if (st.error) parts.push(`error: ${st.error}`);
-          lines.push(`- ${parts.join(" · ")}`);
-          if (s.lastMessage && count <= 20)
-            lines.push(`  last: ${s.lastMessage}`);
-        }
+    const sendCommandMessage = (text: string) => {
+      const sendMessage = (pi as any).sendMessage;
+      if (typeof sendMessage === "function") {
+        sendMessage.call(
+          pi,
+          {
+            customType: "workflow-command",
+            content: text,
+            display: true,
+          },
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    };
+
+    const sendWorkflowCreationPrompt = async (
+      ctx: ExtensionCommandContext,
+      task: string,
+    ) => {
+      const prompt = buildWorkflowCreationPrompt(task);
+      const sendUserMessage = (ctx as any).sendUserMessage;
+      if (typeof sendUserMessage === "function") {
+        await sendUserMessage.call(ctx, prompt, { deliverAs: "followUp" });
+        return;
+      }
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    };
+
+    const startSavedWorkflowFromCommand = (
+      name: string,
+      argsValue: unknown,
+      ctx: ExtensionCommandContext,
+    ) => {
+      const script = loadWorkflowScript(name);
+      if (!script) throw new Error(`No saved workflow named "${name}".`);
+      const meta = parseWorkflow(script).meta;
+      const job = startWorkflowJob(
+        meta.name,
+        script,
+        {
+          args: argsValue,
+          budgetTotal: null,
+          runAgent: makeRunAgent(ctx),
+          loadWorkflow: (n: string) => loadWorkflowScript(n),
+        },
+        Date.now(),
+      );
+      return { job, meta };
+    };
+
+    const runSavedWorkflowCommand = async (
+      rawArgs: string,
+      ctx: ExtensionCommandContext,
+    ) => {
+      const items = listSavedWorkflows();
+      const parsed = parseWorkflowCommandArgs(rawArgs);
+      const choices = items.map((w) => ({
+        name: w.name,
+        label: `${w.name} — ${w.description || "(no description)"}`,
+      }));
+      if (items.length === 0) {
         const text =
-          count === 0
-            ? "No workflow jobs."
-            : `**Workflows (${count})**\n` + lines.join("\n");
-        ctx.ui.notify("📋 Workflows listed.");
-        pi.sendUserMessage(text, { deliverAs: "followUp" });
+          "No saved workflows. Use `/workflow <task>` to create one.";
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+        return;
+      }
+
+      let name = parsed.name;
+      if (!name) {
+        const selected = await ctx.ui.select(
+          "Select workflow to run:",
+          choices.map((c) => c.label),
+        );
+        const choice = choices.find((c) => c.label === selected);
+        if (!choice) return;
+        name = choice.name;
+      }
+
+      const known = items.some((w) => w.name === name);
+      if (!known) {
+        const text = `No saved workflow named "${name}".`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+        return;
+      }
+
+      try {
+        const argsValue = parsed.argsJson
+          ? parseArgsJson(parsed.argsJson)
+          : await promptForWorkflowArgs(ctx);
+        if (argsValue === CANCELLED_ARGS_PROMPT) return;
+        const { job, meta } = startSavedWorkflowFromCommand(
+          name,
+          argsValue,
+          ctx,
+        );
+        const text =
+          `Workflow "${meta.name}" started in background as ${job.id}. ` +
+          "Use `/workflow-status` to inspect running jobs.";
+        ctx.ui.notify(`Started workflow ${meta.name}.`);
+        sendCommandMessage(text);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const text = `Workflow not started: ${msg}`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      }
+    };
+
+    pi.registerCommand("workflow", {
+      description:
+        "Create a reusable workflow from a task, save it, and run it immediately.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const inlineTask = args.trim();
+        const editor = (ctx.ui as any).editor;
+        const input = (ctx.ui as any).input;
+        const promptedTask =
+          !inlineTask && typeof editor === "function"
+            ? await editor.call(ctx.ui, "Workflow task:", "")
+            : !inlineTask && typeof input === "function"
+              ? await input.call(ctx.ui, "Workflow task:", "")
+              : "";
+        const task =
+          inlineTask || (promptedTask == null ? "" : String(promptedTask));
+        if (!task.trim()) {
+          ctx.ui.notify("Workflow task is required.");
+          return;
+        }
+        ctx.ui.notify("Creating workflow from task.");
+        await sendWorkflowCreationPrompt(ctx, task.trim());
+      },
+    });
+
+    pi.registerCommand("workflows", {
+      description: "List saved workflows, select one, and run it.",
+      handler: runSavedWorkflowCommand,
+    });
+
+    pi.registerCommand("list-workflows", {
+      description: "Alias for /workflows.",
+      handler: runSavedWorkflowCommand,
+    });
+
+    pi.registerCommand("workflow-status", {
+      description:
+        "List running and completed workflow jobs with status, agent counts, tokens, and elapsed time.",
+      handler: async (_args: string, ctx: ExtensionCommandContext) => {
+        const text = renderWorkflowJobs();
+        ctx.ui.notify("📋 Workflow status listed.");
+        sendCommandMessage(text);
       },
     });
   }
+  const CANCELLED_ARGS_PROMPT = Symbol("cancelled-workflow-args");
+
+  function parseWorkflowCommandArgs(raw: string): {
+    name: string | null;
+    argsJson: string | null;
+  } {
+    const trimmed = raw.trim();
+    const firstSpace = trimmed.search(/\s/);
+    if (!trimmed) return { name: null, argsJson: null };
+    if (firstSpace === -1) return { name: trimmed, argsJson: null };
+    return {
+      name: trimmed.slice(0, firstSpace),
+      argsJson: trimmed.slice(firstSpace).trim() || null,
+    };
+  }
+
+  function parseArgsJson(raw: string): unknown {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Workflow args must be valid JSON: ${msg}`);
+    }
+  }
+
+  async function promptForWorkflowArgs(
+    ctx: ExtensionCommandContext,
+  ): Promise<unknown | typeof CANCELLED_ARGS_PROMPT> {
+    const editor = (ctx.ui as any).editor;
+    const input = (ctx.ui as any).input;
+    const raw =
+      typeof editor === "function"
+        ? await editor.call(ctx.ui, "Workflow args JSON (optional):", "{}")
+        : typeof input === "function"
+          ? await input.call(ctx.ui, "Workflow args JSON (optional):", "{}")
+          : "{}";
+    if (raw == null) return CANCELLED_ARGS_PROMPT;
+    const trimmed = String(raw).trim();
+    return trimmed ? parseArgsJson(trimmed) : undefined;
+  }
+
+  function buildWorkflowCreationPrompt(task: string): string {
+    return [
+      "You are handling the `/workflow <task>` command.",
+      "",
+      "Create a reusable JavaScript workflow for the user's task, save it, and run it immediately.",
+      "",
+      "Requirements:",
+      "1. Design a bounded workflow script with `export const meta = { name, description, phases }`.",
+      "2. The workflow should accept its task/config through `args` so it can be reused later.",
+      "3. Save the script with `save_workflow` using a lowercase slug name.",
+      "4. Immediately start it with the `workflow` tool by saved `name` and suitable `args`.",
+      "5. Do not use Node APIs inside the workflow script; file I/O must happen inside sub-agents via tools.",
+      "6. Do not set `isolation` unless the workflow explicitly needs to opt out; workflow agents default to tmux/zellij process isolation and fall back to in-process automatically.",
+      "7. Report the saved workflow name and returned workflowId.",
+      "",
+      "User task:",
+      task,
+    ].join("\n");
+  }
+
+  function renderWorkflowJobs(): string {
+    const lines: string[] = [];
+    const now = Date.now();
+    let count = 0;
+    for (const st of workflowJobRegistry.values()) {
+      count++;
+      const elapsed = formatElapsed(now - st.startedAt);
+      const s = st.snapshot;
+      const parts: string[] = [
+        `**${st.name}** (${st.id}) [${st.status}]`,
+        `${s.agentsSpawned} agent(s)`,
+      ];
+      if (s.runningCount && s.runningCount > 0) {
+        parts.push(`⚡ ${s.runningCount} running`);
+      }
+      if (s.errorCount > 0) parts.push(`⚠ ${s.errorCount} error(s)`);
+      parts.push(`${s.tokensSpent} tokens`);
+      parts.push(elapsed);
+      if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
+      if (st.error) parts.push(`error: ${st.error}`);
+      lines.push(`- ${parts.join(" · ")}`);
+      if (s.lastMessage && count <= 20) lines.push(`  last: ${s.lastMessage}`);
+    }
+    return count === 0
+      ? "No workflow jobs."
+      : `**Workflow jobs (${count})**\n` + lines.join("\n");
+  }
+
   function formatElapsed(ms: number): string {
     if (ms < 0) return "0s";
     const s = Math.floor(ms / 1000);
