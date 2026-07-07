@@ -19,6 +19,7 @@ for workflow sub-agents, and slash commands for creating/running workflows.
 | `/workflows`       | List saved workflows, let the user select one, optionally collect JSON args, and run the selected workflow.                                            |
 | `/list-workflows`  | Alias for `/workflows`.                                                                                                                                |
 | `/workflow-status` | Show running/completed workflow jobs from `workflowJobRegistry`: id, name, status, agents, errors, tokens, phase, elapsed time.                        |
+| `/workflow-tree`   | Open an interactive overlay to drill into workflow jobs, expand/collapse details, and cancel a selected running workflow.                              |
 
 `/workflow <task>` is intentionally a prompt bridge. The extension does not
 hard-code a generator model or a fixed template; it asks the active parent agent
@@ -28,13 +29,13 @@ creation flexible while the actual execution still goes through the deterministi
 
 ## Key Decisions
 
-| Decision                | Choice                                 | Rationale                                                                                   |
-| ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Sync vs Async           | Async by default; sync explicit opt-in | Workflows are long-running; blocking the agent makes no sense. Claude Code is always async. |
-| Default agent isolation | Process (tmux/zellij)                  | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux exists.     |
-| Saved workflow UX       | `/workflows` + `/list-workflows`       | These names should mean saved reusable workflows, not job status.                           |
-| Job status UX           | `/workflow-status`                     | Avoids overloading `/workflows`; status remains available without breaking tools.           |
-| TUI scope               | Text/message-based commands            | Full drill-down TUI is deferred to a later phase.                                           |
+| Decision                | Choice                                 | Rationale                                                                                       |
+| ----------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Sync vs Async           | Async by default; sync explicit opt-in | Workflows are long-running; blocking the agent makes no sense. Claude Code is always async.     |
+| Default agent isolation | Process (tmux/zellij)                  | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux exists.         |
+| Saved workflow UX       | `/workflows` + `/list-workflows`       | These names should mean saved reusable workflows, not job status.                               |
+| Job status UX           | `/workflow-status`                     | Avoids overloading `/workflows`; status remains available without breaking tools.               |
+| TUI scope               | Footer/widget plus interactive overlay | Full clickable mouse UI is deferred, but keyboard drill-down and cancel controls are available. |
 
 ## Architecture
 
@@ -81,14 +82,15 @@ graph TD
 
 ## File Changes
 
-| File                     | Change                                                                                                                  |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `src/workflow-tool.ts`   | Add `/workflow`, `/workflows`, `/list-workflows`, `/workflow-status`; keep async default; run selected saved workflows. |
-| `src/workflow-worker.ts` | Normalize omitted `agent()` isolation to `"process"`.                                                                   |
-| `src/workflow-jobs.ts`   | Preserve latest phase/log/agent-start/agent-done message in each workflow snapshot for status UI.                       |
-| `src/artifact-poller.ts` | Paint workflow footer/status widget and cap workflow rows.                                                              |
-| `src/subagent.ts`        | No changes; it already calls `registerWorkflowTool`.                                                                    |
-| `src/multiplexer.ts`     | No changes; tmux/zellij detection and fallback already exist.                                                           |
+| File                      | Change                                                                                                                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/workflow-tool.ts`    | Add `/workflow`, `/workflows`, `/list-workflows`, `/workflow-status`, `/workflow-tree`; keep async default; run selected saved workflows. |
+| `src/workflow-worker.ts`  | Normalize omitted `agent()` isolation to `"process"`.                                                                                     |
+| `src/workflow-jobs.ts`    | Preserve latest phase/log/agent-start/agent-done message in each workflow snapshot for status UI.                                         |
+| `src/artifact-poller.ts`  | Paint workflow footer/status widget and cap workflow rows.                                                                                |
+| `src/workflow-tree-ui.ts` | Interactive workflow tree overlay with expand/collapse and cancel controls.                                                               |
+| `src/subagent.ts`         | No changes; it already calls `registerWorkflowTool`.                                                                                      |
+| `src/multiplexer.ts`      | No changes; tmux/zellij detection and fallback already exist.                                                                             |
 
 ## UI Polish Status
 
@@ -98,10 +100,11 @@ Done:
 - Below-editor workflow summary widget with workflow id, agent counts, tokens, elapsed time, phase, and latest event.
 - Widget row caps for both interactive sub-agent activity and workflow activity.
 - `/workflow-status` textual status command for full running/completed job details.
+- `/workflow-tree` overlay with keyboard drill-down and cancel controls.
 
 Deferred:
 
-- Drillable TUI for workflow → agent → tool-call hierarchy.
 - Pause/resume or restart individual workflow agents.
-- Interactive controls directly on workflow widget rows.
+- Mouse-clickable controls directly on workflow widget rows.
 - Stronger progress-event coalescing/rate limiting for very large sync fan-outs.
+- Full per-agent tool-call history tree beyond the current phase/latest-event summary.

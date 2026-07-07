@@ -263,7 +263,7 @@ Async workflows are discoverable without polling tools:
 
 The footer uses `subagentura-workflows`; the workflow widget uses
 `subagentura-workflow-activity` and is capped to 5 rows with an overflow row.
-Use `/workflow-status` for the full textual status dump.
+Use `/workflow-status` for the full textual status dump, or `/workflow-tree` for an interactive drill-down overlay.
 
 #### 2. Per-agent visibility
 
@@ -272,11 +272,23 @@ runs in tmux/zellij and is also shown by the interactive sub-agent widget below
 the editor. In-process agents still forward live `activeTool` / output-preview
 updates as workflow log events when the underlying runner exposes them.
 
-#### 3. Remaining gaps
+#### 3. Interactive drill-down overlay
 
-- No drill-down workflow tree yet (workflow → agent → tool calls).
-- Workflow widget rows are summaries, not interactive controls.
+Run `/workflow-tree` to open an overlay over the current session. It supports:
+
+- `↑↓` / `j` / `k` to select a workflow
+- `enter` / `→` to expand or collapse phase/latest-event details
+- `←` to collapse
+- `c` to cancel the selected running workflow
+- `q` / `esc` to close
+
+The overlay is keyboard-driven. Mouse-clickable controls directly on widget rows are still deferred because widgets are intentionally passive status surfaces.
+
+#### 4. Remaining gaps
+
+- Workflow widget rows are summaries, not mouse-clickable controls.
 - Progress event coalescing/rate limiting is still basic.
+- The overlay shows workflow-level phase/latest-event details, not full per-agent tool-call history.
 
 ### Process isolation
 
@@ -352,12 +364,14 @@ For a typical machine (8–16 cores): ~2–4 process-backed agents run in parall
 
 ### Recommendations summary
 
-| What                                          | Status   |
-| --------------------------------------------- | -------- |
-| Workflow footer (`⚡ N workflows running`)    | Done     |
-| Workflow summary widget                       | Done     |
-| Interactive sub-agent widget row cap          | Done     |
-| Default process isolation for workflow agents | Done     |
-| Drill-down workflow UI                        | Deferred |
-| Interactive controls for workflow rows        | Deferred |
-| Strong progress-event rate limiting           | Deferred |
+| What                                          | Status                         |
+| --------------------------------------------- | ------------------------------ |
+| Workflow footer (`⚡ N workflows running`)    | Done                           |
+| Workflow summary widget                       | Done                           |
+| Interactive sub-agent widget row cap          | Done                           |
+| Default process isolation for workflow agents | Done                           |
+| Drill-down workflow UI                        | Done (`/workflow-tree`)        |
+| Keyboard cancel control                       | Done (`c` in `/workflow-tree`) |
+| Mouse-clickable controls for widget rows      | Deferred                       |
+| Full per-agent tool-call history tree         | Deferred                       |
+| Strong progress-event rate limiting           | Deferred                       |

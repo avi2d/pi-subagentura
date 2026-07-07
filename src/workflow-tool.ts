@@ -22,6 +22,7 @@ import {
   runWorkflow,
   stringify,
 } from "./workflow-worker";
+import { showWorkflowTree } from "./workflow-tree-ui";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -633,6 +634,17 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         const text = renderWorkflowJobs();
         ctx.ui.notify("📋 Workflow status listed.");
         sendCommandMessage(text);
+      },
+    });
+
+    pi.registerCommand("workflow-tree", {
+      description:
+        "Open an interactive workflow tree with expand/collapse and cancel controls.",
+      handler: async (_args: string, ctx: ExtensionCommandContext) => {
+        const action = await showWorkflowTree(ctx.ui);
+        if (action.kind === "cancel") {
+          sendCommandMessage(`Workflow ${action.workflowId} cancelled.`);
+        }
       },
     });
   }
