@@ -144,6 +144,33 @@ describe("agent() + budget", () => {
     expect(r.agentsSpawned).toBe(1);
   });
 
+  it("defaults agent isolation to process", async () => {
+    let seenIsolation: string | undefined;
+    const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
+      seenIsolation = isolation;
+      return ok("done");
+    };
+
+    await runWorkflow(meta + `return await agent("hello");`, { runAgent });
+
+    expect(seenIsolation).toBe("process");
+  });
+
+  it("allows agent isolation to opt out to in-process", async () => {
+    let seenIsolation: string | undefined;
+    const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
+      seenIsolation = isolation;
+      return ok("done");
+    };
+
+    await runWorkflow(
+      meta + `return await agent("hello", { isolation: "in-process" });`,
+      { runAgent },
+    );
+
+    expect(seenIsolation).toBe("in-process");
+  });
+
   it("returns null and counts errors when the sub-agent errors", async () => {
     const r = await runWorkflow(meta + `return await agent("x");`, {
       runAgent: async () => fail(),
@@ -198,7 +225,7 @@ describe("parallel()", () => {
       active--;
       return ok(prompt);
     };
-    const body = `return await parallel(Array.from({length: 10}, (_, i) => () => agent("t" + i)));`;
+    const body = `return await parallel(Array.from({length: 10}, (_, i) => () => agent("t" + i, { isolation: "in-process" })));`;
     const r = await runWorkflow(meta + body, { runAgent, concurrency: 2 });
     expect((r.result as unknown[]).length).toBe(10);
     expect(maxActive).toBeLessThanOrEqual(2);
@@ -823,6 +850,56 @@ describe("registerWorkflowTool", () => {
       "save_workflow",
       "list_workflows",
     ]);
+  });
+
+  it("registers workflow slash commands", () => {
+    const commands: Array<{ name: string }> = [];
+    const pi = {
+      registerTool: vi.fn(),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn((name: string, def: any) =>
+        commands.push({ name, ...def }),
+      ),
+      on: vi.fn(),
+    };
+
+    registerWorkflowTool(pi as any);
+
+    expect(commands.map((c) => c.name)).toEqual([
+      "workflow",
+      "workflows",
+      "list-workflows",
+      "workflow-status",
+    ]);
+  });
+
+  it("/workflow queues a prompt to create, save, and run a workflow", async () => {
+    const commands: Array<{ name: string; handler: Function }> = [];
+    const pi = {
+      registerTool: vi.fn(),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn((name: string, def: any) =>
+        commands.push({ name, ...def }),
+      ),
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+    };
+    const ctx = {
+      ui: { notify: vi.fn() },
+      sendUserMessage: vi.fn(),
+    };
+
+    registerWorkflowTool(pi as any);
+    const cmd = commands.find((c) => c.name === "workflow")!;
+    await cmd.handler("build a release checklist", ctx);
+
+    expect(ctx.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [prompt, opts] = ctx.sendUserMessage.mock.calls[0];
+    expect(prompt).toContain("save_workflow");
+    expect(prompt).toContain("workflow` tool");
+    expect(prompt).toContain("build a release checklist");
+    expect(prompt).not.toContain("Big Pickle");
+    expect(opts).toEqual({ deliverAs: "followUp" });
   });
 
   it("workflow tool has the expected description and parameters", () => {

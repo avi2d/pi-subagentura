@@ -3,70 +3,94 @@
 ## Overview
 
 The workflow tool orchestrates sub-agents at scale via a JavaScript script that runs
-in a Worker thread. It ports Claude Code's "Dynamic Workflows" model into pi-subagentura.
+in a Worker thread. It ports Claude Code's dynamic workflow model into
+pi-subagentura: workflows are reusable, async by default, and each `agent()`
+call defaults to an attachable tmux/zellij-backed sub-agent when a multiplexer
+is available.
 
-**Phase 2 scope:** Async-by-default, `/workflows` user command, process isolation as default.
+**Phase 2 scope:** async-by-default execution, process isolation as the default
+for workflow sub-agents, and slash commands for creating/running workflows.
+
+## Command UX
+
+| Command            | Purpose                                                                                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/workflow <task>` | Ask the parent agent to create a reusable workflow script for the task, save it with `save_workflow`, and immediately run it with the `workflow` tool. |
+| `/workflows`       | List saved workflows, let the user select one, optionally collect JSON args, and run the selected workflow.                                            |
+| `/list-workflows`  | Alias for `/workflows`.                                                                                                                                |
+| `/workflow-status` | Show running/completed workflow jobs from `workflowJobRegistry`: id, name, status, agents, errors, tokens, phase, elapsed time.                        |
+
+`/workflow <task>` is intentionally a prompt bridge. The extension does not
+hard-code a generator model or a fixed template; it asks the active parent agent
+to synthesize the right workflow, save it, and run it. This keeps workflow
+creation flexible while the actual execution still goes through the deterministic
+`workflow` tool runtime.
 
 ## Key Decisions
 
-| Decision                | Choice                                  | Rationale                                                                                   |
-| ----------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Sync vs Async           | Async by default; sync explicit opt-in  | Workflows are long-running; blocking the agent makes no sense. Claude Code is always async. |
-| Default agent isolation | Process (tmux/zellij)                   | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux.            |
-| Visibility (Phase 1)    | `/workflows` command → sendMessage text | Minimal TUI work; full drill-down deferred to Phase 3.                                      |
-| Backward compat         | Deferred                                | We preserve sync+async tool contract but flip the default.                                  |
+| Decision                | Choice                                 | Rationale                                                                                   |
+| ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Sync vs Async           | Async by default; sync explicit opt-in | Workflows are long-running; blocking the agent makes no sense. Claude Code is always async. |
+| Default agent isolation | Process (tmux/zellij)                  | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux exists.     |
+| Saved workflow UX       | `/workflows` + `/list-workflows`       | These names should mean saved reusable workflows, not job status.                           |
+| Job status UX           | `/workflow-status`                     | Avoids overloading `/workflows`; status remains available without breaking tools.           |
+| TUI scope               | Text/message-based commands            | Full drill-down TUI is deferred to a later phase.                                           |
 
 ## Architecture
 
 ```mermaid
 graph TD
-    A[Agent calls workflow()] --> B{async param?}
-    B -- default true --> C[startWorkflowJob]
-    B -- explicit false --> D[runWorkflow sync]
-    C --> E[WorkflowJobState in registry]
-    E --> F[/workflows command reads registry]
-    E --> G[agent() inside workflow]
-    G --> H{isolation param?}
-    H -- default "process" --> I[launchInteractiveSubagent]
-    I -- tmux/zellij ok --> J[awaitInteractiveResult]
-    I -- NoMultiplexerAvailable --> K[in-process startSubagentJob]
-    H -- "in-process" --> K
-    K --> L[SubagentResult via jobPromise]
-    J --> L
+    A[User runs /workflow task] --> B[Parent agent drafts workflow script]
+    B --> C[save_workflow]
+    C --> D[workflow by saved name]
+    E[User runs /workflows] --> F[Select saved workflow]
+    F --> D
+    D --> G{async param?}
+    G -- default true --> H[startWorkflowJob]
+    G -- explicit false --> I[runWorkflow sync]
+    H --> J[WorkflowJobState in registry]
+    K[User runs /workflow-status] --> J
+    D --> L[agent() inside workflow]
+    L --> M{isolation param?}
+    M -- unset/default process --> N[launchInteractiveSubagent]
+    N -- tmux/zellij ok --> O[awaitInteractiveResult]
+    N -- NoMultiplexerAvailable --> P[in-process startSubagentJob]
+    M -- in-process opt-out --> P
+    P --> Q[SubagentResult]
+    O --> Q
 ```
 
-## Changes from v2
+## Runtime behavior
 
-1. **`async` default flips from `false` to `true`**
+1. **`async` defaults to `true`**
+   - `workflow({ script })` spawns a background job and returns a `workflowId`.
+   - `workflow({ script, async: false })` still blocks and streams progress.
 
-   - `workflow({ script })` now spawns background; returns `workflowId`
-   - `workflow({ script, async: false })` still blocks (sync)
-   - Only ~1 line change in `execute()`: `params.async !== false`
+2. **`agent()` defaults to process isolation**
+   - If `isolation` is omitted, the workflow runtime passes `"process"`.
+   - `makeRunAgent` tries tmux/zellij via `launchInteractiveSubagent()`.
+   - If no multiplexer is available, it logs a warning and falls back to the
+     in-process sub-agent path.
+   - `isolation: "in-process"` remains the explicit opt-out.
 
-2. **`agent()` isolation defaults to `"process"`**
-
-   - In `makeRunAgent`: if no `isolation` param, try process isolation
-   - Fallback chain: tmux → zellij → in-process (already exists for explicit `isolation:"process"`)
-   - Previously defaulted to in-process; now process is the default
-
-3. **`/workflows` command via `registerCommand`**
-   - Iterates `workflowJobRegistry`
-   - Formats as markdown: id, name, status, agents, errors, tokens, phase, elapsed
-   - Injects via `pi.sendMessage()` — no TUI widget needed yet
-   - Coexists with existing `get_workflow_status`/`get_workflow_result` tools
+3. **Saved workflows remain tool-compatible**
+   - `save_workflow`, `list_workflows`, and `workflow({ name })` remain the
+     machine-callable API.
+   - `/workflows` and `/list-workflows` are user-facing command wrappers around
+     the same saved workflow store.
 
 ## File Changes
 
-| File                   | Change                                                                                 |
-| ---------------------- | -------------------------------------------------------------------------------------- |
-| `src/workflow-tool.ts` | Flip async default; add `/workflows` command handler; change agent() default isolation |
-| `src/subagent.ts`      | No changes (already calls `registerWorkflowTool`)                                      |
-| `src/rendering.ts`     | No changes in Phase 2                                                                  |
-| `src/multiplexer.ts`   | No changes — already correct                                                           |
+| File                     | Change                                                                                                                  |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `src/workflow-tool.ts`   | Add `/workflow`, `/workflows`, `/list-workflows`, `/workflow-status`; keep async default; run selected saved workflows. |
+| `src/workflow-worker.ts` | Normalize omitted `agent()` isolation to `"process"`.                                                                   |
+| `src/subagent.ts`        | No changes; it already calls `registerWorkflowTool`.                                                                    |
+| `src/multiplexer.ts`     | No changes; tmux/zellij detection and fallback already exist.                                                           |
 
-## Open Questions (Phase 3)
+## Deferred UI Work
 
-- Drillable TUI (per-agent prompt/tool calls/result)
-- Persistent widget showing running workflows
-- Pause/resume individual agents
-- Restart failed agents
+- Drillable TUI for workflow → agent → tool-call hierarchy.
+- Persistent footer badge such as `⚡ N workflow(s) running`.
+- Pause/resume or restart individual workflow agents.
+- Row caps/grouping for very large process-backed workflow fan-outs.

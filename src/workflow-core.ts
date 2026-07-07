@@ -47,7 +47,7 @@ export interface WorkflowAgentOpts {
   phase?: string;
   model?: string;
   persona?: string;
-  /** "process" routes to a tmux/zellij Pi process; otherwise in-process. */
+  /** Defaults to "process" (tmux/zellij); use "in-process" to opt out. */
   isolation?: string;
   /** Accepted for fidelity but a no-op in v2. */
   agentType?: string;
