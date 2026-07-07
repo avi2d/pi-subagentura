@@ -872,6 +872,7 @@ describe("registerWorkflowTool", () => {
       "workflows",
       "list-workflows",
       "workflow-status",
+      "workflow-tree",
     ]);
   });
 

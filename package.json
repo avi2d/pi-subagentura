@@ -53,6 +53,7 @@
     "src/workflow-worker-thread.mjs",
     "src/workflow-jobs.ts",
     "src/workflow-ui.ts",
+    "src/workflow-tree-ui.ts",
     "src/workflow-tool.ts"
   ],
   "engines": {
