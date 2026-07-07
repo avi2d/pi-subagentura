@@ -85,12 +85,23 @@ graph TD
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
 | `src/workflow-tool.ts`   | Add `/workflow`, `/workflows`, `/list-workflows`, `/workflow-status`; keep async default; run selected saved workflows. |
 | `src/workflow-worker.ts` | Normalize omitted `agent()` isolation to `"process"`.                                                                   |
+| `src/workflow-jobs.ts`   | Preserve latest phase/log/agent-start/agent-done message in each workflow snapshot for status UI.                       |
+| `src/artifact-poller.ts` | Paint workflow footer/status widget and cap workflow rows.                                                              |
 | `src/subagent.ts`        | No changes; it already calls `registerWorkflowTool`.                                                                    |
 | `src/multiplexer.ts`     | No changes; tmux/zellij detection and fallback already exist.                                                           |
 
-## Deferred UI Work
+## UI Polish Status
+
+Done:
+
+- Footer badge: `⚡ N workflow(s) running`.
+- Below-editor workflow summary widget with workflow id, agent counts, tokens, elapsed time, phase, and latest event.
+- Widget row caps for both interactive sub-agent activity and workflow activity.
+- `/workflow-status` textual status command for full running/completed job details.
+
+Deferred:
 
 - Drillable TUI for workflow → agent → tool-call hierarchy.
-- Persistent footer badge such as `⚡ N workflow(s) running`.
 - Pause/resume or restart individual workflow agents.
-- Row caps/grouping for very large process-backed workflow fan-outs.
+- Interactive controls directly on workflow widget rows.
+- Stronger progress-event coalescing/rate limiting for very large sync fan-outs.

@@ -521,10 +521,12 @@ describe("session-log tail-read", () => {
       "subagentura-running",
       "⚡ 1 sub-agent running",
     );
-    // Widget shows the activity row.
-    expect(setWidget).toHaveBeenCalledTimes(1);
-    const [key, lines, opts] = setWidget.mock.calls[0];
-    expect(key).toBe("subagentura-activity");
+    // Widget shows the activity row. Workflow widget is also cleared in the same poll.
+    const activityWidgetCall = setWidget.mock.calls.find(
+      ([key]) => key === "subagentura-activity",
+    );
+    expect(activityWidgetCall).toBeDefined();
+    const [, lines, opts] = activityWidgetCall!;
     expect(opts).toEqual({ placement: "belowEditor" });
     expect(lines[0]).toContain("Test:");
     expect(lines[0]).toContain("rg TODO src/");
