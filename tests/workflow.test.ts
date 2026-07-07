@@ -462,10 +462,12 @@ describe("background workflow jobs", () => {
     // While the agent is still blocked on `gate`, the snapshot must already show 1 spawned.
     // This is the regression: pre-fix, this would be 0.
     expect(job.snapshot.agentsSpawned).toBe(1);
+    expect(job.snapshot.lastMessage).toBe("→ started agent");
 
     release();
     await job.promise;
     expect(job.snapshot.agentsSpawned).toBe(1);
+    expect(job.snapshot.lastMessage).toBe("→ done agent");
   }, 10_000);
 
   it("clears runningCount when runAgent throws", async () => {

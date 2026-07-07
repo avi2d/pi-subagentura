@@ -244,37 +244,54 @@ Every `agent()`, `phase()`, and `log()` call emits a progress event. The parent 
 
 **Two update modes:**
 
-| Mode                      | How progress flows                                                     | TUI effect                                                                               |
-| ------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| **Sync** (`script: ...`)  | `onProgress` → `onUpdate` per event                                    | Live stream in the reply; each `agent()`, `phase()`, `log()` call fires an inline update |
-| **Async** (`async: true`) | Written to `WorkflowJobState.snapshot`; `get_workflow_status` reads it | Nothing in the TUI until you poll                                                        |
+| Mode                      | How progress flows                                                           | TUI effect                                                                                                                          |
+| ------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Sync** (`async: false`) | `onProgress` → `onUpdate` per event                                          | Live stream in the reply; each `agent()`, `phase()`, and `log()` call fires an inline update.                                       |
+| **Async** (default)       | Written to `WorkflowJobState.snapshot`; artifact poller paints footer/widget | Footer shows `⚡ N workflow(s) running`; below-editor widget shows running workflow rows with phase/agent/token/last-event summary. |
 
-### Visibility gaps
+### Current visibility
 
-#### 1. No mid-agent live preview
+#### 1. Workflow footer and widget
 
-Between `→ started verify:claim-x` and `→ done verify:claim-x` there is **no visibility** into what the sub-agent is doing — which tool it's running, what file it read, how much progress it made. The underlying `subagent_isolated` / `subagent_with_context` _do_ produce live status (turn, activeTool, output preview) but the workflow progress stream does not relay it.
+Async workflows are discoverable without polling tools:
 
-To fix this, the `agent()` progress handler in `workflow-worker.ts` would need to forward per-agent `onUpdate` frames as progress events. This is roughly 20 lines of wiring.
+```
+⚡ 2 workflows running
+◇ pr-review (wf_ab12): 3 agents · 2 running · 120 tokens · 5s · phase: Review — → started tests
+◇ ralplan (wf_cd34): 1 agent · 1 running · 80 tokens · 1m 12s · phase: Planner — ◆ phase: Planner
+```
 
-#### 2. No workflow TUI footer
+The footer uses `subagentura-workflows`; the workflow widget uses
+`subagentura-workflow-activity` and is capped to 5 rows with an overflow row.
+Use `/workflow-status` for the full textual status dump.
 
-Interactive sub-agents show `⚡ N sub-agent(s) running` in the pi TUI footer via the artifact poller. Workflows have no equivalent — an async workflow runs silently. The only way to detect it is to call `get_workflow_status`.
+#### 2. Per-agent visibility
 
-There is no `⚡ N workflow(s) running` badge. Adding one would require wiring `WorkflowJobState.snapshot` to a TUI status key, similar to the interactive sub-agent poller's `FOOTER_KEY`.
+Workflow `agent()` calls default to process isolation. Each process-backed agent
+runs in tmux/zellij and is also shown by the interactive sub-agent widget below
+the editor. In-process agents still forward live `activeTool` / output-preview
+updates as workflow log events when the underlying runner exposes them.
 
-#### 3. No attach for in-process agents
+#### 3. Remaining gaps
 
-Default `agent()` calls (no `isolation: "process"`) run in-process. If an agent hangs or the user wants to debug what it's doing, there is no tmux pane to attach to. The only recourse is to abort the workflow.
-
-With `isolation: "process"` the agent runs in a tmux/zellij pane — see [Process isolation below](#process-isolation).
+- No drill-down workflow tree yet (workflow → agent → tool calls).
+- Workflow widget rows are summaries, not interactive controls.
+- Progress event coalescing/rate limiting is still basic.
 
 ### Process isolation
 
-Pass `isolation: "process"` to spawn each agent as a separate `pi` process inside tmux or zellij:
+By default, each `agent()` call spawns a separate `pi` process inside tmux or
+zellij:
 
 ```js
-await agent(prompt, { isolation: "process", label: "verify:claim-x" });
+await agent(prompt, { label: "verify:claim-x" });
+```
+
+Use `isolation: "in-process"` only when the workflow explicitly wants the older
+in-process behavior:
+
+```js
+await agent(prompt, { isolation: "in-process", label: "quick-check" });
 ```
 
 #### How it works
@@ -294,7 +311,8 @@ Running process-backed agents appear below the editor:
 ▶ sweep:backend: grep webapp/rest/themis_token.py (5s ago)
 ```
 
-**⚠ No row cap.** With 50 running agents the widget would show 50 lines, potentially pushing other TUI content off-screen. The `formatActivityRow()` renderer in `src/rendering.ts` has no truncation or grouping logic.
+The interactive sub-agent widget is capped to 10 rows and then shows
+`… and N more`, preventing large fan-outs from pushing other TUI content away.
 
 #### Attaching to a process agent
 
@@ -321,33 +339,25 @@ The `list_subagent_artifacts` tool lists all known sub-agents (including past on
 
 #### Concurrency
 
-| Agent type                              | Default max concurrent          | Cap                                  |
-| --------------------------------------- | ------------------------------- | ------------------------------------ |
-| In-process (`isolation` unset)          | `max(1, min(16, cpuCores - 2))` | `MAX_TOTAL_AGENTS = 1000` (lifetime) |
-| Process-backed (`isolation: "process"`) | `max(1, min(4, cpuCores - 2))`  | Same                                 |
+| Agent type                                                | Default max concurrent          | Cap                                  |
+| --------------------------------------------------------- | ------------------------------- | ------------------------------------ |
+| Process-backed default (`isolation` unset or `"process"`) | `max(1, min(4, cpuCores - 2))`  | `MAX_TOTAL_AGENTS = 1000` (lifetime) |
+| Explicit in-process (`isolation: "in-process"`)           | `max(1, min(16, cpuCores - 2))` | Same                                 |
 
-For a typical machine (8–16 cores): ~6–14 in-process, ~2–4 process-backed agents run in parallel. The rest queue on the semaphore. This prevents CPU/memory exhaustion.
+For a typical machine (8–16 cores): ~2–4 process-backed agents run in parallel by default. The rest queue on the process semaphore. Explicit in-process fan-outs can run wider when a workflow opts into them.
 
 #### Progress event flood
 
-`parallel()` with many thunks (`Promise.all`) fires `agent_start` for all of them nearly simultaneously. Each fires an `onUpdate` call. The `try/catch` around `onUpdate` at `workflow-tool.ts:224` prevents crashes but does **not** throttle or coalesce events.
-
-At ~20+ rapid starts the TUI may visibly stutter. The events are cheap (small strings), so the practical limit is higher — but there is no rate limiter.
-
-#### Widget row limit
-
-As noted above, the interactive sub-agent widget has no cap. For workflows with many process-backed agents, consider:
-
-- Setting a short TTL on completed agents so they clean up quickly
-- Running agents with `background: true` (the default) so they don't clutter the tmux bar
-- Polling `prune_subagent_artifacts` after a workflow completes
+`parallel()` with many thunks (`Promise.all`) fires `agent_start` for many agents nearly simultaneously. The workflow snapshot keeps only the latest summary message for the TUI widget/status path, which limits async UI churn. Sync `onUpdate` still emits each event and may need stricter rate limiting in a future drill-down UI.
 
 ### Recommendations summary
 
-| What                                                | Effort                                    | Impact                                      |
-| --------------------------------------------------- | ----------------------------------------- | ------------------------------------------- |
-| Workflow TUI footer (`⚡ N running`)                | Small (~30 lines + poller interval)       | High — async workflows become discoverable  |
-| Forward live status through progress stream         | Small (~20 lines in `workflow-worker.ts`) | High — mid-agent visibility                 |
-| Widget row cap on `formatActivityRow`               | Trivial (slice at ~10 rows)               | Medium — prevents UI overflow               |
-| Rate-limit progress events                          | Small (debounce `onUpdate`)               | Low-medium — only matters at 50+ agents     |
-| `onUpdate` in async mode (stream to snapshot → TUI) | Medium (new poller or event bus)          | High — closes the sync/async visibility gap |
+| What                                          | Status   |
+| --------------------------------------------- | -------- |
+| Workflow footer (`⚡ N workflows running`)    | Done     |
+| Workflow summary widget                       | Done     |
+| Interactive sub-agent widget row cap          | Done     |
+| Default process isolation for workflow agents | Done     |
+| Drill-down workflow UI                        | Deferred |
+| Interactive controls for workflow rows        | Deferred |
+| Strong progress-event rate limiting           | Deferred |

@@ -3,6 +3,7 @@ import { debugLog } from "./helpers";
 import { runWorkflow } from "./workflow-worker";
 import {
   type RunWorkflowOptions,
+  type WorkflowProgress,
   type WorkflowRunResult,
 } from "./workflow-core";
 
@@ -98,8 +99,14 @@ export function startWorkflowJob(
       if (p.kind === "phase" && p.phase) {
         state.snapshot.currentPhase = p.phase;
         state.snapshot.phases.push(p.phase);
+        state.snapshot.lastMessage = `◆ phase: ${p.phase}`;
+      } else if (p.kind === "log" && p.message) {
+        state.snapshot.lastMessage = p.message;
+      } else if (p.kind === "agent_start") {
+        state.snapshot.lastMessage = `→ started${formatWorkflowAgentTag(p)}`;
+      } else if (p.kind === "agent_done") {
+        state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
       }
-      if (p.kind === "log" && p.message) state.snapshot.lastMessage = p.message;
     },
   })
     .then((r) => {
@@ -126,4 +133,10 @@ export function getRunningWorkflowCount(): number {
     if (st.status === "running") count++;
   }
   return count;
+}
+
+function formatWorkflowAgentTag(p: WorkflowProgress): string {
+  const label = p.label ? ` ${p.label}` : " agent";
+  const model = p.model ? ` @${p.model}` : "";
+  return `${label}${model}`;
 }

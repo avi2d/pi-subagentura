@@ -48,6 +48,7 @@ describe("pollArtifactChanges", () => {
   beforeEach(() => {
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    g.__piSubagenturaWorkflowJobs?.clear?.();
     g.__piSubagenturaPiRef = undefined;
   });
 
@@ -62,6 +63,47 @@ describe("pollArtifactChanges", () => {
     const sendMessage = vi.fn();
     mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("paints workflow footer and widget for running workflows", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { workflowJobRegistry } = await import("../src/workflow");
+    workflowJobRegistry.set("wf_test", {
+      id: "wf_test",
+      name: "demo-flow",
+      status: "running",
+      startedAt: Date.now() - 5_000,
+      promise: Promise.resolve({}) as any,
+      abort: new AbortController(),
+      snapshot: {
+        agentsSpawned: 3,
+        errorCount: 0,
+        tokensSpent: 120,
+        phases: ["Scan"],
+        currentPhase: "Scan",
+        lastMessage: "→ started scout",
+        runningCount: 2,
+      },
+    });
+
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+
+    expect(setStatus).toHaveBeenCalledWith(
+      "subagentura-workflows",
+      "⚡ 1 workflow running",
+    );
+    expect(setWidget).toHaveBeenCalledWith(
+      "subagentura-workflow-activity",
+      [expect.stringContaining("demo-flow (wf_test): 3 agents · 2 running")],
+      { placement: "belowEditor" },
+    );
+
+    delete (globalThis as any).__piSubagenturaUi;
   });
 
   it("logs unexpected top-level poller errors to the debug log", async () => {
