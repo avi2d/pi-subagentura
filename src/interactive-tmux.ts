@@ -927,8 +927,10 @@ export function formatInteractiveState(
   state: InteractiveSubagentState,
 ): string {
   const elapsed = Math.floor((Date.now() - state.startedAt) / 1000);
+  const taskPreview = state.task.replace(/\s+/g, " ").slice(0, 80);
   const lines: string[] = [
     `${state.name} (${state.id}) — ${state.status}, ${elapsed}s`,
+    `Task: ${taskPreview}${state.task.length > 80 ? "…" : ""}`,
     `Mux: ${state.mux}`,
     `Pane: ${state.paneId}`,
   ];
