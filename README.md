@@ -74,6 +74,7 @@ Parameters:
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
 - `notifyOnComplete` — `"notify"` or `"inject"`; auto-deliver completion notification (async only)
+- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Best for:
@@ -95,6 +96,7 @@ Parameters:
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
 - `notifyOnComplete` — `"notify"` or `"inject"`; auto-deliver completion notification (async only)
+- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Best for:
@@ -163,6 +165,7 @@ Parameters:
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
 - `notifyOnComplete` — `"inject"` (default) or `"notify"`; controls how the parent LLM is woken up on completion. See [Completion notifications: notify vs inject](#completion-notifications-notify-vs-inject) below.
+- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification. In `"inject"` mode the injected user message already wakes the parent; this flag only affects notify-style fallbacks/errors.
 
 The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts — sub-agents that finish while you're away are picked up on the next poll.
 
@@ -210,9 +213,9 @@ The child's system prompt embeds the **literal absolute path** of the artifact d
 Interactive sub-agents deliver their completion to the parent through one of two modes (selected via `notifyOnComplete`):
 
 - `"inject"` (**default** for `subagent_interactive`) — the sub-agent's `output.md` is pushed into the parent LLM's conversation as a new user message. The parent LLM gets a turn and can summarize, chain into the next step, or call more tools. Use this when the sub-agent's output is part of a multi-step pipeline.
-- `"notify"` — only a TUI hint is shown (status line + widget). The parent LLM is **not** woken up. The human has to prompt the parent manually to read the sub-agent's output. Use this for spawn-and-forget side-quests.
+- `"notify"` — only a completion notification/pointer is sent by default. The parent LLM is **not** woken up unless `triggerTurnOnComplete: true` is also set. Use plain notify for spawn-and-forget side-quests; add `triggerTurnOnComplete` when the parent should react to the pointer without injecting the full output.
 
-Both modes share a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents finish at the same time, the rest degrade silently to `notify` (UI hint only) to keep the parent conversation from flooding. The cap is concurrent, not lifetime — once some injects settle, more can fire.
+Inject mode has a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents finish at the same time, the rest degrade to notify-style pointer messages to keep the parent conversation from flooding. With `triggerTurnOnComplete: true`, those notify-style fallback messages can still wake the parent. The cap is concurrent, not lifetime — once some injects settle, more can fire.
 
 #### `get_interactive_subagent_status`
 

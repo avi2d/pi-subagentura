@@ -43,6 +43,12 @@ export const BaseParams = Type.Object({
       },
     ),
   ),
+  triggerTurnOnComplete: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, completion notifications can trigger a parent LLM turn. In inject mode the injected user message already triggers a turn; this mainly affects notify mode and inject-cap fallback.",
+    }),
+  ),
   maxAge: Type.Optional(
     Type.Number({
       description:
@@ -112,6 +118,12 @@ export const InteractiveParams = Type.Object({
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
         'How to surface the sub-agent result on completion. "inject" (default) also injects output.md as a user message so the parent LLM processes it in its next turn. "notify" emits a UI hint only — no LLM turn is triggered. Falls back to a pointer hint if the inject cap is exceeded.',
+    }),
+  ),
+  triggerTurnOnComplete: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, completion notifications can trigger a parent LLM turn. In inject mode the injected user message already triggers a turn; this mainly affects notify mode and inject-cap fallback.",
     }),
   ),
   mux: Type.Optional(

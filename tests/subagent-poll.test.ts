@@ -372,6 +372,80 @@ describe("pollArtifactChanges", () => {
       expect(sendUserMessage).not.toHaveBeenCalled();
     });
 
+    it("adds triggerTurn to notify-mode pointer notifications when requested", async () => {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const { state, artifactDir } = makeState();
+      state.notifyOnComplete = "notify";
+      state.triggerTurnOnComplete = true;
+      mod.interactiveSubagentRegistry.set(state.id, state);
+      const art = artifactPath(join(artifactDir, ".."), state.id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+
+      const sendMessage = vi.fn();
+      const sendUserMessage = vi.fn();
+      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0][1]).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not trigger the pointer notification in inject mode when triggerTurnOnComplete is set", async () => {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const { state, artifactDir } = makeState();
+      state.notifyOnComplete = "inject";
+      state.triggerTurnOnComplete = true;
+      mod.interactiveSubagentRegistry.set(state.id, state);
+      const art = artifactPath(join(artifactDir, ".."), state.id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+      writeOutput(art, "final answer");
+
+      const sendMessage = vi.fn();
+      const sendUserMessage = vi.fn();
+      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0][1]).toEqual({
+        deliverAs: "followUp",
+      });
+      expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("does trigger the pointer notification for inject-mode errors when requested", async () => {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const { state, artifactDir } = makeState();
+      state.notifyOnComplete = "inject";
+      state.triggerTurnOnComplete = true;
+      mod.interactiveSubagentRegistry.set(state.id, state);
+      const art = artifactPath(join(artifactDir, ".."), state.id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, {
+        ts: 2,
+        type: "error",
+        status: "error",
+        message: "boom",
+      });
+
+      const sendMessage = vi.fn();
+      const sendUserMessage = vi.fn();
+      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0][1]).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
+
     it("is at-most-once: a second poll does NOT re-inject (state.injected guard)", async () => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");

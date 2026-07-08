@@ -53,6 +53,16 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
   return summary;
 }
 
+function completionMessageOptions(triggerTurnOnComplete?: boolean): {
+  deliverAs: "followUp";
+  triggerTurn?: true;
+} {
+  if (triggerTurnOnComplete) {
+    return { deliverAs: "followUp", triggerTurn: true };
+  }
+  return { deliverAs: "followUp" };
+}
+
 /**
  * Deliver async subagent completion notification.
  * Reads pi from globalThis to survive module reloads.
@@ -79,7 +89,7 @@ export function deliverNotification(
             display: true,
             details: { jobId: jobState.id, result, mode: "notify" },
           },
-          { deliverAs: "followUp" },
+          completionMessageOptions(jobState.triggerTurnOnComplete),
         );
         return;
       }
@@ -114,7 +124,7 @@ export function deliverNotification(
           display: true,
           details: { jobId: jobState.id, result, mode: "notify" },
         },
-        { deliverAs: "followUp" },
+        completionMessageOptions(jobState.triggerTurnOnComplete),
       );
     }
   } catch {
@@ -214,7 +224,10 @@ export function deliverArtifactNotification(
         display: true,
         details: { subagentId: state.id, event },
       },
-      { deliverAs: "followUp" },
+      completionMessageOptions(
+        state.triggerTurnOnComplete === true &&
+          !(state.notifyOnComplete === "inject" && event.type === "done"),
+      ),
     );
     return true;
   } catch {

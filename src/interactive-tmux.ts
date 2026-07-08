@@ -215,6 +215,11 @@ export interface InteractiveSubagentState {
    */
   notifyOnComplete?: "notify" | "inject";
   /**
+   * When true, notify-mode completion messages may trigger a parent LLM turn.
+   * Ignored for inject delivery because sendUserMessage already starts/queues a turn.
+   */
+  triggerTurnOnComplete?: boolean;
+  /**
    * At-most-once guard for the inject path (mirrors lastDeliveredEventTs, inject-only). Compared
    * against the current `done` event's `ts` so each NEW turn re-injects (follow-up support). Set on
    * first inject; `undefined` means "never injected".
@@ -442,6 +447,8 @@ export function launchInteractiveSubagent(params: {
    * message so the parent LLM processes it in its next turn.
    */
   notifyOnComplete?: "notify" | "inject";
+  /** Whether notify-mode completion messages should trigger a parent LLM turn. */
+  triggerTurnOnComplete?: boolean;
   /** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
   muxPreference?: "auto" | "tmux" | "zellij";
   /**
@@ -541,6 +548,7 @@ export function launchInteractiveSubagent(params: {
         artifactDir: paths.artifactDir,
         sessionFile: paths.sessionFile,
         notifyOnComplete: params.notifyOnComplete,
+        triggerTurnOnComplete: params.triggerTurnOnComplete,
         parentSessionId: params.parentSessionId,
       });
       persistedState = true;
@@ -599,6 +607,7 @@ export function launchInteractiveSubagent(params: {
     launchScriptFile: paths.launchScriptFile,
     artifactDir: paths.artifactDir,
     notifyOnComplete: params.notifyOnComplete,
+    triggerTurnOnComplete: params.triggerTurnOnComplete,
     parentSessionId: params.parentSessionId,
   };
   interactiveSubagentRegistry.set(id, state);

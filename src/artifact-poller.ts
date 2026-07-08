@@ -222,7 +222,9 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
                   display: true,
                   details: { subagentId: state.id, mode: "notify" },
                 },
-                { deliverAs: "followUp" },
+                state.triggerTurnOnComplete === true
+                  ? { deliverAs: "followUp", triggerTurn: true }
+                  : { deliverAs: "followUp" },
               );
             } catch {
               /* pi stale */

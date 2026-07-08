@@ -114,6 +114,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
         includeContext: params.includeContext ?? false,
+        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
       });
 
       let contextText: string | null = null;
@@ -141,6 +142,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
           notifyOnComplete: params.notifyOnComplete ?? "inject",
+          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),

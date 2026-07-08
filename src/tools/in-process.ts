@@ -147,6 +147,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "For async (background) execution, the main agent continues immediately.",
       "Use async only if user asked to do so or is willing to continue the conversation.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Set triggerTurnOnComplete: true to make notify-mode completions wake the parent LLM.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -160,6 +161,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
         notifyOnComplete: params.notifyOnComplete ?? null,
+        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
         maxAge: params.maxAge ?? null,
       });
 
@@ -217,6 +219,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
               : params.notifyOnComplete === "notify"
                 ? "notify"
                 : undefined,
+          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -354,6 +357,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       "",
       "For async (background) execution, the main agent continues immediately.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Set triggerTurnOnComplete: true to make notify-mode completions wake the parent LLM.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -367,6 +371,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
         notifyOnComplete: params.notifyOnComplete ?? null,
+        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
         maxAge: params.maxAge ?? null,
       });
 
@@ -405,6 +410,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
               : params.notifyOnComplete === "notify"
                 ? "notify"
                 : undefined,
+          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };

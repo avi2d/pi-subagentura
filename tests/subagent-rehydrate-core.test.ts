@@ -60,6 +60,7 @@ describe("rehydrateInteractiveSubagents", () => {
       mux: state.mux,
       artifactDir: state.artifactDir,
       sessionFile: state.sessionFile,
+      triggerTurnOnComplete: true,
     });
 
     const result = mod.rehydrateInteractiveSubagents(cwd);
@@ -70,6 +71,7 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated?.paneId).toBe("%42");
     expect(rehydrated?.mux).toBe("tmux");
     expect(rehydrated?.parentSessionId).toBe("pi");
+    expect(rehydrated?.triggerTurnOnComplete).toBe(true);
   });
 
   it("rebuilds attach and focus commands on rehydrate", async () => {
