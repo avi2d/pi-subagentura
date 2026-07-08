@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { readEvents, readOutput } from "./artifact";
 import { debugLog } from "./helpers";
-import type { SubagentResult } from "./helpers";
+import type { SubagentResult, Usage } from "./helpers";
 import {
   INTERACTIVE_DEAD_GRACE_TICKS,
   INTERACTIVE_POLL_MS,
@@ -427,6 +427,41 @@ function artifactFor(state: InteractiveSubagentState) {
 }
 
 /**
+ * Parse token usage from a child Pi's session JSONL file.
+ * Reads assistant messages with `usage` data and aggregates them,
+ * mirroring the in-process path in helpers.ts.
+ * Returns zeroUsage() if the file is missing, unparseable, or has no usage data.
+ */
+function parseUsageFromSessionFile(sessionFile: string): Usage {
+  try {
+    if (!existsSync(sessionFile)) return zeroUsage();
+    const raw = readFileSync(sessionFile, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim());
+    const usage: Usage = { ...zeroUsage() };
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.type !== "message") continue;
+        const msg = entry.message;
+        if (msg?.role !== "assistant" || !msg?.usage) continue;
+        const u = msg.usage;
+        usage.turns++;
+        usage.input += u.input ?? 0;
+        usage.output += u.output ?? 0;
+        usage.cacheRead += u.cacheRead ?? 0;
+        usage.cacheWrite += u.cacheWrite ?? 0;
+        if (u.cost?.total != null) usage.cost += u.cost.total;
+      } catch {
+        /* skip malformed lines */
+      }
+    }
+    return usage;
+  } catch {
+    return zeroUsage();
+  }
+}
+
+/**
  * Await a process-backed (tmux/zellij) sub-agent's terminal event by polling its artifact dir,
  * then read its output.md. Honors the abort signal and detects a dead pane that never completed.
  */
@@ -465,14 +500,14 @@ export async function awaitInteractiveResult(
         return {
           isError: false,
           output,
-          usage: zeroUsage(),
+          usage: parseUsageFromSessionFile(state.sessionFile),
           model: state.model ?? "process",
         };
       }
       return {
         isError: true,
         output,
-        usage: zeroUsage(),
+        usage: parseUsageFromSessionFile(state.sessionFile),
         model: undefined,
         errorMessage:
           terminal.message ?? `interactive sub-agent ${terminal.type}`,
