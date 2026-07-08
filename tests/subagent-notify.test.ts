@@ -307,6 +307,40 @@ describe("notifyOnComplete", () => {
           expect(api.sendUserMessage).not.toHaveBeenCalled();
         });
 
+        it("adds triggerTurn when triggerTurnOnComplete is true in notify mode", async () => {
+          const toolDef = getToolDef();
+          const jobId = `both-trigger-turn-${label}`;
+          const control = createJobControl();
+          mockStartSubagentJob.mockImplementationOnce(() =>
+            mockJobResult(jobId, control.jobPromise),
+          );
+
+          await toolDef.execute(
+            "call-trigger-turn",
+            {
+              async: true,
+              task: "test",
+              notifyOnComplete: "notify",
+              triggerTurnOnComplete: true,
+            },
+            undefined,
+            undefined,
+            getCtx(),
+          );
+
+          control.resolve(SUCCESS_RESULT);
+
+          await vi.waitFor(() => {
+            expect(api.sendMessage).toHaveBeenCalledTimes(1);
+          });
+
+          expect(sentMessageOptsAt(api, 0)).toMatchObject({
+            deliverAs: "followUp",
+            triggerTurn: true,
+          });
+          expect(api.sendUserMessage).not.toHaveBeenCalled();
+        });
+
         it("injects full result in inject mode", async () => {
           const toolDef = getToolDef();
           const jobId = `both-inject-${label}`;
@@ -506,7 +540,12 @@ describe("notifyOnComplete", () => {
 
       await isolatedToolDef.execute(
         "call-4",
-        { async: true, task: "test", notifyOnComplete: "inject" },
+        {
+          async: true,
+          task: "test",
+          notifyOnComplete: "inject",
+          triggerTurnOnComplete: true,
+        },
         undefined,
         undefined,
         mockCtx(),
@@ -525,6 +564,10 @@ describe("notifyOnComplete", () => {
       const msg = sentMessageAt(api, 0);
       expect(msg.content).toContain("Inject cap exceeded");
       expect(msg.details).toMatchObject({ mode: "notify", jobId });
+      expect(sentMessageOptsAt(api, 0)).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
     });
 
     it("allows more than five sequential inject completions because the cap is concurrent, not lifetime", async () => {

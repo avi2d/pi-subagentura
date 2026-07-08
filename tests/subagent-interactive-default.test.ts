@@ -138,6 +138,27 @@ describe("subagent_interactive notifyOnComplete default", () => {
     ).toBe("inject");
   });
 
+  it("forwards triggerTurnOnComplete when explicitly passed", async () => {
+    const toolDef = getInteractiveToolDef(api);
+
+    await toolDef.execute(
+      "call-trigger-turn",
+      {
+        task: "research X",
+        notifyOnComplete: "notify",
+        triggerTurnOnComplete: true,
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
+    expect(
+      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
+    ).toBe(true);
+  });
+
   it("exposes notifyOnComplete in the schema with the new default documented", () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
@@ -146,6 +167,7 @@ describe("subagent_interactive notifyOnComplete default", () => {
     const properties = (params as any).properties;
     expect(properties).toBeDefined();
     expect(properties.notifyOnComplete).toBeDefined();
+    expect(properties.triggerTurnOnComplete).toBeDefined();
     // Description must document 'inject' as the default and 'notify' as a valid
     // alternative. We don't assert literal phrasing — just that 'inject' is the
     // documented default — so wording tweaks don't break the test.

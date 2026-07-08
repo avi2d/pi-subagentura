@@ -720,6 +720,33 @@ describe("interactive-tmux", () => {
 
       expect(state.notifyOnComplete).toBe("notify");
     });
+
+    it("propagates triggerTurnOnComplete from launchInteractiveSubagent to the state", async () => {
+      const tmp = makeTmp();
+      process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+      process.env.TMUX = makeArgs().TMUX;
+      process.env.TMUX_PANE = "%9";
+
+      installMockExec((_f, args) => {
+        if (args[0] === "new-window") return MOCK_PANE_ID + "\n";
+        if (args[0] === "display-message") return MOCK_LOCATION;
+        if (args[0] === "show-options") return "0\n";
+        return "";
+      });
+
+      const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+        "../src/interactive-tmux",
+      );
+      const state = mod.launchInteractiveSubagent({
+        name: "TriggerTurn",
+        task: "x",
+        cwd: tmp,
+        notifyOnComplete: "notify",
+        triggerTurnOnComplete: true,
+      });
+
+      expect(state.triggerTurnOnComplete).toBe(true);
+    });
   });
 
   describe("buildPiInteractiveCommand", () => {

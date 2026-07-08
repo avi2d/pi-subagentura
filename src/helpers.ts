@@ -139,6 +139,8 @@ export interface JobState {
   modelLabel?: string;
   /** Notification mode requested by spawner's notifyOnComplete param */
   notifyOnComplete?: NotifyOnComplete;
+  /** Whether completion notifications should trigger a parent LLM turn. */
+  triggerTurnOnComplete?: boolean;
   /** At-most-once delivery guard */
   notificationDelivered?: boolean;
   /** Set true by get_subagent_result to suppress redundant notification */

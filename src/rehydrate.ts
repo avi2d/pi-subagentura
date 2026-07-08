@@ -103,6 +103,7 @@ export function rehydrateInteractiveSubagents(
       launchScriptFile: "",
       artifactDir: entry.artifactDir,
       notifyOnComplete: entry.notifyOnComplete,
+      triggerTurnOnComplete: entry.triggerTurnOnComplete,
       parentSessionId: entry.parentSessionId ?? "pi",
       // All runtime cursors reset (replay-all semantics).
       lastDeliveredEventTs: 0,
