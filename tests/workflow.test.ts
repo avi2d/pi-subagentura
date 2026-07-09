@@ -880,7 +880,7 @@ describe("registerWorkflowTool", () => {
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);
-    expect(tools).toHaveLength(6);
+    expect(tools).toHaveLength(7);
     expect(tools.map((t) => t.name)).toEqual([
       "workflow",
       "get_workflow_status",
@@ -888,6 +888,7 @@ describe("registerWorkflowTool", () => {
       "cancel_workflow",
       "save_workflow",
       "list_workflows",
+      "delete_workflow",
     ]);
   });
 
@@ -910,6 +911,7 @@ describe("registerWorkflowTool", () => {
       "list-workflows",
       "workflow-status",
       "workflow-tree",
+      "delete-workflow",
     ]);
   });
 

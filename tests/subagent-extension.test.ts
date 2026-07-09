@@ -26,6 +26,7 @@ describe("extension registration", () => {
         "cancel_interactive_subagent",
         "cancel_subagent",
         "cancel_workflow",
+        "delete_workflow",
         "cleanup_subagent_artifacts",
         "get_interactive_subagent_status",
         "get_subagent_result",
