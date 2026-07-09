@@ -2,8 +2,7 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { workflowJobRegistry, type WorkflowJobState } from "./workflow-jobs";
 
 export type WorkflowTreeAction =
-  | { kind: "cancel"; workflowId: string }
-  | { kind: "close" };
+  { kind: "cancel"; workflowId: string } | { kind: "close" };
 
 type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 

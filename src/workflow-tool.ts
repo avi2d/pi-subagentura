@@ -502,15 +502,20 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
               type: "text",
               text: existed
                 ? `Deleted workflow "${params.name}".`
-                : `No saved workflow named "${params.name}".`
-            }
+                : `No saved workflow named "${params.name}".`,
+            },
           ],
-          details: { status: existed ? "deleted" : "not_found", name: params.name },
+          details: {
+            status: existed ? "deleted" : "not_found",
+            name: params.name,
+          },
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Could not delete workflow: ${msg}` }],
+          content: [
+            { type: "text", text: `Could not delete workflow: ${msg}` },
+          ],
           details: { status: "error", error: msg },
           isError: true,
         };
@@ -608,10 +613,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         DELETE_LABEL,
       ];
 
-      const selected = await ctx.ui.select(
-        "Select workflow:",
-        pickerLabels,
-      );
+      const selected = await ctx.ui.select("Select workflow:", pickerLabels);
       if (!selected) return;
 
       if (selected === DELETE_LABEL) {
@@ -739,7 +741,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     });
 
     pi.registerCommand("delete-workflow", {
-      description: "Delete a saved workflow by name (interactive picker if no name given).",
+      description:
+        "Delete a saved workflow by name (interactive picker if no name given).",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         const items = listSavedWorkflows();
         if (items.length === 0) {

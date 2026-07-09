@@ -581,8 +581,7 @@ function processSessionLogEntry(
     }
     for (const rawBlock of msg.content) {
       const block = rawBlock as
-        | { type?: string; name?: string; arguments?: unknown }
-        | undefined;
+        { type?: string; name?: string; arguments?: unknown } | undefined;
       if (!block || block.type !== "toolCall") continue;
       const summary = summarizeToolCall(block.name ?? "", block.arguments);
       if (!summary) continue;

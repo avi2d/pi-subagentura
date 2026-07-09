@@ -174,14 +174,12 @@ export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 declare global {
   var __piSubagenturaRegistry: Map<string, JobState> | undefined;
   var __piSubagenturaInteractiveRegistry:
-    | Map<string, InteractiveSubagentState>
-    | undefined;
+    Map<string, InteractiveSubagentState> | undefined;
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
   var __piSubagenturaInjectCount: number | undefined;
   var __piSubagenturaInteractivePollerHandle:
-    | ReturnType<typeof setInterval>
-    | undefined;
+    ReturnType<typeof setInterval> | undefined;
 }
 
 // Initialize the global pi ref

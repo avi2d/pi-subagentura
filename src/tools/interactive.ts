@@ -188,8 +188,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme) {
       const details = result.details as
-        | Partial<InteractiveSubagentState>
-        | undefined;
+        Partial<InteractiveSubagentState> | undefined;
       if ((result as any).isError) {
         const first = result.content?.[0];
         const text =

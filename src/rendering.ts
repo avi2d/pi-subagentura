@@ -139,8 +139,7 @@ export function renderSubagentNotify(
   theme: Theme,
 ): Text {
   const details = message.details as
-    | { mode?: string; result?: SubagentResult }
-    | undefined;
+    { mode?: string; result?: SubagentResult } | undefined;
   const isInject = details?.mode === "inject";
   const isError = details?.result?.isError;
   const text = message.content ?? "";
