@@ -113,23 +113,30 @@ export function makeGuardedDate() {
   };
   Guard.parse = Date.parse;
   Guard.UTC = Date.UTC;
-  Guard.prototype = Date.prototype;
+  // Don't set Guard.prototype = Date.prototype — that leaks host constructors
+  // via Date.prototype.constructor → Function. Use a null-prototype object instead.
+  Guard.prototype = Object.create(null);
+  Guard.prototype.constructor = Guard;
   return Guard;
 }
 
 export function makeGuardedMath() {
-  return new Proxy(Math, {
-    get(target, prop, recv) {
-      if (prop === "random") {
-        return () => {
-          throw new Error(
-            "`Math.random()` is non-deterministic and unavailable in workflows. Vary by index instead.",
-          );
-        };
-      }
-      return Reflect.get(target, prop, recv);
-    },
-  });
+  // Copy all Math properties onto a null-prototype object so the constructor
+  // chain doesn't lead back to host Function via Math.constructor → Object → Function.
+  const safe = Object.create(null);
+  for (const key of Object.getOwnPropertyNames(Math)) {
+    if (key === "random") {
+      safe.random = () => {
+        throw new Error(
+          "`Math.random()` is non-deterministic and unavailable in workflows. Vary by index instead.",
+        );
+      };
+    } else {
+      const val = Math[key];
+      safe[key] = typeof val === "function" ? val.bind(Math) : val;
+    }
+  }
+  return safe;
 }
 
 export function workflowStringify(x) {
