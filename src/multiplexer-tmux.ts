@@ -27,6 +27,29 @@ import type { Multiplexer } from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
 
 /**
+ * Optional test/CI isolation for real tmux integration tests.
+ *
+ * tmux's default server/socket is user-global. In CI, and especially when tests
+ * run in parallel or after a failed job, sharing the default socket makes tests
+ * flaky and can leak panes into a developer's normal tmux session. When this env
+ * var is set, every tmux operation is routed through `tmux -L <socket>`.
+ */
+function withTmuxSocket(args: readonly string[]): string[] {
+  const socket = process.env.PI_SUBAGENTURA_TMUX_SOCKET;
+  return socket ? ["-L", socket, ...args] : [...args];
+}
+
+function tmuxCommandPrefix(): string {
+  const socket = process.env.PI_SUBAGENTURA_TMUX_SOCKET;
+  return socket ? `tmux -L ${shellEscape(socket)}` : "tmux";
+}
+
+function settleTmuxSocketPaneForTests(): void {
+  if (!process.env.PI_SUBAGENTURA_TMUX_SOCKET) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+}
+
+/**
  * Extract the session name, window index, and pane index of a tmux pane
  * via `display-message`. Throws if the pane is dead or the id is malformed —
  * callers that want a liveness probe should use `isPaneAlive` instead.
@@ -40,13 +63,13 @@ function getPaneLocation(paneId: string): {
     "tmux",
     "display-message",
     "tmux",
-    [
+    withTmuxSocket([
       "display-message",
       "-p",
       "-t",
       paneId,
       "#{session_name}\t#{window_index}\t#{pane_index}",
-    ],
+    ]),
     { encoding: "utf8", timeout: 5000 },
   ).trim();
   const [session, window, pane] = output.split("\t");
@@ -127,7 +150,7 @@ export class TmuxMultiplexer implements Multiplexer {
         "tmux",
         "new-session",
         "tmux",
-        [
+        withTmuxSocket([
           "new-session",
           "-d",
           "-s",
@@ -137,7 +160,7 @@ export class TmuxMultiplexer implements Multiplexer {
           "-P",
           "-F",
           "#{pane_id}",
-        ],
+        ]),
         { encoding: "utf8", timeout: 10000 },
       ).trim();
       if (!paneId.startsWith("%")) {
@@ -149,15 +172,22 @@ export class TmuxMultiplexer implements Multiplexer {
       try {
         execFileSync(
           "tmux",
-          ["rename-window", "-t", `${sessionName}:0`, windowName],
+          withTmuxSocket([
+            "rename-window",
+            "-t",
+            `${sessionName}:0`,
+            windowName,
+          ]),
           {
             encoding: "utf8",
+            stdio: "ignore",
             timeout: 5000,
           },
         );
       } catch {
         // Cosmetic; don't fail the spawn if rename doesn't take.
       }
+      settleTmuxSocketPaneForTests();
       return { paneId, windowName };
     }
 
@@ -173,7 +203,7 @@ export class TmuxMultiplexer implements Multiplexer {
         "tmux",
         "new-window",
         "tmux",
-        [
+        withTmuxSocket([
           "new-window",
           "-d",
           "-n",
@@ -183,7 +213,7 @@ export class TmuxMultiplexer implements Multiplexer {
           "#{pane_id}",
           "-c",
           opts.cwd,
-        ],
+        ]),
         { encoding: "utf8", timeout: 10000 },
       ).trim();
     } else {
@@ -203,10 +233,16 @@ export class TmuxMultiplexer implements Multiplexer {
       if (parent) {
         args.splice(4, 0, "-t", parent);
       }
-      paneId = execMuxOrThrow("tmux", "split-window", "tmux", args, {
-        encoding: "utf8",
-        timeout: 10000,
-      }).trim();
+      paneId = execMuxOrThrow(
+        "tmux",
+        "split-window",
+        "tmux",
+        withTmuxSocket(args),
+        {
+          encoding: "utf8",
+          timeout: 10000,
+        },
+      ).trim();
     }
     if (!paneId.startsWith("%")) {
       throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
@@ -214,13 +250,18 @@ export class TmuxMultiplexer implements Multiplexer {
     if (!opts.background) {
       // Pane title is cosmetic and the new window already shows `name`.
       try {
-        execFileSync("tmux", ["select-pane", "-t", paneId, "-T", opts.name], {
-          encoding: "utf8",
-        });
+        execFileSync(
+          "tmux",
+          withTmuxSocket(["select-pane", "-t", paneId, "-T", opts.name]),
+          {
+            encoding: "utf8",
+          },
+        );
       } catch {
         // Pane title is cosmetic and can fail on older tmux versions.
       }
     }
+    settleTmuxSocketPaneForTests();
     return { paneId, windowName };
   }
 
@@ -228,7 +269,7 @@ export class TmuxMultiplexer implements Multiplexer {
     try {
       execFileSync(
         "tmux",
-        ["display-message", "-p", "-t", paneId, "#{pane_id}"],
+        withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
         {
           stdio: "ignore",
           timeout: 5000,
@@ -245,7 +286,7 @@ export class TmuxMultiplexer implements Multiplexer {
       "tmux",
       "send-keys",
       "tmux",
-      ["send-keys", "-t", paneId, "-l", text],
+      withTmuxSocket(["send-keys", "-t", paneId, "-l", text]),
       {
         encoding: "utf8",
         timeout: 5000,
@@ -258,7 +299,7 @@ export class TmuxMultiplexer implements Multiplexer {
       "tmux",
       "send-keys Enter",
       "tmux",
-      ["send-keys", "-t", paneId, "Enter"],
+      withTmuxSocket(["send-keys", "-t", paneId, "Enter"]),
       {
         encoding: "utf8",
         timeout: 5000,
@@ -268,7 +309,7 @@ export class TmuxMultiplexer implements Multiplexer {
 
   killPane(paneId: string): void {
     try {
-      execFileSync("tmux", ["kill-pane", "-t", paneId], {
+      execFileSync("tmux", withTmuxSocket(["kill-pane", "-t", paneId]), {
         stdio: "ignore",
         timeout: 5000,
       });
@@ -289,17 +330,19 @@ export class TmuxMultiplexer implements Multiplexer {
       // chaining — the attach errors with "nested sessions" but the
       // select-window still runs.
       const location = getPaneLocation(opts.paneId);
+      const tmux = tmuxCommandPrefix();
       return {
-        attachCommand: `tmux attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
-        focusCommand: `tmux select-window -t ${shellEscape(opts.windowName)}`,
+        attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
+        focusCommand: `${tmux} select-window -t ${shellEscape(opts.windowName)}`,
       };
     }
     // Visible split: attach by pane id inside the parent's window.
     const location = getPaneLocation(opts.paneId);
     const targetWindow = `${location.session}:${location.window}`;
+    const tmux = tmuxCommandPrefix();
     return {
-      attachCommand: `tmux attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(targetWindow)} \\; select-pane -t ${shellEscape(opts.paneId)}`,
-      focusCommand: `tmux select-pane -t ${shellEscape(opts.paneId)}`,
+      attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(targetWindow)} \\; select-pane -t ${shellEscape(opts.paneId)}`,
+      focusCommand: `${tmux} select-pane -t ${shellEscape(opts.paneId)}`,
     };
   }
 }
@@ -319,7 +362,14 @@ export function readPaneExitCode(paneId: string): number | null {
   try {
     const value = execFileSync(
       "tmux",
-      ["show-options", "-p", "-v", "-t", paneId, "@pi-exit-code"],
+      withTmuxSocket([
+        "show-options",
+        "-p",
+        "-v",
+        "-t",
+        paneId,
+        "@pi-exit-code",
+      ]),
       // stderr must be ignored: while the child is still running the
       // option is unset and tmux would otherwise print
       // `invalid option: @pi-exit-code` to the parent's stderr (the
