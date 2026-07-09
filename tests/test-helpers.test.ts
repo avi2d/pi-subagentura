@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { getProviders } from "@earendil-works/pi-ai";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
+  buildLiveUpdate,
   formatTokens,
   formatUsage,
+  extractTextFromContent,
   resolveModel,
   SubagentLiveStatus,
   SubagentResult,
@@ -108,6 +110,84 @@ describe("formatTokens", () => {
   it("should format millions with M", () => {
     expect(formatTokens(1000000)).toBe("1.0M");
     expect(formatTokens(2500000)).toBe("2.5M");
+  });
+});
+
+describe("buildLiveUpdate", () => {
+  it("should return AgentToolResult with content and details", () => {
+    const status: SubagentLiveStatus = {
+      turn: 1,
+      output: "Testing",
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.001,
+        turns: 1,
+      },
+      activeTool: undefined,
+    };
+    const result = buildLiveUpdate(status, "test/model");
+    expect(result).toBeDefined();
+    expect(result.content).toBeDefined();
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(result.content[0]).toEqual({ type: "text", text: "Testing" });
+    expect(result.details).toEqual({
+      status: "running",
+      subagentStatus: status,
+      model: "test/model",
+    });
+  });
+
+  it("should work with no activeTool and no model", () => {
+    const status: SubagentLiveStatus = {
+      turn: 0,
+      output: "",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+      activeTool: undefined,
+    };
+    const result = buildLiveUpdate(status);
+    expect(result).toBeDefined();
+    expect(result.content[0]).toEqual({ type: "text", text: "" });
+    expect(result.details.model).toBeUndefined();
+    expect(result.details.subagentStatus).toBe(status);
+  });
+});
+
+describe("extractTextFromContent", () => {
+  it("should join text parts from array content", () => {
+    const result = extractTextFromContent([
+      { type: "text", text: "Hello" },
+      { type: "text", text: "world" },
+    ]);
+    expect(result).toBe("Hello\nworld");
+  });
+
+  it("should return string content as-is", () => {
+    expect(extractTextFromContent("plain string")).toBe("plain string");
+  });
+
+  it("should filter out non-text items", () => {
+    const result = extractTextFromContent([
+      { type: "text", text: "only text" },
+      { type: "image", source: { url: "..." } },
+      { type: "tool_use", name: "read" },
+    ]);
+    expect(result).toBe("only text");
+  });
+
+  it("should return empty string for null/undefined/numbers", () => {
+    expect(extractTextFromContent(null)).toBe("");
+    expect(extractTextFromContent(undefined)).toBe("");
+    expect(extractTextFromContent(42)).toBe("");
   });
 });
 
@@ -521,6 +601,41 @@ describe("scheduleJobCleanup", () => {
     // Immediate: setTimeout(fn, 0) — advance past it
     await vi.advanceTimersByTimeAsync(1);
     expect(jobRegistry.has(job.id)).toBe(false);
+  });
+
+  it("should remove job after maxAge timer elapses when maxAge is set", () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+
+    scheduleJobCleanup(job.id, false, 10000);
+    expect(jobRegistry.has(job.id)).toBe(true);
+
+    // Advance to just before expiry
+    vi.advanceTimersByTime(9999);
+    expect(jobRegistry.has(job.id)).toBe(true);
+
+    // Cross the expiry boundary
+    vi.advanceTimersByTime(1);
+    expect(jobRegistry.has(job.id)).toBe(false);
+  });
+
+  it("should not set maxAge timer when maxAge is 0 or undefined", () => {
+    vi.useFakeTimers();
+    const job = createMockJobState();
+    jobRegistry.set(job.id, job);
+
+    // maxAge = 0: no timer set
+    scheduleJobCleanup(job.id, false, 0);
+    vi.advanceTimersByTime(100000);
+    expect(jobRegistry.has(job.id)).toBe(true);
+
+    // maxAge = undefined: no timer set
+    const job2 = createMockJobState();
+    jobRegistry.set(job2.id, job2);
+    scheduleJobCleanup(job2.id, false);
+    vi.advanceTimersByTime(100000);
+    expect(jobRegistry.has(job2.id)).toBe(true);
   });
 });
 
