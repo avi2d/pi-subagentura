@@ -477,7 +477,11 @@ describe("saved workflows", () => {
   it("listSavedWorkflows handles unparseable files", () => {
     const dir = mkdtempSync(join(tmpdir(), "wf-list-"));
     // Write a file that's not valid JSON/meta
-    writeFileSync(join(dir, "broken.js"), "this is not a valid workflow", "utf8");
+    writeFileSync(
+      join(dir, "broken.js"),
+      "this is not a valid workflow",
+      "utf8",
+    );
     const list = listSavedWorkflows(dir);
     expect(list).toEqual([{ name: "broken", description: "(unparseable)" }]);
   });
