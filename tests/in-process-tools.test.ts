@@ -1431,7 +1431,7 @@ describe("subagent_with_context async path", () => {
 
     const result = await toolDef.execute(
       "call-1",
-      { task: "summarize", async: true },
+      { task: "summarize", async: true, notifyOnComplete: "inject" },
       undefined,
       undefined,
       ctx,
@@ -1503,10 +1503,9 @@ describe("subagent_with_context async path", () => {
         getSessionId: vi.fn().mockReturnValue("test-session"),
       },
     });
-
     const result = await toolDef.execute(
       "call-1",
-      { task: "test", async: true },
+      { task: "test", async: true, notifyOnComplete: "inject" },
       undefined,
       undefined,
       ctx,
@@ -1542,7 +1541,7 @@ describe("subagent_with_context async path", () => {
 
     await toolDef.execute(
       "call-1",
-      { task: "test", async: true },
+      { task: "test", async: true, notifyOnComplete: "inject" },
       undefined,
       undefined,
       ctx,
@@ -1581,10 +1580,9 @@ describe("subagent_with_context async path", () => {
         getSessionId: vi.fn().mockReturnValue("test-session"),
       },
     });
-
     await toolDef.execute(
       "call-1",
-      { task: "test", async: true },
+      { task: "test", async: true, notifyOnComplete: "inject" },
       undefined,
       undefined,
       ctx,
@@ -1629,7 +1627,7 @@ describe("subagent_with_context async path", () => {
 
     await toolDef.execute(
       "call-1",
-      { task: "test", async: true },
+      { task: "test", async: true, notifyOnComplete: "inject" },
       undefined,
       undefined,
       ctx,

@@ -226,41 +226,38 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         state.lastInjectedEventTs !== last.ts
       ) {
         if (!isLateAutoDoneDuplicate) {
-        const output = readOutput(art);
-        if (output !== null) {
-          if (getInjectCount() >= MAX_INJECT) {
-            // Degrade silently: pointer notification was already delivered above,
-            // so the user still sees a hint. We just don't inject.
-            try {
-              interactivePi.sendMessage!(
-                {
-                  customType: "subagent-notify",
-                  content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
-                  display: true,
-                  details: { subagentId: state.id, mode: "notify" },
-                },
-                state.triggerTurnOnComplete === true
-                  ? { deliverAs: "followUp", triggerTurn: true }
-                  : { deliverAs: "followUp" },
-              );
-            } catch {
-              /* pi stale */
-            }
-          } else {
-            incrementInjectCount();
-            try {
-              (interactivePi as any).sendUserMessage?.(
-                output || "(sub-agent produced no output)",
-                { deliverAs: "followUp" },
-              );
-            } catch {
-              /* pi stale — next poll tick will re-attempt with a refreshed ctx */
-            } finally {
-              decrementInjectCount();
-            }
-          }
-        }
-        }
+          const output = readOutput(art);
+          if (output !== null) {
+            if (getInjectCount() >= MAX_INJECT) {
+              // Degrade silently: pointer notification was already delivered above,
+              // so the user still sees a hint. We just don't inject.
+              try {
+                interactivePi.sendMessage!(
+                  {
+                    customType: "subagent-notify",
+                    content: `Inject cap exceeded for interactive sub-agent ${state.id} — degraded to notify.`,
+                    display: true,
+                    details: { subagentId: state.id, mode: "notify" },
+                  },
+                  state.triggerTurnOnComplete === true
+                    ? { deliverAs: "followUp", triggerTurn: true }
+                    : { deliverAs: "followUp" },
+                );
+              } catch {
+                /* pi stale */
+              }
+            } else {
+              incrementInjectCount();
+              try {
+                (interactivePi as any).sendUserMessage?.(
+                  output || "(sub-agent produced no output)",
+                  { deliverAs: "followUp" },
+                );
+              } catch {
+                /* pi stale — next poll tick will re-attempt with a refreshed ctx */
+              } finally {
+                decrementInjectCount();
+              }
             }
           }
         }
