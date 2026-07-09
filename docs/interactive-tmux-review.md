@@ -8,7 +8,7 @@ keywords:
 
 Review of `src/interactive-tmux.ts` and adjacent mux files (`src/multiplexer-tmux.ts`, `src/multiplexer-zellij.ts`, `src/multiplexer.ts`) conducted via an interactive subagent running on **GLM-5.2** (`opencode-go/glm-5.2`) on 2026-06-18.
 
-The reviewer read all source and test files plus the consumer call sites in `src/subagent.ts`. Output saved to the subagent artifact at `/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-56efad/artifacts/193b1019/output.md`.
+The reviewer read all source and test files plus the consumer call sites in `src/subagent.ts`. Output was saved to a local subagent artifact directory.
 
 ## Summary
 

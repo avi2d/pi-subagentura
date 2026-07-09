@@ -22,9 +22,12 @@ export function parseWorkflow(script) {
 
   let meta;
   try {
-    meta = runInNewContext(`(${metaText})`, {
+    const sandbox = Object.assign(Object.create(null), {
       Date: makeGuardedDate(),
       Math: makeGuardedMath(),
+    });
+    meta = runInNewContext(`(${metaText})`, sandbox, {
+      contextCodeGeneration: { strings: false, wasm: false },
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

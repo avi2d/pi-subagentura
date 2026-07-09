@@ -7,6 +7,8 @@ keywords: [workflow, subagent, ralplan, planner, architect, critic, consensus]
 
 This project ships several `.mjs` workflow scripts that orchestrate isolated sub-agents via the `workflow` tool. Two are **generic converters**; the rest are **concrete instantiations** of consensus planning pipelines.
 
+Workflow scripts are trusted agent-authored JavaScript. The worker VM hides accidental Node globals and disables string code generation, but it is not a security boundary; do not feed arbitrary user-supplied JavaScript to the workflow tool.
+
 ## Inventory
 
 | File                     | Size    | Purpose                                                  |
@@ -128,7 +130,7 @@ This is in `skill-to-workflow.mjs` and `package-to-skill.mjs`. The two hand-craf
 
 ### 2. JSON-stringified payloads for large content
 
-Schema validation breaks on multi-KB string fields. The workflow runtime's `validateSchema` (in `src/workflow.ts`) only handles a small subset: `type`, `enum`, `properties`, `required`, `items`, `minItems`, `maxItems`. Anything >10KB inline is risky. Wrap large structured data in a single string field:
+Schema validation breaks on multi-KB string fields. The workflow runtime's `validateSchema` (in `src/workflow-core.ts`) only handles a small subset: `type`, `enum`, `properties`, `required`, `items`, `minItems`, `maxItems`. Anything >10KB inline is risky. Wrap large structured data in a single string field:
 
 ```js
 // BAD — critic.md at 22KB breaks validation
@@ -184,11 +186,11 @@ This avoided the "JSON-encoding of large file map fails" failure mode in `packag
 
 ### 5. The runtime does not inject Node APIs
 
-The sandbox exposes only: `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `args`, `budget`, `console`. No `fs`, no `path`, no `process`. Calling `mkdirSync` or `readFileSync` in the script body throws `ReferenceError`. All file I/O must happen in sub-agents via tools.
+The sandbox exposes only: `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `args`, `budget`, `console`. No `fs`, no `path`, no `process`. Calling `mkdirSync` or `readFileSync` in the script body throws `ReferenceError`. String code generation is disabled, but this VM is still a determinism aid rather than a security boundary. All file I/O must happen in sub-agents via tools.
 
 ### 6. `additionalProperties` is silently ignored
 
-The `validateSchema` function in `src/workflow.ts:295` does not check `additionalProperties`. If you write a schema like `{ type: "object", required: ["SKILL.md"], additionalProperties: { type: "string" } }`, the agent may produce objects with extra keys, and they won't be validated. Either enumerate all properties explicitly, or use a single string field (see point 2).
+The `validateSchema` function in `src/workflow-core.ts` does not check `additionalProperties`. If you write a schema like `{ type: "object", required: ["SKILL.md"], additionalProperties: { type: "string" } }`, the agent may produce objects with extra keys, and they won't be validated. Either enumerate all properties explicitly, or use a single string field (see point 2).
 
 ## Round-trip: package ↔ skill ↔ workflow
 

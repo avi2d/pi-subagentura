@@ -71,7 +71,7 @@ The package also ships parent-only orchestration guidance for common multi-agent
 ```bash
 pi --orchestrator
 PI_ORCHESTRATOR=1 pi
-pi --append-system-prompt "$(cat /Users/applesucks/dev/pi-agents/skills/orchestrator/SKILL.md)"
+pi --append-system-prompt "$(cat ./skills/orchestrator/SKILL.md)"
 ```
 
 When enabled, the extension appends the orchestrator guidance to the system prompt and shows `🧭 orchestrator` in the footer. It gives the parent agent reasonable default behavior when the user asks for things like:

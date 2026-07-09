@@ -181,7 +181,7 @@ async function executeBody(meta, body, args, depth) {
     remaining: () => budgetRemaining(),
   };
 
-  const sandbox = {
+  const sandbox = Object.assign(Object.create(null), {
     agent,
     parallel,
     pipeline,
@@ -197,7 +197,7 @@ async function executeBody(meta, body, args, depth) {
     },
     Date: makeGuardedDate(),
     Math: makeGuardedMath(),
-  };
+  });
 
   try {
     return await runInNewContext(
@@ -206,6 +206,7 @@ async function executeBody(meta, body, args, depth) {
       {
         filename: "workflow:" + meta.name + ".js",
         timeout: workerConfig.syncTimeoutMs,
+        contextCodeGeneration: { strings: false, wasm: false },
       },
     );
   } catch (err) {

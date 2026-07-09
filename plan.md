@@ -1,7 +1,7 @@
 # Plan — Rehydrate interactive sub-agents on parent reload
 
 Branch: `fix/interactive-reload-visibility`
-Cwd: `/Users/applesucks/dev/pi-workflow-v2-worktrees/interactive-reload-visibility`
+Cwd: `<worktree>`
 Locked: 2026-06-19
 
 ---

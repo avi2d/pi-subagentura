@@ -11,8 +11,7 @@ export const meta = {
   ],
 };
 
-// === ROLE PROMPTS (inlined verbatim from
-//     /Users/applesucks/dev/pi-ralplan/pi/skills/ralplan/prompts/*.md) ===
+// === ROLE PROMPTS (inlined verbatim from the ralplan skill prompts) ===
 
 const PLANNER_PERSONA = `# Planner Role Prompt
 
