@@ -391,7 +391,7 @@ describe("notifyOnComplete", () => {
 
           await toolDef.execute(
             "call-default-inject",
-            { async: true, task: "test", notifyOnComplete: "inject" },
+            { async: true, task: "test" },
             undefined,
             undefined,
             getCtx(),

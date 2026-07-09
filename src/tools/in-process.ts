@@ -215,11 +215,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+            params.notifyOnComplete === "notify" ? "notify" : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete === true,
           notificationDelivered: false,
           maxAge: params.maxAge,
@@ -406,11 +402,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : undefined,
+            params.notifyOnComplete === "notify" ? "notify" : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete === true,
           notificationDelivered: false,
           maxAge: params.maxAge,
