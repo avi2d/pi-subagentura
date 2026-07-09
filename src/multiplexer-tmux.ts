@@ -254,6 +254,7 @@ export class TmuxMultiplexer implements Multiplexer {
           "tmux",
           withTmuxSocket(["select-pane", "-t", paneId, "-T", opts.name]),
           {
+            stdio: "ignore",
             encoding: "utf8",
           },
         );
