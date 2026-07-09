@@ -82,6 +82,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 // ── Imports (after mocks, vitest resolves to mocked modules) ─────────
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { Text } from "@earendil-works/pi-tui";
 import {
   type JobState,
   type SubagentResult,
@@ -1003,5 +1004,640 @@ describe("list_available_models tool", () => {
 
     expect(result.content[0].text).toContain("0 models with auth configured");
     expect(result.details.count).toBe(0);
+  });
+});
+
+// ── Render method tests ─────────────────────────────────────────
+
+const mockTheme = {
+  fg: vi
+    .fn<(...args: string[]) => string>()
+    .mockImplementation((_style: string, text: string) => text),
+  bold: vi
+    .fn<(text: string) => string>()
+    .mockImplementation((text: string) => text),
+};
+
+describe("tool renderCall methods", () => {
+  let api: ReturnType<typeof setupExtension>;
+
+  beforeEach(() => {
+    api = setupExtension();
+  });
+
+  it("subagent_with_context renderCall returns a Text", () => {
+    const t = getToolDef(api, "subagent_with_context");
+    const result = t.renderCall({ task: "hello world" }, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+  });
+
+  it("subagent_isolated renderCall returns a Text", () => {
+    const t = getToolDef(api, "subagent_isolated");
+    const result = t.renderCall({ task: "analyze code" }, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+  });
+
+  it("get_subagent_status renderCall includes jobId", () => {
+    const t = getToolDef(api, "get_subagent_status");
+    const result = t.renderCall({ jobId: "abc123" }, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("accent", "abc123");
+  });
+
+  it("get_subagent_result renderCall includes jobId", () => {
+    const t = getToolDef(api, "get_subagent_result");
+    const result = t.renderCall({ jobId: "def456" }, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("accent", "def456");
+  });
+
+  it("cancel_subagent renderCall includes jobId in error color", () => {
+    const t = getToolDef(api, "cancel_subagent");
+    const result = t.renderCall({ jobId: "xyz789" }, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("error", "xyz789");
+  });
+
+  it("prune_subagent_jobs renderCall returns a Text", () => {
+    const t = getToolDef(api, "prune_subagent_jobs");
+    const result = t.renderCall({}, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+    expect(mockTheme.bold).toHaveBeenCalledWith("prune_subagent_jobs");
+  });
+
+  it("cleanup_subagent_artifacts renderCall returns a Text", () => {
+    const t = getToolDef(api, "cleanup_subagent_artifacts");
+    const result = t.renderCall({}, mockTheme);
+    expect(result).toBeInstanceOf(Text);
+    expect(mockTheme.bold).toHaveBeenCalledWith("cleanup_subagent_artifacts");
+  });
+});
+
+describe("tool renderResult methods", () => {
+  let api: ReturnType<typeof setupExtension>;
+
+  beforeEach(() => {
+    api = setupExtension();
+  });
+
+  const mockOpts = { expanded: false, isPartial: false };
+
+  it("subagent_with_context renderResult returns Text for done result", () => {
+    const t = getToolDef(api, "subagent_with_context");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "complete" }],
+        details: { status: "done" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("subagent_with_context renderResult returns Text for error result", () => {
+    const t = getToolDef(api, "subagent_with_context");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "failed" }],
+        isError: true,
+        details: { status: "error" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("subagent_isolated renderResult returns Text for done result", () => {
+    const t = getToolDef(api, "subagent_isolated");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "analysis complete" }],
+        details: { status: "done" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("get_subagent_status renderResult passes isPartial for running", () => {
+    const t = getToolDef(api, "get_subagent_status");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "working" }],
+        details: { status: "running" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("get_subagent_status renderResult returns Text for done status", () => {
+    const t = getToolDef(api, "get_subagent_status");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "output" }],
+        details: { status: "done" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("get_subagent_result renderResult returns Text for done result", () => {
+    const t = getToolDef(api, "get_subagent_result");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "result" }],
+        details: { status: "done" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+  });
+
+  it("cancel_subagent renderResult shows cancelled icon when cancelled", () => {
+    const t = getToolDef(api, "cancel_subagent");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "Job abc cancelled." }],
+        details: { status: "cancelled", jobId: "abc" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("error", "✕ Job abc cancelled");
+  });
+
+  it("cancel_subagent renderResult shows message when not cancelled", () => {
+    const t = getToolDef(api, "cancel_subagent");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "Job xyz not found." }],
+        details: { status: "not_found", jobId: "xyz" },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("error", "Job xyz not found.");
+  });
+
+  it("prune_subagent_jobs renderResult shows success when jobs removed", () => {
+    const t = getToolDef(api, "prune_subagent_jobs");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "Removed 3 jobs." }],
+        details: { removed: 3 },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith(
+      "success",
+      expect.stringContaining("Pruned"),
+    );
+  });
+
+  it("prune_subagent_jobs renderResult shows dim when no jobs removed", () => {
+    const t = getToolDef(api, "prune_subagent_jobs");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "No completed jobs to prune" }],
+        details: { removed: 0 },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith(
+      "dim",
+      "No completed jobs to prune",
+    );
+  });
+
+  it("cleanup_subagent_artifacts renderResult warns on dry-run with items", () => {
+    const t = getToolDef(api, "cleanup_subagent_artifacts");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: { removed: 2, skipped: 1, errors: [], dryRun: true },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("warning", expect.any(String));
+  });
+
+  it("cleanup_subagent_artifacts renderResult dim on dry-run with nothing", () => {
+    const t = getToolDef(api, "cleanup_subagent_artifacts");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: { removed: 0, skipped: 0, errors: [], dryRun: true },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("dim", expect.any(String));
+  });
+
+  it("cleanup_subagent_artifacts renderResult success on live cleanup with items", () => {
+    const t = getToolDef(api, "cleanup_subagent_artifacts");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: { removed: 3, skipped: 2, errors: [], dryRun: false },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("success", expect.any(String));
+  });
+
+  it("cleanup_subagent_artifacts renderResult dim on live cleanup with nothing", () => {
+    const t = getToolDef(api, "cleanup_subagent_artifacts");
+    const r = t.renderResult(
+      {
+        content: [{ type: "text", text: "" }],
+        details: { removed: 0, skipped: 3, errors: [], dryRun: false },
+      },
+      mockOpts,
+      mockTheme,
+      {},
+    );
+    expect(r).toBeInstanceOf(Text);
+    expect(mockTheme.fg).toHaveBeenCalledWith("dim", expect.any(String));
+  });
+});
+
+// ── prune_subagent_jobs tool ────────────────────────────────────
+
+describe("prune_subagent_jobs tool", () => {
+  let api: ReturnType<typeof setupExtension>;
+  let toolDef: ReturnType<typeof getToolDef>;
+
+  beforeEach(() => {
+    api = setupExtension();
+    toolDef = getToolDef(api, "prune_subagent_jobs");
+  });
+
+  it("returns 0 removed when registry is empty", async () => {
+    const result = await toolDef.execute();
+    expect(result.content[0].text).toContain("Removed 0");
+    expect(result.details.removed).toBe(0);
+  });
+
+  it("returns correct count when done/error jobs exist", async () => {
+    jobRegistry.set("j1", createJobState({ id: "j1", status: "done" }));
+    jobRegistry.set("j2", createJobState({ id: "j2", status: "error" }));
+    jobRegistry.set("j3", createJobState({ id: "j3", status: "running" }));
+
+    const result = await toolDef.execute();
+    expect(result.content[0].text).toContain("Removed 2");
+    expect(result.details.removed).toBe(2);
+    expect(result.details.before).toBe(3);
+    expect(result.details.after).toBe(1);
+  });
+
+  it("preserves running and cancelled jobs, removes done", async () => {
+    jobRegistry.set("r1", createJobState({ id: "r1", status: "running" }));
+    jobRegistry.set("c1", createJobState({ id: "c1", status: "cancelled" }));
+    jobRegistry.set("d1", createJobState({ id: "d1", status: "done" }));
+
+    await toolDef.execute();
+    expect(jobRegistry.has("r1")).toBe(true);
+    expect(jobRegistry.has("c1")).toBe(true);
+    expect(jobRegistry.has("d1")).toBe(false);
+  });
+});
+
+// ── cleanup_subagent_artifacts tool ─────────────────────────────
+
+describe("cleanup_subagent_artifacts tool", () => {
+  let api: ReturnType<typeof setupExtension>;
+  let toolDef: ReturnType<typeof getToolDef>;
+
+  beforeEach(() => {
+    api = setupExtension();
+    toolDef = getToolDef(api, "cleanup_subagent_artifacts");
+  });
+
+  const nonexistentRoot = "/tmp/nonexistent-subagentura-test-dir";
+
+  it("returns 0 removed for dry-run on nonexistent rootDir", async () => {
+    const result = await toolDef.execute("call-1", {
+      ttlMs: 60000,
+      rootDir: nonexistentRoot,
+      dryRun: true,
+    });
+    expect(result.details.removed).toBe(0);
+    expect(result.details.errors).toEqual([]);
+    expect(result.details.dryRun).toBe(true);
+    expect(result.content[0].text).toContain("(dry run)");
+  });
+
+  it("returns 0 removed for non-dry-run on nonexistent rootDir", async () => {
+    const result = await toolDef.execute("call-1", {
+      ttlMs: 60000,
+      rootDir: nonexistentRoot + "-2",
+      dryRun: false,
+    });
+    expect(result.details.removed).toBe(0);
+    expect(result.details.dryRun).toBe(false);
+    expect(result.content[0].text).not.toContain("(dry run)");
+  });
+
+  it("dryRun defaults to true when omitted", async () => {
+    const result = await toolDef.execute("call-1", {
+      ttlMs: 60000,
+      rootDir: nonexistentRoot + "-3",
+    });
+    expect(result.details.dryRun).toBe(true);
+    expect(result.content[0].text).toContain("(dry run)");
+  });
+});
+
+// ── subagent_with_context async path ────────────────────────────
+
+describe("subagent_with_context async path", () => {
+  let api: ReturnType<typeof setupExtension>;
+  let toolDef: ReturnType<typeof getToolDef>;
+
+  beforeEach(() => {
+    api = setupExtension();
+    toolDef = getToolDef(api, "subagent_with_context");
+  });
+
+  it("returns 'No conversation history' when branch empty with async:true", async () => {
+    const ctx = mockCtx();
+    const result = await toolDef.execute(
+      "call-1",
+      { task: "do async", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toBe("No conversation history to inherit.");
+    expect(mockStartSubagentJob).not.toHaveBeenCalled();
+  });
+
+  it("starts async job with serialized context when branch has messages", async () => {
+    const branchMessages = [
+      { type: "message", message: { role: "user", content: "Hello" } },
+      {
+        type: "message",
+        message: { role: "assistant", content: "Hi there" },
+      },
+    ];
+
+    mockConvertToLlm.mockReturnValue([
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: "Hi there" },
+    ]);
+    mockSerializeConversation.mockReturnValue(
+      "User: Hello\nAssistant: Hi there",
+    );
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi.fn().mockReturnValue(branchMessages),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    const result = await toolDef.execute(
+      "call-1",
+      { task: "summarize", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.details.status).toBe("started");
+    expect(result.details.jobId).toBe("default-job");
+    expect(result.details.contextMessages).toBe(2);
+
+    expect(mockConvertToLlm).toHaveBeenCalledWith([
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: "Hi there" },
+    ]);
+    expect(mockSerializeConversation).toHaveBeenCalled();
+
+    expect(mockStartSubagentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task: "summarize",
+        contextText: "User: Hello\nAssistant: Hi there",
+      }),
+    );
+
+    expect(jobRegistry.has("default-job")).toBe(true);
+    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("inject");
+  });
+
+  it("uses notify mode when notifyOnComplete is 'notify'", async () => {
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    await toolDef.execute(
+      "call-1",
+      { task: "test", async: true, notifyOnComplete: "notify" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("notify");
+  });
+
+  it("includes modelWarning in async response when present", async () => {
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      modelWarning: "Model not found, using default",
+    });
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    const result = await toolDef.execute(
+      "call-1",
+      { task: "test", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.content[0].text).toContain("Model not found");
+  });
+
+  it("delivers notification when async job completes successfully", async () => {
+    let resolveJob!: (v: SubagentResult) => void;
+    const deferred = new Promise<SubagentResult>((r) => {
+      resolveJob = r;
+    });
+
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    await toolDef.execute(
+      "call-1",
+      { task: "test", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    resolveJob(defaultSuccessResult);
+    // Flush microtask queue so the .then handler runs
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const job = jobRegistry.get("default-job")!;
+    expect(job.status).toBe("done");
+    expect(mockDeliverNotification).toHaveBeenCalled();
+  });
+
+  it("does not deliver notification when job is cancelled before completion", async () => {
+    let resolveJob!: (v: SubagentResult) => void;
+    const deferred = new Promise<SubagentResult>((r) => {
+      resolveJob = r;
+    });
+
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    await toolDef.execute(
+      "call-1",
+      { task: "test", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    // Cancel the job before the promise resolves
+    const job = jobRegistry.get("default-job")!;
+    job.status = "cancelled";
+
+    resolveJob(defaultSuccessResult);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
+  });
+
+  it("delivers notification on job promise rejection", async () => {
+    let rejectJob!: (err: Error) => void;
+    const deferred = new Promise<SubagentResult>((_, reject) => {
+      rejectJob = reject;
+    });
+    // Suppress unhandled rejection warning
+    deferred.catch(() => {});
+
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+
+    await toolDef.execute(
+      "call-1",
+      { task: "test", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    rejectJob(new Error("LLM crash"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(mockDeliverNotification).toHaveBeenCalled();
   });
 });
