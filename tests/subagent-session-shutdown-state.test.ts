@@ -39,10 +39,12 @@ describe("session_shutdown clean-slate on /new and quit", () => {
     mod.default(api as any);
 
     const shutdownHandlers: Array<(event: any, ctx: any) => void> = [];
+    const startHandlers: Array<(event: any, ctx: any) => void> = [];
     for (const [event, handler] of (api.on as any).mock.calls) {
       if (event === "session_shutdown") shutdownHandlers.push(handler);
+      if (event === "session_start") startHandlers.push(handler);
     }
-    return { api, shutdownHandlers, mod };
+    return { api, shutdownHandlers, startHandlers, mod };
   }
 
   it("session_shutdown with reason='new' deletes the state file", async () => {
@@ -85,6 +87,39 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       },
     );
     expect(loadInteractiveStates(cwd)).not.toBeNull();
+  });
+
+  it("rehydrates interactive subagents after quit and matching startup", async () => {
+    const id = "survives-quit";
+    const sessionId = "session-mine";
+    await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%42",
+      mux: "tmux",
+      artifactDir: join(cwd, id),
+      sessionFile: "/tmp/sess.jsonl",
+      parentSessionId: sessionId,
+    });
+
+    const { shutdownHandlers } = await setupExtension();
+    const shutdownHandler = shutdownHandlers[shutdownHandlers.length - 1];
+    shutdownHandler(
+      { type: "session_shutdown", reason: "quit" },
+      { cwd, sessionManager: { getSessionId: () => sessionId } },
+    );
+
+    expect(interactiveSubagentRegistry.has(id)).toBe(false);
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+
+    const { startHandlers } = await setupExtension();
+    const startHandler = startHandlers[startHandlers.length - 1];
+    startHandler(
+      { type: "session_start", reason: "startup" },
+      { cwd, sessionManager: { getSessionId: () => sessionId } },
+    );
+
+    expect(interactiveSubagentRegistry.has(id)).toBe(true);
   });
 
   it("session_shutdown with reason='reload' KEEPS the state file (rehydrate depends on it)", async () => {
