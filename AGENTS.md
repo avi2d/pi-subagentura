@@ -44,7 +44,7 @@ The pre-commit hook (`simple-git-hooks` → `lint-staged` → `prettier --write`
 | `src/notifications.ts`         | Unified in-process completion delivery and output sanitization.                                                                                                                                                   |
 | `src/rendering.ts`             | TUI rendering helpers: `renderSubagentCall`, `renderSubagentResult`, `renderInteractiveStateSummary`.                                                                                                             |
 | `src/schemas.ts`               | TypeBox schemas for tool parameter validation (`BaseParams`, `InteractiveParams`, etc.).                                                                                                                          |
-| `src/workflow.ts`              | The `workflow` tool (v1, on `feat/workflow-tool` branch — see "Known quirks" below).                                                                                                                              |
+| `src/workflow*.ts`             | Workflow tool/core/worker/job/UI modules. Worker execution is isolated from the parent thread but the VM is not a security boundary.                                                                              |
 | `src/test-utils.ts`            | `importFresh` helper used by tests to reset module-level state (interactive sub-agent registry, mux mock, etc.).                                                                                                  |
 
 ## Code conventions
@@ -85,13 +85,13 @@ Snapshot writers must enforce `MAX_OUTPUT_SNAPSHOT_BYTES` before reading or
 copying child-controlled `output.md`. Oversized staging output records explicit
 `outputError` metadata and must never be loaded synchronously into the parent.
 
-### `extractJson` in `src/workflow.ts` is dependency-free on purpose
+### `extractJson` in `src/workflow-core.ts` is dependency-free on purpose
 
 The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is a hand-rolled ~80-line JSON Schema subset, not a dep. This is intentional: the tool is in-process and must not pull `ajv` or similar into the parent Pi install. Don't replace it with a library without a strong reason.
 
-### The `workflow` tool's determinism story is more limited than the docs imply
+### The `workflow` VM is a determinism aid, not a security boundary
 
-`runInNewContext` is not an escape-proof jail. The `Date.now()` / `Math.random()` / argless `new Date()` guards throw when called directly, but a script that goes out of its way to be non-deterministic can reach the real ones via `eval()` / `new Function()`. The script author is the trusted main agent, so this is acceptable — but the docs and source comments must keep saying so, because the day someone un-trusts the author, the only thing standing between them and a non-deterministic workflow is a one-line `codeGeneration: { strings: false }` we have not added yet.
+`runInNewContext` is not an escape-proof jail. The workflow VM uses null-prototype sandboxes, guarded `Date`/`Math`, and disabled string/wasm code generation to block known accidental escapes (including constructor-chain `Function` calls), but workflow scripts are still trusted agent-authored code. Do not expose workflow execution to arbitrary user-supplied JavaScript without adding real process-level isolation and a security review.
 
 ### Rehydrate state file (`<cwd>/.pi/subagentura-state.json`)
 

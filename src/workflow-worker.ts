@@ -241,18 +241,8 @@ function loadWorkflowRef(nameOrRef: unknown, engine: Engine): string | null {
   if (typeof nameOrRef === "string") {
     return engine.loadWorkflow ? engine.loadWorkflow(nameOrRef) : null;
   }
-  if (
-    nameOrRef &&
-    typeof nameOrRef === "object" &&
-    typeof (nameOrRef as any).scriptPath === "string"
-  ) {
-    const p = (nameOrRef as any).scriptPath as string;
-    if (!existsSync(p))
-      throw new Error(`workflow(): scriptPath not found: ${p}`);
-    return readFileSync(p, "utf8");
-  }
   throw new Error(
-    "workflow(nameOrRef): expected a saved-workflow name or { scriptPath }.",
+    "workflow(nameOrRef): expected a saved-workflow name string.",
   );
 }
 

@@ -19,8 +19,8 @@
 // environment and is out of scope for this skill.
 //
 // Mode is sticky once resolved: DELIBERATE never demotes to SHORT mid-loop.
-// All file I/O is delegated to spawned sub-agents — the script itself has no fs
-// access (vm.runInNewContext sandbox; src/workflow.ts:248-282 in pi-subagentura).
+// All file I/O is delegated to spawned sub-agents — the workflow script itself
+// is not given direct fs helpers.
 
 export const meta = {
   name: "ralplan",

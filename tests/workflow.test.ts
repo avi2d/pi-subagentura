@@ -98,6 +98,14 @@ return 42;`;
     ).toThrow(/pure literal/i);
   });
 
+  it("rejects constructor-chain code generation in meta", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: "f", description: "d", leak: this.constructor.constructor("return process.version")() };\nreturn 1;`,
+      ),
+    ).toThrow(/pure literal|Code generation from strings disallowed/i);
+  });
+
   it("throws when meta is missing", () => {
     expect(() => parseWorkflow(`return 1;`)).toThrow(/export const meta/);
   });
@@ -130,6 +138,18 @@ describe("determinism guards", () => {
   it("does not inject Node globals", async () => {
     const r = await run(`return typeof process + "," + typeof require;`);
     expect(r.result).toBe("undefined,undefined");
+  });
+
+  it("blocks constructor-chain access to host process", async () => {
+    await expect(
+      run(`return this.constructor.constructor("return process.version")();`),
+    ).rejects.toThrow(/Code generation from strings disallowed|process/i);
+  });
+
+  it("blocks constructor-chain Date.now bypass", async () => {
+    await expect(
+      run(`return this.constructor.constructor("return Date.now()")();`),
+    ).rejects.toThrow(/Code generation from strings disallowed|Date\.now/i);
   });
 });
 
@@ -375,6 +395,23 @@ describe("workflow() composition", () => {
         loadWorkflow: () => null,
       }),
     ).rejects.toThrow(/no saved workflow named/);
+  });
+
+  it("rejects object refs instead of reading scriptPath", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-script-path-"));
+    const external = join(dir, "external.js");
+    writeFileSync(
+      external,
+      `export const meta = { name: "external", description: "d" };\nreturn "external";`,
+    );
+
+    await expect(
+      runWorkflow(
+        meta +
+          `return await workflow({ scriptPath: ${JSON.stringify(external)} });`,
+        { runAgent: echoRunner() },
+      ),
+    ).rejects.toThrow(/saved-workflow name/i);
   });
 
   it("rejects nesting beyond one level", async () => {
