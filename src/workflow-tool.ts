@@ -8,6 +8,7 @@ import {
   loadWorkflowScript,
   parseWorkflow,
   saveWorkflowScript,
+  deleteWorkflowScript,
   type WorkflowAgentRunner,
   type WorkflowMeta,
 } from "./workflow-core";
@@ -42,7 +43,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       onProgress,
     }) => {
       // Track last update time per agent label to throttle mid-agent previews
-      const lastUpdateKey = `wf_update_${label ?? ""}`;
+
       let lastUpdateTs = 0;
       const THROTTLE_MS = 2000;
 
@@ -482,6 +483,41 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     },
   });
 
+  // ── delete_workflow ──
+  pi.registerTool({
+    name: "delete_workflow",
+    label: "Delete Workflow",
+    description: "Delete a saved workflow by name.",
+    parameters: Type.Object({
+      name: Type.String({
+        description: "Name of the saved workflow to delete.",
+      }),
+    }),
+    async execute(_id: string, params: any): Promise<any> {
+      try {
+        const existed = deleteWorkflowScript(params.name);
+        return {
+          content: [
+            {
+              type: "text",
+              text: existed
+                ? `Deleted workflow "${params.name}".`
+                : `No saved workflow named "${params.name}".`
+            }
+          ],
+          details: { status: existed ? "deleted" : "not_found", name: params.name },
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Could not delete workflow: ${msg}` }],
+          details: { status: "error", error: msg },
+          isError: true,
+        };
+      }
+    },
+  });
+
   // ── Workflow user commands (guarded) ──
   if (typeof pi.registerCommand === "function") {
     const sendCommandMessage = (text: string) => {
@@ -542,10 +578,14 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     ) => {
       const items = listSavedWorkflows();
       const parsed = parseWorkflowCommandArgs(rawArgs);
+
+      const DELETE_LABEL = "🗑  Delete a workflow…";
+
       const choices = items.map((w) => ({
         name: w.name,
         label: `${w.name} — ${w.description || "(no description)"}`,
       }));
+
       if (items.length === 0) {
         const text =
           "No saved workflows. Use `/workflow <task>` to create one.";
@@ -554,16 +594,47 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         return;
       }
 
+      // If name was provided inline, try run it directly
       let name = parsed.name;
-      if (!name) {
-        const selected = await ctx.ui.select(
-          "Select workflow to run:",
-          choices.map((c) => c.label),
-        );
-        const choice = choices.find((c) => c.label === selected);
-        if (!choice) return;
-        name = choice.name;
+      if (name) {
+        await runNamedWorkflow(name, parsed, ctx);
+        return;
       }
+
+      // Show the picker with delete option
+      const pickerLabels = [
+        ...choices.map((c) => c.label),
+        "──────────────",
+        DELETE_LABEL,
+      ];
+
+      const selected = await ctx.ui.select(
+        "Select workflow:",
+        pickerLabels,
+      );
+      if (!selected) return;
+
+      if (selected === DELETE_LABEL) {
+        // Delete mode: pick a workflow to delete
+        const deleteLabels = choices.map((c) => c.label);
+        const toDelete = await ctx.ui.select(
+          "Select workflow to delete:",
+          deleteLabels,
+        );
+        if (!toDelete) return;
+        const choice = choices.find((c) => c.label === toDelete);
+        if (!choice) return;
+        deleteWorkflowScript(choice.name);
+        const text = `Deleted workflow "${choice.name}".`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+        return;
+      }
+
+      // Run mode
+      const choice = choices.find((c) => c.label === selected);
+      if (!choice) return;
+      name = choice.name;
 
       const known = items.some((w) => w.name === name);
       if (!known) {
@@ -573,6 +644,22 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         return;
       }
 
+      await runNamedWorkflow(name, parsed, ctx);
+    };
+
+    async function runNamedWorkflow(
+      name: string,
+      parsed: { name: string | null; argsJson: string | null },
+      ctx: ExtensionCommandContext,
+    ) {
+      const items = listSavedWorkflows();
+      const known = items.some((w) => w.name === name);
+      if (!known) {
+        const text = `No saved workflow named "${name}".`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+        return;
+      }
       try {
         const argsValue = parsed.argsJson
           ? parseArgsJson(parsed.argsJson)
@@ -594,7 +681,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         ctx.ui.notify(text);
         sendCommandMessage(text);
       }
-    };
+    }
 
     pi.registerCommand("workflow", {
       description:
@@ -648,6 +735,44 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         if (action.kind === "cancel") {
           sendCommandMessage(`Workflow ${action.workflowId} cancelled.`);
         }
+      },
+    });
+
+    pi.registerCommand("delete-workflow", {
+      description: "Delete a saved workflow by name (interactive picker if no name given).",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const items = listSavedWorkflows();
+        if (items.length === 0) {
+          const text = "No saved workflows to delete.";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const choices = items.map((w) => ({
+          name: w.name,
+          label: `${w.name} — ${w.description || "(no description)"}`,
+        }));
+        let name = args.trim();
+        if (!name) {
+          const selected = await ctx.ui.select(
+            "Select workflow to delete:",
+            choices.map((c) => c.label),
+          );
+          const choice = choices.find((c) => c.label === selected);
+          if (!choice) return;
+          name = choice.name;
+        }
+        const known = items.some((w) => w.name === name);
+        if (!known) {
+          const text = `No saved workflow named "${name}".`;
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        deleteWorkflowScript(name);
+        const text = `Deleted workflow "${name}".`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
       },
     });
   }
