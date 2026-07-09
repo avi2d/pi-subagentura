@@ -7,9 +7,9 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: ["src/ndjson.d.ts"],
       thresholds: {
-        statements: 70,
-        branches: 63,
-        functions: 73,
+        statements: 71,
+        branches: 64,
+        functions: 74,
         lines: 72,
       },
     },
