@@ -25,6 +25,7 @@
   },
   "files": [
     "LICENSE",
+    "ORCHESTRATOR_SYSTEM_PROMPT.md",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
