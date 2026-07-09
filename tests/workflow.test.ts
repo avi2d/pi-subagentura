@@ -11,6 +11,7 @@ import {
   sanitizeWorkflowName,
   MAX_WORKFLOW_JOBS,
   startWorkflowJob,
+  deleteWorkflowScript,
   workflowJobRegistry,
   awaitInteractiveResult,
   renderProgress,
@@ -448,6 +449,37 @@ describe("saved workflows", () => {
     expect(() => saveWorkflowScript("ok", `return 1;`, dir)).toThrow(
       /export const meta/,
     );
+  });
+
+  it("deleteWorkflowScript removes a saved workflow", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-del-"));
+    const script = `export const meta = { name: "greet", description: "say hi" };\nreturn "hi";`;
+    saveWorkflowScript("greet", script, dir);
+    expect(loadWorkflowScript("greet", dir)).toBe(script);
+    const result = deleteWorkflowScript("greet", dir);
+    expect(result).toBe(true);
+    expect(loadWorkflowScript("greet", dir)).toBeNull();
+  });
+
+  it("deleteWorkflowScript returns false for missing workflow", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-del-"));
+    const result = deleteWorkflowScript("nonexistent", dir);
+    expect(result).toBe(false);
+  });
+
+  it("deleteWorkflowScript throws on invalid name", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-del-"));
+    expect(() => deleteWorkflowScript("Bad Name", dir)).toThrow(
+      /Invalid workflow name/,
+    );
+  });
+
+  it("listSavedWorkflows handles unparseable files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-list-"));
+    // Write a file that's not valid JSON/meta
+    writeFileSync(join(dir, "broken.js"), "this is not a valid workflow", "utf8");
+    const list = listSavedWorkflows(dir);
+    expect(list).toEqual([{ name: "broken", description: "(unparseable)" }]);
   });
 });
 
