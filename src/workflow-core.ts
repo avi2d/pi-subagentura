@@ -5,6 +5,7 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { SubagentResult, Usage } from "./helpers";
@@ -342,4 +343,19 @@ export function listSavedWorkflows(
     out.push({ name: m[1], description });
   }
   return out;
+}
+
+export function deleteWorkflowScript(
+  name: string,
+  dir = WORKFLOWS_DIR,
+): boolean {
+  const safe = sanitizeWorkflowName(name);
+  const file = join(dir, `${safe}.js`);
+  try {
+    unlinkSync(file);
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return false;
+    throw err;
+  }
 }
