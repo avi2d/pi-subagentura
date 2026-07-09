@@ -24,10 +24,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+
       - name: Type check
         run: npm run typecheck
       - name: Run tests
         run: npm test
+
+      - name: Run tmux integration tests
+        run: npm run test:tmux
+        env:
+          PI_SUBAGENTURA_TMUX_SOCKET: pi-subagentura-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          TERM: xterm-256color
       - name: "Verify published tarball is loadable (regression: v2.0.0 missing helpers.ts)"
         run: npx vitest run published-tarball.test.ts
 
