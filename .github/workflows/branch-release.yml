@@ -23,12 +23,15 @@ jobs:
       - name: Resolve release ref
         id: release_ref
         shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          DEFAULT_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          raw_ref="${{ inputs.ref }}"
+          raw_ref="$INPUT_REF"
           if [ -z "$raw_ref" ]; then
-            raw_ref="$GITHUB_REF_NAME"
+            raw_ref="$DEFAULT_REF"
           fi
 
           safe_ref=$(printf '%s' "$raw_ref" \
@@ -40,9 +43,14 @@ jobs:
             exit 1
           fi
 
-          echo "ref=$raw_ref" >> "$GITHUB_OUTPUT"
-          echo "safe_ref=$safe_ref" >> "$GITHUB_OUTPUT"
-          echo "tag=branch-$safe_ref" >> "$GITHUB_OUTPUT"
+          delimiter="release_ref_${BASHPID}_$(date +%s%N)"
+          {
+            printf 'ref<<%s\n' "$delimiter"
+            printf '%s\n' "$raw_ref"
+            printf '%s\n' "$delimiter"
+            printf 'safe_ref=%s\n' "$safe_ref"
+            printf 'tag=branch-%s\n' "$safe_ref"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v6
@@ -80,13 +88,16 @@ jobs:
       - name: Pack release asset
         id: pack
         shell: bash
+        env:
+          SHORT_SHA: ${{ steps.release_sha.outputs.short_sha }}
+          SAFE_REF: ${{ steps.release_ref.outputs.safe_ref }}
         run: |
           set -euo pipefail
 
           mkdir -p dist
           packed=$(npm pack --pack-destination dist --silent | tail -n 1)
-          short_sha="${{ steps.release_sha.outputs.short_sha }}"
-          asset="pi-subagentura-${{ steps.release_ref.outputs.safe_ref }}-$short_sha.tgz"
+          short_sha="$SHORT_SHA"
+          asset="pi-subagentura-${SAFE_REF}-$short_sha.tgz"
 
           mv "dist/$packed" "dist/$asset"
           (cd dist && shasum -a 256 "$asset" > SHA256SUMS)
@@ -96,49 +107,52 @@ jobs:
 
       - name: Move branch release tag
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_ref.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release_sha.outputs.sha }}
         run: |
           set -euo pipefail
 
-          tag="${{ steps.release_ref.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$tag" "${{ steps.release_sha.outputs.sha }}"
-          git push --force origin "refs/tags/$tag"
+          git tag -f "$RELEASE_TAG" "$RELEASE_SHA"
+          git push --force origin "refs/tags/$RELEASE_TAG"
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_ref.outputs.tag }}
+          RAW_REF: ${{ steps.release_ref.outputs.ref }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHORT_SHA: ${{ steps.pack.outputs.short_sha }}
+          RELEASE_SHA: ${{ steps.release_sha.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
-          tag="${{ steps.release_ref.outputs.tag }}"
-          raw_ref="${{ steps.release_ref.outputs.ref }}"
-          asset="${{ steps.pack.outputs.asset }}"
-          short_sha="${{ steps.pack.outputs.short_sha }}"
           notes=$(mktemp)
 
           cat > "$notes" <<EOF
-          Branch preview for \`$raw_ref\` at \`${{ steps.release_sha.outputs.sha }}\`.
+          Branch preview for \`$RAW_REF\` at \`$RELEASE_SHA\`.
 
           Pi consumes this preview through the git tag, not the attached tarball:
 
           \`\`\`bash
-          pi install git:github.com/$GITHUB_REPOSITORY@$tag
-          pi -e git:github.com/$GITHUB_REPOSITORY@$tag
+          pi install git:github.com/$GITHUB_REPOSITORY@$RELEASE_TAG
+          pi -e git:github.com/$GITHUB_REPOSITORY@$RELEASE_TAG
           \`\`\`
 
           Attached files:
-          - \`$asset\` — output of \`npm pack\` for inspection or manual download
+          - \`$ASSET\` — output of \`npm pack\` for inspection or manual download
           - \`SHA256SUMS\` — checksum for the attached tarball
           EOF
 
-          title="Branch preview: $raw_ref ($short_sha)"
+          title="Branch preview: $RAW_REF ($SHORT_SHA)"
 
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" --title "$title" --notes-file "$notes" --prerelease
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$notes" --prerelease
           else
-            gh release create "$tag" --title "$title" --notes-file "$notes" --prerelease
+            gh release create "$RELEASE_TAG" --title "$title" --notes-file "$notes" --prerelease
           fi
 
-          gh release upload "$tag" "dist/$asset" "dist/SHA256SUMS" --clobber
+          gh release upload "$RELEASE_TAG" "dist/$ASSET" "dist/SHA256SUMS" --clobber
