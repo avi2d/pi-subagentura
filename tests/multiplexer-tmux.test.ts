@@ -270,6 +270,56 @@ describe("multiplexer-tmux", () => {
     expect(rn).toContain("demo");
   });
 
+  it("reuses the detached session and opens later subagents as windows", async () => {
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
+    const calls: string[][] = [];
+    installMockExec((args) => {
+      calls.push(args);
+      if (args[0] === "new-session") return "%42\n";
+      if (args[0] === "new-window") return "%43\n";
+      if (args[0] === "display-message") {
+        return "pi-subagent-abc12345\t1\t0\n";
+      }
+      if (args.includes("-lc")) return ""; // commandExists
+      return "";
+    });
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    const mux = new TmuxMultiplexer();
+    const first = mux.createPane({
+      name: "First",
+      cwd: "/tmp",
+      background: true,
+      id: "abc12345",
+    });
+    const second = mux.createPane({
+      name: "Second",
+      cwd: "/tmp",
+      background: true,
+      id: "def67890",
+    });
+
+    expect(first.windowName).toBe("first");
+    expect(second.windowName).toBe("second");
+    expect(calls.filter((args) => args[0] === "new-session")).toHaveLength(1);
+    const newWindow = calls.find((args) => args[0] === "new-window");
+    expect(newWindow).toBeDefined();
+    expect(newWindow).toContain("-t");
+    expect(newWindow).toContain("pi-subagent-abc12345");
+    expect(newWindow).toContain("second");
+    const commands = mux.buildAttachCommands({
+      paneId: second.paneId,
+      windowName: second.windowName,
+    });
+    expect(commands.attachCommand).toContain(
+      "tmux attach -t 'pi-subagent-abc12345'",
+    );
+    expect(commands.attachCommand).toContain("select-window -t 'second'");
+    expect(commands.focusCommand).toBe("tmux select-window -t 'second'");
+  });
+
   it("createPane relaxed path validates pane id starts with %", async () => {
     delete process.env.TMUX;
     delete process.env.TMUX_PANE;
