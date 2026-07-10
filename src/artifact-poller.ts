@@ -75,14 +75,12 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
     const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
 
     for (const state of interactiveSubagentRegistry.values()) {
-      // Skip strictly-terminal states. "exited" is INTENTIONALLY not in this list: the user-role
-      // revival at processSessionLogEntry can revive an "exited" sub-agent back to "running" if a
-      // follow-up user message lands in the session log (auto-done case). To make that reachable,
-      // the poll loop must keep tail-reading the session log for "exited" sub-agents too. The
-      // status-update block below may re-mark the state as "exited" (based on a stale synthesized
-      // error event in the artifact) but the revival, running later in the same poll via
-      // tailReadSessionLog, will reset it to "running" within this same tick.
-      if (state.status === "cancelled" || state.status === "unknown") continue;
+      // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
+      // the artifact log: a later done/error event must still reach the parent.
+      // 'exited' is INTENTIONALLY not in this list: the user-role revival at processSessionLogEntry
+      // can revive an 'exited' sub-agent back to 'running' if a follow-up user message lands
+      // in the session log (auto-done case).
+      if (state.status === "cancelled") continue;
 
       const art = artifactPath(
         dirname(state.artifactDir),
