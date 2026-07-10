@@ -29,6 +29,8 @@ export interface WorkflowJobState {
   };
   result?: WorkflowRunResult;
   error?: string;
+  /** Set during parent shutdown so late settlement cannot notify a replacement session. */
+  suppressCompletionNotification?: boolean;
 }
 
 const g = typeof global !== "undefined" ? global : globalThis;
@@ -133,7 +135,7 @@ function invokeCompletionHook(
   onComplete: ((job: WorkflowJobState) => void) | undefined,
   job: WorkflowJobState,
 ): void {
-  if (!onComplete) return;
+  if (!onComplete || job.suppressCompletionNotification) return;
   try {
     onComplete(job);
   } catch (err) {

@@ -206,7 +206,7 @@ export function validateSchema(
       }
     }
   }
-  if (matchesType(value, "array") && schema.items) {
+  if (matchesType(value, "array")) {
     const arr = value as unknown[];
     if (typeof schema.minItems === "number" && arr.length < schema.minItems) {
       errs.push(
@@ -218,9 +218,11 @@ export function validateSchema(
         `${path}: expected <= ${schema.maxItems} items, got ${arr.length}`,
       );
     }
-    arr.forEach((el, idx) =>
-      errs.push(...validateSchema(el, schema.items, `${path}[${idx}]`)),
-    );
+    if (schema.items) {
+      arr.forEach((el, idx) =>
+        errs.push(...validateSchema(el, schema.items, `${path}[${idx}]`)),
+      );
+    }
   }
   return errs;
 }

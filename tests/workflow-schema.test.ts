@@ -130,6 +130,17 @@ describe("validateSchema additionalProperties", () => {
   });
 });
 
+describe("validateSchema array cardinality", () => {
+  it("enforces minItems and maxItems without an items schema", () => {
+    expect(validateSchema([], { type: "array", minItems: 1 })).toEqual([
+      "$: expected >= 1 items, got 0",
+    ]);
+    expect(validateSchema([1, 2], { type: "array", maxItems: 1 })).toEqual([
+      "$: expected <= 1 items, got 2",
+    ]);
+  });
+});
+
 describe("workflow schema retries", () => {
   it("retries after an additional property violation", async () => {
     let calls = 0;

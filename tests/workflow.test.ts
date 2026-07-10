@@ -636,6 +636,31 @@ describe("background workflow jobs", () => {
     expect(onComplete).toHaveBeenCalledWith(job);
   });
 
+  it("suppresses a late completion hook after parent shutdown", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const onComplete = vi.fn();
+    const job = startWorkflowJob(
+      "late",
+      `export const meta = { name: "late", description: "d" };\nreturn await agent("x");`,
+      {
+        runAgent: async ({ prompt }) => {
+          await gate;
+          return ok(prompt);
+        },
+      },
+      undefined,
+      onComplete,
+    );
+
+    job.suppressCompletionNotification = true;
+    job.abort.abort();
+    release();
+
+    await expect(job.promise).rejects.toThrow(/aborted/);
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
   it("snapshot reflects in-flight agents before they complete (regression: agent_start emit)", async () => {
     // Pre-fix bug: the only "agent" emit fired AFTER `await runAgent` returned, so the snapshot's
     // agentsSpawned stayed at 0 until every agent finished. Process-isolated agents can take minutes,
@@ -1121,6 +1146,43 @@ describe("registerWorkflowTool", () => {
     expect(Object.keys(wf.parameters.properties)).toContain("script");
     expect(Object.keys(wf.parameters.properties)).toContain("name");
     expect(Object.keys(wf.parameters.properties)).toContain("async");
+  });
+
+  it("does not report a completed workflow as cancelled", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const job = startWorkflowJob(
+      "already-done",
+      `export const meta = { name: "already-done", description: "d" };\nreturn "done";`,
+      { runAgent: echoRunner() },
+    );
+    await job.promise;
+
+    const cancel = tools.find((tool) => tool.name === "cancel_workflow")!;
+    const result = await cancel.execute("", { workflowId: job.id });
+
+    expect(result.details).toMatchObject({
+      status: "done",
+      workflowId: job.id,
+      cancelled: false,
+    });
+    expect(result.content[0].text).toContain("already done");
+
+    job.status = "cancelled";
+    const repeated = await cancel.execute("", { workflowId: job.id });
+    expect(repeated.details).toMatchObject({
+      status: "cancelled",
+      workflowId: job.id,
+      cancelled: true,
+    });
+    expect(repeated.content[0].text).toContain("already cancelled");
+    workflowJobRegistry.delete(job.id);
   });
 
   it("save_workflow tool validates the script before persisting", async () => {

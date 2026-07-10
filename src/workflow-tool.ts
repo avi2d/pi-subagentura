@@ -468,11 +468,42 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      if (st.status === "cancelled") {
+        return {
+          content: [
+            { type: "text", text: `Workflow ${st.id} is already cancelled.` },
+          ],
+          details: {
+            status: "cancelled",
+            workflowId: st.id,
+            cancelled: true,
+          },
+        };
+      }
+      if (st.status !== "running") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow ${st.id} is already ${st.status}; nothing was cancelled.`,
+            },
+          ],
+          details: {
+            status: st.status,
+            workflowId: st.id,
+            cancelled: false,
+          },
+        };
+      }
       st.abort.abort();
-      if (st.status === "running") st.status = "cancelled";
+      st.status = "cancelled";
       return {
         content: [{ type: "text", text: `Workflow ${st.id} cancelled.` }],
-        details: { status: "cancelled", workflowId: st.id },
+        details: {
+          status: "cancelled",
+          workflowId: st.id,
+          cancelled: true,
+        },
       };
     },
   });
