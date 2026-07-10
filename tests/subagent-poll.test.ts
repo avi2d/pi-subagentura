@@ -239,33 +239,51 @@ describe("pollArtifactChanges", () => {
     expect(state.status).toBe("cancelled");
   });
 
-  it("skips sub-agents that are strictly terminal (cancelled, unknown)", async () => {
-    // 'cancelled' and 'unknown' are strictly terminal — the poll loop must not re-deliver events
-    // for them and they cannot be revived.
-    // 'exited' is INTENTIONALLY not in this list: the user-role revival at processSessionLogEntry
-    // can revive an 'exited' sub-agent back to 'running' on a follow-up user message. The poll
-    // loop must keep tail-reading the session log for 'exited' sub-agents so the revival is
-    // reachable. (See subagent-auto-done.test.ts for the revival tests.)
-    // 'idle' is between-turns, not terminal — must always be processed for follow-up support.
-    for (const terminal of ["cancelled", "unknown"] as const) {
-      vi.resetModules();
-      const mod =
-        await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      const { state, artifactDir } = makeState();
-      state.status = terminal;
-      mod.interactiveSubagentRegistry.set(state.id, state);
-      const art = artifactPath(join(artifactDir, ".."), state.id);
-      appendEvent(art, { ts: 1, type: "done", status: "done", exitCode: 0 });
+  it("skips cancelled sub-agents but keeps unknown states polling", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState();
+    state.status = "cancelled";
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    appendEvent(art, { ts: 1, type: "done", status: "done", exitCode: 0 });
 
-      const sendMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage } as any);
-      expect(
-        sendMessage,
-        `status=${terminal} should be skipped`,
-      ).not.toHaveBeenCalled();
-      // Reset for next iteration.
-      mod.interactiveSubagentRegistry.delete(state.id);
-    }
+    const sendMessage = vi.fn();
+    mod.pollArtifactChanges({ sendMessage } as any);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("retries an unknown pane and notifies when done arrives later", async () => {
+    vi.resetModules();
+    let paneProbeCount = 0;
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (_file: string, args: string[]) => {
+        if (args[0] === "display-message") {
+          paneProbeCount++;
+          if (paneProbeCount === 1) {
+            throw new Error("pane not ready yet");
+          }
+          return Buffer.from("#99");
+        }
+        return "";
+      },
+    }));
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState();
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    appendEvent(art, { ts: 1, type: "started", status: "running" });
+
+    const sendMessage = vi.fn();
+    mod.pollArtifactChanges({ sendMessage } as any);
+    expect(state.status).toBe("unknown");
+
+    appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    mod.pollArtifactChanges({ sendMessage } as any);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0][0].content).toContain("done");
   });
 
   it("keeps processing 'idle' sub-agents — the follow-up case", async () => {
