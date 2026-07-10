@@ -20,6 +20,7 @@ import {
   type WorkflowProgress,
 } from "../src/workflow";
 import type { SubagentResult } from "../src/helpers";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +116,75 @@ return 42;`;
     expect(() => parseWorkflow(`export const meta = { name: "x" };\n`)).toThrow(
       /description/,
     );
+  });
+  it("ignores fake metadata in comments, templates, and regex literals", () => {
+    const script = [
+      '// export const meta = { name: "fake", description: "fake" };',
+      'const text = `export const meta = { name: "fake-template", description: "fake" }; ${{ nested: { value: 1 } }.nested.value}`;',
+      "const pattern = /export\\s+const\\s+meta\\s*=\\s*\\{/;",
+      'export const meta = { name: "real", description: "real" };',
+      "return [text, pattern.source];",
+    ].join("\n");
+    const { meta, body } = parseWorkflow(script);
+
+    expect(meta.name).toBe("real");
+    expect(body).toContain('export const meta = { name: "fake-template"');
+    expect(body).toContain("/export\\s+const\\s+meta");
+    expect(body).toContain("// export const meta");
+  });
+
+  it("finds the real metadata after a fake metadata string", () => {
+    const script = String.raw`const fake = "export const meta = { name: 'fake', description: 'fake' };";
+export const meta = { name: "real", description: "real" };
+return fake;`;
+    const { meta, body } = parseWorkflow(script);
+
+    expect(meta).toEqual({ name: "real", description: "real" });
+    expect(body).toContain("export const meta");
+  });
+
+  it("transforms actual top-level exports into executable declarations", async () => {
+    const script = `export const helper = 40;
+export default function increment(value) { return value + 2; }
+export const meta = { name: "exports", description: "d" };
+return increment(helper);`;
+    const result = await runWorkflow(script, { runAgent: echoRunner() });
+
+    expect(result.result).toBe(42);
+  });
+
+  it("handles a regex statement after a control-flow condition", async () => {
+    const script = `export default function helper() {
+  if (true) /}/.test("}");
+  return 1;
+}
+export const meta = { name: "regex-control", description: "d" };
+return helper();`;
+    const result = await runWorkflow(script, { runAgent: echoRunner() });
+
+    expect(result.result).toBe(1);
+  });
+
+  it("times out metadata evaluation in a child process", () => {
+    const script =
+      'export const meta = { name: "loop", description: "d", loop: (() => { while (true) {} })() };';
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { parseWorkflow } from ${JSON.stringify(
+          "./src/workflow-script.mjs",
+        )}; parseWorkflow(${JSON.stringify(script)});`,
+      ],
+      { encoding: "utf8", timeout: 2_000 },
+    );
+
+    expect((child.error as NodeJS.ErrnoException | undefined)?.code).not.toBe(
+      "ETIMEDOUT",
+    );
+    expect(child.status).not.toBe(0);
+    expect(`${child.stderr}${child.stdout}`).toMatch(/timed out|pure literal/i);
   });
 });
 
