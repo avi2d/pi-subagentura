@@ -92,6 +92,9 @@ function safeSegment(value: string): string {
 export class TmuxMultiplexer implements Multiplexer {
   readonly name = "tmux" as const;
 
+  /** Shared detached session used when the parent is outside tmux. */
+  private detachedSessionName?: string;
+
   /**
    * True iff the `tmux` binary is on PATH. Does NOT require the parent
    * process to be attached to a tmux server (the relaxed-spawn path in
@@ -106,6 +109,18 @@ export class TmuxMultiplexer implements Multiplexer {
     return commandExists("tmux");
   }
 
+  private hasSession(sessionName: string): boolean {
+    try {
+      execFileSync("tmux", withTmuxSocket(["has-session", "-t", sessionName]), {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Create a pane for the child process. When the parent is in tmux
    * (the common case), behaves as before:
@@ -113,15 +128,14 @@ export class TmuxMultiplexer implements Multiplexer {
    *   - background: false → `split-window -h` from `$TMUX_PANE` (a visible
    *                         side-by-side; the parent keeps focus)
    *
-   * When the parent is NOT in tmux (the new relaxed-spawn path), creates a
-   * brand-new detached session named `pi-subagent-<id>` and puts the
-   * child in its only window. The user attaches via `tmux attach -t
-   * pi-subagent-<id>`. This path is selected by the orchestrator
-   * (`launchInteractiveSubagent`) — it passes a non-empty `id` to the
-   * unique-session path. For backwards compat, callers that don't pass
-   * an id (e.g., the pre-PR-1 `createTmuxPane(name, cwd, { background })`
-   * shape) still get the old behavior, and the relaxed path is only used
-   * when the parent is not in tmux AND background is true.
+   * When the parent is NOT in tmux (the relaxed-spawn path), the first child
+   * creates a detached session named `pi-subagent-<id>`. Later children are
+   * placed in new windows in that same session. The user attaches via
+   * `tmux attach -t <session-name>`. This path is selected by the
+   * orchestrator (`launchInteractiveSubagent`).
+   *
+   * For backwards compatibility, callers that don't pass an id still get a
+   * safe session name derived from the display name.
    *
    * Note: this method intentionally does not check `isAvailable` — the
    * relaxed path must work even when `process.env.TMUX` is unset, as long
@@ -141,51 +155,82 @@ export class TmuxMultiplexer implements Multiplexer {
       );
     }
 
-    // Relaxed path: parent not in tmux. Create a brand-new detached
-    // session so the child has somewhere to live. The user attaches via
-    // `tmux attach -t <session-name>` after the spawn returns.
+    // Relaxed path: the first child creates a detached session; later children
+    // become detached windows in that same session. This keeps plain-terminal
+    // usage organized without changing the in-session behavior below.
     if (!process.env.TMUX) {
-      const sessionName = `pi-subagent-${opts.id ?? safeSegment(opts.name)}`;
-      const paneId = execMuxOrThrow(
-        "tmux",
-        "new-session",
-        "tmux",
-        withTmuxSocket([
-          "new-session",
-          "-d",
-          "-s",
-          sessionName,
-          "-c",
-          opts.cwd,
-          "-P",
-          "-F",
-          "#{pane_id}",
-        ]),
-        { encoding: "utf8", timeout: 10000 },
-      ).trim();
+      let isFirstPane = this.detachedSessionName === undefined;
+      let sessionName =
+        this.detachedSessionName ??
+        `pi-subagent-${opts.id ?? safeSegment(opts.name)}`;
+      if (!isFirstPane && !this.hasSession(sessionName)) {
+        // The last child may have been cancelled, taking the only session
+        // window with it. Recreate the shared session on the next spawn.
+        this.detachedSessionName = undefined;
+        isFirstPane = true;
+      }
+      const windowName = opts.windowName ?? safeSegment(opts.name);
+      const paneId = isFirstPane
+        ? execMuxOrThrow(
+            "tmux",
+            "new-session",
+            "tmux",
+            withTmuxSocket([
+              "new-session",
+              "-d",
+              "-s",
+              sessionName,
+              "-c",
+              opts.cwd,
+              "-P",
+              "-F",
+              "#{pane_id}",
+            ]),
+            { encoding: "utf8", timeout: 10000 },
+          ).trim()
+        : execMuxOrThrow(
+            "tmux",
+            "new-window",
+            "tmux",
+            withTmuxSocket([
+              "new-window",
+              "-d",
+              "-t",
+              sessionName,
+              "-n",
+              windowName,
+              "-P",
+              "-F",
+              "#{pane_id}",
+              "-c",
+              opts.cwd,
+            ]),
+            { encoding: "utf8", timeout: 10000 },
+          ).trim();
       if (!paneId.startsWith("%")) {
         throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
       }
-      // Rename the default window to the sub-agent's display name so the
-      // user's `tmux ls` output is recognizable.
-      const windowName = opts.windowName ?? safeSegment(opts.name);
-      try {
-        execFileSync(
-          "tmux",
-          withTmuxSocket([
-            "rename-window",
-            "-t",
-            `${sessionName}:0`,
-            windowName,
-          ]),
-          {
-            encoding: "utf8",
-            stdio: "ignore",
-            timeout: 5000,
-          },
-        );
-      } catch {
-        // Cosmetic; don't fail the spawn if rename doesn't take.
+      this.detachedSessionName = sessionName;
+      if (isFirstPane) {
+        // Rename the default window to the sub-agent's display name.
+        try {
+          execFileSync(
+            "tmux",
+            withTmuxSocket([
+              "rename-window",
+              "-t",
+              `${sessionName}:0`,
+              windowName,
+            ]),
+            {
+              encoding: "utf8",
+              stdio: "ignore",
+              timeout: 5000,
+            },
+          );
+        } catch {
+          // Cosmetic; don't fail the spawn if rename doesn't take.
+        }
       }
       settleTmuxSocketPaneForTests();
       return { paneId, windowName };
