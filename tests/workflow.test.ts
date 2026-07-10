@@ -568,6 +568,50 @@ describe("background workflow jobs", () => {
     expect(job.snapshot.agentsSpawned).toBe(1);
   });
 
+  it("calls the completion hook after all agents finish", async () => {
+    const onComplete = vi.fn();
+    const script =
+      `export const meta = { name: "bg-hook", description: "d" };\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "bg-hook",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+
+    await job.promise;
+
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith(job);
+    expect(job.status).toBe("done");
+    expect(job.result?.result).toBe("done");
+  });
+
+  it("calls the completion hook when a workflow fails", async () => {
+    const onComplete = vi.fn();
+    const runAgent: WorkflowAgentRunner = () => {
+      throw new Error("workflow boom");
+    };
+    const script =
+      `export const meta = { name: "bg-error", description: "d" };\n` +
+      `return await agent("fail");`;
+    const job = startWorkflowJob(
+      "bg-error",
+      script,
+      { runAgent },
+      undefined,
+      onComplete,
+    );
+
+    await expect(job.promise).rejects.toThrow("workflow boom");
+
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith(job);
+    expect(job.status).toBe("error");
+  });
+
   it("marks the job cancelled when aborted", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
@@ -576,11 +620,20 @@ describe("background workflow jobs", () => {
       return ok(prompt);
     };
     const script = `export const meta = { name: "bgc", description: "d" };\nreturn await agent("x");`;
-    const job = startWorkflowJob("bgc", script, { runAgent });
+    const onComplete = vi.fn();
+    const job = startWorkflowJob(
+      "bgc",
+      script,
+      { runAgent },
+      undefined,
+      onComplete,
+    );
     job.abort.abort();
     release();
     await expect(job.promise).rejects.toThrow(/aborted/);
     expect(job.status).toBe("cancelled");
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith(job);
   });
 
   it("snapshot reflects in-flight agents before they complete (regression: agent_start emit)", async () => {
@@ -1090,5 +1143,150 @@ describe("registerWorkflowTool", () => {
     );
     expect(result.content[0].text).toContain("Could not save workflow");
     expect(result.isError).toBe(true);
+  });
+  it("notifies the current parent and triggers a turn when a background workflow completes", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const staleSendMessage = vi.fn();
+    const sendMessage = vi.fn();
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage: staleSendMessage,
+    };
+    const currentPi = { sendMessage };
+    const g = globalThis as any;
+    const previousPi = g.__piSubagenturaPiRef;
+    g.__piSubagenturaPiRef = currentPi;
+    registerWorkflowTool(pi as any);
+    try {
+      const workflow = tools.find((tool) => tool.name === "workflow")!;
+      const started = await workflow.execute(
+        "call-id",
+        {
+          script:
+            'export const meta = { name: "notify", description: "d" };\n' +
+            'return "final result";',
+          async: true,
+        },
+        undefined,
+        vi.fn(),
+        { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+      );
+      const job = workflowJobRegistry.get(started.details.workflowId)!;
+
+      await job.promise;
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          customType: "workflow-notify",
+          content: expect.stringContaining(
+            `Call get_workflow_result with workflowId "${job.id}"`,
+          ),
+        }),
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      expect(staleSendMessage).not.toHaveBeenCalled();
+      expect(sendMessage.mock.calls[0][0].content).not.toContain(
+        "final result",
+      );
+      workflowJobRegistry.delete(job.id);
+    } finally {
+      g.__piSubagenturaPiRef = previousPi;
+    }
+  });
+
+  it("notifies and triggers a turn when a workflow returns no result", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const sendMessage = vi.fn();
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage,
+    };
+    const g = globalThis as any;
+    const previousPi = g.__piSubagenturaPiRef;
+    g.__piSubagenturaPiRef = pi;
+    registerWorkflowTool(pi as any);
+    try {
+      const workflow = tools.find((tool) => tool.name === "workflow")!;
+      const started = await workflow.execute(
+        "call-id",
+        {
+          script:
+            'export const meta = { name: "empty", description: "d" };\n' +
+            "return;",
+          async: true,
+        },
+        undefined,
+        vi.fn(),
+        { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+      );
+      const job = workflowJobRegistry.get(started.details.workflowId)!;
+
+      await job.promise;
+
+      expect(job.status).toBe("done");
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          customType: "workflow-notify",
+          content: expect.stringContaining(
+            `Call get_workflow_result with workflowId "${job.id}"`,
+          ),
+        }),
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      expect(sendMessage.mock.calls[0][0].content).not.toContain(
+        "workflow returned no result",
+      );
+      workflowJobRegistry.delete(job.id);
+    } finally {
+      g.__piSubagenturaPiRef = previousPi;
+    }
+  });
+
+  it("sanitizes and caps workflow failure notifications", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const sendMessage = vi.fn();
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage,
+    };
+    const g = globalThis as any;
+    const previousPi = g.__piSubagenturaPiRef;
+    g.__piSubagenturaPiRef = pi;
+    registerWorkflowTool(pi as any);
+    try {
+      const workflow = tools.find((tool) => tool.name === "workflow")!;
+      const secret = "sk-" + "a".repeat(30);
+      const started = await workflow.execute(
+        "call-id",
+        {
+          script:
+            'export const meta = { name: "error", description: "d" };\n' +
+            `throw new Error(${JSON.stringify(secret + " ".repeat(30_000))});`,
+          async: true,
+        },
+        undefined,
+        vi.fn(),
+        { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+      );
+      const job = workflowJobRegistry.get(started.details.workflowId)!;
+
+      await expect(job.promise).rejects.toThrow();
+
+      const message = sendMessage.mock.calls[0]?.[0].content as string;
+      expect(message).not.toContain(secret);
+      expect(message.length).toBeLessThan(21_000);
+      workflowJobRegistry.delete(job.id);
+    } finally {
+      g.__piSubagenturaPiRef = previousPi;
+    }
   });
 });

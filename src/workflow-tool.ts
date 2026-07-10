@@ -23,6 +23,7 @@ import {
   runWorkflow,
   stringify,
 } from "./workflow-worker";
+import { sanitizeOutput } from "./notifications";
 import { showWorkflowTree } from "./workflow-tree-ui";
 import type {
   ExtensionAPI,
@@ -106,6 +107,48 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       });
       return jobPromise;
     };
+  }
+
+  const MAX_WORKFLOW_NOTIFICATION_CHARS = 20_000;
+  const WORKFLOW_TRUNCATION_MARKER = "\n\n[Content truncated.]";
+
+  function truncateWorkflowNotification(text: string): string {
+    if (text.length <= MAX_WORKFLOW_NOTIFICATION_CHARS) return text;
+    const end =
+      MAX_WORKFLOW_NOTIFICATION_CHARS - WORKFLOW_TRUNCATION_MARKER.length;
+    return text.slice(0, Math.max(0, end)) + WORKFLOW_TRUNCATION_MARKER;
+  }
+
+  function notifyWorkflowCompletion(job: WorkflowJobState): void {
+    const g2 = typeof global !== "undefined" ? global : globalThis;
+    const currentPi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
+    const run = job.result;
+    const icon = job.status === "done" ? "✅" : "❌";
+    const rawSummary = run
+      ? `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens.`
+      : (job.error ?? "Workflow did not produce a result.");
+    const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
+    let content = `${icon} Workflow "${job.name}" (${job.id}) ${job.status} — ${summary}`;
+    if (run) {
+      content += `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
+    }
+    if (!currentPi) return;
+    try {
+      currentPi.sendMessage!(
+        {
+          customType: "workflow-notify",
+          content,
+          display: true,
+          details: { workflowId: job.id, status: job.status },
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    } catch (err) {
+      debugLog("warn", "workflow_completion_notification_failed", {
+        workflowId: job.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   pi.registerTool({
@@ -221,7 +264,13 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         const jobStartedAt = Date.now();
         let job: WorkflowJobState;
         try {
-          job = startWorkflowJob(meta.name, script, baseOpts, jobStartedAt);
+          job = startWorkflowJob(
+            meta.name,
+            script,
+            baseOpts,
+            jobStartedAt,
+            notifyWorkflowCompletion,
+          );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return {
@@ -573,6 +622,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           loadWorkflow: (n: string) => loadWorkflowScript(n),
         },
         Date.now(),
+        notifyWorkflowCompletion,
       );
       return { job, meta };
     };

@@ -52,6 +52,7 @@ export function startWorkflowJob(
   script: string,
   opts: Omit<RunWorkflowOptions, "signal" | "onProgress">,
   startedAt?: number,
+  onComplete?: (job: WorkflowJobState) => void,
 ): WorkflowJobState {
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
     // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
@@ -112,18 +113,35 @@ export function startWorkflowJob(
     .then((r) => {
       if (state.status === "running") state.status = "done";
       state.result = r;
+      invokeCompletionHook(onComplete, state);
       return r;
     })
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       state.status = abort.signal.aborted ? "cancelled" : "error";
       state.error = msg;
+      invokeCompletionHook(onComplete, state);
       throw err;
     });
   // Don't crash the process on an unobserved rejection before get_workflow_result is called.
   state.promise.catch(() => {});
   workflowJobRegistry.set(id, state);
   return state;
+}
+
+function invokeCompletionHook(
+  onComplete: ((job: WorkflowJobState) => void) | undefined,
+  job: WorkflowJobState,
+): void {
+  if (!onComplete) return;
+  try {
+    onComplete(job);
+  } catch (err) {
+    debugLog("warn", "workflow_completion_hook_failed", {
+      workflowId: job.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /** Count running workflow jobs (status === "running"). */
