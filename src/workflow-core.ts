@@ -178,15 +178,32 @@ export function validateSchema(
       errs.push(`${path}: value not in enum`);
     }
   }
-  if (matchesType(value, "object") && schema.properties) {
+  if (matchesType(value, "object")) {
     const obj = value as Record<string, unknown>;
+    const properties =
+      schema.properties &&
+      typeof schema.properties === "object" &&
+      !Array.isArray(schema.properties)
+        ? schema.properties
+        : {};
     if (Array.isArray(schema.required)) {
       for (const r of schema.required) {
-        if (!(r in obj)) errs.push(`${path}.${r}: required property missing`);
+        if (!Object.prototype.hasOwnProperty.call(obj, r)) {
+          errs.push(`${path}.${r}: required property missing`);
+        }
       }
     }
-    for (const [k, sub] of Object.entries(schema.properties)) {
-      if (k in obj) errs.push(...validateSchema(obj[k], sub, `${path}.${k}`));
+    for (const [k, sub] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        errs.push(...validateSchema(obj[k], sub, `${path}.${k}`));
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(obj)) {
+        if (!Object.prototype.hasOwnProperty.call(properties, key)) {
+          errs.push(`${path}.${key}: additional property not allowed`);
+        }
+      }
     }
   }
   if (matchesType(value, "array") && schema.items) {
