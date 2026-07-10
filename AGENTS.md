@@ -93,6 +93,22 @@ The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is
 
 `runInNewContext` is not an escape-proof jail. The workflow VM uses null-prototype sandboxes, guarded `Date`/`Math`, and disabled string/wasm code generation to block known accidental escapes (including constructor-chain `Function` calls), but workflow scripts are still trusted agent-authored code. Do not expose workflow execution to arbitrary user-supplied JavaScript without adding real process-level isolation and a security review.
 
+### Background workflows are parent-session scoped
+
+Background workflow jobs and in-process async sub-agent jobs do **not** survive
+parent session replacement. On every `session_shutdown` reason (`reload`,
+`resume`, `quit`, `new`, and similar), `src/session-handlers.ts` suppresses late
+workflow completion hooks, aborts running workflow workers, and clears
+`workflowJobRegistry`. Suppression must happen **before** abort/clear so a promise
+that settles during shutdown cannot notify the next parent session through the
+global Pi reference.
+
+This intentionally differs from interactive sub-agents: their mux processes and
+artifact-backed state can survive reload/resume/quit and be rehydrated. Do not
+make background workflows survive reload by merely retaining the global
+registry; safe survival requires persisted job state plus rebinding `runAgent`
+and notification delivery to the new parent context.
+
 ### Rehydrate state file (`<cwd>/.pi/subagentura-state.json`)
 
 The interactive sub-agent registry is persisted to a per-(cwd) state file on

@@ -151,6 +151,13 @@ Best for:
 
 When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Async jobs inject their result into the parent conversation by default when they complete, so you usually do not need to poll. Use these tools only when the user asks for status/collection, when a job appears stuck, or when manual follow-up is needed:
 
+Background jobs are scoped to the current parent session. This includes both
+`async: true` sub-agent jobs and jobs started by the `workflow` tool. They are
+cancelled on `/reload`, `/resume`, quit, and `/new`; their in-memory registries
+are not rehydrated into the next parent context. Interactive sub-agents are
+different: their mux panes and artifact-backed registry can survive reloads and
+restarts as described in [Interactive Sub-agent Tools](#interactive-sub-agent-tools).
+
 #### `get_subagent_status`
 
 Poll an async subagent job by jobId. Returns a live preview of the subagent's current turn, active tool, and partial output.
