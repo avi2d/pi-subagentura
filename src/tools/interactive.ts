@@ -33,6 +33,12 @@ import { InteractiveParams } from "../schemas";
 
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
+const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
+
+function formatFollowupPreview(message: string): string {
+  if (message.length <= MAX_FOLLOWUP_PREVIEW_CHARS) return message;
+  return `${message.slice(0, MAX_FOLLOWUP_PREVIEW_CHARS)}… [truncated; ${message.length} chars total]`;
+}
 
 export function findArtifactById(id: string): SubagentArtifact | null {
   // Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
@@ -429,17 +435,24 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      const messagePreview = formatFollowupPreview(params.message);
+      const messageTruncated =
+        params.message.length > MAX_FOLLOWUP_PREVIEW_CHARS;
       return {
         content: [
           {
             type: "text",
-            text: `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.`,
+            text:
+              `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.` +
+              `\n\nMessage sent:\n${messagePreview}`,
           },
         ],
         details: {
           id: params.id,
           paneId: state.paneId,
           messageLength: params.message.length,
+          messagePreview,
+          messageTruncated,
           status: "sent",
         },
       };
