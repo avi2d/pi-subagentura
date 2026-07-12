@@ -1641,3 +1641,170 @@ describe("subagent_with_context async path", () => {
     expect(mockDeliverNotification).toHaveBeenCalled();
   });
 });
+
+describe("async rejection settlement", () => {
+  async function flushPromiseHandlers(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  it("settles rejected subagent_with_context jobs for status and result tools", async () => {
+    let rejectJob!: (error: Error) => void;
+    const deferred = new Promise<SubagentResult>((_, reject) => {
+      rejectJob = reject;
+    });
+    deferred.catch(() => {});
+    mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
+    mockSerializeConversation.mockReturnValue("Hi");
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const api = setupExtension();
+    const ctx = mockCtx({
+      sessionManager: {
+        getBranch: vi
+          .fn()
+          .mockReturnValue([
+            { type: "message", message: { role: "user", content: "Hi" } },
+          ]),
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+      },
+    });
+    const startTool = getToolDef(api, "subagent_with_context");
+    await startTool.execute(
+      "call-1",
+      { task: "test", async: true, notifyOnComplete: "inject" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    rejectJob(new Error("context crash"));
+    await flushPromiseHandlers();
+
+    const job = jobRegistry.get("default-job")!;
+    expect(job.status).toBe("error");
+    expect(job.result).toEqual(
+      expect.objectContaining({
+        isError: true,
+        output: "Sub-agent crashed: context crash",
+        errorMessage: "context crash",
+      }),
+    );
+    expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
+      "default-job",
+      false,
+      undefined,
+    );
+    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      undefined,
+    );
+
+    const status = await getToolDef(api, "get_subagent_status").execute(
+      "status-call",
+      { jobId: "default-job" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(status.details.status).toBe("error");
+    expect(status.isError).toBe(true);
+
+    const result = await getToolDef(api, "get_subagent_result").execute(
+      "result-call",
+      { jobId: "default-job" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toBe("Sub-agent failed: context crash");
+    expect(result.details.status).toBe("error");
+    expect(result.isError).toBe(true);
+  });
+
+  it("settles rejected subagent_isolated jobs as structured errors", async () => {
+    let rejectJob!: (error: Error) => void;
+    const deferred = new Promise<SubagentResult>((_, reject) => {
+      rejectJob = reject;
+    });
+    deferred.catch(() => {});
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const api = setupExtension();
+    const ctx = mockCtx();
+    await getToolDef(api, "subagent_isolated").execute(
+      "call-1",
+      { task: "test", async: true, notifyOnComplete: "notify" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    rejectJob(new Error("isolated crash"));
+    await flushPromiseHandlers();
+
+    const job = jobRegistry.get("default-job")!;
+    expect(job.status).toBe("error");
+    expect(job.result).toEqual(
+      expect.objectContaining({
+        isError: true,
+        output: "Sub-agent crashed: isolated crash",
+        errorMessage: "isolated crash",
+      }),
+    );
+    expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
+      "default-job",
+      false,
+      undefined,
+    );
+    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+
+    const result = await getToolDef(api, "get_subagent_result").execute(
+      "result-call",
+      { jobId: "default-job" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toBe("Sub-agent failed: isolated crash");
+    expect(result.details.status).toBe("error");
+    expect(result.isError).toBe(true);
+  });
+
+  it("keeps a cancelled job cancelled when its promise rejects", async () => {
+    let rejectJob!: (error: Error) => void;
+    const deferred = new Promise<SubagentResult>((_, reject) => {
+      rejectJob = reject;
+    });
+    deferred.catch(() => {});
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobPromise: deferred,
+    });
+
+    const api = setupExtension();
+    const ctx = mockCtx();
+    await getToolDef(api, "subagent_isolated").execute(
+      "call-1",
+      { task: "test", async: true, notifyOnComplete: "inject" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    jobRegistry.get("default-job")!.status = "cancelled";
+
+    rejectJob(new Error("cancelled crash"));
+    await flushPromiseHandlers();
+
+    const job = jobRegistry.get("default-job")!;
+    expect(job.status).toBe("cancelled");
+    expect(job.result).toBeUndefined();
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
+  });
+});
