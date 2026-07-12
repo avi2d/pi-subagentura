@@ -122,6 +122,22 @@ describe("WorkflowTreeComponent", () => {
     expect(done).not.toHaveBeenCalled();
   });
 
+  it("marks resolved workflows with errors as completed with errors", () => {
+    const job = makeJob({
+      status: "done",
+      snapshot: {
+        ...makeJob().snapshot,
+        errorCount: 2,
+      },
+    });
+    workflowJobRegistry.set(job.id, job);
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+
+    expect(component.render(100).join("\n")).toContain(
+      "⚠ demo-flow (wf_test) · [completed with errors]",
+    );
+  });
+
   it("falls back when custom UI is unavailable", async () => {
     const notify = vi.fn();
     const result = await showWorkflowTree({ notify } as any);

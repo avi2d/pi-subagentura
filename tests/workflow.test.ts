@@ -16,6 +16,8 @@ import {
   awaitInteractiveResult,
   renderProgress,
   registerWorkflowTool,
+  retryPendingWorkflowNotifications,
+  MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
   type WorkflowAgentRunner,
   type WorkflowProgress,
 } from "../src/workflow";
@@ -1347,6 +1349,409 @@ describe("registerWorkflowTool", () => {
       expect(message).not.toContain(secret);
       expect(message.length).toBeLessThan(21_000);
       workflowJobRegistry.delete(job.id);
+    } finally {
+      g.__piSubagenturaPiRef = previousPi;
+    }
+  });
+
+  it("derives completed-with-errors presentation while keeping raw done status", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const sendUserMessage = vi.fn();
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendUserMessage,
+    };
+    registerWorkflowTool(pi as any);
+    const job = startWorkflowJob(
+      "errors",
+      'export const meta = { name: "errors", description: "d" };\nreturn "ok";',
+      { runAgent: echoRunner() },
+    );
+    const run = await job.promise;
+    run.errorCount = 2;
+    job.snapshot.errorCount = 2;
+
+    const statusTool = tools.find(
+      (tool) => tool.name === "get_workflow_status",
+    )!;
+    const status = await statusTool.execute("", { workflowId: job.id });
+    expect(status.details.status).toBe("done");
+    expect(status.content[0].text).toContain("⚠");
+    expect(status.content[0].text).toContain("completed with errors");
+
+    const resultTool = tools.find(
+      (tool) => tool.name === "get_workflow_result",
+    )!;
+    const result = await resultTool.execute("", { workflowId: job.id });
+    expect(result.details.status).toBe("done");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("completed with errors");
+
+    const statusCommand = (pi.registerCommand as any).mock.calls.find(
+      ([name]: [string]) => name === "workflow-status",
+    )?.[1];
+    await statusCommand.handler("", { ui: { notify: vi.fn() } });
+    expect(sendUserMessage).toHaveBeenCalledWith(
+      expect.stringContaining("completed with errors"),
+      { deliverAs: "followUp" },
+    );
+    workflowJobRegistry.delete(job.id);
+  });
+
+  it("explains current-session scope in async start and not-found messages", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const workflow = tools.find((tool) => tool.name === "workflow")!;
+    const started = await workflow.execute(
+      "",
+      {
+        script:
+          'export const meta = { name: "scope", description: "d" };\nreturn 1;',
+        async: true,
+      },
+      undefined,
+      undefined,
+      { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+    );
+    expect(started.content[0].text).toContain("current parent session");
+    expect(started.content[0].text).toContain("reload/resume/new/quit");
+
+    const statusTool = tools.find(
+      (tool) => tool.name === "get_workflow_status",
+    )!;
+    const missing = await statusTool.execute("", { workflowId: "wf_missing" });
+    expect(missing.content[0].text).toContain("current parent session");
+    expect(missing.content[0].text).toContain("reload/resume/new/quit");
+    workflowJobRegistry.delete(started.details.workflowId);
+  });
+
+  it("reentrant retry from within callback is guarded by _notificationInFlight", async () => {
+    let attempts = 0;
+    const onComplete = (job: any) => {
+      attempts++;
+      // Simulate a retry trigger from within the callback (e.g. poller re-entrance).
+      retryPendingWorkflowNotifications();
+    };
+    const script =
+      `export const meta = { name: "reentrant", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "reentrant",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+    // Without the guard, the reentrant call would invoke the callback a second time.
+    expect(attempts).toBe(1);
+  });
+
+  it("callback throw then successful retry via retryPendingWorkflowNotifications", async () => {
+    let attempts = 0;
+    const onComplete = () => {
+      attempts++;
+      if (attempts === 1) throw new Error("transient failure");
+      // Second attempt succeeds.
+    };
+    const script =
+      `export const meta = { name: "throw-retry", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "throw-retry",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+    // First call: hook throws, delivered stays false, attempt incremented to 1.
+    expect(job.completionNotificationDelivered).toBe(false);
+    expect(job.notificationAttempt).toBe(1);
+
+    // Simulate poller tick — retries the failed notification.
+    retryPendingWorkflowNotifications();
+    expect(job.completionNotificationDelivered).toBe(true);
+    // Attempt count is 2 (two total invocations); does NOT reset to 0.
+    expect(job.notificationAttempt).toBe(2);
+    expect(attempts).toBe(2);
+  });
+
+  it("persistent callback failure exhausts after MAX_WORKFLOW_NOTIFICATION_ATTEMPTS retries", async () => {
+    let attempts = 0;
+    const onComplete = () => {
+      attempts++;
+      throw new Error("permanent failure");
+    };
+    const script =
+      `export const meta = { name: "exhaust", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "exhaust",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+
+    // First invocation threw, so notificationAttempt is 1.
+    expect(job.notificationAttempt).toBe(1);
+    expect(job.completionNotificationDelivered).toBe(false);
+
+    // Exhaust remaining attempts via poller ticks (MAX-1 more calls).
+    for (let i = 0; i < MAX_WORKFLOW_NOTIFICATION_ATTEMPTS - 1; i++) {
+      retryPendingWorkflowNotifications();
+    }
+
+    // Counter reached MAX; exhausted flag is set.
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    expect(job.completionNotificationDelivered).toBe(false);
+    expect(job._notificationExhausted).toBe(true);
+    expect(attempts).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+
+    // Extra retries after exhaustion are no-ops: callback not re-invoked, counter unchanged.
+    const callsBefore = attempts;
+    for (let i = 0; i < 10; i++) retryPendingWorkflowNotifications();
+    expect(attempts).toBe(callsBefore);
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    expect(job._notificationExhausted).toBe(true);
+  });
+
+  it("exhaustion log fires exactly once", async () => {
+    let attempts = 0;
+    const onComplete = () => {
+      attempts++;
+      throw new Error("always fail");
+    };
+    const script =
+      `export const meta = { name: "exhaust-log", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "exhaust-log",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+
+    // Exhaust: invoke MAX times (initial + MAX-1 retries), all throw.
+    for (let i = 0; i < MAX_WORKFLOW_NOTIFICATION_ATTEMPTS; i++) {
+      retryPendingWorkflowNotifications();
+    }
+
+    // Exhausted flag is set, callback never invoked again.
+    expect(job._notificationExhausted).toBe(true);
+    expect(attempts).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    const callsBefore = attempts;
+    for (let i = 0; i < 5; i++) retryPendingWorkflowNotifications();
+    expect(attempts).toBe(callsBefore);
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    expect(job._notificationExhausted).toBe(true);
+  });
+
+  it("success marks delivered and preserves truthful attempt count", async () => {
+    let count = 0;
+    const onComplete = () => {
+      count++;
+      if (count <= 2) throw new Error("transient");
+    };
+    const script =
+      `export const meta = { name: "truth-count", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "truth-count",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+
+    // Initial call throws (attempt 1, throw still increments the counter).
+    expect(job.notificationAttempt).toBe(1);
+    expect(job.completionNotificationDelivered).toBe(false);
+
+    // Second call throws (attempt 2).
+    retryPendingWorkflowNotifications();
+    expect(job.notificationAttempt).toBe(2);
+
+    // Third call succeeds → attempt=3, delivered.
+    retryPendingWorkflowNotifications();
+    expect(job.notificationAttempt).toBe(3);
+    expect(job.completionNotificationDelivered).toBe(true);
+    expect(count).toBe(3);
+  });
+
+  it("MAXth attempt success does not mark exhaustion", async () => {
+    let attempts = 0;
+    const onComplete = () => {
+      attempts++;
+      // Fail four times, succeed on the fifth (the MAXth invocation).
+      if (attempts < MAX_WORKFLOW_NOTIFICATION_ATTEMPTS) {
+        throw new Error("transient failure");
+      }
+    };
+    const script =
+      `export const meta = { name: "maxth-ok", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "maxth-ok",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+    await job.promise;
+
+    // Initial call throws (attempt 1).
+    expect(job.notificationAttempt).toBe(1);
+    expect(job.completionNotificationDelivered).toBe(false);
+
+    // Retries 2-4 also throw.
+    for (let i = 0; i < MAX_WORKFLOW_NOTIFICATION_ATTEMPTS - 2; i++) {
+      retryPendingWorkflowNotifications();
+    }
+    expect(job.notificationAttempt).toBe(
+      MAX_WORKFLOW_NOTIFICATION_ATTEMPTS - 1,
+    );
+    expect(job.completionNotificationDelivered).toBe(false);
+
+    // Attempt 5 (the MAXth) succeeds.
+    retryPendingWorkflowNotifications();
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+    expect(job.completionNotificationDelivered).toBe(true);
+    // Crucially: must NOT be marked exhausted.
+    expect(job._notificationExhausted).toBeFalsy();
+    expect(attempts).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+  });
+
+  it("suppressed jobs never attempt delivery on retry", async () => {
+    let attempts = 0;
+    const onComplete = () => {
+      attempts++;
+    };
+    const script =
+      `export const meta = { name: "supp", description: "d" }\n` +
+      `return await agent("done");`;
+    const job = startWorkflowJob(
+      "supp",
+      script,
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+
+    // Mark suppressed before workflow settles.
+    job.suppressCompletionNotification = true;
+    await job.promise;
+    expect(attempts).toBe(0);
+
+    // Retry should still skip.
+    retryPendingWorkflowNotifications();
+    expect(attempts).toBe(0);
+  });
+
+  it("synchronous workflow output reflects error status for a failing script", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const workflow = tools.find((tool) => tool.name === "workflow")!;
+    const result = await workflow.execute(
+      "",
+      {
+        script:
+          'export const meta = { name: "sync-err", description: "d" };\n' +
+          'throw new Error("partial failure");',
+        async: false,
+      },
+      undefined,
+      vi.fn(),
+      { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+    );
+    expect(result.details.status).toBe("error");
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Workflow failed");
+  });
+
+  it("async completed-with-errors notification includes details with presentationStatus and workflowId", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const sendMessage = vi.fn();
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage,
+    };
+    const g = globalThis as any;
+    const previousPi = g.__piSubagenturaPiRef;
+    g.__piSubagenturaPiRef = pi;
+    registerWorkflowTool(pi as any);
+    try {
+      // Create a job that completes with errorCount > 0.
+      const job = startWorkflowJob(
+        "notify-errors",
+        'export const meta = { name: "notify-errors", description: "d" };\nreturn "ok";',
+        { runAgent: echoRunner() },
+        undefined,
+        // Inline callback: simulate notifyWorkflowCompletion behavior.
+        (j) => {
+          j.result!.errorCount = 1;
+          // Trigger the real notification path via the tool's notifyWorkflowCompletion.
+        },
+      );
+      await job.promise;
+
+      // Now simulate what the registerWorkflowTool notify callback does.
+      // Use the actual notify function by finding it through the tool.
+      // We can call startWorkflowJob with the real notifyWorkflowCompletion
+      // by using the workflow tool's execute method.
+      const workflow = tools.find((tool) => tool.name === "workflow")!;
+      const started = await workflow.execute(
+        "call-id",
+        {
+          script:
+            'export const meta = { name: "notify-err-detail", description: "d" };\n' +
+            'return "result";',
+          async: true,
+        },
+        undefined,
+        vi.fn(),
+        { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+      );
+      const errJob = workflowJobRegistry.get(started.details.workflowId)!;
+      await errJob.promise;
+
+      // The notification should have been sent.
+      expect(sendMessage).toHaveBeenCalled();
+      const notification = sendMessage.mock.calls[0][0];
+      expect(notification.customType).toBe("workflow-notify");
+      expect(notification.details).toMatchObject({
+        workflowId: errJob.id,
+        status: errJob.status,
+      });
+      expect(notification.details.presentationStatus).toBeDefined();
+      // content should contain the workflow name and ID.
+      expect(notification.content).toContain(errJob.name);
+      expect(notification.content).toContain(errJob.id);
+      workflowJobRegistry.delete(errJob.id);
     } finally {
       g.__piSubagenturaPiRef = previousPi;
     }

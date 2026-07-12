@@ -1,5 +1,9 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { workflowJobRegistry, type WorkflowJobState } from "./workflow-jobs";
+import {
+  getWorkflowCompletionPresentation,
+  workflowJobRegistry,
+  type WorkflowJobState,
+} from "./workflow-jobs";
 
 export type WorkflowTreeAction =
   { kind: "cancel"; workflowId: string } | { kind: "close" };
@@ -187,13 +191,19 @@ function selectableJobs(): WorkflowJobState[] {
 
 function formatWorkflowSummary(job: WorkflowJobState): string {
   const s = job.snapshot;
+  const errorCount = job.result?.errorCount ?? s.errorCount;
+  const presentation = getWorkflowCompletionPresentation(
+    job.status,
+    errorCount,
+  );
+  const statusPrefix = presentation.icon ? `${presentation.icon} ` : "";
   const parts = [
-    `${job.name} (${job.id})`,
-    `[${job.status}]`,
+    `${statusPrefix}${job.name} (${job.id})`,
+    `[${presentation.label}]`,
     `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
     `${s.runningCount ?? 0} running`,
   ];
-  if (s.errorCount > 0) parts.push(`${s.errorCount} errors`);
+  if (errorCount > 0) parts.push(`${errorCount} errors`);
   parts.push(`${s.tokensSpent} tokens`);
   if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
   return parts.join(" · ");

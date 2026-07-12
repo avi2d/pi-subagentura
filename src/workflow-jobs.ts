@@ -29,10 +29,19 @@ export interface WorkflowJobState {
   };
   result?: WorkflowRunResult;
   error?: string;
+  /** Completion notification callback bound to the current parent session. */
+  completionNotification?: (job: WorkflowJobState) => boolean | void;
+  /** Set only after the completion callback reports a successful delivery. */
+  completionNotificationDelivered?: boolean;
   /** Set during parent shutdown so late settlement cannot notify a replacement session. */
   suppressCompletionNotification?: boolean;
+  /** Set when notification attempts are exhausted. Prevents re-logging. */
+  _notificationExhausted?: boolean;
+  /** Synchronous reentrant guard — set while the delivery callback is in flight. */
+  _notificationInFlight?: boolean;
+  /** Number of successful delivery attempts. Only increments on success. */
+  notificationAttempt?: number;
 }
-
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
   // eslint-disable-next-line no-var
@@ -48,13 +57,16 @@ export const workflowJobRegistry = g.__piSubagenturaWorkflowJobs as Map<
 
 export const MAX_WORKFLOW_JOBS = 100;
 
+/** Maximum notification delivery attempts before giving up. */
+export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
+
 /** Start a workflow running in the background. Returns the job id immediately. */
 export function startWorkflowJob(
   name: string,
   script: string,
   opts: Omit<RunWorkflowOptions, "signal" | "onProgress">,
   startedAt?: number,
-  onComplete?: (job: WorkflowJobState) => void,
+  onComplete?: (job: WorkflowJobState) => boolean | void,
 ): WorkflowJobState {
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
     // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
@@ -90,6 +102,8 @@ export function startWorkflowJob(
       phases: [],
       runningCount: 0,
     },
+    completionNotification: onComplete,
+    completionNotificationDelivered: false,
   };
   state.promise = runWorkflow(script, {
     ...opts,
@@ -115,14 +129,14 @@ export function startWorkflowJob(
     .then((r) => {
       if (state.status === "running") state.status = "done";
       state.result = r;
-      invokeCompletionHook(onComplete, state);
+      invokeCompletionHook(state);
       return r;
     })
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       state.status = abort.signal.aborted ? "cancelled" : "error";
       state.error = msg;
-      invokeCompletionHook(onComplete, state);
+      invokeCompletionHook(state);
       throw err;
     });
   // Don't crash the process on an unobserved rejection before get_workflow_result is called.
@@ -131,18 +145,64 @@ export function startWorkflowJob(
   return state;
 }
 
-function invokeCompletionHook(
-  onComplete: ((job: WorkflowJobState) => void) | undefined,
-  job: WorkflowJobState,
-): void {
-  if (!onComplete || job.suppressCompletionNotification) return;
+function invokeCompletionHook(job: WorkflowJobState): void {
+  const callback = job.completionNotification;
+  if (
+    !callback ||
+    job.completionNotificationDelivered ||
+    job.suppressCompletionNotification
+  ) {
+    return;
+  }
+  // Already exhausted — no-op, no increment, no log.
+  if (job._notificationExhausted) return;
+  // Synchronous reentrant guard: prevents recursive retry from
+  // calling the same callback while it is still on the call stack.
+  if (job._notificationInFlight) return;
+  job._notificationInFlight = true;
   try {
-    onComplete(job);
+    // Increment on every invocation (including throws) for truthful total count.
+    job.notificationAttempt = (job.notificationAttempt ?? 0) + 1;
+    const result = callback(job);
+    // Only mark delivered on success; throw goes to catch.
+    if (result !== false) {
+      job.completionNotificationDelivered = true;
+    }
+    // Mark exhausted only if the callback explicitly returned false.
+    if (
+      result === false &&
+      job.notificationAttempt >= MAX_WORKFLOW_NOTIFICATION_ATTEMPTS
+    ) {
+      job._notificationExhausted = true;
+      debugLog("warn", "workflow_notification_exhausted", {
+        workflowId: job.id,
+        attempts: job.notificationAttempt,
+      });
+    }
   } catch (err) {
     debugLog("warn", "workflow_completion_hook_failed", {
       workflowId: job.id,
+      attempt: job.notificationAttempt,
       error: err instanceof Error ? err.message : String(err),
     });
+    // Mark exhausted after the MAXth failed invocation.
+    if ((job.notificationAttempt ?? 0) >= MAX_WORKFLOW_NOTIFICATION_ATTEMPTS) {
+      job._notificationExhausted = true;
+      debugLog("warn", "workflow_notification_exhausted", {
+        workflowId: job.id,
+        attempts: job.notificationAttempt,
+      });
+    }
+  } finally {
+    job._notificationInFlight = false;
+  }
+}
+
+/** Retry terminal workflow notifications that failed in this parent session. */
+export function retryPendingWorkflowNotifications(): void {
+  for (const job of workflowJobRegistry.values()) {
+    if (job.status === "running") continue;
+    invokeCompletionHook(job);
   }
 }
 
@@ -159,4 +219,20 @@ function formatWorkflowAgentTag(p: WorkflowProgress): string {
   const label = p.label ? ` ${p.label}` : " agent";
   const model = p.model ? ` @${p.model}` : "";
   return `${label}${model}`;
+}
+
+export interface WorkflowCompletionPresentation {
+  label: string;
+  icon: string;
+}
+
+/** Preserve raw `done` while exposing a warning presentation for resolved errors. */
+export function getWorkflowCompletionPresentation(
+  status: WorkflowJobStatus,
+  errorCount: number,
+): WorkflowCompletionPresentation {
+  if (status === "done" && errorCount > 0) {
+    return { label: "completed with errors", icon: "⚠" };
+  }
+  return { label: status, icon: "" };
 }

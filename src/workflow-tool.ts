@@ -13,6 +13,7 @@ import {
   type WorkflowMeta,
 } from "./workflow-core";
 import {
+  getWorkflowCompletionPresentation,
   startWorkflowJob,
   workflowJobRegistry,
   type WorkflowJobState,
@@ -29,6 +30,16 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+
+const WORKFLOW_SESSION_SCOPE_MESSAGE =
+  "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
+
+function workflowNotFoundMessage(workflowId: string): string {
+  return (
+    `Workflow ${workflowId} not found in the current parent session. ` +
+    "It may have been created in another session or removed by reload/resume/new/quit."
+  );
+}
 
 export function registerWorkflowTool(pi: ExtensionAPI): void {
   debugLog("info", "workflow_registered", {});
@@ -119,35 +130,46 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     return text.slice(0, Math.max(0, end)) + WORKFLOW_TRUNCATION_MARKER;
   }
 
-  function notifyWorkflowCompletion(job: WorkflowJobState): void {
+  function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
     const g2 = typeof global !== "undefined" ? global : globalThis;
     const currentPi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     const run = job.result;
-    const icon = job.status === "done" ? "✅" : "❌";
+    const errorCount = run?.errorCount ?? job.snapshot.errorCount;
+    const presentation = getWorkflowCompletionPresentation(
+      job.status,
+      errorCount,
+    );
+    const icon = presentation.icon || (job.status === "done" ? "✅" : "❌");
     const rawSummary = run
       ? `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens.`
       : (job.error ?? "Workflow did not produce a result.");
     const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
-    let content = `${icon} Workflow "${job.name}" (${job.id}) ${job.status} — ${summary}`;
+    let content = `${icon} Workflow "${job.name}" (${job.id}) ${presentation.label} — ${summary}`;
     if (run) {
       content += `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
     }
-    if (!currentPi) return;
+    if (!currentPi) return false;
     try {
       currentPi.sendMessage!(
         {
           customType: "workflow-notify",
           content,
           display: true,
-          details: { workflowId: job.id, status: job.status },
+          details: {
+            workflowId: job.id,
+            status: job.status,
+            presentationStatus: presentation.label,
+          },
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
+      return true;
     } catch (err) {
       debugLog("warn", "workflow_completion_notification_failed", {
         workflowId: job.id,
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 
@@ -283,7 +305,9 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: `Workflow "${meta.name}" started in background as ${job.id}. Poll get_workflow_status / get_workflow_result.`,
+              text:
+                `Workflow "${meta.name}" started in background as ${job.id}. ` +
+                `Poll get_workflow_status / get_workflow_result. ${WORKFLOW_SESSION_SCOPE_MESSAGE}`,
             },
           ],
           details: { status: "started", workflowId: job.id, name: meta.name },
@@ -314,13 +338,24 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         });
         const resultText =
           typeof run.result === "string" ? run.result : stringify(run.result);
+        const presentation = getWorkflowCompletionPresentation(
+          "done",
+          run.errorCount,
+        );
+        const completionPrefix = presentation.icon
+          ? `${presentation.icon} `
+          : "";
+        const completionLabel = presentation.icon
+          ? presentation.label
+          : "complete";
         const summary =
-          `Workflow "${run.meta.name}" complete — ${run.agentsSpawned} agent(s), ` +
-          `${run.errorCount} error(s), ${run.tokensSpent} output tokens.`;
+          `${completionPrefix}Workflow "${run.meta.name}" ${completionLabel} — ` +
+          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens.`;
         return {
           content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
           details: {
             status: "done",
+            presentationStatus: presentation.label,
             name: run.meta.name,
             agentsSpawned: run.agentsSpawned,
             errorCount: run.errorCount,
@@ -355,22 +390,28 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       if (!st) {
         return {
           content: [
-            { type: "text", text: `Workflow ${params.workflowId} not found.` },
+            { type: "text", text: workflowNotFoundMessage(params.workflowId) },
           ],
           details: { status: "not_found", workflowId: params.workflowId },
           isError: true,
         };
       }
+      const errorCount = st.result?.errorCount ?? st.snapshot.errorCount;
+      const presentation = getWorkflowCompletionPresentation(
+        st.status,
+        errorCount,
+      );
+      const statusPrefix = presentation.icon ? `${presentation.icon} ` : "";
       return {
         content: [
           {
             type: "text",
             text:
-              `Workflow "${st.name}" [${st.status}] — ${st.snapshot.agentsSpawned} agent(s)` +
+              `${statusPrefix}Workflow "${st.name}" [${presentation.label}] — ${st.snapshot.agentsSpawned} agent(s)` +
               (st.snapshot.runningCount && st.snapshot.runningCount > 0
                 ? `, ${st.snapshot.runningCount} running`
                 : "") +
-              `, ${st.snapshot.errorCount} error(s), ${st.snapshot.tokensSpent} tokens` +
+              `, ${errorCount} error(s), ${st.snapshot.tokensSpent} tokens` +
               (st.snapshot.currentPhase
                 ? `, phase: ${st.snapshot.currentPhase}`
                 : "") +
@@ -379,6 +420,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         ],
         details: {
           status: st.status,
+          presentationStatus: presentation.label,
           workflowId: st.id,
           name: st.name,
           elapsedMs: Date.now() - st.startedAt,
@@ -404,7 +446,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       if (!st) {
         return {
           content: [
-            { type: "text", text: `Workflow ${params.workflowId} not found.` },
+            { type: "text", text: workflowNotFoundMessage(params.workflowId) },
           ],
           details: { status: "not_found", workflowId: params.workflowId },
           isError: true,
@@ -414,17 +456,29 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         const run = await st.promise;
         const resultText =
           typeof run.result === "string" ? run.result : stringify(run.result);
+        const presentation = getWorkflowCompletionPresentation(
+          "done",
+          run.errorCount,
+        );
         return {
           content: [
             {
               type: "text",
-              text:
-                `Workflow "${run.meta.name}" complete — ${run.agentsSpawned} agent(s), ` +
-                `${run.errorCount} error(s), ${run.tokensSpent} tokens.\n\n${resultText}`,
+              text: (() => {
+                const prefix = presentation.icon ? `${presentation.icon} ` : "";
+                const label = presentation.icon
+                  ? presentation.label
+                  : "complete";
+                return (
+                  `${prefix}Workflow "${run.meta.name}" ${label} — ` +
+                  `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} tokens.\n\n${resultText}`
+                );
+              })(),
             },
           ],
           details: {
             status: "done",
+            presentationStatus: presentation.label,
             workflowId: st.id,
             name: run.meta.name,
             agentsSpawned: run.agentsSpawned,
@@ -462,7 +516,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       if (!st) {
         return {
           content: [
-            { type: "text", text: `Workflow ${params.workflowId} not found.` },
+            { type: "text", text: workflowNotFoundMessage(params.workflowId) },
           ],
           details: { status: "not_found", workflowId: params.workflowId },
           isError: true,
@@ -755,7 +809,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         );
         const text =
           `Workflow "${meta.name}" started in background as ${job.id}. ` +
-          "Use `/workflow-status` to inspect running jobs.";
+          `${WORKFLOW_SESSION_SCOPE_MESSAGE} Use /workflow-status to inspect running jobs.`;
         ctx.ui.notify(`Started workflow ${meta.name}.`);
         sendCommandMessage(text);
       } catch (err) {
@@ -929,14 +983,20 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       count++;
       const elapsed = formatElapsed(now - st.startedAt);
       const s = st.snapshot;
+      const errorCount = st.result?.errorCount ?? s.errorCount;
+      const presentation = getWorkflowCompletionPresentation(
+        st.status,
+        errorCount,
+      );
+      const statusPrefix = presentation.icon ? `${presentation.icon} ` : "";
       const parts: string[] = [
-        `**${st.name}** (${st.id}) [${st.status}]`,
+        `**${st.name}** (${st.id}) [${statusPrefix}${presentation.label}]`,
         `${s.agentsSpawned} agent(s)`,
       ];
       if (s.runningCount && s.runningCount > 0) {
         parts.push(`⚡ ${s.runningCount} running`);
       }
-      if (s.errorCount > 0) parts.push(`⚠ ${s.errorCount} error(s)`);
+      if (errorCount > 0) parts.push(`⚠ ${errorCount} error(s)`);
       parts.push(`${s.tokensSpent} tokens`);
       parts.push(elapsed);
       if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
