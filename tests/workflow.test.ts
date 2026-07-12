@@ -1809,4 +1809,48 @@ describe("registerWorkflowTool", () => {
       g.__piSubagenturaPiRef = previousPi;
     }
   });
+
+  it("marks _notificationExhausted after MAX_WORKFLOW_NOTIFICATION_ATTEMPTS callback-return-false retries", async () => {
+    const falseReturns = Array.from(
+      { length: MAX_WORKFLOW_NOTIFICATION_ATTEMPTS },
+      () => false,
+    );
+    let callCount = 0;
+    const onComplete = vi.fn(() => {
+      callCount++;
+      return false;
+    });
+
+    const job = startWorkflowJob(
+      "exhaust-test",
+      'export const meta = { name: "exhaust-test", description: "d" };\nreturn "done";',
+      { runAgent: echoRunner() },
+      undefined,
+      onComplete,
+    );
+
+    await job.promise;
+
+    // First call succeeded, notification delivered = false because callback returned false
+    expect(job.completionNotificationDelivered).toBe(false);
+    expect(job._notificationExhausted).toBeFalsy();
+
+    // Simulate retries by calling retryPendingWorkflowNotifications
+    for (let i = 0; i < MAX_WORKFLOW_NOTIFICATION_ATTEMPTS - 1; i++) {
+      retryPendingWorkflowNotifications();
+    }
+
+    // After MAX attempts total (1 initial + MAX-1 retries), should be exhausted
+    expect(onComplete).toHaveBeenCalledTimes(
+      MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
+    );
+    expect(job._notificationExhausted).toBe(true);
+    expect(job.notificationAttempt).toBe(MAX_WORKFLOW_NOTIFICATION_ATTEMPTS);
+
+    // Further calls should be no-ops (exhausted guard)
+    retryPendingWorkflowNotifications();
+    expect(onComplete).toHaveBeenCalledTimes(
+      MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
+    );
+  });
 });

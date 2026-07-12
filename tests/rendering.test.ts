@@ -869,3 +869,55 @@ describe("formatActivityRow", () => {
     expect(result).toBe("\u25b6 time-travel: future (just now)");
   });
 });
+
+describe("renderSubagentNotify interactive branch", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("renders expanded interactive notification with body only (no header/output)", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "Artifact pointer",
+        details: { event: { type: "done" } },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    expect(result).toBeInstanceOf(MockText);
+    const text = t(result);
+    // Interactive branch: body only, no header, no output
+    expect(text).toBe("Artifact pointer");
+    expect(text).not.toContain("Sub-agent");
+    expect(text).not.toContain("✅");
+    expect(text).not.toContain("❌");
+  });
+
+  it("renders expanded interactive error notification with body only", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "Error artifact pointer",
+        details: { event: { type: "error" } },
+      },
+      { expanded: true },
+      testTheme,
+    );
+    const text = t(result);
+    expect(text).toBe("Error artifact pointer");
+    expect(text).not.toContain("Sub-agent Failed");
+  });
+
+  it("still renders collapsed interactive notification with text", () => {
+    const result = renderSubagentNotify(
+      {
+        content: "Collapsed content",
+        details: { event: { type: "done" } },
+      },
+      { expanded: false },
+      testTheme,
+    );
+    const text = t(result);
+    // Collapsed: uses accent color (no isError), just text
+    expect(text).toBe("Collapsed content");
+  });
+});
