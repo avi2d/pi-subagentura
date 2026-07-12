@@ -104,6 +104,28 @@ describe("send_interactive_subagent_message", () => {
       "Sent follow-up to interactive sub-agent abc12345",
     );
     expect(result.content[0].text).toContain("pane %99");
+    expect(result.content[0].text).toContain("Message sent:\nnow do step 2");
+  });
+
+  it("shows the sent message and trims an oversized preview", async () => {
+    mockGet.mockReturnValue(runningState());
+    mockSendCommandToPane.mockReturnValue(undefined);
+    const message = "a".repeat(600);
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-long", {
+      id: "abc12345",
+      message,
+    });
+
+    const text = result.content[0].text as string;
+    expect(text).toContain("Message sent:");
+    expect(text).toContain("a".repeat(500));
+    expect(text).toContain("… [truncated; 600 chars total]");
+    expect(text).not.toContain(message);
+    expect(result.details).toMatchObject({
+      messagePreview: "a".repeat(500) + "… [truncated; 600 chars total]",
+      messageTruncated: true,
+    });
   });
 
   it("accepts 'idle' sub-agents (the follow-up case — child between turns, REPL open)", async () => {
