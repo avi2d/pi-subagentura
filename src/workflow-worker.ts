@@ -422,9 +422,9 @@ function artifactFor(state: InteractiveSubagentState) {
  * mirroring the in-process path in helpers.ts.
  * Returns zeroUsage() if the file is missing, unparseable, or has no usage data.
  */
-function parseUsageFromSessionFile(sessionFile: string): Usage {
+function parseUsageFromSessionFile(sessionFile: string | undefined): Usage {
   try {
-    if (!existsSync(sessionFile)) return zeroUsage();
+    if (!sessionFile || !existsSync(sessionFile)) return zeroUsage();
     const raw = readFileSync(sessionFile, "utf8");
     const lines = raw.split("\n").filter((l) => l.trim());
     const usage: Usage = { ...zeroUsage() };
