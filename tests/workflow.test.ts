@@ -237,6 +237,52 @@ describe("agent() + budget", () => {
     expect(r.agentsSpawned).toBe(1);
   });
 
+  it("waits for unawaited agent work before completing", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => (started = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const runAgent: WorkflowAgentRunner = async ({ prompt }) => {
+      started();
+      await gate;
+      return ok(prompt);
+    };
+    const completion = runWorkflow(
+      meta + `agent("background"); return "workflow-result";`,
+      { runAgent },
+    );
+    let settled = false;
+    void completion.then(() => (settled = true));
+    await startedPromise;
+    await tick();
+    expect(settled).toBe(false);
+    release();
+    expect((await completion).result).toBe("workflow-result");
+  });
+
+  it("waits for agent work chained from an unawaited call", async () => {
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>(
+      (resolve) => (releaseSecond = resolve),
+    );
+    const runAgent: WorkflowAgentRunner = async ({ prompt }) => {
+      if (prompt === "second") await secondGate;
+      return ok(prompt);
+    };
+    const completion = runWorkflow(
+      meta +
+        `agent("first").then(() => agent("second")); return "workflow-result";`,
+      { runAgent },
+    );
+    let settled = false;
+    void completion.then(() => (settled = true));
+    await tick();
+    await tick();
+    expect(settled).toBe(false);
+    releaseSecond();
+    expect((await completion).result).toBe("workflow-result");
+  });
+
   it("defaults agent isolation to process", async () => {
     let seenIsolation: string | undefined;
     const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
@@ -348,6 +394,13 @@ describe("pipeline()", () => {
       { prev: 20, item: 2, index: 1 },
       { prev: 30, item: 3, index: 2 },
     ]);
+  });
+
+  it("rejects non-function stages instead of filtering them", async () => {
+    const body = `return await pipeline([1], (prev) => prev + 1, null);`;
+    await expect(
+      runWorkflow(meta + body, { runAgent: echoRunner() }),
+    ).rejects.toThrow(/pipeline\(\): stages must be functions/i);
   });
 
   it("drops an item to null when a stage throws", async () => {

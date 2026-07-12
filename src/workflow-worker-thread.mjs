@@ -13,6 +13,7 @@ if (!parentPort) {
 
 let nextRpcId = 1;
 const pending = new Map();
+const outstandingAgentCalls = new Set();
 let aborted = false;
 let workerConfig = {
   syncTimeoutMs: 30_000,
@@ -72,6 +73,9 @@ parentPort.on("message", (msg) => {
 async function executeScript(script, args, depth) {
   const parsed = parseWorkflow(script);
   const result = await executeBody(parsed.meta, parsed.body, args, depth);
+  while (outstandingAgentCalls.size > 0) {
+    await Promise.all([...outstandingAgentCalls]);
+  }
   return { meta: parsed.meta, result };
 }
 
@@ -80,18 +84,26 @@ async function executeBody(meta, body, args, depth) {
     if (aborted) throw new Error("Workflow aborted.");
   }
 
-  async function agent(prompt, opts = {}) {
-    checkAbort();
-    if (typeof prompt !== "string" || prompt.trim() === "") {
-      throw new Error("agent(prompt): prompt must be a non-empty string.");
-    }
-    if (workerConfig.budgetTotal != null && budgetRemaining() <= 0) {
-      throw new Error("Workflow token budget exhausted.");
-    }
-    const res = await rpc("agent", { prompt, opts });
-    tokensSpent +=
-      res && typeof res.tokensDelta === "number" ? res.tokensDelta : 0;
-    return res ? res.value : null;
+  function agent(prompt, opts = {}) {
+    const call = (async () => {
+      checkAbort();
+      if (typeof prompt !== "string" || prompt.trim() === "") {
+        throw new Error("agent(prompt): prompt must be a non-empty string.");
+      }
+      if (workerConfig.budgetTotal != null && budgetRemaining() <= 0) {
+        throw new Error("Workflow token budget exhausted.");
+      }
+      const res = await rpc("agent", { prompt, opts });
+      tokensSpent +=
+        res && typeof res.tokensDelta === "number" ? res.tokensDelta : 0;
+      return res ? res.value : null;
+    })();
+    outstandingAgentCalls.add(call);
+    void call.then(
+      () => outstandingAgentCalls.delete(call),
+      () => outstandingAgentCalls.delete(call),
+    );
+    return call;
   }
 
   async function parallel(thunks) {
@@ -132,7 +144,12 @@ async function executeBody(meta, body, args, depth) {
         `pipeline(): ${items.length} items exceeds the ${workerConfig.maxItemsPerCall} cap.`,
       );
     }
-    const fns = stages.filter((s) => typeof s === "function");
+    for (const stage of stages) {
+      if (typeof stage !== "function") {
+        throw new Error("pipeline(): stages must be functions.");
+      }
+    }
+    const fns = stages;
     return Promise.all(
       items.map(async (item, index) => {
         let acc = item;
