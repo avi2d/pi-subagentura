@@ -10,9 +10,11 @@ import {
   appendEvent,
   appendInteractiveState,
   artifactPath,
+  updateInteractiveState,
 } from "../src/artifact";
 import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import { flushDeliveries } from "../src/delivery";
 import { importFresh } from "./test-utils";
 import { makeTmp, makeState } from "./subagent-rehydrate-helpers";
 
@@ -131,7 +133,7 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(after?.paneId).toBe("%OLD");
   });
 
-  it("resets all runtime cursors on rehydrate", async () => {
+  it("restores persisted v2 cursors on rehydrate", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const state = makeState(cwd, "abc12345");
@@ -147,12 +149,149 @@ describe("rehydrateInteractiveSubagents", () => {
     mod.rehydrateInteractiveSubagents(cwd);
 
     const rehydrated = interactiveSubagentRegistry.get("abc12345")!;
-    expect(rehydrated.lastDeliveredEventTs).toBe(0);
+    expect(rehydrated.eventByteCursor).toBe(0);
+    expect(rehydrated.lastDeliveredEventTs).toBeUndefined();
     expect(rehydrated.lastDeliveredSessionByte).toBe(0);
     expect(rehydrated.lastInjectedEventTs).toBeUndefined();
     expect(rehydrated.lastSnapshotEventTs).toBeUndefined();
     expect(rehydrated.injected).toBeUndefined();
     expect(rehydrated.autoDoneForTurnAt).toBeUndefined();
+  });
+
+  it("requeues unmatched dispatchAttempted delivery after rehydrate", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+      eventByteCursor: 10,
+      sessionByteCursor: 0,
+      pendingDeliveries: [
+        {
+          deliveryId: "retry-me",
+          subagentId: state.id,
+          turnId: "turn",
+          eventId: "event",
+          mode: "inject",
+          triggerTurn: false,
+          status: "done",
+          artifactDir: state.artifactDir,
+          state: "dispatchAttempted",
+        },
+      ],
+      deliveryReceipts: [],
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd, undefined, []);
+    const rehydrated = interactiveSubagentRegistry.get("abc12345")!;
+    expect(rehydrated.pendingDeliveries?.[0].state).toBe("queued");
+    const sendMessage = vi.fn();
+    flushDeliveries({ sendMessage } as any, undefined);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("removes matched dispatchAttempted delivery after rehydrate", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+      eventByteCursor: 10,
+      sessionByteCursor: 0,
+      pendingDeliveries: [
+        {
+          deliveryId: "already-sent",
+          subagentId: state.id,
+          turnId: "turn",
+          eventId: "event",
+          mode: "inject",
+          triggerTurn: true,
+          status: "done",
+          artifactDir: state.artifactDir,
+          state: "dispatchAttempted",
+        },
+      ],
+      deliveryReceipts: [],
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd, undefined, [
+      {
+        type: "custom_message",
+        details: { deliveryIds: ["already-sent"] },
+      },
+    ]);
+    const rehydrated = interactiveSubagentRegistry.get("abc12345")!;
+    expect(rehydrated.pendingDeliveries).toEqual([]);
+    expect(rehydrated.deliveryReceipts).toContain("already-sent");
+    const sendMessage = vi.fn();
+    flushDeliveries({ sendMessage } as any, undefined);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("rehydrates parent process cancellation as terminal without process exit", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+      eventByteCursor: 10,
+      sessionByteCursor: 0,
+      pendingDeliveries: [],
+      deliveryReceipts: [],
+      lifecycle: {
+        parentCancelled: true,
+        completionTurnId: "process-cancel-id",
+        completionOutcome: "cancelled",
+        completionSource: "parent",
+      },
+    });
+
+    const result = mod.rehydrateInteractiveSubagents(cwd);
+
+    expect(interactiveSubagentRegistry.get(state.id)?.status).toBe("cancelled");
+    expect(result.terminal).toBe(1);
+  });
+
+  it("restores completion status from persisted lifecycle without log replay", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+      eventByteCursor: 1_000_000,
+      sessionByteCursor: 0,
+      pendingDeliveries: [],
+      deliveryReceipts: [],
+      lifecycle: {
+        currentTurnId: "turn",
+        completionTurnId: "turn",
+        completionOutcome: "done",
+        completionSource: "agent_settled",
+      },
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd);
+
+    expect(interactiveSubagentRegistry.get(state.id)?.status).toBe("exited");
+    expect(interactiveSubagentRegistry.get(state.id)?.eventByteCursor).toBe(
+      1_000_000,
+    );
   });
 
   it("counts alive vs terminal in the return value", async () => {
@@ -175,6 +314,13 @@ describe("rehydrateInteractiveSubagents", () => {
     const art1 = artifactPath(cwdB, "done1");
     appendEvent(art1, { ts: 1, type: "started", status: "running" });
     appendEvent(art1, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    updateInteractiveState(cwd, "done1", (entry) => {
+      entry.lifecycle = {
+        completionOutcome: "done",
+        completionSource: "explicit",
+        completionExitCode: 0,
+      };
+    });
 
     const result = mod.rehydrateInteractiveSubagents(cwdA);
 

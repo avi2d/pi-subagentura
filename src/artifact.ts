@@ -5,12 +5,10 @@
  * The directory holds three kinds of files:
  *
  *   events.ndjson    — append-only log of lifecycle and tool_activity events
- *   output.md        — latest output the sub-agent produced; atomically rewritten each turn
- *   output-N.md      — per-turn snapshots: written by the parent poller on each new `done` event,
- *                      where N is the count of `done` events in events.ndjson at the time of the snapshot.
- *                      These preserve full turn history so a parent can re-read earlier turns even after
- *                      output.md is overwritten. The poller writes them right after it sees a new done event,
- *                      so by protocol (write output.md before calling done) the snapshot reflects that turn.
+ *   output.md        — mutable staging file for the active child turn; reset at turn start
+ *   outputs/<id>.md  — immutable protocol-v2 snapshots, atomically captured
+ *                      before their completion event is appended
+ *   output-N.md      — legacy numeric snapshots retained for compatibility
  *
  * Files survive parent-agent restarts, so a sub-agent can complete while the
  * parent is down and the parent can catch up by reading the artifact later.
@@ -18,6 +16,11 @@
 
 import {
   appendFileSync,
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  readSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -29,18 +32,91 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import isPathInside from "is-path-inside";
-import ndjson from "ndjson";
 import { debugLog } from "./helpers";
 import type { MuxName } from "./multiplexer";
 
 /** Current schema version for the interactive state file. */
-const CURRENT_STATE_SCHEMA_VERSION = 1;
+export const CURRENT_STATE_SCHEMA_VERSION = 2;
 
 // ── Types ───────────────────────────────────────────────────────────
 
 export type SubagentStatus = "running" | "done" | "error" | "cancelled";
+
+export interface OutputSnapshot {
+  path: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface OutputHistoryEntry {
+  turnId: string;
+  eventId: string;
+  output?: OutputSnapshot;
+}
+
+export type CompletionOutcome = "done" | "error" | "cancelled";
+export type CompletionSource =
+  | "agent_settled"
+  | "agent_end"
+  | "explicit"
+  | "process_exit"
+  | "parent";
+
+export type SubagentEventV2 =
+  | {
+      version: 2;
+      eventId: string;
+      turnId: string;
+      ts: number;
+      type: "turn_started";
+      status: "running";
+      message?: string;
+    }
+  | {
+      version: 2;
+      eventId: string;
+      turnId: string;
+      ts: number;
+      type: "tool_activity";
+      status: "running";
+      phase: "start" | "end";
+      tool?: string;
+      summary?: string;
+      message?: string;
+    }
+  | {
+      version: 2;
+      eventId: string;
+      turnId: string;
+      ts: number;
+      type: "completion";
+      status: "done" | "error" | "cancelled";
+      outcome: CompletionOutcome;
+      source: CompletionSource;
+      output?: OutputSnapshot;
+      exitCode?: number;
+      message?: string;
+      errorMessage?: string;
+      summary?: string;
+    }
+  | {
+      version: 2;
+      eventId: string;
+      turnId: string;
+      ts: number;
+      type: "process_exited";
+      status: "done" | "error" | "cancelled";
+      exitCode: number;
+      message?: string;
+    };
+
+export type CompletionEventV2 = Extract<
+  SubagentEventV2,
+  { type: "completion" }
+>;
 
 export type SubagentEvent =
   | { ts: number; type: "started"; status: "running"; message?: string }
@@ -67,7 +143,23 @@ export type SubagentEvent =
       message?: string;
       exitCode?: number;
     }
-  | { ts: number; type: "cancelled"; status: "cancelled"; message?: string };
+  | { ts: number; type: "cancelled"; status: "cancelled"; message?: string }
+  | SubagentEventV2;
+
+export interface EventRecord {
+  event: SubagentEvent;
+  startOffset: number;
+  endOffset: number;
+  raw: string;
+  legacy: boolean;
+}
+
+export const MAX_EVENT_BATCH_BYTES = 256 * 1024;
+export const MAX_EVENT_ID_LENGTH = 128;
+export const MAX_TURN_ID_LENGTH = 256;
+export const MAX_EVENT_TEXT_LENGTH = 2_000;
+export const MAX_TOOL_NAME_LENGTH = 128;
+export const MAX_OUTPUT_SNAPSHOT_BYTES = 1024 * 1024;
 
 export interface SubagentArtifact {
   id: string;
@@ -99,6 +191,57 @@ export function ensureArtifactDir(art: SubagentArtifact): void {
 export function appendEvent(art: SubagentArtifact, event: SubagentEvent): void {
   ensureArtifactDir(art);
   appendFileSync(art.statusFile, JSON.stringify(event) + "\n", { mode: 0o600 });
+}
+
+export function newEventId(): string {
+  return randomUUID();
+}
+
+const COMPLETION_LOCK_TIMEOUT_MS = 2_000;
+const COMPLETION_LOCK_STALE_MS = 30_000;
+const completionLockWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+function completionLockPath(art: SubagentArtifact, turnId: string): string {
+  const key = createHash("sha256").update(turnId).digest("hex").slice(0, 24);
+  return join(art.dir, `.completion-${key}.lock`);
+}
+
+function withCompletionLock<T>(
+  art: SubagentArtifact,
+  turnId: string,
+  operation: () => T,
+): T {
+  ensureArtifactDir(art);
+  const lockPath = completionLockPath(art, turnId);
+  const deadline = Date.now() + COMPLETION_LOCK_TIMEOUT_MS;
+  while (true) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        if (
+          Date.now() - statSync(lockPath).mtimeMs >
+          COMPLETION_LOCK_STALE_MS
+        ) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring completion lock for ${turnId}`);
+      }
+      Atomics.wait(completionLockWaiter, 0, 0, 10);
+    }
+  }
+  try {
+    return operation();
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -138,6 +281,71 @@ export function snapshotOutput(art: SubagentArtifact, turn: number): void {
   renameSync(tmp, target);
 }
 
+export function snapshotOutputForEvent(
+  art: SubagentArtifact,
+  eventId: string,
+): OutputSnapshot {
+  const outputsDir = join(art.dir, "outputs");
+  mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
+  const target = join(outputsDir, `${eventId}.md`);
+  const content = existsSync(art.outputFile)
+    ? readFileSync(art.outputFile)
+    : Buffer.alloc(0);
+  if (!existsSync(target)) {
+    const tmp = target + ".tmp";
+    writeFileSync(tmp, content, { mode: 0o600 });
+    renameSync(tmp, target);
+  }
+  return {
+    path: target,
+    bytes: content.byteLength,
+    sha256: createHash("sha256").update(content).digest("hex"),
+  };
+}
+
+export function appendCompletionEvent(
+  art: SubagentArtifact,
+  params: {
+    turnId: string;
+    outcome: CompletionOutcome;
+    source: CompletionSource;
+    exitCode?: number;
+    message?: string;
+    errorMessage?: string;
+    eventId?: string;
+    ts?: number;
+  },
+): CompletionEventV2 | null {
+  return withCompletionLock(art, params.turnId, () => {
+    const existing = readEvents(art).find(
+      (event) =>
+        "version" in event &&
+        event.version === 2 &&
+        event.type === "completion" &&
+        event.turnId === params.turnId,
+    );
+    if (existing) return null;
+    const eventId = params.eventId ?? newEventId();
+    const output = snapshotOutputForEvent(art, eventId);
+    const event: CompletionEventV2 = {
+      version: 2,
+      eventId,
+      turnId: params.turnId,
+      ts: params.ts ?? Date.now(),
+      type: "completion",
+      status: params.outcome,
+      outcome: params.outcome,
+      source: params.source,
+      output,
+      ...(params.exitCode === undefined ? {} : { exitCode: params.exitCode }),
+      ...(params.message ? { message: params.message } : {}),
+      ...(params.errorMessage ? { errorMessage: params.errorMessage } : {}),
+    };
+    appendEvent(art, event);
+    return event;
+  });
+}
+
 /**
  * Read a specific turn's snapshot (output-N.md). Returns null if the snapshot doesn't exist.
  */
@@ -175,7 +383,227 @@ export function listOutputTurns(art: SubagentArtifact): number[] {
   return turns;
 }
 
+/** Protocol-v2 completion-to-snapshot mappings in physical event-log order. */
+export function listOutputHistory(art: SubagentArtifact): OutputHistoryEntry[] {
+  return readEvents(art).flatMap((event) => {
+    if (
+      !("version" in event) ||
+      event.version !== 2 ||
+      event.type !== "completion"
+    ) {
+      return [];
+    }
+    return [
+      {
+        turnId: event.turnId,
+        eventId: event.eventId,
+        ...(event.output ? { output: event.output } : {}),
+      },
+    ];
+  });
+}
+
+/** Read a protocol-v2 immutable snapshot through its Pi-derived turn id. */
+export function readOutputForTurnId(
+  art: SubagentArtifact,
+  turnId: string,
+): string | null {
+  const history = listOutputHistory(art).find(
+    (entry) => entry.turnId === turnId,
+  );
+  if (!history?.output) return null;
+  const target = join(art.dir, "outputs", `${history.eventId}.md`);
+  if (
+    history.output.path !== target ||
+    history.output.bytes > MAX_OUTPUT_SNAPSHOT_BYTES ||
+    !existsSync(target)
+  ) {
+    return null;
+  }
+  let fd: number | undefined;
+  try {
+    const realArtifactDir = realpathSync(art.dir);
+    const realTarget = realpathSync(target);
+    if (!isPathInside(realTarget, realArtifactDir)) return null;
+    fd = openSync(realTarget, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size !== history.output.bytes) return null;
+    const content = readFileSync(fd);
+    if (
+      content.byteLength !== history.output.bytes ||
+      createHash("sha256").update(content).digest("hex") !==
+        history.output.sha256.toLowerCase()
+    ) {
+      return null;
+    }
+    return content.toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 // ── Reads ───────────────────────────────────────────────────────────
+
+function boundedEventString(
+  value: unknown,
+  maxLength = MAX_EVENT_TEXT_LENGTH,
+): string | undefined {
+  return typeof value === "string" ? value.slice(0, maxLength) : undefined;
+}
+
+function normalizeEvent(
+  value: unknown,
+  startOffset: number,
+  raw: string,
+): { event: SubagentEvent; legacy: boolean } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.ts !== "number" || !Number.isFinite(obj.ts) || obj.ts < 0) {
+    return null;
+  }
+  const message = boundedEventString(obj.message);
+  const summary = boundedEventString(obj.summary);
+  const tool = boundedEventString(obj.tool, MAX_TOOL_NAME_LENGTH);
+  const exitCode =
+    typeof obj.exitCode === "number" && Number.isSafeInteger(obj.exitCode)
+      ? obj.exitCode
+      : undefined;
+  if (obj.version !== 2) {
+    const base = { ts: obj.ts, message };
+    if (obj.type === "started")
+      return {
+        event: { ...base, type: "started", status: "running" },
+        legacy: true,
+      };
+    if (obj.type === "tool_activity")
+      return {
+        event: {
+          ...base,
+          type: "tool_activity",
+          status: "running",
+          tool,
+          summary,
+        },
+        legacy: true,
+      };
+    if (obj.type === "done")
+      return {
+        event: { ...base, type: "done", status: "done", exitCode, summary },
+        legacy: true,
+      };
+    if (obj.type === "error")
+      return {
+        event: { ...base, type: "error", status: "error", exitCode },
+        legacy: true,
+      };
+    if (obj.type === "cancelled")
+      return {
+        event: { ...base, type: "cancelled", status: "cancelled" },
+        legacy: true,
+      };
+    return null;
+  }
+  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 24);
+  const normalizeId = (
+    candidate: unknown,
+    prefix: "event" | "turn",
+    maxLength: number,
+  ): string =>
+    typeof candidate === "string" &&
+    candidate.length > 0 &&
+    candidate.length <= maxLength &&
+    /^[A-Za-z0-9._:-]+$/.test(candidate)
+      ? candidate
+      : `invalid-${prefix}-${startOffset}-${hash}`;
+  const eventId = normalizeId(obj.eventId, "event", MAX_EVENT_ID_LENGTH);
+  const turnId = normalizeId(obj.turnId, "turn", MAX_TURN_ID_LENGTH);
+  const base = { version: 2 as const, eventId, turnId, ts: obj.ts };
+  if (obj.type === "turn_started")
+    return {
+      event: { ...base, type: "turn_started", status: "running", message },
+      legacy: false,
+    };
+  if (
+    obj.type === "tool_activity" &&
+    (obj.phase === "start" || obj.phase === "end")
+  )
+    return {
+      event: {
+        ...base,
+        type: "tool_activity",
+        status: "running",
+        phase: obj.phase,
+        tool,
+        summary,
+        message,
+      },
+      legacy: false,
+    };
+  if (
+    obj.type === "completion" &&
+    (obj.outcome === "done" ||
+      obj.outcome === "error" ||
+      obj.outcome === "cancelled") &&
+    (obj.source === "agent_settled" ||
+      obj.source === "agent_end" ||
+      obj.source === "explicit" ||
+      obj.source === "process_exit" ||
+      obj.source === "parent")
+  ) {
+    const rawOutput = obj.output as Record<string, unknown> | undefined;
+    const output =
+      rawOutput &&
+      typeof rawOutput === "object" &&
+      typeof rawOutput.path === "string" &&
+      rawOutput.path.length <= 4096 &&
+      typeof rawOutput.bytes === "number" &&
+      Number.isSafeInteger(rawOutput.bytes) &&
+      rawOutput.bytes >= 0 &&
+      typeof rawOutput.sha256 === "string" &&
+      /^[a-f0-9]{64}$/i.test(rawOutput.sha256)
+        ? {
+            path: rawOutput.path,
+            bytes: rawOutput.bytes,
+            sha256: rawOutput.sha256,
+          }
+        : undefined;
+    return {
+      event: {
+        ...base,
+        type: "completion",
+        status: obj.outcome,
+        outcome: obj.outcome,
+        source: obj.source,
+        output,
+        exitCode,
+        message,
+        errorMessage: boundedEventString(obj.errorMessage),
+        summary,
+      },
+      legacy: false,
+    };
+  }
+  if (
+    obj.type === "process_exited" &&
+    (obj.status === "done" ||
+      obj.status === "error" ||
+      obj.status === "cancelled") &&
+    exitCode !== undefined
+  )
+    return {
+      event: {
+        ...base,
+        type: "process_exited",
+        status: obj.status,
+        exitCode,
+        message,
+      },
+      legacy: false,
+    };
+  return null;
+}
 
 /**
  * Read all events for a sub-agent. If `since` is provided, only events with
@@ -183,33 +611,110 @@ export function listOutputTurns(art: SubagentArtifact): number[] {
  * sub-agent CLI is the only writer, but a partial write could in theory
  * leave a truncated line).
  *
- * Uses the `ndjson` library with `strict: false` so a single bad line does not abort the whole
- * file — ndjson drops the bad row and continues with the rest. Any trailing partial line (file
- * did not end with a newline) is buffered by the parser and dropped on `end()`; it is treated as a
- * in-progress write that the next reader will pick up once completed.
+ * Reads through the same bounded validator as the incremental poller.
  */
 export function readEvents(
   art: SubagentArtifact,
   since?: number,
 ): SubagentEvent[] {
-  if (!existsSync(art.statusFile)) return [];
-  let content: string;
-  try {
-    content = readFileSync(art.statusFile, "utf8");
-  } catch {
-    return [];
-  }
-  const parser = ndjson.parse({ strict: false });
   const events: SubagentEvent[] = [];
-  parser.on("data", (obj: unknown) => {
-    const ev = obj as SubagentEvent;
-    if (since === undefined || ev.ts >= since) events.push(ev);
-  });
-  // Non-strict mode never emits 'error' for bad JSON; attach a no-op so an unhandled error event
-  // can never crash the parent process.
-  parser.on("error", () => {});
-  parser.end(Buffer.from(content, "utf8"));
+  let cursor = 0;
+  for (;;) {
+    const batch = readEventBatch(art, cursor);
+    for (const { event } of batch.records) {
+      if (since === undefined || event.ts >= since) events.push(event);
+    }
+    if (batch.endOffset <= cursor) break;
+    cursor = batch.endOffset;
+    if (cursor >= eventLogEndOffset(art)) break;
+  }
   return events;
+}
+
+export function readEventRecords(
+  art: SubagentArtifact,
+  fromOffset = 0,
+): EventRecord[] {
+  return readEventBatch(art, fromOffset).records;
+}
+
+export function readEventBatch(
+  art: SubagentArtifact,
+  fromOffset = 0,
+): { records: EventRecord[]; endOffset: number } {
+  let fd: number | undefined;
+  let size = 0;
+  try {
+    fd = openSync(art.statusFile, "r");
+    size = statSync(art.statusFile).size;
+  } catch {
+    return { records: [], endOffset: fromOffset };
+  }
+  const offset = Math.max(0, Math.min(fromOffset, size));
+  const content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
+  try {
+    if (content.byteLength > 0)
+      readSync(fd, content, 0, content.length, offset);
+  } finally {
+    closeSync(fd);
+  }
+  const records: EventRecord[] = [];
+  let start = 0;
+  let endOffset = offset;
+  while (start < content.byteLength) {
+    const newline = content.indexOf(0x0a, start);
+    if (newline < 0) break;
+    const lineEnd = newline + 1;
+    const raw = content.subarray(start, newline).toString("utf8");
+    try {
+      const normalized = normalizeEvent(JSON.parse(raw), offset + start, raw);
+      if (normalized) {
+        if (normalized.legacy) {
+          Object.defineProperties(normalized.event, {
+            eventId: {
+              value: `legacy-${createHash("sha256")
+                .update(`${offset + start}:`)
+                .update(raw)
+                .digest("hex")
+                .slice(0, 24)}`,
+              enumerable: false,
+            },
+            turnId: {
+              value: `legacy-${offset + start}`,
+              enumerable: false,
+            },
+          });
+        }
+        records.push({
+          event: normalized.event,
+          startOffset: offset + start,
+          endOffset: offset + lineEnd,
+          raw,
+          legacy: normalized.legacy,
+        });
+      }
+    } catch {
+      /* malformed complete lines are skipped; physical cursor still advances */
+    }
+    start = lineEnd;
+    endOffset = offset + start;
+  }
+  if (
+    endOffset === offset &&
+    content.byteLength === MAX_EVENT_BATCH_BYTES &&
+    offset + content.byteLength < size
+  ) {
+    endOffset = offset + content.byteLength;
+  }
+  return { records, endOffset };
+}
+
+export function eventLogEndOffset(art: SubagentArtifact): number {
+  try {
+    return statSync(art.statusFile).size;
+  } catch {
+    return 0;
+  }
 }
 
 /** Returns output.md content, or null if it doesn't exist yet. */
@@ -495,15 +1000,63 @@ export interface InteractiveSubagentPersistedStateV1 {
   parentSessionId?: string;
 }
 
+export interface PersistedDeliveryIntent {
+  deliveryId: string;
+  subagentId: string;
+  turnId: string;
+  eventId: string;
+  mode: "notify" | "inject";
+  triggerTurn: boolean;
+  status: CompletionOutcome;
+  artifactDir: string;
+  output?: OutputSnapshot;
+  message?: string;
+  state: "queued" | "dispatchAttempted";
+}
+
+export const MAX_DELIVERY_RECEIPTS = 256;
+const MAX_PERSISTED_DELIVERY_INTENTS = 32;
+
+export interface PersistedLifecycleFold {
+  startedAt?: number;
+  currentTurnId?: string;
+  completionTurnId?: string;
+  completionOutcome?: CompletionOutcome;
+  completionSource?: CompletionSource;
+  completionExitCode?: number;
+  processStatus?: "done" | "error" | "cancelled";
+  processExitCode?: number;
+  parentCancelled?: boolean;
+  legacyTerminal?: "done" | "error" | "cancelled";
+}
+
+export interface InteractiveSubagentPersistedStateV2 extends InteractiveSubagentPersistedStateV1 {
+  eventByteCursor: number;
+  sessionByteCursor: number;
+  activeTurnId?: string;
+  pendingDeliveries: PersistedDeliveryIntent[];
+  deliveryReceipts: string[];
+  legacyCutoverOffset?: number;
+  lifecycle?: PersistedLifecycleFold;
+}
+
 export interface InteractiveSubagentStateFile {
-  schemaVersion: 1;
+  schemaVersion: 2;
 
   /** Parent pi session id; redundant with the filename but kept for verification/debugging. */
 
   parent: string;
 
-  states: { [id: string]: InteractiveSubagentPersistedStateV1 };
+  states: { [id: string]: InteractiveSubagentPersistedStateV2 };
 }
+
+type InteractiveSubagentStateFileInput =
+  | InteractiveSubagentStateFile
+  | {
+      schemaVersion: 1;
+      parent: string;
+      states: { [id: string]: InteractiveSubagentPersistedStateV1 };
+    };
 
 /** File path for the project-local state file under .pi/. */
 
@@ -538,7 +1091,11 @@ export function loadInteractiveStates(
   if (!parsed || typeof parsed !== "object") return null;
 
   const obj = parsed as Record<string, unknown>;
-  return migrateStatePayload(obj);
+  try {
+    return migrateStatePayload(obj);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -554,31 +1111,263 @@ function migrateStatePayload(
 ): InteractiveSubagentStateFile | null {
   const version = obj.schemaVersion;
   const rawStates = obj.states;
+  const parent =
+    typeof obj.parent === "string" && obj.parent.length > 0 ? obj.parent : "pi";
 
   // Helper: produce a valid states object from an untrusted value.
   const asStates = (
     v: unknown,
-  ): { [id: string]: InteractiveSubagentPersistedStateV1 } =>
-    v && typeof v === "object"
-      ? (v as { [id: string]: InteractiveSubagentPersistedStateV1 })
-      : {};
+    legacy: boolean,
+  ): { [id: string]: InteractiveSubagentPersistedStateV2 } => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const migrated: { [id: string]: InteractiveSubagentPersistedStateV2 } = {};
+    for (const [id, value] of Object.entries(v)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const raw = value as Record<string, unknown>;
+      if (
+        typeof raw.id !== "string" ||
+        raw.id !== id ||
+        id.length === 0 ||
+        id.length > 128 ||
+        id.includes("/") ||
+        id.includes("\\") ||
+        typeof raw.artifactDir !== "string" ||
+        !isAbsolute(raw.artifactDir) ||
+        basename(raw.artifactDir) !== id ||
+        typeof raw.paneId !== "string" ||
+        typeof raw.sessionFile !== "string" ||
+        (raw.mux !== "tmux" && raw.mux !== "zellij")
+      ) {
+        continue;
+      }
+      const entry = raw as unknown as InteractiveSubagentPersistedStateV1 &
+        Partial<InteractiveSubagentPersistedStateV2>;
+      const art = artifactPath(
+        dirname(entry.artifactDir),
+        basename(entry.artifactDir),
+      );
+      const cutoverOffset = legacy ? eventLogEndOffset(art) : 0;
+      const cursor = (candidate: unknown, fallback: number): number =>
+        typeof candidate === "number" &&
+        Number.isSafeInteger(candidate) &&
+        candidate >= 0
+          ? candidate
+          : fallback;
+      const pendingDeliveries = Array.isArray(entry.pendingDeliveries)
+        ? entry.pendingDeliveries
+            .flatMap((intent): PersistedDeliveryIntent[] => {
+              if (!intent || typeof intent !== "object") return [];
+              const rawIntent = intent as unknown as Record<string, unknown>;
+              if (
+                typeof rawIntent.deliveryId !== "string" ||
+                typeof rawIntent.subagentId !== "string" ||
+                rawIntent.subagentId !== id ||
+                typeof rawIntent.turnId !== "string" ||
+                typeof rawIntent.eventId !== "string" ||
+                (rawIntent.mode !== "notify" && rawIntent.mode !== "inject") ||
+                typeof rawIntent.triggerTurn !== "boolean" ||
+                (rawIntent.status !== "done" &&
+                  rawIntent.status !== "error" &&
+                  rawIntent.status !== "cancelled") ||
+                rawIntent.artifactDir !== entry.artifactDir ||
+                (rawIntent.state !== "queued" &&
+                  rawIntent.state !== "dispatchAttempted")
+              ) {
+                return [];
+              }
+              const output =
+                rawIntent.output &&
+                typeof rawIntent.output === "object" &&
+                typeof (rawIntent.output as Record<string, unknown>).path ===
+                  "string" &&
+                typeof (rawIntent.output as Record<string, unknown>).bytes ===
+                  "number" &&
+                Number.isSafeInteger(
+                  (rawIntent.output as Record<string, unknown>).bytes,
+                ) &&
+                ((rawIntent.output as Record<string, unknown>)
+                  .bytes as number) >= 0 &&
+                typeof (rawIntent.output as Record<string, unknown>).sha256 ===
+                  "string" &&
+                /^[a-f0-9]{64}$/i.test(
+                  (rawIntent.output as Record<string, unknown>)
+                    .sha256 as string,
+                )
+                  ? (rawIntent.output as unknown as OutputSnapshot)
+                  : undefined;
+              return [
+                {
+                  deliveryId: rawIntent.deliveryId,
+                  subagentId: rawIntent.subagentId,
+                  turnId: rawIntent.turnId,
+                  eventId: rawIntent.eventId,
+                  mode: rawIntent.mode,
+                  triggerTurn: rawIntent.triggerTurn,
+                  status: rawIntent.status,
+                  artifactDir: rawIntent.artifactDir,
+                  ...(output ? { output } : {}),
+                  ...(typeof rawIntent.message === "string"
+                    ? { message: rawIntent.message.slice(0, 500) }
+                    : {}),
+                  state: rawIntent.state,
+                },
+              ];
+            })
+            .slice(-MAX_PERSISTED_DELIVERY_INTENTS)
+        : [];
+      const deliveryReceipts = Array.isArray(entry.deliveryReceipts)
+        ? [
+            ...new Set(
+              entry.deliveryReceipts.filter(
+                (receipt): receipt is string => typeof receipt === "string",
+              ),
+            ),
+          ].slice(-MAX_DELIVERY_RECEIPTS)
+        : [];
+      const rawLifecycle =
+        entry.lifecycle &&
+        typeof entry.lifecycle === "object" &&
+        !Array.isArray(entry.lifecycle)
+          ? (entry.lifecycle as PersistedLifecycleFold)
+          : undefined;
+      const lifecycle: PersistedLifecycleFold | undefined = rawLifecycle
+        ? {
+            ...(typeof rawLifecycle.startedAt === "number" &&
+            Number.isFinite(rawLifecycle.startedAt) &&
+            rawLifecycle.startedAt >= 0
+              ? { startedAt: rawLifecycle.startedAt }
+              : {}),
+            ...(typeof rawLifecycle.currentTurnId === "string" &&
+            rawLifecycle.currentTurnId.length <= MAX_TURN_ID_LENGTH
+              ? { currentTurnId: rawLifecycle.currentTurnId }
+              : {}),
+            ...(typeof rawLifecycle.completionTurnId === "string" &&
+            rawLifecycle.completionTurnId.length <= MAX_TURN_ID_LENGTH
+              ? { completionTurnId: rawLifecycle.completionTurnId }
+              : {}),
+            ...(rawLifecycle.completionOutcome === "done" ||
+            rawLifecycle.completionOutcome === "error" ||
+            rawLifecycle.completionOutcome === "cancelled"
+              ? { completionOutcome: rawLifecycle.completionOutcome }
+              : {}),
+            ...(rawLifecycle.completionSource === "agent_settled" ||
+            rawLifecycle.completionSource === "agent_end" ||
+            rawLifecycle.completionSource === "explicit" ||
+            rawLifecycle.completionSource === "process_exit" ||
+            rawLifecycle.completionSource === "parent"
+              ? { completionSource: rawLifecycle.completionSource }
+              : {}),
+            ...(typeof rawLifecycle.completionExitCode === "number" &&
+            Number.isSafeInteger(rawLifecycle.completionExitCode)
+              ? { completionExitCode: rawLifecycle.completionExitCode }
+              : {}),
+            ...(rawLifecycle.processStatus === "done" ||
+            rawLifecycle.processStatus === "error" ||
+            rawLifecycle.processStatus === "cancelled"
+              ? { processStatus: rawLifecycle.processStatus }
+              : {}),
+            ...(typeof rawLifecycle.processExitCode === "number" &&
+            Number.isSafeInteger(rawLifecycle.processExitCode)
+              ? { processExitCode: rawLifecycle.processExitCode }
+              : {}),
+            ...(rawLifecycle.parentCancelled === true
+              ? { parentCancelled: true }
+              : {}),
+            ...(rawLifecycle.legacyTerminal === "done" ||
+            rawLifecycle.legacyTerminal === "error" ||
+            rawLifecycle.legacyTerminal === "cancelled"
+              ? { legacyTerminal: rawLifecycle.legacyTerminal }
+              : {}),
+          }
+        : undefined;
+      migrated[id] = {
+        id,
+        paneId: entry.paneId,
+        ...(typeof entry.windowName === "string"
+          ? { windowName: entry.windowName }
+          : {}),
+        mux: entry.mux,
+        ...(typeof entry.muxSession === "string"
+          ? { muxSession: entry.muxSession }
+          : {}),
+        artifactDir: entry.artifactDir,
+        sessionFile: entry.sessionFile,
+        ...(entry.notifyOnComplete === "notify" ||
+        entry.notifyOnComplete === "inject"
+          ? { notifyOnComplete: entry.notifyOnComplete }
+          : {}),
+        ...(typeof entry.triggerTurnOnComplete === "boolean"
+          ? { triggerTurnOnComplete: entry.triggerTurnOnComplete }
+          : {}),
+        ...(typeof entry.parentSessionId === "string"
+          ? { parentSessionId: entry.parentSessionId }
+          : {}),
+        eventByteCursor: cursor(entry.eventByteCursor, cutoverOffset),
+        sessionByteCursor: cursor(entry.sessionByteCursor, 0),
+        ...(typeof entry.activeTurnId === "string"
+          ? { activeTurnId: entry.activeTurnId }
+          : {}),
+        pendingDeliveries,
+        deliveryReceipts,
+        legacyCutoverOffset: cursor(entry.legacyCutoverOffset, cutoverOffset),
+        ...(lifecycle ? { lifecycle } : {}),
+      };
+    }
+    return migrated;
+  };
+  const withLegacyCatchup = (states: {
+    [id: string]: InteractiveSubagentPersistedStateV2;
+  }): { [id: string]: InteractiveSubagentPersistedStateV2 } => {
+    for (const entry of Object.values(states)) {
+      const cutover = entry.legacyCutoverOffset ?? 0;
+      if (cutover <= 0 || entry.pendingDeliveries.length > 0) continue;
+      const turnId = `legacy-cutover-${cutover}`;
+      const mode = "notify";
+      entry.pendingDeliveries.push({
+        deliveryId: createHash("sha256")
+          .update(
+            `${entry.parentSessionId ?? "pi"}\0${entry.id}\0${turnId}\0${mode}`,
+          )
+          .digest("hex")
+          .slice(0, 32),
+        subagentId: entry.id,
+        turnId,
+        eventId: turnId,
+        mode,
+        triggerTurn: false,
+        status: "done",
+        artifactDir: entry.artifactDir,
+        message: `Legacy artifact backlog cut over at byte ${cutover}; inspect the artifact pointers for content.`,
+        state: "queued",
+      });
+    }
+    return states;
+  };
 
   // No schema version → assume oldest known (v1 format).
   if (version === undefined || version === null) {
     debugLog("warn", "state-file-missing-schema", {});
     return {
       schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
-      parent: String(obj.parent ?? "pi"),
-      states: asStates(rawStates),
+      parent,
+      states: withLegacyCatchup(asStates(rawStates, true)),
     };
   }
 
   // Known version → return validated shape.
   if (version === 1) {
     return {
-      schemaVersion: 1,
-      parent: String(obj.parent ?? "pi"),
-      states: asStates(rawStates),
+      schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
+      parent,
+      states: withLegacyCatchup(asStates(rawStates, true)),
+    };
+  }
+
+  if (version === CURRENT_STATE_SCHEMA_VERSION) {
+    return {
+      schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
+      parent,
+      states: asStates(rawStates, false),
     };
   }
 
@@ -587,8 +1376,8 @@ function migrateStatePayload(
     debugLog("warn", "state-file-old-schema", { schemaVersion: version });
     return {
       schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
-      parent: String(obj.parent ?? "pi"),
-      states: asStates(rawStates),
+      parent,
+      states: withLegacyCatchup(asStates(rawStates, true)),
     };
   }
 
@@ -604,9 +1393,13 @@ function migrateStatePayload(
  */
 export function saveInteractiveStates(
   cwd: string,
-  payload: InteractiveSubagentStateFile,
+  payload: InteractiveSubagentStateFileInput,
 ): void {
-  if (payload.schemaVersion !== CURRENT_STATE_SCHEMA_VERSION) {
+  const current =
+    payload.schemaVersion === 1
+      ? migrateStatePayload(payload as unknown as Record<string, unknown>)
+      : payload;
+  if (!current || current.schemaVersion !== CURRENT_STATE_SCHEMA_VERSION) {
     throw new Error(`unsupported schemaVersion: ${payload.schemaVersion}`);
   }
   const file = stateFilePath(cwd);
@@ -615,7 +1408,7 @@ export function saveInteractiveStates(
 
   const tmp = file + ".tmp";
 
-  writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 });
 
   renameSync(tmp, file);
 }
@@ -629,18 +1422,48 @@ export function saveInteractiveStates(
  */
 export function appendInteractiveState(
   cwd: string,
-  entry: InteractiveSubagentPersistedStateV1,
+  entry:
+    | InteractiveSubagentPersistedStateV1
+    | InteractiveSubagentPersistedStateV2,
 ): void {
   const current = loadInteractiveStates(cwd) ?? {
-    schemaVersion: 1,
+    schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
 
     parent: "pi",
 
     states: {},
   };
 
-  current.states[entry.id] = entry;
+  const art = artifactPath(
+    dirname(entry.artifactDir),
+    basename(entry.artifactDir),
+  );
+  current.states[entry.id] = {
+    ...entry,
+    eventByteCursor: "eventByteCursor" in entry ? entry.eventByteCursor : 0,
+    sessionByteCursor:
+      "sessionByteCursor" in entry ? entry.sessionByteCursor : 0,
+    pendingDeliveries:
+      "pendingDeliveries" in entry ? entry.pendingDeliveries : [],
+    deliveryReceipts: "deliveryReceipts" in entry ? entry.deliveryReceipts : [],
+    legacyCutoverOffset:
+      "legacyCutoverOffset" in entry
+        ? entry.legacyCutoverOffset
+        : eventLogEndOffset(art),
+  };
 
+  saveInteractiveStates(cwd, current);
+}
+
+export function updateInteractiveState(
+  cwd: string,
+  id: string,
+  update: (entry: InteractiveSubagentPersistedStateV2) => void,
+): void {
+  const current = loadInteractiveStates(cwd);
+  const entry = current?.states[id];
+  if (!current || !entry) return;
+  update(entry);
   saveInteractiveStates(cwd, current);
 }
 

@@ -34,6 +34,8 @@ import {
 } from "./tools/in-process";
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
+import { registerChildProtocol } from "./child-protocol";
+import { renderSubagentNotify } from "./rendering";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
 /**
@@ -61,6 +63,16 @@ export type SubagentDetails =
   | { status: "invalid_id"; id: string };
 
 export default function (pi: ExtensionAPI) {
+  if (process.env.PI_SUBAGENTURA_CHILD === "1") {
+    registerChildProtocol(pi);
+    return;
+  }
+  if (typeof pi.registerMessageRenderer !== "function") {
+    throw new Error(
+      "pi-subagentura requires Pi >= 0.80.6 with agent_settled and custom message renderer support",
+    );
+  }
+  pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
   registerSessionHandlers(pi);
   registerWorkflowTool(pi);
   registerInProcessSubagentTools(pi);
@@ -94,10 +106,10 @@ export {
   type JobStatus,
   type NotifyOnComplete,
 } from "./helpers";
+export { getInjectCount, MAX_INJECT } from "./notifications";
 /** @internal Interactive-subagent registry, consumed by session-handlers and tests */
 export { interactiveSubagentRegistry } from "./interactive-tmux";
 /** @internal Inject-count guard; exported for test assertions */
-export { getInjectCount, MAX_INJECT } from "./notifications";
 /** @internal Artifact-change poller; exported for test access */
 export { pollArtifactChanges } from "./artifact-poller";
 /** @internal Interactive-artifact lookup; exported for test access */

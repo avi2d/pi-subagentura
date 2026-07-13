@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { getProviders } from "@earendil-works/pi-ai";
+import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import {
   ACTIVE_TOOL_DEBOUNCE_MS,
   formatTokens,
@@ -274,11 +274,13 @@ describe("resolveModel", () => {
   });
 
   it("should parse provider/id format correctly", () => {
+    const provider = getProviders()[0];
+    const expected = getModels(provider)[0];
     const result = resolveModel(
-      "anthropic/claude-3-5-sonnet-20241022",
+      `${expected.provider}/${expected.id}`,
       undefined,
     );
-    expect(result?.provider).toBe("anthropic");
+    expect(result).toEqual(expected);
   });
 
   it("should return undefined for unknown provider/id when no default", () => {

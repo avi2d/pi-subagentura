@@ -20,12 +20,18 @@ import {
   cleanupOldArtifacts,
   deleteInteractiveStatesFile,
   ensureArtifactDir,
+  eventLogEndOffset,
   lastEvent,
   listArtifacts,
   listOutputTurns,
   loadInteractiveStates,
+  MAX_EVENT_TEXT_LENGTH,
+  MAX_EVENT_BATCH_BYTES,
+  MAX_TOOL_NAME_LENGTH,
   outputPathForTurn,
   readEvents,
+  readEventBatch,
+  readEventRecords,
   readOutput,
   readOutputForTurn,
   removeInteractiveState,
@@ -33,7 +39,7 @@ import {
   snapshotOutput,
   stateFilePath,
   writeOutput,
-  type InteractiveSubagentPersistedStateV1,
+  type InteractiveSubagentPersistedStateV2,
   type SubagentEvent,
 } from "../src/artifact";
 
@@ -176,6 +182,86 @@ describe("artifact", () => {
       const events = readEvents(art);
       expect(events).toHaveLength(2);
     });
+
+    it("normalizes malformed object fields and bounds adversarial text", () => {
+      const art = artifactPath(root, "bounded");
+      ensureArtifactDir(art);
+      appendFileSync(
+        art.statusFile,
+        [
+          JSON.stringify({
+            version: 2,
+            eventId: "e".repeat(10_000),
+            turnId: { bad: true },
+            ts: 1,
+            type: "completion",
+            status: { bad: true },
+            outcome: "error",
+            source: "agent_settled",
+            message: { bad: true },
+            errorMessage: ["bad"],
+            summary: "s".repeat(10_000),
+          }),
+          JSON.stringify({
+            version: 2,
+            eventId: "tool-event",
+            turnId: "turn",
+            ts: 2,
+            type: "tool_activity",
+            phase: "start",
+            tool: "t".repeat(10_000),
+            summary: "s".repeat(10_000),
+          }),
+          JSON.stringify({
+            version: 2,
+            eventId: "bad",
+            turnId: "turn",
+            ts: 3,
+            type: "completion",
+            outcome: { bad: true },
+            source: "explicit",
+          }),
+        ].join("\n") + "\n",
+      );
+
+      const records = readEventRecords(art);
+      expect(records).toHaveLength(2);
+      const completion = records[0].event as any;
+      expect(completion.eventId).toMatch(/^invalid-event-/);
+      expect(completion.turnId).toMatch(/^invalid-turn-/);
+      expect(completion.message).toBeUndefined();
+      expect(completion.errorMessage).toBeUndefined();
+      expect(completion.summary).toHaveLength(MAX_EVENT_TEXT_LENGTH);
+      const activity = records[1].event as any;
+      expect(activity.tool).toHaveLength(MAX_TOOL_NAME_LENGTH);
+      expect(activity.summary).toHaveLength(MAX_EVENT_TEXT_LENGTH);
+    });
+  });
+
+  it("reads long logs in bounded physical batches", () => {
+    const art = artifactPath(root, "long-log");
+    ensureArtifactDir(art);
+    const line =
+      JSON.stringify({ ts: 1, type: "tool_activity", status: "running" }) +
+      "\n";
+    const count = Math.ceil((MAX_EVENT_BATCH_BYTES * 3) / line.length);
+    appendFileSync(art.statusFile, line.repeat(count));
+    const eof = eventLogEndOffset(art);
+    let cursor = 0;
+    let records = 0;
+    let batches = 0;
+    while (cursor < eof) {
+      const batch = readEventBatch(art, cursor);
+      expect(batch.endOffset - cursor).toBeLessThanOrEqual(
+        MAX_EVENT_BATCH_BYTES,
+      );
+      expect(batch.endOffset).toBeGreaterThan(cursor);
+      cursor = batch.endOffset;
+      records += batch.records.length;
+      batches++;
+    }
+    expect(batches).toBeGreaterThan(1);
+    expect(records).toBe(count);
   });
 
   describe("readOutput", () => {
@@ -578,7 +664,7 @@ describe("persisted interactive state helpers", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  const SAMPLE: InteractiveSubagentPersistedStateV1 = {
+  const SAMPLE: InteractiveSubagentPersistedStateV2 = {
     id: "abc12345",
 
     paneId: "%42",
@@ -592,6 +678,11 @@ describe("persisted interactive state helpers", () => {
     sessionFile: "/tmp/session.jsonl",
 
     notifyOnComplete: "inject",
+    eventByteCursor: 0,
+    sessionByteCursor: 0,
+    pendingDeliveries: [],
+    deliveryReceipts: [],
+    legacyCutoverOffset: 0,
   };
 
   it("stateFilePath returns <cwd>/.pi/subagentura-state.json", () => {
@@ -602,7 +693,7 @@ describe("persisted interactive state helpers", () => {
 
   it("saveInteractiveStates + loadInteractiveStates round-trips a state file", () => {
     saveInteractiveStates(root, {
-      schemaVersion: 1,
+      schemaVersion: 2,
       parent: "pi",
       states: { abc12345: SAMPLE },
     });
@@ -610,7 +701,7 @@ describe("persisted interactive state helpers", () => {
     const loaded = loadInteractiveStates(root);
 
     expect(loaded).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       parent: "pi",
       states: { abc12345: SAMPLE },
     });
@@ -654,7 +745,7 @@ describe("persisted interactive state helpers", () => {
     );
     const loaded = loadInteractiveStates(root);
     expect(loaded).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       parent: "pi",
       states: { abc12345: SAMPLE },
     });
@@ -674,7 +765,7 @@ describe("persisted interactive state helpers", () => {
     );
     const loaded = loadInteractiveStates(root);
     expect(loaded).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       parent: "pi",
       states: { abc12345: SAMPLE },
     });
@@ -694,7 +785,7 @@ describe("persisted interactive state helpers", () => {
     );
     const loaded = loadInteractiveStates(root);
     expect(loaded).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       parent: "pi",
       states: { abc12345: SAMPLE },
     });
@@ -711,7 +802,123 @@ describe("persisted interactive state helpers", () => {
 
     const loaded = loadInteractiveStates(root);
 
-    expect(loaded).toEqual({ schemaVersion: 1, parent: "pi", states: {} });
+    expect(loaded).toEqual({ schemaVersion: 2, parent: "pi", states: {} });
+  });
+
+  it("skips malformed v1 entries and normalizes untrusted fields", () => {
+    const file = stateFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    const validIntent = {
+      deliveryId: "delivery",
+      subagentId: SAMPLE.id,
+      turnId: "turn",
+      eventId: "event",
+      mode: "notify",
+      triggerTurn: false,
+      status: "done",
+      artifactDir: SAMPLE.artifactDir,
+      state: "queued",
+    };
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        parent: "pi",
+        states: {
+          wrongId: { ...SAMPLE, id: "different" },
+          badArtifact: { ...SAMPLE, id: "badArtifact", artifactDir: 42 },
+          [SAMPLE.id]: {
+            ...SAMPLE,
+            eventByteCursor: "not-a-number",
+            sessionByteCursor: -10,
+            pendingDeliveries: [null, { nope: true }, validIntent],
+            deliveryReceipts: ["one", "one", 42, "two"],
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    expect(() => loadInteractiveStates(root)).not.toThrow();
+    const loaded = loadInteractiveStates(root)!;
+    expect(Object.keys(loaded.states)).toEqual([SAMPLE.id]);
+    expect(loaded.states[SAMPLE.id].eventByteCursor).toBe(0);
+    expect(loaded.states[SAMPLE.id].sessionByteCursor).toBe(0);
+    expect(loaded.states[SAMPLE.id].pendingDeliveries).toEqual([validIntent]);
+    expect(loaded.states[SAMPLE.id].deliveryReceipts).toEqual(["one", "two"]);
+  });
+
+  it("skips malformed v2 state and intent shapes without throwing", () => {
+    const file = stateFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        parent: "pi",
+        states: {
+          [SAMPLE.id]: {
+            ...SAMPLE,
+            artifactDir: "relative/artifact",
+            pendingDeliveries: "not-an-array",
+          },
+          arrayEntry: [],
+          primitiveEntry: "bad",
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    expect(() => loadInteractiveStates(root)).not.toThrow();
+    expect(loadInteractiveStates(root)?.states).toEqual({});
+  });
+
+  it("uses EOF cutover for v1 but zero for missing or invalid v2 cursor", () => {
+    const art = artifactPath(join(root, "artifacts"), SAMPLE.id);
+    ensureArtifactDir(art);
+    appendEvent(art, { ts: 1, type: "done", status: "done" });
+    const eof = statSync(art.statusFile).size;
+    const file = stateFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        parent: "pi",
+        states: {
+          [SAMPLE.id]: {
+            ...SAMPLE,
+            artifactDir: art.dir,
+            eventByteCursor: "invalid",
+            legacyCutoverOffset: "invalid",
+          },
+        },
+      }),
+    );
+    expect(loadInteractiveStates(root)?.states[SAMPLE.id]).toMatchObject({
+      eventByteCursor: eof,
+      legacyCutoverOffset: eof,
+    });
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        parent: "pi",
+        states: {
+          [SAMPLE.id]: {
+            ...SAMPLE,
+            artifactDir: art.dir,
+            eventByteCursor: "invalid",
+            legacyCutoverOffset: "invalid",
+          },
+        },
+      }),
+    );
+    expect(loadInteractiveStates(root)?.states[SAMPLE.id]).toMatchObject({
+      eventByteCursor: 0,
+      legacyCutoverOffset: 0,
+    });
   });
 
   it("saveInteractiveStates creates the .pi/ directory if missing (mode 0o700)", () => {
@@ -742,10 +949,10 @@ describe("persisted interactive state helpers", () => {
     expect(existsSync(stateFilePath(root))).toBe(true);
   });
 
-  it("saveInteractiveStates rejects schemaVersion !== 1", () => {
+  it("saveInteractiveStates rejects an unknown future schema", () => {
     expect(() =>
       saveInteractiveStates(root, {
-        schemaVersion: 2 as any,
+        schemaVersion: 3 as any,
         parent: "pi",
         states: {},
       }),
@@ -789,7 +996,11 @@ describe("persisted interactive state helpers", () => {
   it("removeInteractiveState drops the entry by id", () => {
     appendInteractiveState(root, SAMPLE);
 
-    appendInteractiveState(root, { ...SAMPLE, id: "def67890" });
+    appendInteractiveState(root, {
+      ...SAMPLE,
+      id: "def67890",
+      artifactDir: "/tmp/artifacts/def67890",
+    });
 
     removeInteractiveState(root, "abc12345");
 

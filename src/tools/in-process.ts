@@ -218,8 +218,8 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
               ? "inject"
               : params.notifyOnComplete === "notify"
                 ? "notify"
-                : undefined,
-          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
+                : "inject",
+          triggerTurnOnComplete: params.triggerTurnOnComplete,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -409,8 +409,8 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
               ? "inject"
               : params.notifyOnComplete === "notify"
                 ? "notify"
-                : undefined,
-          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
+                : "inject",
+          triggerTurnOnComplete: params.triggerTurnOnComplete,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };

@@ -20,7 +20,7 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
   The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
 
-Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and the poller snapshots `output.md` into `output-N.md` on each new `done` event so full turn history is recoverable via `read_subagent_artifact { turn: N }`.
+Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and each completion maps its Pi `turnId` to an immutable `outputs/<eventId>.md` snapshot recoverable through `read_subagent_artifact`.
 
 ## Why use it?
 
@@ -73,8 +73,8 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"notify"` or `"inject"`; auto-deliver completion notification (async only)
-- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification
+- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only
+- `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Best for:
@@ -95,8 +95,8 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"notify"` or `"inject"`; auto-deliver completion notification (async only)
-- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification
+- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only
+- `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Best for:
@@ -164,8 +164,8 @@ Parameters:
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `notifyOnComplete` — `"inject"` (default) or `"notify"`; controls how the parent LLM is woken up on completion. See [Completion notifications: notify vs inject](#completion-notifications-notify-vs-inject) below.
-- `triggerTurnOnComplete` — optional boolean; with `notifyOnComplete: "notify"`, trigger a parent LLM turn after sending the completion notification. In `"inject"` mode the injected user message already wakes the parent; this flag only affects notify-style fallbacks/errors.
+- `notifyOnComplete` — `"inject"` (default) persists full output; `"notify"` persists a pointer-only message.
+- `triggerTurnOnComplete` — optional override. Notify defaults to `false`; inject defaults to `true`.
 
 The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts — sub-agents that finish while you're away are picked up on the next poll.
 
@@ -191,14 +191,19 @@ The state file and subagent panes are preserved across these actions:
 On `/reload` and `/resume`, the `session_start` handler rehydrates
 the in-memory registry, filtering by `parentSessionId` so only subagents
 that were created in the current session are restored.
-Runtime cursors are reset so the poller replays any backlog.
+Protocol-v2 byte cursors, pending delivery intents, and receipts are restored so
+reload does not unconditionally replay already-dispatched completions.
 
 See the [state file gotcha](AGENTS.md#rehydrate-state-file-cwdpisubagentura-state-json)
 in AGENTS.md for the crash-safety ordering and inject-mode flood fix.
 
 #### Sub-agent completion protocol
 
-Every interactive sub-agent receives a built-in system prompt that tells it how to signal completion. The child **must** call one of these when it has nothing more to add before waiting for the next user input:
+Every interactive child runs protocol-only Pi lifecycle hooks and therefore
+requires Pi SDK `>=0.80.6 <0.81.0`. `before_agent_start` creates a provisional
+turn, the first `turn_start` binds it to the persisted Pi user-entry id, tool
+hooks record activity, and `agent_settled` records the authoritative completion
+after retries, compaction, and queued continuations. The explicit CLI remains supported:
 
 ```bash
 $ARTIFACT_DIR/cli.mjs done 0       # success — parent reads the literal output.md path baked into the child prompt
@@ -206,16 +211,32 @@ $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
 # 'cancelled' is only set by the parent via cancel_interactive_subagent
 ```
 
-The child's system prompt embeds the **literal absolute path** of the artifact dir at the top, e.g. `Your artifact directory is: /Users/.../artifacts/<id>`. Use that literal path in any `write` tool call (the `write` tool does not expand `$ARTIFACT_DIR`) — the bash examples above work because the launch script exports `ARTIFACT_DIR` to the shell. After `done`, the REPL stays open and the child can be re-prompted via `send_interactive_subagent_message` (delivers text + Enter to the child's pane via the same backend that created it). The parent gets a pointer notification on `done` / `error` / `cancelled` and reads the result via `read_subagent_artifact`. Tool calls and progress are visible in the TUI widget below the editor; no separate progress event is needed.
+At each child turn start, mutable `output.md` is atomically reset without
+touching earlier snapshots. Before each completion event, the current staging
+file (including an empty file when the turn wrote nothing) is copied atomically to
+`outputs/<eventId>.md` with byte count and SHA-256 metadata. Events are consumed
+in physical NDJSON byte order; timestamps are display-only. Mixed v1/v2 logs and
+legacy `output-N.md` snapshots remain readable. New legacy completions are
+pointer-only because mutable `output.md` cannot be safely attributed to a turn.
 
 #### Completion notifications: notify vs inject
 
 Interactive sub-agents deliver their completion to the parent through one of two modes (selected via `notifyOnComplete`):
 
-- `"inject"` (**default** for `subagent_interactive`) — the sub-agent's `output.md` is pushed into the parent LLM's conversation as a new user message. The parent LLM gets a turn and can summarize, chain into the next step, or call more tools. Use this when the sub-agent's output is part of a multi-step pipeline.
-- `"notify"` — only a completion notification/pointer is sent by default. The parent LLM is **not** woken up unless `triggerTurnOnComplete: true` is also set. Use plain notify for spawn-and-forget side-quests; add `triggerTurnOnComplete` when the parent should react to the pointer without injecting the full output.
+- `"inject"` (**default**, including async in-process tools) persists one attributed custom
+  completion message and triggers a turn by default. Explicit
+  `triggerTurnOnComplete: false` disables triggering.
+- `"notify"` persists an attributed pointer-only custom message in parent
+  context without triggering a provider call. Explicit
+  `triggerTurnOnComplete: true` wakes the parent immediately.
 
-Inject mode has a `MAX_INJECT` cap of 5 concurrent injects. If more sub-agents finish at the same time, the rest degrade to notify-style pointer messages to keep the parent conversation from flooding. With `triggerTurnOnComplete: true`, those notify-style fallback messages can still wake the parent. The cap is concurrent, not lifetime — once some injects settle, more can fire.
+LLM-facing completions wait while the parent streams and flush as one bounded
+message after `agent_settled`. The durable FIFO is limited to 32 records / 256 KiB,
+with 32 KiB output per record and 64 KiB per flush. Overflow keeps status and
+artifact pointers rather than silently dropping completion. Delivery is
+at-least-once: deterministic delivery IDs and session receipts prevent routine
+reload replay, but a crash between synchronous dispatch and receipt persistence
+can still duplicate one completion.
 
 #### `get_interactive_subagent_status`
 
@@ -243,14 +264,19 @@ Lists all known interactive sub-agents: id, name, status, and last-update timest
 
 Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content (the latest turn's output). This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
 
-For follow-up support, the parent poller snapshots `output.md` into `output-N.md` after each new `done` event (where N is the turn number). Pass `turn: N` to read a specific historical turn's snapshot. The response's `details.availableTurns` lists all turns with snapshots.
+Protocol-v2 completions map each Pi-derived `turnId` to an immutable
+`outputs/<eventId>.md` snapshot. Pass `turnId` to read that output; the response's
+`details.outputHistory` lists the available `turnId`/`eventId` mappings. Legacy
+`output-N.md` history remains available through numeric `turn` and
+`details.availableTurns`.
 
 Parameters:
 
 - `id` — required sub-agent id
 - `since` — optional unix-ms timestamp; only return events with `ts >= since`
-- `includeOutput` — include the output (default `true`); ignored if `turn` is set (turn implies output)
+- `includeOutput` — include the output (default `true`); historical selectors imply output
 - `turn` — optional turn number; read `output-N.md` for that specific turn instead of the latest `output.md`
+- `turnId` — optional protocol-v2 Pi turn id; read its immutable `outputs/<eventId>.md` snapshot
 
 ### `list_available_models`
 

@@ -158,7 +158,7 @@ test("launches an interactive subagent in an isolated tmux session", async () =>
     return (
       existsSync(join(state.artifactDir, "output.md")) &&
       existsSync(eventsFile) &&
-      readFileSync(eventsFile, "utf8").includes('"type":"done"')
+      readFileSync(eventsFile, "utf8").includes('"type":"completion"')
     );
   }, "timed out waiting for fake pi to finish initial turn");
 
@@ -168,7 +168,8 @@ test("launches an interactive subagent in an isolated tmux session", async () =>
 
   const events = readFileSync(join(state.artifactDir, "events.ndjson"), "utf8");
   expect(events).toContain('"type":"started"');
-  expect(events).toContain('"type":"done"');
+  expect(events).toContain('"type":"completion"');
+  expect(events).toContain('"outcome":"done"');
 });
 
 test("sends a follow-up message into the same tmux pane", async () => {

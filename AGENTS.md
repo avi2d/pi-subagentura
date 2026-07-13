@@ -6,7 +6,7 @@ A public [Pi](https://pi.dev) extension that adds in-process and attachable sub-
 
 - **npm package** `pi-subagentura` — published via OIDC trusted publishing on push of a `v*` tag.
 - **Pi extension** — single entry point: `./src/subagent.ts` (declared in `package.json#pi.extensions`).
-- **TypeScript, ESM, strict mode**, `target: ESNext`, Node ≥ 18.
+- **TypeScript, ESM, strict mode**, `target: ESNext`, Node ≥ 18, Pi SDK ≥ 0.80.6 and < 0.81.
 - **Runtime deps** are minimal: `ndjson`, `is-path-inside`. Pi SDKs are peer dependencies.
 - **Tests** are `vitest` and live in `tests/` as `*.test.ts` (27 test files, ~12k lines of test code).
 - **CI** is a single GitHub Actions workflow: typecheck → tests → published-tarball smoke → pack dry-run.
@@ -32,14 +32,16 @@ The pre-push hook (`simple-git-hooks` → `lint-staged` → `prettier --check`) 
 | `src/tools/in-process.ts`      | `subagent_with_context`, `subagent_isolated`, async job management tools (`get_subagent_status`, `get_subagent_result`, `cancel_subagent`, `prune_subagent_jobs`), and `list_available_models`.                   |
 | `src/tools/interactive.ts`     | Interactive sub-agent tools (`subagent_interactive`, `get_interactive_subagent_status`, `cancel_interactive_subagent`, `send_interactive_subagent_message`, `list_subagent_artifacts`, `read_subagent_artifact`). |
 | `src/session-handlers.ts`      | `session_start`/`session_shutdown` handlers; poller interval setup/teardown on extension load/reload/shutdown.                                                                                                    |
-| `src/artifact-poller.ts`       | Per-tick artifact walk, session-JSONL tail-reading, `tool_activity` event appending, auto-done fallback, and notification delivery.                                                                               |
-| `src/rehydrate.ts`             | Reconstruct `InteractiveSubagentState` from on-disk state file on session start/reload/resume. Idempotent; resets cursors for backlog replay.                                                                     |
+| `src/artifact-poller.ts`       | Per-tick byte-ordered artifact walk, legacy session-JSONL tail-reading, durable delivery enqueue, and UI activity updates.                                                                                        |
+| `src/rehydrate.ts`             | Reconstruct persisted cursors, queues, and delivery receipts on session start/reload/resume.                                                                                                                      |
 | `src/helpers.ts`               | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `formatUsage`, job registry and cleanup.                                                                                              |
-| `src/artifact.ts`              | On-disk artifact protocol: `events.ndjson`, `output.md`, `output-N.md` snapshots, atomic writes via `*.tmp` + `renameSync`, state file helpers.                                                                   |
+| `src/artifact.ts`              | Versioned artifact protocol, immutable `outputs/<eventId>.md`, byte readers, mixed-v1 compatibility, and state-v2 helpers.                                                                                        |
+| `src/child-protocol.ts`        | Child-only Pi lifecycle hooks selected by `PI_SUBAGENTURA_CHILD=1`.                                                                                                                                               |
+| `src/delivery.ts`              | Bounded durable idle-only delivery queue and deterministic delivery IDs.                                                                                                                                          |
 | `src/interactive-tmux.ts`      | `InteractiveSubagentState` and registry, launch-script builder, mux backend dispatch (is-alive, send-keys, kill-pane).                                                                                            |
 | `src/multiplexer*.ts`          | Pluggable multiplexer interface + tmux and zellij backends. Registry auto-detects available backend at runtime.                                                                                                   |
 | `src/subagent-artifact-cli.ts` | Tiny `cli.mjs` wrapper called by the child: `cli.mjs done N` / `cli.mjs error "msg"`.                                                                                                                             |
-| `src/notifications.ts`         | Notification delivery (notify/inject), `MAX_INJECT` concurrent cap, inject-count tracking.                                                                                                                        |
+| `src/notifications.ts`         | Unified in-process completion delivery and output sanitization.                                                                                                                                                   |
 | `src/rendering.ts`             | TUI rendering helpers: `renderSubagentCall`, `renderSubagentResult`, `renderInteractiveStateSummary`.                                                                                                             |
 | `src/schemas.ts`               | TypeBox schemas for tool parameter validation (`BaseParams`, `InteractiveParams`, etc.).                                                                                                                          |
 | `src/workflow.ts`              | The `workflow` tool (v1, on `feat/workflow-tool` branch — see "Known quirks" below).                                                                                                                              |
@@ -58,19 +60,21 @@ The pre-push hook (`simple-git-hooks` → `lint-staged` → `prettier --check`) 
 
 These are non-obvious behaviors that have bitten people. Read them before touching the relevant code.
 
-### The auto-done-fallback (`src/artifact-poller.ts` → `maybeAutoDone`)
+### Physical byte order is authoritative
 
-The `auto-done-fallback` synthesizes a completion event when a child ends a turn with `stopReason: "stop"` but never calls `cli.mjs done` (a common LLM failure mode). It is **time-bounded** by `AUTO_DONE_DEBOUNCE_MS` (10s default).
-
-**The guard is `readEvents(art).some(ev => isTerminal(ev))`, NOT `lastEvent(art)`.** This was a real bug: `tailReadSessionLog` runs immediately before the fallback and can append `tool_activity` rows to `events.ndjson` _after_ the child's explicit `done`. `lastEvent` would then return a `tool_activity` and the guard would miss, causing a double-notify. See commit `01cd745` for the postmortem and the regression test. **Do not "simplify" this back to `lastEvent()`.**
-
-### `lastDeliveredEventTs` is the only poller cursor (`src/artifact-poller.ts`)
-
-Every notification delivery advances `state.lastDeliveredEventTs` to the highest `ev.ts` it delivered. The next poll calls `readEvents(art, cursor + 1)`. **Never read events without going through this cursor** — you will re-deliver notifications and double-fire.
+Protocol-v2 event identity is `eventId` plus Pi-derived `turnId`. The poller
+advances `eventByteCursor` using complete NDJSON line offsets. Timestamps are
+display/TTL metadata only; never use them for ordering, deduplication, snapshot
+association, injection, or delivery cursors.
 
 ### `cli.mjs done` is the contract for interactive sub-agents
 
-The child MUST call `cli.mjs done N` after writing `output.md`. The fallback exists because LLMs forget. If you change the protocol, update `src/subagent-artifact-cli.ts` AND the wrapper scripts AND the auto-done-fallback tests.
+The child lifecycle hooks capture `agent_end` messages and append the
+authoritative completion only at `agent_settled`, after retries, compaction, and
+queued continuations. The first `turn_start` binds the provisional turn to the
+persisted Pi user-entry id. `cli.mjs done N` remains an explicit compatible
+signal, but is idempotent by `turnId`; a late call cannot duplicate a snapshot
+or delivery. Protocol v2 has no timeout-based auto-done heuristic.
 
 ### `extractJson` in `src/workflow.ts` is dependency-free on purpose
 
@@ -85,17 +89,16 @@ The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is
 The interactive sub-agent registry is persisted to a per-(cwd) state file on
 `launchInteractiveSubagent`. The file stores the minimum fields needed to rehydrate
 (`paneId`, `mux`, `artifactDir`, `sessionFile`, `notifyOnComplete`). On `session_start` the
-rehydrate function reads the file and reconstructs `InteractiveSubagentState` entries with
-reset runtime cursors (replay-all semantics).
+rehydrate function reads schema v2 and reconstructs artifact/session byte
+cursors, active turn, pending delivery intents, and delivery receipts.
 
 **Crash-safe ordering at both write sites:**
 
 - **Spawn** — write the state file BEFORE `interactiveSubagentRegistry.set`.
   A crash between the two is recoverable on next reload.
   A crash before the write leaves no zombie.
-- **Poll cleanup** — advance `lastDeliveredEventTs` (in-memory) BEFORE
-  `removeInteractiveState` (disk). A crash between them re-delivers rather
-  than drops the event.
+- **Poll enqueue** — persist the delivery intent before advancing the artifact
+  byte cursor. A crash may duplicate dispatch, but cannot silently drop it.
 
 **Rehydrate on startup, reload, and resume:**
 
@@ -108,11 +111,10 @@ deleted on `session_shutdown(reason="new")` to give the next session a clean sla
 On `session_shutdown(reason="quit")` the panes and state file are preserved so the
 subagents survive a restart.
 
-**Inject-mode flood fix at rehydrate:**
-When `notifyOnComplete="inject"` and the artifact already has a terminal event,
-`lastInjectedEventTs` is set to the latest event's ts so the poller does NOT
-re-inject the existing result into the new parent session on its first tick.
-Future follow-up `done` events (higher ts) still inject normally.
+**Delivery receipts:** Rehydrate reconciles deterministic `deliveryId` values
+against parent custom session entries. The synchronous Pi API proves dispatch,
+not durable commit, so delivery is at-least-once and a crash-window duplicate
+remains possible.
 
 **Edge cases:**
 
@@ -122,7 +124,7 @@ Future follow-up `done` events (higher ts) still inject normally.
 - If a rehydrated entry's pane is dead, `deriveInteractiveSubagentStatus`
   sets `status="exited"` or `status="unknown"`; registry entry is retained
   so `list_subagent_artifacts` can still surface it before the next cleanup.
-- The schema is versioned (`schemaVersion: 1`) so future migrations can
+- The schema is versioned (`schemaVersion: 2`) with explicit v1 migration so
   coexist with older state files on upgrades.
 
 ## Git
@@ -157,14 +159,16 @@ src/
     in-process.ts                  # subagent_with_context, subagent_isolated, async tools
     interactive.ts                 # subagent_interactive, get/send/cancel/read/list tools
   session-handlers.ts              # session_start/shutdown handlers, poller setup
-  artifact-poller.ts               # per-tick artifact walk, auto-done fallback, notifications
-  rehydrate.ts                     # reconstruct InteractiveSubagentState from state file
+  artifact-poller.ts               # byte-ordered event fold, durable enqueue, activity UI
+  child-protocol.ts                # child-only Pi lifecycle hooks and completion writer
+  delivery.ts                      # bounded delivery broker and receipt reconciliation
+  rehydrate.ts                     # restore persisted cursors, queues, and receipts
   helpers.ts                       # startSubagentJob, resolveModel, job registry
-  artifact.ts                      # events.ndjson + output.md protocol, state file helpers
+  artifact.ts                      # v2 events, immutable outputs, state migration
   interactive-tmux.ts              # InteractiveSubagentState, registry, mux dispatch
   multiplexer{,-tmux,-zellij}.ts   # mux backend abstraction (tmux + zellij)
   subagent-artifact-cli.ts         # cli.mjs wrapper
-  notifications.ts                 # notify/inject delivery, MAX_INJECT cap
+  notifications.ts                 # in-process completion delivery and compatibility exports
   rendering.ts                     # TUI render helpers
   schemas.ts                       # TypeBox tool-param schemas
   workflow.ts                      # workflow tool
@@ -181,5 +185,5 @@ docs/                              # Managed by the separate pi-docs package; do
 ## When in doubt
 
 - The existing tests in the same directory are the best documentation of intended behavior.
-- `tests/subagent-auto-done.test.ts`, `tests/subagent-notify.test.ts`, `tests/subagent-rehydrate-core.test.ts`, and `tests/subagent-rehydrate-artifacts.test.ts` together define the artifact-protocol contract — if you're not sure what `events.ndjson` is supposed to contain, those tests are the spec.
+- `tests/artifact-delivery.integration.test.ts`, `tests/pi-session-delivery.integration.test.ts`, `tests/subagent-notify.test.ts`, and the rehydrate tests together define the protocol-v2 delivery contract.
 - The release flow is in `CONTRIBUTING.md`. The dev loop (typecheck + test + format) is above. If a step seems to be missing from this file, it probably is — add it.

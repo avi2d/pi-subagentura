@@ -30,23 +30,23 @@ export const BaseParams = Type.Object({
       [
         Type.Literal("notify", {
           description:
-            "Send a brief summary notification when the sub-agent completes (no turn triggered)",
+            "Persist a pointer-only completion message in parent context without triggering by default.",
         }),
         Type.Literal("inject", {
           description:
-            "Inject the full result as a user message when the sub-agent completes (triggers a new turn)",
+            "Queue one attributed, bounded custom completion message. Triggers a turn by default; false explicitly disables triggering.",
         }),
       ],
       {
         description:
-          "When set, automatically deliver completion notification to the main agent. Only valid with async: true.",
+          'How to deliver async completion. Defaults to "inject" when async is true.',
       },
     ),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "When true, completion notifications can trigger a parent LLM turn. In inject mode the injected user message already triggers a turn; this mainly affects notify mode and inject-cap fallback.",
+        "Override parent-turn triggering. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
     }),
   ),
   maxAge: Type.Optional(
@@ -117,13 +117,13 @@ export const InteractiveParams = Type.Object({
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
-        'How to surface the sub-agent result on completion. "inject" (default) also injects output.md as a user message so the parent LLM processes it in its next turn. "notify" emits a UI hint only — no LLM turn is triggered. Falls back to a pointer hint if the inject cap is exceeded.',
+        'How to surface completion. "inject" (default) persists full output and triggers by default. "notify" persists a pointer-only message without triggering. Streaming parents flush a bounded FIFO after agent_settled.',
     }),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "When true, completion notifications can trigger a parent LLM turn. In inject mode the injected user message already triggers a turn; this mainly affects notify mode and inject-cap fallback.",
+        "Override parent-turn triggering. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
     }),
   ),
   mux: Type.Optional(

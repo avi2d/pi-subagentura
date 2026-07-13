@@ -563,23 +563,26 @@ describe("session-log tail-read", () => {
     });
 
     const sendMessage = vi.fn();
+    const notify = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      notify,
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
     mod.pollArtifactChanges({ sendMessage } as any);
 
-    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(notify).not.toHaveBeenCalled();
+    const content = sendMessage.mock.calls[0][0].content as string;
 
     // done: pointer only, no body.
-    const doneCall = sendMessage.mock.calls[0][0];
-    expect(doneCall.content).toContain("done");
-    expect(doneCall.content).toContain("Output:");
-    expect(doneCall.content).toContain("Activity log:");
-    expect(doneCall.content).not.toContain("exited with code");
+    expect(content).toContain("done");
+    expect(content).toContain("Output:");
+    expect(content).toContain("Activity log:");
 
     // error: inline message + pointers.
-    const errCall = sendMessage.mock.calls[1][0];
-    expect(errCall.content).toContain("error");
-    expect(errCall.content).toContain("bash exited with code 1");
-    expect(errCall.content).toContain("Output:");
-    expect(errCall.content).toContain("Activity log:");
+    expect(content).toContain("error");
+    expect(content).toContain("bash exited with code 1");
   });
 
   it("truncates the inline error message to 500 chars", async () => {
@@ -599,8 +602,15 @@ describe("session-log tail-read", () => {
     });
 
     const sendMessage = vi.fn();
+    const notify = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      notify,
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
     mod.pollArtifactChanges({ sendMessage } as any);
 
+    expect(notify).not.toHaveBeenCalled();
     const content = sendMessage.mock.calls[0][0].content as string;
     // The "x".repeat(2000) portion must be capped.
     const match = content.match(/x+/);
