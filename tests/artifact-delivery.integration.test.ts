@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -7,6 +8,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,12 +19,14 @@ import {
   eventLogEndOffset,
   MAX_EVENT_BATCH_BYTES,
   MAX_DELIVERY_RECEIPTS,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
   listOutputHistory,
   readEventRecords,
   readOutput,
   readOutputForTurnId,
   writeOutput,
 } from "../src/artifact";
+import { writeCliScript } from "../src/subagent-artifact-cli";
 import {
   deliveryIdFor,
   enqueueDelivery,
@@ -134,6 +138,58 @@ describe("artifact protocol v2 delivery", () => {
     expect(readFileSync(first.output!.path, "utf8")).toBe("turn one");
     expect(readFileSync(second.output!.path, "utf8")).toBe("turn two");
     expect(readOutput(art)).toBe("turn two");
+  });
+
+  it("records oversized parent-side staging output without snapshotting it", () => {
+    const art = makeArtifact();
+    writeOutput(art, "");
+    const bytes = MAX_OUTPUT_SNAPSHOT_BYTES + 1;
+    writeFileSync(art.outputFile, Buffer.alloc(bytes, 120));
+
+    const completion = appendCompletionEvent(art, {
+      turnId: "oversized-parent-turn",
+      outcome: "cancelled",
+      source: "parent",
+      eventId: "oversized-parent-event",
+    })!;
+
+    expect(completion.output).toBeUndefined();
+    expect(completion.outputError).toEqual({
+      code: "output_too_large",
+      bytes,
+      maxBytes: MAX_OUTPUT_SNAPSHOT_BYTES,
+    });
+    expect(
+      existsSync(join(art.dir, "outputs", "oversized-parent-event.md")),
+    ).toBe(false);
+  });
+
+  it("makes generated CLI completion omit oversized staging output", () => {
+    const art = makeArtifact();
+    writeOutput(art, "");
+    const bytes = MAX_OUTPUT_SNAPSHOT_BYTES + 1;
+    writeFileSync(art.outputFile, Buffer.alloc(bytes, 120));
+    const cli = join(art.dir, "cli.mjs");
+    writeCliScript(cli);
+
+    expect(
+      spawnSync(process.execPath, [cli, "done", "0"], {
+        env: { ...process.env, ARTIFACT_DIR: art.dir },
+      }).status,
+    ).toBe(0);
+    const completion = readEventRecords(art)
+      .map(({ event }) => event)
+      .find((event) => event.type === "completion") as any;
+
+    expect(completion.output).toBeUndefined();
+    expect(completion.outputError).toEqual({
+      code: "output_too_large",
+      bytes,
+      maxBytes: MAX_OUTPUT_SNAPSHOT_BYTES,
+    });
+    expect(
+      existsSync(join(art.dir, "outputs", `${completion.eventId}.md`)),
+    ).toBe(false);
   });
 
   it("discovers and reads immutable protocol-v2 output by Pi turn id", () => {

@@ -19,6 +19,8 @@
  * Exit codes: 0 on success, 2 on usage error (missing env var / unknown cmd).
  */
 
+import { MAX_OUTPUT_SNAPSHOT_BYTES } from "./artifact";
+
 /**
  * The body of the CLI as a string, written verbatim to
  * `$ARTIFACT_DIR/cli.mjs` by `writeLaunchScript`. The string is the literal
@@ -30,10 +32,14 @@ export const CLI_SOURCE = String.raw`#!/usr/bin/env node
 // See subagent-artifact-cli.ts for the source.
 import {
   appendFileSync,
-  copyFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -51,6 +57,7 @@ mkdirSync(dir, { recursive: true, mode: 0o700 });
 
 const statusFile = join(dir, "events.ndjson");
 const activeTurnFile = join(dir, "active-turn.json");
+const MAX_OUTPUT_SNAPSHOT_BYTES = ${MAX_OUTPUT_SNAPSHOT_BYTES};
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
@@ -112,24 +119,60 @@ const completed = () =>
     event.version === 2 && event.type === "completion" && event.turnId === turnId);
 const snapshot = (eventId) => {
   const source = join(dir, "output.md");
-  if (!existsSync(source)) return undefined;
+  let fd;
+  let content;
+  try {
+    fd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      return { outputError: { code: "output_unavailable", message: "output.md is not a regular file" } };
+    }
+    if (stat.size > MAX_OUTPUT_SNAPSHOT_BYTES) {
+      return {
+        outputError: {
+          code: "output_too_large",
+          bytes: stat.size,
+          maxBytes: MAX_OUTPUT_SNAPSHOT_BYTES,
+        },
+      };
+    }
+    content = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytesRead = readSync(fd, content, offset, content.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    content = content.subarray(0, offset);
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    return { outputError: { code: "output_unavailable", message: "output.md could not be read safely" } };
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* bounded content is already in memory */ }
+    }
+  }
   const outputs = join(dir, "outputs");
   mkdirSync(outputs, { recursive: true, mode: 0o700 });
   const target = join(outputs, eventId + ".md");
   if (!existsSync(target)) {
     const tmp = target + ".tmp";
-    copyFileSync(source, tmp);
+    writeFileSync(tmp, content, { mode: 0o600 });
     renameSync(tmp, target);
   }
-  const bytes = statSync(target).size;
-  const sha256 = createHash("sha256").update(readFileSync(target)).digest("hex");
-  return { path: target, bytes, sha256 };
+  return {
+    output: {
+      path: target,
+      bytes: content.byteLength,
+      sha256: createHash("sha256").update(content).digest("hex"),
+    },
+  };
 };
 const completion = (outcome, source, extra = {}) => {
   withCompletionLock(() => {
     if (completed()) return;
     const eventId = randomUUID();
-    const output = snapshot(eventId);
+    const snapshotResult = snapshot(eventId);
     write({
       version: 2,
       eventId,
@@ -139,7 +182,7 @@ const completion = (outcome, source, extra = {}) => {
       status: outcome,
       outcome,
       source,
-      ...(output ? { output } : {}),
+      ...snapshotResult,
       ...extra,
     });
   });

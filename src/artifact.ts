@@ -51,10 +51,22 @@ export interface OutputSnapshot {
   sha256: string;
 }
 
+export type OutputSnapshotError =
+  | {
+      code: "output_too_large";
+      bytes: number;
+      maxBytes: number;
+    }
+  | {
+      code: "output_unavailable";
+      message: string;
+    };
+
 export interface OutputHistoryEntry {
   turnId: string;
   eventId: string;
   output?: OutputSnapshot;
+  outputError?: OutputSnapshotError;
 }
 
 export type CompletionOutcome = "done" | "error" | "cancelled";
@@ -97,6 +109,7 @@ export type SubagentEventV2 =
       outcome: CompletionOutcome;
       source: CompletionSource;
       output?: OutputSnapshot;
+      outputError?: OutputSnapshotError;
       exitCode?: number;
       message?: string;
       errorMessage?: string;
@@ -284,22 +297,77 @@ export function snapshotOutput(art: SubagentArtifact, turn: number): void {
 export function snapshotOutputForEvent(
   art: SubagentArtifact,
   eventId: string,
-): OutputSnapshot {
+): { output?: OutputSnapshot; outputError?: OutputSnapshotError } {
+  let fd: number | undefined;
+  let content: Buffer;
+  try {
+    fd = openSync(art.outputFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      return {
+        outputError: {
+          code: "output_unavailable",
+          message: "output.md is not a regular file",
+        },
+      };
+    }
+    if (stat.size > MAX_OUTPUT_SNAPSHOT_BYTES) {
+      return {
+        outputError: {
+          code: "output_too_large",
+          bytes: stat.size,
+          maxBytes: MAX_OUTPUT_SNAPSHOT_BYTES,
+        },
+      };
+    }
+    content = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytesRead = readSync(
+        fd,
+        content,
+        offset,
+        content.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    content = content.subarray(0, offset);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      content = Buffer.alloc(0);
+    } else {
+      return {
+        outputError: {
+          code: "output_unavailable",
+          message: "output.md could not be read safely",
+        },
+      };
+    }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* snapshot content is already bounded in memory */
+      }
+    }
+  }
   const outputsDir = join(art.dir, "outputs");
   mkdirSync(outputsDir, { recursive: true, mode: 0o700 });
   const target = join(outputsDir, `${eventId}.md`);
-  const content = existsSync(art.outputFile)
-    ? readFileSync(art.outputFile)
-    : Buffer.alloc(0);
   if (!existsSync(target)) {
     const tmp = target + ".tmp";
     writeFileSync(tmp, content, { mode: 0o600 });
     renameSync(tmp, target);
   }
   return {
-    path: target,
-    bytes: content.byteLength,
-    sha256: createHash("sha256").update(content).digest("hex"),
+    output: {
+      path: target,
+      bytes: content.byteLength,
+      sha256: createHash("sha256").update(content).digest("hex"),
+    },
   };
 }
 
@@ -326,7 +394,7 @@ export function appendCompletionEvent(
     );
     if (existing) return null;
     const eventId = params.eventId ?? newEventId();
-    const output = snapshotOutputForEvent(art, eventId);
+    const snapshot = snapshotOutputForEvent(art, eventId);
     const event: CompletionEventV2 = {
       version: 2,
       eventId,
@@ -336,7 +404,7 @@ export function appendCompletionEvent(
       status: params.outcome,
       outcome: params.outcome,
       source: params.source,
-      output,
+      ...snapshot,
       ...(params.exitCode === undefined ? {} : { exitCode: params.exitCode }),
       ...(params.message ? { message: params.message } : {}),
       ...(params.errorMessage ? { errorMessage: params.errorMessage } : {}),
@@ -398,6 +466,7 @@ export function listOutputHistory(art: SubagentArtifact): OutputHistoryEntry[] {
         turnId: event.turnId,
         eventId: event.eventId,
         ...(event.output ? { output: event.output } : {}),
+        ...(event.outputError ? { outputError: event.outputError } : {}),
       },
     ];
   });
@@ -569,6 +638,30 @@ function normalizeEvent(
             sha256: rawOutput.sha256,
           }
         : undefined;
+    const rawOutputError = obj.outputError as
+      | Record<string, unknown>
+      | undefined;
+    const outputError: OutputSnapshotError | undefined =
+      rawOutputError?.code === "output_too_large" &&
+      typeof rawOutputError.bytes === "number" &&
+      Number.isSafeInteger(rawOutputError.bytes) &&
+      rawOutputError.bytes >= 0 &&
+      typeof rawOutputError.maxBytes === "number" &&
+      Number.isSafeInteger(rawOutputError.maxBytes) &&
+      rawOutputError.maxBytes === MAX_OUTPUT_SNAPSHOT_BYTES &&
+      rawOutputError.bytes > rawOutputError.maxBytes
+        ? {
+            code: "output_too_large",
+            bytes: rawOutputError.bytes,
+            maxBytes: rawOutputError.maxBytes,
+          }
+        : rawOutputError?.code === "output_unavailable" &&
+            typeof rawOutputError.message === "string"
+          ? {
+              code: "output_unavailable",
+              message: rawOutputError.message.slice(0, MAX_EVENT_TEXT_LENGTH),
+            }
+          : undefined;
     return {
       event: {
         ...base,
@@ -577,6 +670,7 @@ function normalizeEvent(
         outcome: obj.outcome,
         source: obj.source,
         output,
+        outputError,
         exitCode,
         message,
         errorMessage: boundedEventString(obj.errorMessage),

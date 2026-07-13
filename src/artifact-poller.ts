@@ -130,6 +130,9 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           message:
             v2?.errorMessage ??
             v2?.message ??
+            (v2?.outputError?.code === "output_too_large"
+              ? `Output omitted: ${v2.outputError.bytes} bytes exceeds the ${v2.outputError.maxBytes}-byte snapshot limit.`
+              : v2?.outputError?.message) ??
             ("message" in ev ? ev.message : undefined),
           state: "queued",
         });
