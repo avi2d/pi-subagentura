@@ -22,7 +22,7 @@ npm run format:check  # prettier --check .
 npm run pack:check  # npm pack --dry-run, mirrors the publish step
 ```
 
-The pre-push hook (`simple-git-hooks` → `lint-staged` → `prettier --check`) runs the third one on staged files. Skip it for emergencies: `SKIP_SIMPLE_GIT_HOOKS=1 git push`.
+The pre-commit hook (`simple-git-hooks` → `lint-staged` → `prettier --write`) formats staged files. The pre-push hook runs the third command across the repository. Install or refresh both with `npm run hooks:install`. Skip either for emergencies with `SKIP_SIMPLE_GIT_HOOKS=1`.
 
 ## Source layout (the 30-second tour)
 

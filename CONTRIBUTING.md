@@ -6,6 +6,7 @@ Thanks for contributing to `pi-subagentura`.
 
 ```bash
 npm install
+npm run hooks:install
 npm run typecheck
 npm test
 npm run pack:check

@@ -322,9 +322,9 @@ SUBAGENT_DEBUG_LOG_DIR=./.pi-debug pi   # writes ./pi-debug/debug-2026-06-10.jso
 
 Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-A pre-push hook runs `prettier --check` on staged files (via `simple-git-hooks` + `lint-staged`).
+A pre-commit hook formats staged files (via `simple-git-hooks` + `lint-staged`). A pre-push hook runs `npm run format:check` across the repository.
 
-It auto-installs on `npm install`. To skip once: `SKIP_SIMPLE_GIT_HOOKS=1 git push`. To reformat:
+Install or refresh the hooks with `npm run hooks:install`. To skip a hook once, set `SKIP_SIMPLE_GIT_HOOKS=1`. To reformat the repository:
 
 `npm run format`.
 
