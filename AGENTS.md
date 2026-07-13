@@ -76,6 +76,15 @@ persisted Pi user-entry id. `cli.mjs done N` remains an explicit compatible
 signal, but is idempotent by `turnId`; a late call cannot duplicate a snapshot
 or delivery. Protocol v2 has no timeout-based auto-done heuristic.
 
+Pi treats Enter during streaming as steering within the existing agent run and
+does not emit another `before_agent_start`. The child protocol must rotate to
+the newly persisted user-entry id in `before_provider_request`; otherwise that
+turn's `done` is deduplicated against the prior turn and its output is lost.
+
+Snapshot writers must enforce `MAX_OUTPUT_SNAPSHOT_BYTES` before reading or
+copying child-controlled `output.md`. Oversized staging output records explicit
+`outputError` metadata and must never be loaded synchronously into the parent.
+
 ### `extractJson` in `src/workflow.ts` is dependency-free on purpose
 
 The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is a hand-rolled ~80-line JSON Schema subset, not a dep. This is intentional: the tool is in-process and must not pull `ajv` or similar into the parent Pi install. Don't replace it with a library without a strong reason.

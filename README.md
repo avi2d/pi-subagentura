@@ -203,7 +203,11 @@ Every interactive child runs protocol-only Pi lifecycle hooks and therefore
 requires Pi SDK `>=0.80.6 <0.81.0`. `before_agent_start` creates a provisional
 turn, the first `turn_start` binds it to the persisted Pi user-entry id, tool
 hooks record activity, and `agent_settled` records the authoritative completion
-after retries, compaction, and queued continuations. The explicit CLI remains supported:
+after retries, compaction, and queued continuations. When Pi accepts Enter while
+streaming, it treats the message as steering inside the current agent run and
+does not emit another `before_agent_start`. The child protocol therefore detects
+the newly persisted steering user entry before its provider request and starts a
+distinct artifact turn for it. The explicit CLI remains supported:
 
 ```bash
 $ARTIFACT_DIR/cli.mjs done 0       # success — parent reads the literal output.md path baked into the child prompt
@@ -229,6 +233,13 @@ file (including an empty file when the turn wrote nothing) is copied atomically 
 in physical NDJSON byte order; timestamps are display-only. Mixed v1/v2 logs and
 legacy `output-N.md` snapshots remain readable. New legacy completions are
 pointer-only because mutable `output.md` cannot be safely attributed to a turn.
+
+Immutable snapshots are limited to 1 MiB. The parent and generated child CLI
+check the staging file size before reading it. If `output.md` exceeds the limit,
+the completion is still recorded with `outputError.code = "output_too_large"`
+and its observed byte count, but no immutable snapshot is created or injected
+into parent context. The oversized staging file remains available for manual
+inspection in the artifact directory.
 
 #### Completion notifications: notify vs inject
 
@@ -271,8 +282,8 @@ Kills the mux pane for an interactive sub-agent by id. Writes a `cancelled` even
 
 #### `send_interactive_subagent_message`
 
-Sends a follow-up prompt to a running interactive sub-agent by id. The message is delivered into the child's existing REPL via the sub-agent's mux backend (tmux send-keys or zellij write-chars + write 13), so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its system prompt) call `cli.mjs done 0` again when finished, which wakes the parent via the usual `notifyOnComplete` path.
-Refuses to send if the sub-agent is not in the registry, is not in `running` status, or if the mux itself rejects the send call (e.g. the pane was killed between status check and send). All three failure modes return a structured `isError: true` result.
+Sends a follow-up prompt to a running or idle interactive sub-agent by id. The message is delivered into the child's existing REPL via the sub-agent's mux backend (tmux send-keys or zellij write-chars + write 13), so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. A message submitted while the child streams is processed through Pi's one-at-a-time steering queue; its persisted user entry receives a distinct artifact turn and immutable completion snapshot. The child will call `cli.mjs done 0` again when finished, which wakes the parent through the usual `notifyOnComplete` path.
+Refuses to send if the sub-agent is not in the registry, is neither `running` nor `idle`, or if the mux itself rejects the send call (e.g. the pane was killed between the status check and send). All three failure modes return a structured `isError: true` result.
 
 Parameters:
 
