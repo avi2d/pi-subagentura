@@ -230,6 +230,18 @@ Interactive sub-agents deliver their completion to the parent through one of two
   context without triggering a provider call. Explicit
   `triggerTurnOnComplete: true` wakes the parent immediately.
 
+| Configuration                             | Persisted in parent context | Starts an immediate parent turn |
+| ----------------------------------------- | --------------------------- | ------------------------------- |
+| `inject` (default)                        | Full completion output      | Yes                             |
+| `inject` + `triggerTurnOnComplete: false` | Full completion output      | No                              |
+| `notify` (default trigger behavior)       | Artifact pointer only       | No                              |
+| `notify` + `triggerTurnOnComplete: true`  | Artifact pointer only       | Yes                             |
+
+Therefore plain `notify` records the completion for both the UI and the parent
+conversation, but the LLM does not react immediately. The pointer becomes
+available to the model when the user starts the next parent turn. It is not a
+visual-only notification and the completion is not discarded.
+
 LLM-facing completions wait while the parent streams and flush as one bounded
 message after `agent_settled`. The durable FIFO is limited to 32 records / 256 KiB,
 with 32 KiB output per record and 64 KiB per flush. Overflow keeps status and
