@@ -954,7 +954,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     expect(loaded?.states[id]).toBeDefined();
     expect(state.status).toBe("idle");
   });
-  it("removes the state.json entry after delivering an error event", async () => {
+  it("removes the state.json entry after delivering an error event when the pane is dead", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        throw new Error("pane dead");
+      },
+    }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
@@ -971,6 +977,33 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeUndefined();
+    expect(state.status).toBe("exited");
+  });
+
+  it("keeps the state.json entry after an error when the pane is alive", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (_file: string, args: string[]) => {
+        if (args[0] === "display-message") return Buffer.from("#99");
+        return "";
+      },
+    }));
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { cwd, id, state } = makePersistedState();
+    mod.interactiveSubagentRegistry.set(id, state);
+    const art = artifactPath(join(state.artifactDir, ".."), id);
+    appendEvent(art, {
+      ts: 1,
+      type: "error",
+      status: "error",
+      message: "provider failed",
+    });
+
+    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+    expect(state.status).toBe("idle");
   });
 
   it("removes the state.json entry after delivering a cancelled event", async () => {

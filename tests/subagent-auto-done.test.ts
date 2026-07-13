@@ -193,6 +193,42 @@ describe("auto-done fallback", () => {
     );
   });
 
+  it("notifies the parent when a provider error stops a turn without an explicit error event", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({
+      outputContent: "partial result",
+    });
+    state.lastStopReason = "error";
+    state.lastStopText = "WebSocket transport failed after streaming began";
+    state.notifyOnComplete = "notify";
+    state.triggerTurnOnComplete = true;
+    mod.interactiveSubagentRegistry.set(state.id, state);
+
+    const sendMessage = vi.fn();
+    mod.pollArtifactChanges({ sendMessage } as any);
+
+    const art = artifactPath(dirname(artifactDir), state.id);
+    const events = readEvents(art);
+    const err = events.find((e) => e.type === "error");
+    expect(err).toBeDefined();
+    expect(err && err.type === "error" ? err.message : "").toContain(
+      "stopReason:error",
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0][0].content).toContain(
+      "WebSocket transport failed",
+    );
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+
+    // The live REPL remains recoverable; the next poll transitions it to idle.
+    mod.pollArtifactChanges({ sendMessage } as any);
+    expect(state.status).toBe("idle");
+  });
+
   it("does NOT synthesize for stopReason 'toolUse' (model is mid-turn, not finished)", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -213,8 +249,8 @@ describe("auto-done fallback", () => {
     expect(state.status).toBe("running");
   });
 
-  it.each(["length", "error", "aborted"] as const)(
-    "does NOT auto-synthesize for stopReason '%s'",
+  it.each(["length", "error"] as const)(
+    "auto-synthesizes an error for stopReason '%s'",
     async (reason) => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -226,12 +262,26 @@ describe("auto-done fallback", () => {
 
       const art = artifactPath(dirname(artifactDir), state.id);
       const events = readEvents(art);
-      const synthesized = events.find(
-        (e) => e.type === "done" || e.type === "error",
-      );
-      expect(synthesized).toBeUndefined();
+      const synthesized = events.find((e) => e.type === "error");
+      expect(synthesized).toBeDefined();
+      expect(
+        synthesized && synthesized.type === "error" ? synthesized.message : "",
+      ).toContain(`stopReason:${reason}`);
     },
   );
+
+  it("does NOT auto-synthesize for stopReason 'aborted'", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({ outputContent: "result" });
+    state.lastStopReason = "aborted";
+    mod.interactiveSubagentRegistry.set(state.id, state);
+
+    mod.pollArtifactChanges({} as any);
+
+    const art = artifactPath(dirname(artifactDir), state.id);
+    expect(readEvents(art).some((e) => e.type === "error")).toBe(false);
+  });
 
   it("does NOT synthesize before the debounce window elapses", async () => {
     const mod =
@@ -563,7 +613,7 @@ describe("auto-done fallback", () => {
     expect(state.lastStopText).toBe("Done. Wrote the result.");
   });
 
-  it("does NOT capture lastStopText for non-'stop' stopReasons", async () => {
+  it("captures lastStopText for provider and length stopReasons", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
@@ -583,7 +633,7 @@ describe("auto-done fallback", () => {
     mod.pollArtifactChanges({} as any);
 
     expect(state.lastStopReason).toBe("length");
-    expect(state.lastStopText).toBeUndefined();
+    expect(state.lastStopText).toBe("I hit the token limit.");
   });
 
   it("a user message in the session log clears the per-turn stop-capture (lastStopReason, lastStopReasonAt, lastStopText)", async () => {

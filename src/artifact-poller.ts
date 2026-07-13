@@ -88,9 +88,8 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       );
       const last = lastEvent(art);
 
-      // Refresh status from the artifact + pane liveness. `done` + pane alive → "idle" (not exited),
-      // which is what allows follow-ups: a second `done` after the follow-up turn will be picked up
-      // here and the inject path below will fire again.
+      // Refresh status from the artifact + pane liveness. `done` or recoverable `error` + pane alive
+      // becomes "idle", which allows the parent to send a follow-up after a failed model turn.
       const paneAlive = isPaneAlive(state);
       const next = deriveInteractiveSubagentStatus(last, paneAlive);
       if (next !== state.status) {
@@ -126,10 +125,10 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       // TUI-widget only — the LLM never sees them.
       tailReadSessionLog(state, art);
 
-      // Auto-done fallback: synthesize a completion event when the model ended its turn with
-      // stopReason:"stop" but never called `cli.mjs done`. Runs BEFORE reading events so the synthesized
-      // event is part of the same poll's read-back. The normal event loop still owns delivery/cursor
-      // advancement so stale Pi contexts can retry on the next tick.
+      // Auto-completion fallback: synthesize a terminal event when the child ended a model turn
+      // without calling `cli.mjs done` or `cli.mjs error`. Runs BEFORE reading events so the
+      // synthesized event is part of the same poll's read-back. The normal event loop still owns
+      // delivery/cursor advancement so stale Pi contexts can retry on the next tick.
       maybeAutoDone(state, art, Date.now());
 
       // Read events newer than the last delivered. `lastDeliveredEventTs` starts at 0,
@@ -164,7 +163,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           if (ev.ts > nextCursor) nextCursor = ev.ts;
           // Keep done+alive entries persisted: the child REPL is idle and can
           // accept follow-ups, so a later parent reload still needs rehydrate.
-          if (ev.type === "error" || ev.type === "cancelled") {
+          if (ev.type === "cancelled" || (ev.type === "error" && !paneAlive)) {
             shouldRemovePersistedState = true;
           } else if (ev.type === "done" && !paneAlive) {
             shouldRemovePersistedState = true;
@@ -478,7 +477,7 @@ function processSessionLogEntry(
     return;
   }
 
-  // Assistant message: extract toolCall blocks AND record stopReason for the auto-done fallback.
+  // Assistant message: extract toolCall blocks AND record terminal stopReason for the fallback.
   if (msg.role === "assistant" && Array.isArray(msg.content)) {
     const ts = (msg.timestamp as number) ?? Date.now();
     const stopReason = (msg as { stopReason?: string }).stopReason;
@@ -490,12 +489,10 @@ function processSessionLogEntry(
     ) {
       state.lastStopReason = stopReason;
       state.lastStopReasonAt = ts;
-      // Capture the textual summary the model produced for the final turn. Used as fallback
-      // content when auto-synthesizing an `error` event for a child that stopped without writing output.md.
-      if (stopReason === "stop") {
-        const text = extractAssistantText(msg.content);
-        if (text) state.lastStopText = text;
-      }
+      // Capture the textual summary for fallback error notifications. The provider may include
+      // useful transport/model details in the assistant text even when output.md is absent.
+      const text = extractAssistantText(msg.content);
+      if (text) state.lastStopText = text;
     }
     for (const rawBlock of msg.content) {
       const block = rawBlock as
@@ -535,19 +532,16 @@ function extractAssistantText(content: unknown[]): string {
 // ── Auto-done fallback ────────────────────────────────────────────────
 
 /**
- * Auto-done fallback. The protocol requires the child to call `cli.mjs done` after writing
- * output.md, but LLMs routinely forget. We observe the child's session log and synthesize a
- * completion event when:
- *   1. The most recent assistant message had stopReason "stop" (the model finished a turn naturally), AND
+ * Completion fallback. The protocol requires the child to call `cli.mjs done` or `cli.mjs error`,
+ * but provider failures and interrupted model turns can leave neither event. We observe the child's
+ * session log and synthesize a terminal event when:
+ *   1. The most recent assistant message had stopReason "stop", "length", or "error", AND
  *   2. The model has not produced any new session-log activity for AUTO_DONE_DEBOUNCE_MS, AND
  *   3. No explicit done/error/cancelled event is in the artifact log yet, AND
  *   4. We have not already synthesized one for this turn.
  *
- * The synthesized event is appended to events.ndjson so the regular poller path picks it up; we also
- * advance the cursor and the `injected` flag so a late-arriving explicit `done` (or a duplicate poller pass)
- * does not double-notify. When output.md is missing, we synthesize `error` instead and include the child's
- * last assistant text as a fallback message — most models inline a summary in chat even when the actual
- * result landed at a different path.
+ * A natural "stop" with output becomes a synthetic done event. Missing output or a provider/length
+ * failure becomes an error event, which still reaches the parent through the normal notification path.
  */
 function maybeAutoDone(
   state: InteractiveSubagentState,
@@ -555,9 +549,13 @@ function maybeAutoDone(
   now: number,
 ): void {
   if (state.autoDoneForTurnAt !== undefined) return; // already fired for this turn
-
-  if (state.lastStopReason !== "stop") return;
-
+  if (
+    state.lastStopReason !== "stop" &&
+    state.lastStopReason !== "length" &&
+    state.lastStopReason !== "error"
+  ) {
+    return;
+  }
   const stopAt = state.lastStopReasonAt ?? 0;
 
   if (now - stopAt < AUTO_DONE_DEBOUNCE_MS) return;
@@ -586,13 +584,14 @@ function maybeAutoDone(
 
   if (existingTerminal) return;
 
-  // Detect output.md state. We want to synthesize `done` only when the model has actually produced a result.
+  // Only a natural stop with output is a successful completion. Provider errors and truncated
+  // turns must notify the parent even if output.md happens to contain partial content.
   const output = readOutput(art);
   const hasOutput = output !== null && output.length > 0;
-
+  const isSuccessfulStop = state.lastStopReason === "stop" && hasOutput;
   const ts = now;
   let ev: SubagentEvent;
-  if (hasOutput) {
+  if (isSuccessfulStop) {
     ev = {
       ts,
       type: "done",
@@ -602,7 +601,10 @@ function maybeAutoDone(
     };
   } else {
     const fallback = state.lastStopText;
-    const baseMessage = "sub-agent stopped without writing output.md";
+    const baseMessage =
+      state.lastStopReason === "stop"
+        ? "sub-agent stopped without writing output.md"
+        : `sub-agent turn ended with stopReason:${state.lastStopReason}`;
     const FALLBACK_SLICE = 500;
     const message =
       fallback && fallback.length > 0

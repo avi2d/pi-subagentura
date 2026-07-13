@@ -392,8 +392,8 @@ describe("interactive-tmux", () => {
     it("done event + pane dead → 'exited' (terminal)", () => {
       expect(deriveInteractiveSubagentStatus(doneEv, false)).toBe("exited");
     });
-    it("error event + pane alive → 'exited' (child declared it unrecoverable)", () => {
-      expect(deriveInteractiveSubagentStatus(errorEv, true)).toBe("exited");
+    it("error event + pane alive → 'idle' (failed turn can be retried)", () => {
+      expect(deriveInteractiveSubagentStatus(errorEv, true)).toBe("idle");
     });
     it("error event + pane dead → 'exited'", () => {
       expect(deriveInteractiveSubagentStatus(errorEv, false)).toBe("exited");

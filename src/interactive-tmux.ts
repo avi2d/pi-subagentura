@@ -87,7 +87,7 @@ When your task is done, follow this checklist in order. The parent is a parent a
   4. Run exactly one of these bash commands. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
 
        "$ARTIFACT_DIR/cli.mjs" done 0       # success
-       "$ARTIFACT_DIR/cli.mjs" error "short reason"   # unrecoverable failure
+       "$ARTIFACT_DIR/cli.mjs" error "short reason"   # failed turn; keep the REPL open for recovery
 
   5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 4 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
 
@@ -96,7 +96,7 @@ Do not call 'cancelled' yourself — the parent agent writes that event only whe
 For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJSON line to events.ndjson. The parent reads that file every few seconds. The atomic write pattern (write to .tmp, then rename onto output.md) is fine if you want crash-safety.
 
 ─── HARDENING REMINDER (read this last, it is the most recent instruction on purpose) ───
-If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a fallback \`error\` event from your session log, but only if your final assistant turn ended with stopReason "stop" and you have not produced any output for 10 seconds. That fallback may not include the full result if output.md is missing. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If the wrapper detects an auto-fallback it will not double-inject, so do not worry about being late — but a late done is still better than no done. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
+If you forget step 4 (\`cli.mjs done\` or \`cli.mjs error\`), the parent will synthesize a fallback event from your session log after 10 seconds of inactivity when the final stopReason is \`stop\`, \`length\`, or \`error\`. The fallback is delivered to the parent through the normal notify/inject path, so provider failures do not disappear silently. If the pane is still alive, the parent can send a follow-up prompt after an error; do not exit the REPL. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If you have finished your work, your single next action should be the appropriate \`cli.mjs\` command, not another tool call.`;
 }
 
 /**
@@ -105,7 +105,7 @@ If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a
  * - "running"  — child is processing a turn (last artifact event is "started" or absent)
  * - "idle"     — child finished a turn, REPL is open, pane alive; ready for a follow-up prompt
  * - "cancelled" — parent called cancel_interactive_subagent; terminal, no follow-up allowed
- * - "exited"   — child pi process is actually gone (pane dead, or it called `error`); terminal
+ * - "exited"   — child pi process is actually gone (pane dead); terminal
  * - "unknown"  — can't determine (rare; pane dead but no recorded event)
  */
 export type InteractiveSubagentStatus =
@@ -153,7 +153,8 @@ export interface InteractiveSubagentState {
   /**
    * Lifecycle status. Transition triggers:
    * - spawn sets "running" (interactive-tmux.ts setup)
-   * - cli.mjs done / error event in events.ndjson sets "exited" or "cancelled"
+   * - cli.mjs done / error event in events.ndjson sets "idle" when the pane remains alive
+   * - pane death or an error event with a dead pane sets "exited"
    * - user-msg after "exited" revives to "running" so follow-up turns can fire
    *   auto-done again (subagent.ts processSessionLogEntry)
    * - cancel_interactive_subagent tool sets "cancelled"
@@ -769,8 +770,9 @@ export function cancelInteractiveSubagentByState(
  * Pure status-decision matrix used by both `pruneDeadInteractiveSubagents` (here) and the
  * artifact poller in `subagent.ts`. Pulled out so the rules are testable without a live tmux.
  *
- * Semantics: a `done` event means "this turn is finished" — the child's REPL stays open and the
- * child is ready for a follow-up prompt. Only `error` / pane-dead / `cancelled` are terminal.
+ * Semantics: a `done` or recoverable `error` event means "this turn is finished" — the child's
+ * REPL stays open and the child is ready for a follow-up prompt. Only a dead pane or an explicit
+ * `cancelled` event is terminal.
  */
 export function deriveInteractiveSubagentStatus(
   lastEvent: SubagentEvent | null,
@@ -778,7 +780,7 @@ export function deriveInteractiveSubagentStatus(
 ): InteractiveSubagentStatus {
   if (lastEvent) {
     if (lastEvent.type === "cancelled") return "cancelled";
-    if (lastEvent.type === "error") return "exited"; // child declared it unrecoverable; terminal
+    if (lastEvent.type === "error") return paneAlive ? "idle" : "exited";
     if (lastEvent.type === "done") return paneAlive ? "idle" : "exited";
   }
   return paneAlive ? "running" : "unknown";
