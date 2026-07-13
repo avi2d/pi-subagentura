@@ -88,23 +88,19 @@ function appendActivity(
 
 export function registerChildProtocol(pi: ExtensionAPI): void {
   const art = getArtifact();
-  const bindPersistedTurn = (
-    ctx: any,
+  const startPersistedTurn = (
+    turnId: string,
     timestamp: number,
-  ): ActiveTurn | null => {
-    const active = readActiveTurn(art);
-    if (!active) return null;
-    if (active.started) return active;
-    const persistedId = latestUserEntryId(ctx);
-    if (!persistedId || persistedId === active.previousUserEntryId) {
-      return active;
-    }
+    previousUserEntryId?: string,
+  ): ActiveTurn => {
     const turn: ActiveTurn = {
-      turnId: persistedId,
+      turnId,
       startedAt: timestamp,
       started: true,
-      previousUserEntryId: active.previousUserEntryId,
+      previousUserEntryId,
     };
+    latestAgentMessages = [];
+    writeOutput(art, "");
     writeActiveTurn(turn, art);
     appendEvent(art, {
       version: 2,
@@ -115,6 +111,29 @@ export function registerChildProtocol(pi: ExtensionAPI): void {
       status: "running",
     });
     return turn;
+  };
+  const bindPersistedTurn = (
+    ctx: any,
+    timestamp: number,
+  ): ActiveTurn | null => {
+    const active = readActiveTurn(art);
+    if (!active) return null;
+    const persistedId = latestUserEntryId(ctx);
+    if (active.started) {
+      if (!persistedId || persistedId === active.turnId) return active;
+      // Pi handles Enter during streaming as a steering message inside the
+      // existing agent run, so it emits no before_agent_start. The persisted
+      // user entry is the authoritative boundary for that new child turn.
+      return startPersistedTurn(persistedId, timestamp, active.turnId);
+    }
+    if (!persistedId || persistedId === active.previousUserEntryId) {
+      return active;
+    }
+    return startPersistedTurn(
+      persistedId,
+      timestamp,
+      active.previousUserEntryId,
+    );
   };
   pi.on("before_agent_start", (_event, ctx) => {
     const turn: ActiveTurn = {

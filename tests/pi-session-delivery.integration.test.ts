@@ -4,6 +4,7 @@ import {
   appendCompletionEvent,
   appendInteractiveState,
   eventLogEndOffset,
+  listOutputHistory,
   readEventRecords,
   writeOutput,
 } from "../src/artifact";
@@ -424,6 +425,64 @@ describe("child protocol lifecycle integration", () => {
         .filter((event) => event.type === "completion")
         .map((event: any) => event.turnId),
     ).toEqual(userIds);
+  });
+
+  it("gives a mid-run steering message its own completion snapshot", async () => {
+    const art = childArtifact();
+    const harness = await createPiSessionHarness(repoRoot, {
+      childArtifactDir: art.dir,
+    });
+    harnesses.push(harness);
+    const cli = join(art.dir, "cli.mjs");
+
+    const run = harness.session.prompt("initial turn");
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    writeCliScript(cli);
+    await harness.session.prompt("mid-run follow-up", {
+      streamingBehavior: "steer",
+    });
+    writeOutput(art, "initial output");
+    expect(
+      spawnSync(process.execPath, [cli, "done", "0"], {
+        env: { ...process.env, ARTIFACT_DIR: art.dir },
+      }).status,
+    ).toBe(0);
+
+    harness.completeNext("initial assistant response");
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(2));
+    writeOutput(art, "follow-up output");
+    expect(
+      spawnSync(process.execPath, [cli, "done", "0"], {
+        env: { ...process.env, ARTIFACT_DIR: art.dir },
+      }).status,
+    ).toBe(0);
+    harness.completeNext("follow-up assistant response");
+    await run;
+    await harness.session.waitForIdle();
+
+    const userIds = harness.sessionManager
+      .getEntries()
+      .filter(
+        (entry: any) =>
+          entry.type === "message" && entry.message?.role === "user",
+      )
+      .map((entry: any) => entry.id);
+    const events = readEventRecords(art).map(({ event }) => event);
+    expect(
+      events
+        .filter((event) => event.type === "turn_started")
+        .map((event: any) => event.turnId),
+    ).toEqual(userIds);
+    expect(
+      events
+        .filter((event) => event.type === "completion")
+        .map((event: any) => event.turnId),
+    ).toEqual(userIds);
+    expect(
+      listOutputHistory(art).map((entry) =>
+        entry.output ? readFileSync(entry.output.path, "utf8") : null,
+      ),
+    ).toEqual(["initial output", "follow-up output"]);
   });
 
   it("retry success ignores the intermediate error completion", async () => {
