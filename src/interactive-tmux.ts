@@ -73,7 +73,9 @@ export function buildChildSubagentProtocol(artifactDir: string): string {
   const outputPath = `${artifactDir}/output.md`;
   return `You are running inside a Pi sub-agent launched by a parent agent. The parent agent reads your work from two files in your artifact directory and from one CLI command. You MUST follow this protocol or your work will be lost.
 
-BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary in step 3. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
+BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary after the lifecycle command succeeds. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
+
+COMPLETION IS MANDATORY FOR EVERY TURN. A turn is not complete when output.md is written or when you have drafted a final response; it is complete only after cli.mjs returns successfully. This applies to the initial turn and every turn created by a follow-up message. Do not produce or send your final assistant response before invoking cli.mjs, because ending the response first can prevent the lifecycle command from running and leave the parent waiting forever.
 
 Your artifact directory is: ${artifactDir}
 
@@ -83,24 +85,26 @@ Your artifact directory is: ${artifactDir}
 
 Use the literal path above in your \`write\` tool calls — the \`write\` tool does not expand \$ARTIFACT_DIR or any other shell variable, so a path like "\$ARTIFACT_DIR/output.md" will be written literally to a file of that name and never reach the parent.
 
-When your task is done, follow this checklist in order. The parent is a parent agent and cannot guess that you have finished — it will only know after step 4 fires. Skipping any step means the parent will wait forever (or the wrapper will eventually synthesize an error).
+When your task is done, follow this checklist in order. The parent is a parent agent and cannot guess that you have finished — it will only know after step 3 succeeds. Skipping or reordering any step breaks the completion contract.
 
-  1. Stop calling tools. If you are mid-tool-call, finish it.
+  1. Finish all task work. Once you start this checklist, do not begin new work.
   2. Write your final result to ${outputPath} using the \`write\` tool. Use the exact path above. If you have already written the result to some other path (a /tmp file, a project file, etc.), copy or append it to output.md so the parent can read it.
-  3. Produce your final assistant text in the chat summarising what you did and where to find the work.
-  4. Run exactly one of these bash commands. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
+  3. Run the appropriate bash command and wait for it to return. A successful invocation must record exactly one completion event for this turn. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
 
        "$ARTIFACT_DIR/cli.mjs" done 0       # success
        "$ARTIFACT_DIR/cli.mjs" error "short reason"   # unrecoverable failure
 
-  5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 4 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
+     This must be your final tool call for the turn. If the command itself fails, do not send the final assistant response; fix the cause and retry until one completion event has been recorded successfully.
+
+  4. Only after the lifecycle command succeeds, produce your final assistant text in the chat summarising what you did and where to find the work. Make no more tool calls during this turn.
+  5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 3 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
 
 Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
 
 For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJSON line to events.ndjson. The parent reads that file every few seconds. The atomic write pattern (write to .tmp, then rename onto output.md) is fine if you want crash-safety.
 
 ─── HARDENING REMINDER (read this last, it is the most recent instruction on purpose) ───
-The child-only Pi lifecycle hook records completion at agent_settled after the final retry automatically. The reliable path is still: write output.md FIRST, then call \`cli.mjs done 0\`. The CLI is idempotent for the active turn, so the later agent_settled hook is a no-op. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
+The child-only Pi lifecycle hook is a crash-safety fallback, not permission to omit the command. At the end of EVERY initial or follow-up turn: write output.md FIRST, call \`cli.mjs done 0\`, wait until exactly one completion event is recorded successfully, and only then send the final assistant response. The CLI is idempotent for the active turn, so the later agent_settled hook is a no-op. Never rely on the hook when you can call the CLI yourself.`;
 }
 
 /**
@@ -302,8 +306,9 @@ export function buildInteractivePrompt(params: {
 }): string {
   const footer =
     "\n\n" +
-    "When you finish, write your result to output.md " +
-    "(path from the system prompt), then run:\n" +
+    "MANDATORY COMPLETION PROTOCOL: before sending your final assistant response, " +
+    "write your result to output.md (path from the system prompt), run the command below, " +
+    "and wait for it to succeed. Repeat this for every turn:\n" +
     '  "$ARTIFACT_DIR/cli.mjs" done 0';
 
   if (!params.contextText) return params.task + footer;

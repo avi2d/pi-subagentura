@@ -211,6 +211,17 @@ $ARTIFACT_DIR/cli.mjs error "msg"  # unrecoverable failure
 # 'cancelled' is only set by the parent via cancel_interactive_subagent
 ```
 
+The explicit completion command is mandatory for every initial and follow-up
+turn. The child must complete these steps in order: write the final result to
+`output.md`, run `cli.mjs done 0`, wait until exactly one completion event is
+recorded successfully, then send its final assistant response. The command must
+be the final tool call of the turn. If it fails to execute, the child must not
+finalize; it fixes the failure and retries until completion is recorded. The
+child lifecycle hook at `agent_settled` is a crash-safety fallback, not a
+substitute for the explicit command. The system prompt, initial task footer,
+and every injected follow-up prompt repeat this requirement so the command
+remains the model's most recent instruction.
+
 At each child turn start, mutable `output.md` is atomically reset without
 touching earlier snapshots. Before each completion event, the current staging
 file (including an empty file when the turn wrote nothing) is copied atomically to

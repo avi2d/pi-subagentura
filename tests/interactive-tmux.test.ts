@@ -568,7 +568,7 @@ describe("interactive-tmux", () => {
       expect(protocol).toMatch(/do not call .\/exit.|press Ctrl-D/i);
     });
 
-    it("tells the child to be brief (avoid verbose preambles, short summary in step 3)", async () => {
+    it("tells the child to be brief after lifecycle completion", async () => {
       const { buildChildSubagentProtocol } = await importFresh<
         typeof import("../src/interactive-tmux")
       >("../src/interactive-tmux");
@@ -577,6 +577,30 @@ describe("interactive-tmux", () => {
       // high attention. We match the literal "BE BRIEF" token so the exact
       // wording can be tuned without breaking the test.
       expect(protocol).toMatch(/BE BRIEF/);
+    });
+
+    it("requires done before the final assistant response on every turn", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<
+        typeof import("../src/interactive-tmux")
+      >("../src/interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+
+      expect(protocol).toMatch(/A turn is not complete.*cli\.mjs.*returns/i);
+      expect(protocol).toMatch(/every turn.*follow-up/i);
+      expect(protocol).toMatch(
+        /do not (?:produce|send|emit).*final assistant.*before.*cli\.mjs/i,
+      );
+      expect(protocol).toMatch(/final tool call/i);
+      expect(protocol).toMatch(
+        /if the command.*fails.*do not.*final assistant.*retry/i,
+      );
+
+      const doneCommand = protocol.indexOf('"$ARTIFACT_DIR/cli.mjs" done 0');
+      const finalResponse = protocol.indexOf(
+        "Only after the lifecycle command succeeds",
+      );
+      expect(doneCommand).toBeGreaterThanOrEqual(0);
+      expect(finalResponse).toBeGreaterThan(doneCommand);
     });
 
     it("embeds the literal artifact dir in the rendered prompt", async () => {
@@ -588,6 +612,19 @@ describe("interactive-tmux", () => {
       // Sanity: the fixture from a different call must not appear here.
       expect(protocol).not.toContain("/tmp/pi-subagentura-fixture");
     });
+  });
+
+  it("repeats the mandatory completion contract in the initial task prompt", async () => {
+    const { buildInteractivePrompt } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
+    const prompt = buildInteractivePrompt({ task: "inspect the project" });
+
+    expect(prompt).toMatch(/^inspect the project/);
+    expect(prompt).toMatch(/mandatory completion protocol/i);
+    expect(prompt).toMatch(/before sending your final assistant response/i);
+    expect(prompt).toContain('"$ARTIFACT_DIR/cli.mjs" done 0');
+    expect(prompt).toMatch(/every turn/i);
   });
 
   describe("system prompt is always written", () => {

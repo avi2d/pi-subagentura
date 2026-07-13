@@ -91,7 +91,7 @@ describe("send_interactive_subagent_message", () => {
     expect(mockGet).toHaveBeenCalledWith("abc12345");
     expect(mockSendCommandToPane).toHaveBeenCalledWith(
       expect.objectContaining({ paneId: "%99" }),
-      "now do step 2",
+      expect.stringMatching(/^now do step 2 \[MANDATORY COMPLETION PROTOCOL/),
     );
     expect(result.isError).toBeFalsy();
     expect(result.details).toMatchObject({
@@ -105,6 +105,24 @@ describe("send_interactive_subagent_message", () => {
     );
     expect(result.content[0].text).toContain("pane %99");
     expect(result.content[0].text).toContain("Message sent:\nnow do step 2");
+  });
+
+  it("appends the mandatory done reminder to every follow-up turn", async () => {
+    mockGet.mockReturnValue(runningState({ status: "idle" }));
+    mockSendCommandToPane.mockReturnValue(undefined);
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    await toolDef.execute("call-reminder", {
+      id: "abc12345",
+      message: "inspect the second case",
+    });
+
+    const forwarded = mockSendCommandToPane.mock.calls[0][1] as string;
+    expect(forwarded).toMatch(/^inspect the second case/);
+    expect(forwarded).toMatch(/mandatory.*every.*turn/i);
+    expect(forwarded).toContain('"$ARTIFACT_DIR/cli.mjs" done 0');
+    expect(forwarded).toMatch(/before.*final assistant response/i);
+    expect(forwarded).toMatch(/if.*fails.*do not.*final.*retry/i);
   });
 
   it("shows the sent message and trims an oversized preview", async () => {
@@ -142,7 +160,9 @@ describe("send_interactive_subagent_message", () => {
 
     expect(mockSendCommandToPane).toHaveBeenCalledWith(
       expect.objectContaining({ paneId: "%99" }),
-      "follow-up after turn 1",
+      expect.stringMatching(
+        /^follow-up after turn 1 \[MANDATORY COMPLETION PROTOCOL/,
+      ),
     );
     expect(result.isError).toBeFalsy();
     expect(result.details.status).toBe("sent");
@@ -217,10 +237,9 @@ describe("send_interactive_subagent_message", () => {
       message,
     });
 
-    expect(mockSendCommandToPane).toHaveBeenCalledWith(
-      expect.objectContaining({ paneId: "%99" }),
-      message,
-    );
+    const forwarded = mockSendCommandToPane.mock.calls[0][1] as string;
+    expect(forwarded.startsWith(message)).toBe(true);
+    expect(forwarded).toContain('"$ARTIFACT_DIR/cli.mjs" done 0');
     expect(result.isError).toBeFalsy();
     expect(result.details.status).toBe("sent");
     expect(result.details.messageLength).toBe(64 * 1024);

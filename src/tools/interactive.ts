@@ -36,6 +36,8 @@ import { InteractiveParams } from "../schemas";
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
+const FOLLOWUP_COMPLETION_REMINDER =
+  ' [MANDATORY COMPLETION PROTOCOL FOR EVERY FOLLOW-UP TURN: Before sending your final assistant response, write the result to output.md; make "$ARTIFACT_DIR/cli.mjs" done 0 your final tool call and wait for success. If it fails, do not send the final response; fix the cause and retry until completion is recorded. Do not rely on the lifecycle hook.]';
 
 function formatFollowupPreview(message: string): string {
   if (message.length <= MAX_FOLLOWUP_PREVIEW_CHARS) return message;
@@ -418,7 +420,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       // pane is gone (e.g. the child exited between the status check and now).
       // Wrap so the parent gets a structured error instead of an exception trace.
       try {
-        sendCommandToPane(state, params.message);
+        sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
