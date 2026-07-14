@@ -320,6 +320,38 @@ describe("notifyOnComplete", () => {
           expect(api.sendUserMessage).not.toHaveBeenCalled();
         });
 
+        it("shows active async jobs in the footer and clears them on completion", async () => {
+          const toolDef = getToolDef();
+          const ctx = getCtx();
+          const jobId = `footer-${label}`;
+          const control = createJobControl();
+          mockStartSubagentJob.mockImplementationOnce(() =>
+            mockJobResult(jobId, control.jobPromise),
+          );
+
+          await toolDef.execute(
+            "call-footer",
+            { async: true, task: "test" },
+            undefined,
+            undefined,
+            ctx,
+          );
+
+          expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+            "subagentura-running",
+            "⚡ 1 sub-agent running",
+          );
+
+          control.resolve(SUCCESS_RESULT);
+
+          await vi.waitFor(() => {
+            expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+              "subagentura-running",
+              undefined,
+            );
+          });
+        });
+
         it("defaults async completion delivery to inject", async () => {
           const toolDef = getToolDef();
           const jobId = `both-default-inject-${label}`;
