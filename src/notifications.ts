@@ -1,41 +1,232 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { appendFileSync, readFileSync, unlinkSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   JobState,
   NotifyOnComplete,
   SubagentResult,
   Usage,
 } from "./helpers";
-import { formatUsage } from "./helpers";
+import { formatUsage, jobRegistry } from "./helpers";
 import type { SubagentEvent } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 
-// ── Inject cap tracking ─────────────────────────────────────────
+/**
+ * @deprecated Delivery is queue-bounded rather than concurrency-capped.
+ * Retained as a runtime export for compatibility with existing consumers.
+ */
+export const MAX_INJECT = 5;
 
-/** Track concurrent inject-mode notifications to prevent conversation explosion */
+/** @deprecated Always reports zero; the inject concurrency cap was removed. */
 export function getInjectCount(): number {
-  const g2 = typeof global !== "undefined" ? global : globalThis;
-  return (g2.__piSubagenturaInjectCount ?? 0) as number;
+  return 0;
 }
 
-export function incrementInjectCount(): void {
-  const g2 = typeof global !== "undefined" ? global : globalThis;
-  g2.__piSubagenturaInjectCount =
-    ((g2.__piSubagenturaInjectCount ?? 0) as number) + 1;
+export const MAX_IN_PROCESS_DELIVERY_RECORDS = 32;
+export const MAX_IN_PROCESS_DELIVERY_BYTES = 256 * 1024;
+const MAX_IN_PROCESS_OUTPUT_BYTES = 32 * 1024;
+const MAX_IN_PROCESS_FLUSH_BYTES = 64 * 1024;
+
+interface PendingJobCompletion {
+  kind: "completion";
+  deliveryId: string;
+  jobState: JobState;
+  result: SubagentResult;
 }
 
-export function decrementInjectCount(): void {
-  const g2 = typeof global !== "undefined" ? global : globalThis;
-  g2.__piSubagenturaInjectCount = Math.max(
-    0,
-    ((g2.__piSubagenturaInjectCount ?? 0) as number) - 1,
+interface PendingJobOverflow {
+  kind: "overflow";
+  deliveryId: string;
+  overflowPath: string;
+  mode: NotifyOnComplete;
+  triggerTurn: boolean;
+  status: "done" | "error";
+}
+
+type PendingJobDelivery = PendingJobCompletion | PendingJobOverflow;
+
+function pendingJobDeliveries(): PendingJobDelivery[] {
+  const g = globalThis as any;
+  return (g.__piSubagenturaPendingJobDeliveries ??= []);
+}
+
+function pendingDeliveryBytes(queue: PendingJobDelivery[]): number {
+  return queue.reduce((total, pending) => {
+    if (pending.kind === "overflow") {
+      return total + Buffer.byteLength(pending.overflowPath, "utf8") + 128;
+    }
+    return (
+      total +
+      Buffer.byteLength(pending.deliveryId, "utf8") +
+      Buffer.byteLength(pending.jobState.id, "utf8") +
+      Buffer.byteLength(pending.result.output, "utf8") +
+      Buffer.byteLength(
+        pending.result.isError ? pending.result.errorMessage : "",
+        "utf8",
+      ) +
+      256
+    );
+  }, 0);
+}
+
+function appendOverflowIdentity(
+  path: string,
+  pending: PendingJobCompletion,
+): void {
+  appendFileSync(
+    path,
+    `${JSON.stringify({
+      deliveryId: pending.deliveryId,
+      jobId: pending.jobState.id,
+      mode: pending.jobState.notifyOnComplete ?? "inject",
+      triggerTurn:
+        (pending.jobState.notifyOnComplete ?? "inject") === "inject"
+          ? pending.jobState.triggerTurnOnComplete !== false
+          : pending.jobState.triggerTurnOnComplete === true,
+      status: pending.result.isError ? "error" : "done",
+    })}\n`,
+    { mode: 0o600 },
   );
 }
 
-/** Max concurrent inject-mode notifications before degrading to notify */
-export const MAX_INJECT = 5;
+function mergeJobOverflowSemantics(
+  summary: PendingJobOverflow,
+  collapsed: PendingJobCompletion,
+): void {
+  const mode = collapsed.jobState.notifyOnComplete ?? "inject";
+  const trigger = completionTriggersTurn(
+    mode,
+    collapsed.jobState.triggerTurnOnComplete,
+  );
+  if (mode === "inject") summary.mode = "inject";
+  if (trigger) summary.triggerTurn = true;
+  if (collapsed.result.isError) summary.status = "error";
+}
+
+function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
+  const summary = queue.find(
+    (pending): pending is PendingJobOverflow => pending.kind === "overflow",
+  );
+  const oldestIndex = queue.findIndex(
+    (pending) => pending.kind === "completion",
+  );
+  if (oldestIndex < 0) return;
+  const [oldest] = queue.splice(oldestIndex, 1) as [PendingJobCompletion];
+  const overflowPath =
+    summary?.overflowPath ??
+    join(
+      tmpdir(),
+      `pi-subagentura-delivery-overflow-${process.pid}-${randomUUID()}.ndjson`,
+    );
+  appendOverflowIdentity(overflowPath, oldest);
+  if (summary) {
+    mergeJobOverflowSemantics(summary, oldest);
+    return;
+  }
+  let second: PendingJobCompletion | undefined;
+  const secondIndex = queue.findIndex(
+    (pending) => pending.kind === "completion",
+  );
+  if (secondIndex >= 0) {
+    [second] = queue.splice(secondIndex, 1) as [PendingJobCompletion];
+    appendOverflowIdentity(overflowPath, second);
+  }
+  const overflow: PendingJobOverflow = {
+    kind: "overflow",
+    deliveryId: createHash("sha256")
+      .update(`in-process-overflow\0${oldest.deliveryId}`)
+      .digest("hex")
+      .slice(0, 32),
+    overflowPath,
+    mode: "notify",
+    triggerTurn: false,
+    status: "done",
+  };
+  mergeJobOverflowSemantics(overflow, oldest);
+  if (second) mergeJobOverflowSemantics(overflow, second);
+  queue.unshift(overflow);
+}
 
 // ── Notification Delivery ───────────────────────────────────────
+
+export type CompletionDeliveryStatus = "done" | "error" | "cancelled";
+
+interface CompletionNotificationUi {
+  notify(message: string, level: "info" | "warning" | "error"): void;
+}
+
+export interface CompletionDeliveryNotice {
+  label: string;
+  mode: NotifyOnComplete;
+  triggerTurn: boolean;
+  status: CompletionDeliveryStatus;
+}
+
+export function completionTriggersTurn(
+  mode: NotifyOnComplete,
+  override?: boolean,
+): boolean {
+  return mode === "inject" ? override !== false : override === true;
+}
+
+export function formatCompletionDeliveryBehavior(
+  mode: NotifyOnComplete,
+  triggerTurn: boolean,
+  phase: "planned" | "delivered",
+): string {
+  const injected =
+    mode === "inject"
+      ? phase === "planned"
+        ? "Completion output will be injected into the parent LLM."
+        : "Completion output was injected into the parent LLM."
+      : phase === "planned"
+        ? "Completion output will not be injected into the parent LLM; only an artifact pointer will be added to parent context."
+        : "Completion output was not injected into the parent LLM; only an artifact pointer was added to parent context.";
+  const timing =
+    phase === "planned" ? " Delivery will wait until the parent is idle." : "";
+  if (!triggerTurn) {
+    const visibility =
+      mode === "inject"
+        ? " The injected output will be visible to the LLM on its next turn."
+        : " The artifact pointer will be visible to the LLM on its next turn.";
+    return `${injected}${timing} No new parent turn will start automatically.${visibility}`;
+  }
+  const delivery = mode === "inject" ? "the injection" : "the pointer delivery";
+  return `${injected}${timing} A new parent turn will start automatically after ${delivery}.`;
+}
+
+export function notifyCompletionDelivery(
+  ui: CompletionNotificationUi | undefined,
+  notices: CompletionDeliveryNotice[],
+): void {
+  if (!ui || typeof ui.notify !== "function" || notices.length === 0) return;
+  const lines = notices.map((notice) => {
+    const behavior = formatCompletionDeliveryBehavior(
+      notice.mode,
+      notice.triggerTurn,
+      "delivered",
+    );
+    return `${notice.label} (${notice.status}). ${behavior}`;
+  });
+  const message =
+    lines.length === 1
+      ? lines[0]
+      : `${lines.length} sub-agent completions delivered:\n${lines
+          .map((line) => `- ${line}`)
+          .join("\n")}`;
+  const level = notices.some(({ status }) => status === "error")
+    ? "error"
+    : notices.some(({ status }) => status === "cancelled")
+      ? "warning"
+      : "info";
+  try {
+    ui.notify(message, level);
+  } catch {
+    /* stale UI context must not make durable completion delivery retry */
+  }
+}
 
 function buildNotifySummary(jobId: string, result: SubagentResult): string {
   const status = result.isError ? "❌" : "✅";
@@ -75,63 +266,169 @@ export function deliverNotification(
   const pi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return; // extension not loaded yet
 
-  try {
-    const summary = buildNotifySummary(jobState.id, result);
-
-    if (jobState.notifyOnComplete === "inject") {
-      // Check inject cap
-      if ((getInjectCount() as number) >= MAX_INJECT) {
-        // Degrade to notify mode silently
-        pi.sendMessage!(
-          {
-            customType: "subagent-notify",
-            content: `Inject cap exceeded for job ${jobState.id} — degraded to notify. ${summary}`,
-            display: true,
-            details: { jobId: jobState.id, result, mode: "notify" },
-          },
-          completionMessageOptions(jobState.triggerTurnOnComplete),
-        );
-        return;
-      }
-      incrementInjectCount();
-      try {
-        // Inject full result as user message
-        (pi as any).sendUserMessage?.(
-          result.output || "(sub-agent produced no output)",
-          {
-            deliverAs: "followUp",
-          },
-        );
-        // Also send a summary notification
-        pi.sendMessage!(
-          {
-            customType: "subagent-notify",
-            content: `⚡ Sub-agent **${jobState.id}** completed — result injected above. ${summary}`,
-            display: true,
-            details: { jobId: jobState.id, result, mode: "inject" },
-          },
-          { deliverAs: "followUp" },
-        );
-      } finally {
-        decrementInjectCount();
-      }
-    } else {
-      // notify mode
-      pi.sendMessage!(
-        {
-          customType: "subagent-notify",
-          content: summary,
-          display: true,
-          details: { jobId: jobState.id, result, mode: "notify" },
-        },
-        completionMessageOptions(jobState.triggerTurnOnComplete),
-      );
+  const mode = jobState.notifyOnComplete ?? "inject";
+  const deliveryId = createHash("sha256")
+    .update(`${jobState.id}\0${mode}`)
+    .digest("hex")
+    .slice(0, 32);
+  const queue = pendingJobDeliveries();
+  if (!queue.some((item) => item.deliveryId === deliveryId)) {
+    const output = Buffer.from(result.output, "utf8")
+      .subarray(0, MAX_IN_PROCESS_OUTPUT_BYTES)
+      .toString("utf8");
+    const boundedResult: SubagentResult = result.isError
+      ? {
+          ...result,
+          output,
+          errorMessage: result.errorMessage.slice(0, 500),
+        }
+      : { ...result, output };
+    queue.push({
+      kind: "completion",
+      deliveryId,
+      jobState,
+      result: boundedResult,
+    });
+    while (
+      queue.length > MAX_IN_PROCESS_DELIVERY_RECORDS ||
+      pendingDeliveryBytes(queue) > MAX_IN_PROCESS_DELIVERY_BYTES
+    ) {
+      collapseOldestJobDelivery(queue);
     }
-  } catch {
-    // pi may be stale after session replacement
   }
+  flushInProcessDeliveries();
+}
 
-  jobState.notificationDelivered = true;
+export function flushInProcessDeliveries(): void {
+  const g = globalThis as any;
+  if (g.__piSubagenturaParentStreaming) return;
+  const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
+  if (!pi) return;
+  const queue = pendingJobDeliveries();
+  const llm: Array<{
+    pending: PendingJobDelivery;
+    content: string;
+    mode: NotifyOnComplete;
+    trigger: boolean;
+    status: "done" | "error";
+  }> = [];
+  let bytes = 0;
+  for (let index = 0; index < queue.length; ) {
+    const pending = queue[index];
+    if (pending.kind === "overflow") {
+      const content =
+        "⚠️ In-process completion delivery overflowed its bounded queue." +
+        `\nCompletion identity ledger: ${pending.overflowPath}`;
+      const itemBytes = Buffer.byteLength(content, "utf8");
+      if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES)
+        break;
+      llm.push({
+        pending,
+        content,
+        mode: pending.mode,
+        trigger: pending.triggerTurn,
+        status: pending.status,
+      });
+      bytes += itemBytes;
+      index++;
+      continue;
+    }
+    const { jobState, result, deliveryId } = pending;
+    const mode = jobState.notifyOnComplete ?? "inject";
+    const trigger = completionTriggersTurn(
+      mode,
+      jobState.triggerTurnOnComplete,
+    );
+    const summary = buildNotifySummary(jobState.id, result);
+    const content =
+      mode === "inject"
+        ? `${summary}\n[Untrusted sub-agent output]\n${
+            sanitizeOutput(result.output) || "(sub-agent produced no output)"
+          }`
+        : `${summary}\nResult retained in job ${jobState.id}; use get_subagent_result for details.`;
+    const itemBytes = Buffer.byteLength(content, "utf8");
+    if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES) break;
+    llm.push({
+      pending,
+      content,
+      mode,
+      trigger,
+      status: result.isError ? "error" : "done",
+    });
+    bytes += itemBytes;
+    index++;
+  }
+  if (llm.length === 0) return;
+  const deliveryIds = llm.map(({ pending }) => pending.deliveryId);
+  try {
+    pi.sendMessage(
+      {
+        customType: "subagent-notify",
+        content: llm.map(({ content }) => content).join("\n\n---\n\n"),
+        display: true,
+        details: {
+          deliveryIds,
+          ...(llm.length === 1 && llm[0].pending.kind === "completion"
+            ? { jobId: llm[0].pending.jobState.id }
+            : {}),
+          mode: llm.some(({ mode }) => mode === "inject") ? "inject" : "notify",
+          statuses: llm.map(({ status }) => status),
+          status: llm.some(({ status }) => status === "error")
+            ? "error"
+            : "done",
+          error: llm.some(({ status }) => status === "error"),
+        },
+      },
+      {
+        deliverAs: "followUp",
+        triggerTurn: llm.some(({ trigger }) => trigger),
+      },
+    );
+  } catch {
+    return;
+  }
+  notifyCompletionDelivery(
+    g.__piSubagenturaUi as CompletionNotificationUi | undefined,
+    llm.map(({ pending, mode, trigger, status }) => ({
+      label:
+        pending.kind === "completion"
+          ? `Job ${pending.jobState.id}`
+          : "In-process completion overflow",
+      mode,
+      triggerTurn: trigger,
+      status,
+    })),
+  );
+  for (const { pending } of llm) {
+    if (pending.kind === "overflow") markOverflowDelivered(pending);
+    else pending.jobState.notificationDelivered = true;
+  }
+  const delivered = new Set(deliveryIds);
+  const remaining = queue.filter(
+    (pending) => !delivered.has(pending.deliveryId),
+  );
+  queue.splice(0, queue.length, ...remaining);
+}
+
+function markOverflowDelivered(pending: PendingJobOverflow): void {
+  try {
+    const lines = readFileSync(pending.overflowPath, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const record = JSON.parse(line) as { jobId?: string };
+        if (record.jobId) {
+          const state = jobRegistry.get(record.jobId);
+          if (state) state.notificationDelivered = true;
+        }
+      } catch {
+        /* malformed overflow rows remain represented by the pointer notification */
+      }
+    }
+    unlinkSync(pending.overflowPath);
+  } catch {
+    /* the pointer was delivered; missing ledger data cannot be recovered in-process */
+  }
 }
 
 // ── Interactive artifact notification helpers ───────────────────
@@ -139,6 +436,7 @@ export function deliverNotification(
 /** True when the event should trigger a wakeup notification to the parent. */
 export function shouldNotify(event: SubagentEvent): boolean {
   return (
+    event.type === "completion" ||
     event.type === "done" ||
     event.type === "error" ||
     event.type === "cancelled"
@@ -168,6 +466,16 @@ function iconFor(event: SubagentEvent): string {
       return "❌";
     case "cancelled":
       return "🚫";
+    case "turn_started":
+      return "▶";
+    case "completion":
+      return event.outcome === "done"
+        ? "✅"
+        : event.outcome === "cancelled"
+          ? "🚫"
+          : "❌";
+    case "process_exited":
+      return event.exitCode === 0 ? "✅" : "❌";
     default:
       return assertNever(event);
   }
@@ -187,6 +495,12 @@ function labelFor(event: SubagentEvent): string {
     // and the widget row is a better signal than a one-shot message.
     case "started":
       return "started";
+    case "turn_started":
+      return "started";
+    case "completion":
+      return `${event.outcome}${event.exitCode === undefined ? "" : ` (exit ${event.exitCode})`}`;
+    case "process_exited":
+      return `process exited (${event.exitCode})`;
     default:
       return assertNever(event);
   }

@@ -8,7 +8,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { getModel, getProviders } from "@earendil-works/pi-ai";
+import { getModel, getProviders } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -178,6 +178,9 @@ declare global {
     | undefined;
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
+  var __piSubagenturaSessionManager:
+    | { getEntries?: () => unknown[] }
+    | undefined;
   var __piSubagenturaInjectCount: number | undefined;
   var __piSubagenturaInteractivePollerHandle:
     | ReturnType<typeof setInterval>

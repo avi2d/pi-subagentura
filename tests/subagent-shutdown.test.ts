@@ -5,8 +5,7 @@
  *
  *   1. `handle.unref?.()` on the global poller handle
  *   2. `clearInterval` of the poller handle in `session_shutdown`
- *   3. iteration over `interactiveSubagentRegistry`, calling
- *      `cancelInteractiveSubagent` only for `running` states
+ *   3. preserving live panes on reload/resume/quit and cancelling them otherwise
  *   4. clear of `interactiveSubagentRegistry` (the fix in this branch)
  *
  * These tests stub `setInterval` / `clearInterval` to capture the handle
@@ -68,10 +67,15 @@ function setupExtension() {
   // one and the actual cleanup handler at the end of the default export.
   // We want the LAST one — the one that runs clearInterval, the cancel
   // loop, and the registry clear.
-  let shutdownHandler: (() => void) | undefined;
+  let shutdownHandler:
+    | ((event?: { reason?: string }, ctx?: { cwd?: string }) => void)
+    | undefined;
   for (const [event, handler] of (api.on as any).mock.calls) {
     if (event === "session_shutdown") {
-      shutdownHandler = handler as () => void;
+      shutdownHandler = handler as (
+        event?: { reason?: string },
+        ctx?: { cwd?: string },
+      ) => void;
     }
   }
 
@@ -166,35 +170,57 @@ describe("session_shutdown handler", () => {
     ).toBeUndefined();
   });
 
-  it("cancels running sub-agents via cancelInteractiveSubagentByState (registry-bypass) and skips non-running", () => {
-    const running = makeState("run-1", "running");
+  it.each(["new", "fork"])(
+    "kills running and idle panes for non-preserving reason %s",
+    (reason) => {
+      const running = makeState("run-1", "running");
+      const idle = makeState("idle-1", "idle");
 
-    const cancelled = makeState("canc-1", "cancelled");
+      const cancelled = makeState("canc-1", "cancelled");
 
-    const exited = makeState("exit-1", "exited");
+      const exited = makeState("exit-1", "exited");
 
-    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+      interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+      interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
 
-    interactiveTmux.interactiveSubagentRegistry.set(cancelled.id, cancelled);
+      interactiveTmux.interactiveSubagentRegistry.set(cancelled.id, cancelled);
 
-    interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
+      interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
 
-    const { shutdownHandler } = setupExtension();
+      const { shutdownHandler } = setupExtension();
 
-    shutdownHandler!();
+      shutdownHandler!({ reason });
 
-    // The handler snapshots running states, clears the registry, then calls the
+      // The handler snapshots running states, clears the registry, then calls the
 
-    // byState variant (which bypasses the registry lookup). The id-based
+      // byState variant (which bypasses the registry lookup). The id-based
 
-    // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
+      // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
 
-    expect(cancelByStateSpy).toHaveBeenCalledTimes(1);
+      expect(cancelByStateSpy).toHaveBeenCalledTimes(2);
 
-    expect(cancelByStateSpy).toHaveBeenCalledWith(running);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(running);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(idle);
 
-    expect(cancelSpy).not.toHaveBeenCalled();
-  });
+      expect(cancelSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["reload", "resume", "quit"])(
+    "preserves running and idle panes for reason %s",
+    (reason) => {
+      const running = makeState("run-1", "running");
+      const idle = makeState("idle-1", "idle");
+      interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+      interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
+
+      const { shutdownHandler } = setupExtension();
+      shutdownHandler!({ reason });
+
+      expect(cancelByStateSpy).not.toHaveBeenCalled();
+      expect(cancelSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it("clears interactiveSubagentRegistry in session_shutdown", () => {
     // Pre-populate with both running and non-running states. The cancel
@@ -254,6 +280,12 @@ describe("session_shutdown handler", () => {
     const { api, shutdownHandler } = setupExtension();
 
     (globalThis as any).__piSubagenturaPiRef = api;
+    const notify = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      notify,
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
 
     // Capture the actual setInterval callback. setupExtension() above
 
@@ -316,6 +348,12 @@ describe("session_shutdown handler", () => {
     const { api, shutdownHandler } = setupExtension();
 
     (globalThis as any).__piSubagenturaPiRef = api;
+    const notify = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      notify,
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
 
     // Capture the actual setInterval callback for the real code path.
 
@@ -328,6 +366,7 @@ describe("session_shutdown handler", () => {
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledOnce();
 
     // 2. Shutdown handler runs.
 
@@ -342,6 +381,7 @@ describe("session_shutdown handler", () => {
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledOnce();
   });
 
   afterEach(() => {

@@ -1,7 +1,7 @@
 /**
- * Tests for the auto-done fallback: when the child ends a turn with
- * stopReason:"stop" but never calls `cli.mjs done`, the parent synthesizes a
- * completion event from the session log alone.
+ * Negative regressions for the removed timeout completion heuristic.
+ * Session stop metadata and output.md are never authoritative completion
+ * signals; protocol-v2 child lifecycle events own completion.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -12,7 +12,7 @@ import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
-  return mkdtempSync(join(tmpdir(), "pi-subagentura-auto-done-"));
+  return mkdtempSync(join(tmpdir(), "pi-subagentura-no-synthesis-"));
 }
 
 interface MakeOpts {
@@ -51,7 +51,7 @@ function makeState(overrides: MakeOpts): {
     selectPaneCommand: "tmux select-pane -t '%99'",
     launchScriptFile: "/tmp/launch.sh",
     artifactDir,
-    // Pretend the model stopped 11s ago, past the 10s debounce.
+    // Seed legacy stop metadata to prove the poller ignores it.
     lastStopReason: "stop",
     lastStopReasonAt: Date.now() - 11_000,
   };
@@ -101,7 +101,7 @@ function writeAssistantTurn(
   writeFileSync(file, JSON.stringify(entry) + "\n");
 }
 
-describe("auto-done fallback", () => {
+describe("no parent-side timeout completion synthesis", () => {
   let root: string;
 
   beforeEach(() => {
@@ -130,7 +130,7 @@ describe("auto-done fallback", () => {
 
   // ─── Core behavior ────────────────────────────────────────────────
 
-  it("synthesizes a done event when stopReason is 'stop' and output.md exists, after the debounce", async () => {
+  it("does not synthesize completion from stopReason when output.md exists", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "the result" });
@@ -141,21 +141,12 @@ describe("auto-done fallback", () => {
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
-    const done = events.find((e) => e.type === "done");
-    expect(done).toBeDefined();
-    afterEach(() => {
-      rmSync(root, { recursive: true, force: true });
-      vi.doUnmock("node:child_process");
-    });
-    expect(done && done.type === "done" && done.summary).toMatch(
-      /auto-detected/,
-    );
-    expect(sendMessage).toHaveBeenCalled();
-    expect(state.status).toBe("running"); // stays running so for-loop keeps tail-reading
-    expect(state.injected).toBe(true);
+    expect(events).toEqual([]);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(state.status).toBe("running");
   });
 
-  it("synthesizes an error event (not done) when stopReason is 'stop' but output.md is missing", async () => {
+  it("does not synthesize an error when output.md is missing", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: null });
@@ -167,16 +158,12 @@ describe("auto-done fallback", () => {
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
-    const err = events.find((e) => e.type === "error");
-    expect(err).toBeDefined();
-    const msg = err && err.type === "error" ? err.message : "";
-    expect(msg).toMatch(/without writing output\.md/);
-    expect(msg).toMatch(/review-sec\.md/); // fallback content from lastStopText
+    expect(events).toEqual([]);
     expect(state.status).toBe("running");
-    expect(state.exitCode).toBe(1);
+    expect(state.exitCode).toBeUndefined();
   });
 
-  it("synthesizes an error event with a generic message when output.md is missing AND no lastStopText", async () => {
+  it("does not invent a generic error without an authoritative child event", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: null });
@@ -186,14 +173,10 @@ describe("auto-done fallback", () => {
 
     const art = artifactPath(dirname(state.artifactDir), state.id);
     const events = readEvents(art);
-    const err = events.find((e) => e.type === "error");
-    expect(err).toBeDefined();
-    expect(err && err.type === "error" && err.message).toBe(
-      "sub-agent stopped without writing output.md",
-    );
+    expect(events).toEqual([]);
   });
 
-  it("does NOT synthesize for stopReason 'toolUse' (model is mid-turn, not finished)", async () => {
+  it("ignores stopReason 'toolUse' as a completion signal", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
@@ -206,15 +189,15 @@ describe("auto-done fallback", () => {
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
-    const synthesized = events.find(
+    const inferred = events.find(
       (e) => e.type === "done" || e.type === "error",
     );
-    expect(synthesized).toBeUndefined();
+    expect(inferred).toBeUndefined();
     expect(state.status).toBe("running");
   });
 
   it.each(["length", "error", "aborted"] as const)(
-    "does NOT auto-synthesize for stopReason '%s'",
+    "ignores stopReason '%s' as a completion signal",
     async (reason) => {
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -226,18 +209,18 @@ describe("auto-done fallback", () => {
 
       const art = artifactPath(dirname(artifactDir), state.id);
       const events = readEvents(art);
-      const synthesized = events.find(
+      const inferred = events.find(
         (e) => e.type === "done" || e.type === "error",
       );
-      expect(synthesized).toBeUndefined();
+      expect(inferred).toBeUndefined();
     },
   );
 
-  it("does NOT synthesize before the debounce window elapses", async () => {
+  it("does not use elapsed time to infer completion", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
-    state.lastStopReasonAt = Date.now() - 1_000; // 1s ago, well inside the 10s debounce
+    state.lastStopReasonAt = Date.now() - 1_000; // legacy timestamp must not matter
     mod.interactiveSubagentRegistry.set(state.id, state);
 
     mod.pollArtifactChanges({} as any);
@@ -249,7 +232,7 @@ describe("auto-done fallback", () => {
     ).toHaveLength(0);
   });
 
-  it("does NOT synthesize when an explicit done event already exists in the artifact", async () => {
+  it("preserves an explicit done event without adding another completion", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
@@ -285,15 +268,15 @@ describe("auto-done fallback", () => {
 
   // `tool_activity` row to events.ndjson AFTER the explicit done — making `lastEvent` return the
 
-  // tool_activity and the previous `lastEvent().type === "done"` guard miss. The fallback then
+  // tool_activity. Physical-order processing must still retain the earlier completion and never
 
-  // synthesizes a duplicate `done` and the events loop re-delivers the explicit one, causing
+  // add or deliver a duplicate completion.
 
-  // a double-notify. This was observed in production on 2026-06-15 (subagentura sessions under
+  // This ordering was observed in production on 2026-06-15 (subagentura sessions under
 
-  // pi-agents-5c91e6). The fix scans ALL events for a terminal type, not just lastEvent.
+  // pi-agents-5c91e6).
 
-  it("regression: does NOT synthesize when an explicit done is present AND a tool_activity is appended after it in the same poll", async () => {
+  it("preserves explicit done when trailing tool activity is appended in the same poll", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
 
@@ -318,11 +301,11 @@ describe("auto-done fallback", () => {
 
     // Session log: a `write` tool call (so tailReadSessionLog appends a tool_activity) plus an
 
-    // assistant message with stopReason "stop" (so the auto-done preconditions are met).
+    // assistant message carrying legacy stop metadata.
 
     // The tool-call timestamp is later than the explicit done but still 11s in the past relative
 
-    // to "now" so the debounce has elapsed.
+    // to the explicit event, proving timestamp order is not the cursor.
 
     const toolTs = explicitTs + 5_000; // later than the explicit done
 
@@ -377,13 +360,13 @@ describe("auto-done fallback", () => {
       }) + "\n",
     );
 
-    // makeState already set lastStopReasonAt = Date.now() - 11_000 (past debounce). After this
+    // The session tail updates legacy stop metadata, which must not affect completion.
 
-    // poll, tailReadSessionLog will set lastStopReasonAt to assistantTs. Since assistantTs is
+    // Event delivery remains driven solely by events.ndjson physical order.
 
-    // 20s+ in the past, the debounce is comfortably satisfied. The previous lastStopReasonAt
+    // The actual age of the assistant entry is intentionally irrelevant.
 
-    // was also past the debounce, so either way the time check would pass.
+    //
 
     const sendMessage = vi.fn();
 
@@ -393,7 +376,7 @@ describe("auto-done fallback", () => {
 
     const doneEvents = events.filter((e) => e.type === "done");
 
-    // Without the fix: there would be a synthesized `done` here (in addition to the explicit one).
+    // No completion is inferred from session metadata.
 
     expect(doneEvents).toHaveLength(1);
 
@@ -403,9 +386,9 @@ describe("auto-done fallback", () => {
 
     // The sendMessage call (if any) must be for the original done only, never a second time
 
-    // for the synthesized one. We check that sendMessage was called at most once with content
+    // for an inferred one. We check that no legacy inferred marker was sent.
 
-    // matching the done event — the simplest assertion is "no synthesized event was sent".
+    // The original explicit event remains the only completion.
 
     const sendMessageCalls = sendMessage.mock.calls.filter((call) => {
       const text = JSON.stringify(call);
@@ -416,7 +399,7 @@ describe("auto-done fallback", () => {
     expect(sendMessageCalls).toHaveLength(0);
   });
 
-  it("does NOT synthesize twice (idempotent across repeated polls)", async () => {
+  it("does not infer completion across repeated polls", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
@@ -429,10 +412,10 @@ describe("auto-done fallback", () => {
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
     const doneEvents = events.filter((e) => e.type === "done");
-    expect(doneEvents).toHaveLength(1);
+    expect(doneEvents).toHaveLength(0);
   });
 
-  it("suppresses duplicate notification if an explicit done arrives after the auto-synthesis", async () => {
+  it("processes an explicit completion after stopReason without a synthetic predecessor", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
@@ -440,8 +423,7 @@ describe("auto-done fallback", () => {
 
     const sendMessage = vi.fn();
     mod.pollArtifactChanges({ sendMessage } as any);
-    const callsAfterAuto = sendMessage.mock.calls.length;
-    expect(callsAfterAuto).toBeGreaterThan(0);
+    expect(sendMessage).not.toHaveBeenCalled();
 
     const art = artifactPath(dirname(artifactDir), state.id);
     appendEvent(art, {
@@ -451,19 +433,18 @@ describe("auto-done fallback", () => {
       exitCode: 0,
     });
 
-    sendMessage.mockClear();
     mod.pollArtifactChanges({ sendMessage } as any);
-    expect(sendMessage).not.toHaveBeenCalled();
+    expect(state.pendingDeliveries).toHaveLength(1);
   });
 
-  it("a new user message in the session log resets the auto-done guard for the next turn", async () => {
+  it("a new user message does not create legacy synthesis state", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
     mod.pollArtifactChanges({} as any);
-    expect(state.autoDoneForTurnAt).toBeDefined();
+    expect(state.autoDoneForTurnAt).toBeUndefined();
 
     const userMsg = {
       type: "message",
@@ -479,15 +460,14 @@ describe("auto-done fallback", () => {
     expect(state.autoDoneForTurnAt).toBeUndefined();
   });
 
-  it("a new user message in the session log revives status from 'exited' to 'running' (auto-done case)", async () => {
+  it("a new user message revives exited status for a follow-up turn", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
     mod.pollArtifactChanges({} as any);
-    // Simulate the post-synthesized-error state: the poller's main loop sets status to "exited"
-    // once the synthesized error event lands in the artifact. The user has now sent a follow-up;
+    // Simulate a terminal previous turn. The user has now sent a follow-up;
     // we want to verify the user-role revival clears "exited" too.
     state.status = "exited";
 
@@ -502,7 +482,7 @@ describe("auto-done fallback", () => {
     writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
 
     mod.pollArtifactChanges({} as any);
-    // Status revived so the next auto-done / done-event opportunity can fire for the new turn.
+    // Status revived so child lifecycle events for the next turn are observed.
     expect(state.status).toBe("running");
   });
 
@@ -516,7 +496,7 @@ describe("auto-done fallback", () => {
     // (so a `done` event is in the artifact and the poller would naturally transition to "idle" via
     // deriveInteractiveSubagentStatus), and the parent has just sent a follow-up keystroke into
     // the REPL. The user-role entry in the session log must revive status so the next
-    // auto-done / done-event opportunity fires for the new turn.
+    // child completion event arrives for the new turn.
     const art = artifactPath(join(artifactDir, ".."), state.id);
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
@@ -622,7 +602,7 @@ describe("auto-done fallback", () => {
     expect(after.lastStopText).toBeUndefined();
   });
 
-  it("appends a '… (truncated)' marker to the synthesized error when lastStopText exceeds the slice length", async () => {
+  it("does not convert long assistant text into a synthetic error", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
@@ -637,15 +617,10 @@ describe("auto-done fallback", () => {
     const events = readEvents(
       artifactPath(dirname(state.artifactDir), state.id),
     );
-    const err = events.find((e) => e.type === "error");
-    expect(err).toBeDefined();
-    const msg = err && err.type === "error" ? err.message : "";
-    expect(msg).toMatch(/… \(truncated\)/);
-    expect(msg).toContain("X".repeat(500));
-    expect(msg).not.toContain("X".repeat(501)); // slice is exact
+    expect(events).toEqual([]);
   });
 
-  it("does NOT append a '… (truncated)' marker when lastStopText fits within the slice length", async () => {
+  it("does not convert short assistant text into a synthetic error", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({});
@@ -660,13 +635,10 @@ describe("auto-done fallback", () => {
     const events = readEvents(
       artifactPath(dirname(state.artifactDir), state.id),
     );
-    const err = events.find((e) => e.type === "error");
-    const msg = err && err.type === "error" ? err.message : "";
-    expect(msg).not.toMatch(/… \(truncated\)/);
-    expect(msg).toContain(shortText);
+    expect(events).toEqual([]);
   });
 
-  it("auto-fallback does NOT mark state.injected when notifyOnComplete is 'inject' (so the regular inject path can fire next poll)", async () => {
+  it("legacy stop metadata does not mutate injected state in inject mode", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
@@ -678,15 +650,12 @@ describe("auto-done fallback", () => {
 
     mod.pollArtifactChanges({} as any);
 
-    // W1 fix: in inject mode, leave state.injected unset so the regular
-    // inject path at lines 547-585 picks up the synthesized `done` event
-    // on the next poll. With the old behavior (state.injected = true
-    // unconditionally), inject mode would silently degrade to pointer-only.
+    // Legacy state remains untouched; protocol-v2 delivery receipts own deduplication.
     const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
     expect(after.injected).not.toBe(true);
   });
 
-  it("auto-fallback DOES mark state.injected when notifyOnComplete is 'notify' (no inject path to defer to)", async () => {
+  it("does not mutate legacy injected state in notify mode", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state } = makeState({ outputContent: "final result" });
@@ -698,11 +667,9 @@ describe("auto-done fallback", () => {
 
     mod.pollArtifactChanges({} as any);
 
-    // For non-inject modes, the inject path at lines 547-585 will never
-    // fire (gated on notifyOnComplete === "inject"). Marking injected
-    // here is a no-op-defensive; what matters is no regression.
+    // Legacy state remains untouched in notify mode too.
     const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
-    expect(after.injected).toBe(true);
+    expect(after.injected).toBeUndefined();
   });
 
   // ─── End-to-end: real session JSONL is the only input ────────────
@@ -710,9 +677,9 @@ describe("auto-done fallback", () => {
   // ~/.pi/agent/sessions/subagentura. The only input to the poller is a
   // session JSONL containing a final assistant turn with stopReason:"stop"
   // — no pre-seeded state, no events.ndjson activity, no `cli.mjs done`.
-  // After AUTO_DONE_DEBOUNCE_MS the parent must synthesize a recovery event.
+  // Even after an arbitrary delay, no parent-side completion may be inferred.
 
-  it("end-to-end (with output): silent sub-agent whose model wrote output.md but never called `cli.mjs done` → auto-done", async () => {
+  it("end-to-end: session stop plus output is not authoritative without child completion", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeFreshState({
@@ -758,13 +725,11 @@ describe("auto-done fallback", () => {
     expect(state.lastStopReasonAt).toBe(stopTs);
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
-    const done = events.find((e) => e.type === "done");
-    expect(done).toBeDefined();
-    expect(done && done.type === "done" && done.exitCode).toBe(0);
-    expect(sendMessage).toHaveBeenCalled();
+    expect(events).toEqual([]);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it("end-to-end (no output): silent sub-agent whose model wrote to /tmp not output.md → auto-error with lastStopText fallback", async () => {
+  it("end-to-end: session stop without output is not converted into an error", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeFreshState({ outputContent: null });
@@ -807,28 +772,22 @@ describe("auto-done fallback", () => {
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
-    const err = events.find((e) => e.type === "error");
-    expect(err).toBeDefined();
-    const msg = err && err.type === "error" ? err.message : "";
-    expect(msg).toMatch(/without writing output\.md/);
-    expect(msg).toMatch(/review-sec\.md/);
+    expect(events).toEqual([]);
   });
 
   // ─── Regression guard: replay the real `notdone.jsonl` session ────
   // The model produced a 10K-char audit at t=183s, then sat in the REPL for
   // 4.5 minutes until the parent prompted it with "u didnt make the done".
-  // With the fix, auto-done would have fired at t=193s — 4.5 minutes BEFORE
-  // the user had to notice and prompt. Skips if the production session is
-  // not present (e.g. CI without the local session dir).
+  // Protocol v2 deliberately does not infer completion from this session log.
+  // Skips if the production session is not present (e.g. CI).
   //
   // SAFETY: the production session JSONL is read-only input; the replay
   // runs against a tmp artifactDir. The production dir is never written to.
-  it("regression: notdone.jsonl would have auto-recovered the 10K audit at t=193s", async () => {
+  it("regression: notdone.jsonl does not create a parent-inferred completion", async () => {
     const fs = await import("node:fs");
     const sourceSession =
       "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/2026-06-11T19-25-31-403Z-fb57cd05.jsonl";
     if (!fs.existsSync(sourceSession)) {
-      console.warn("skip: real notdone.jsonl not present at", sourceSession);
       return;
     }
 
@@ -900,19 +859,21 @@ describe("auto-done fallback", () => {
 
     mod.pollArtifactChanges({} as any);
 
-    // The poller wrote a synthesized event into the tmp artifact dir.
+    // Session text alone must not create a completion event.
     const eventsFile = join(replayArtifactDir, "events.ndjson");
-    expect(fs.existsSync(eventsFile)).toBe(true);
-    const events = fs
-      .readFileSync(eventsFile, "utf8")
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l));
-    const err = events.find((e) => e.type === "error");
-    expect(err, "expected synthesized error event").toBeDefined();
-    const msg = err && err.type === "error" ? err.message : "";
-    expect(msg).toMatch(/without writing output\.md/);
-    expect(msg).toMatch(/Test Quality Audit Report/);
+    const events = fs.existsSync(eventsFile)
+      ? fs
+          .readFileSync(eventsFile, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+      : [];
+    expect(
+      events.filter((event) =>
+        ["completion", "done", "error", "cancelled"].includes(event.type),
+      ),
+    ).toEqual([]);
 
     // Defensive: confirm we did NOT touch the production dir. If
     // events.ndjson exists there, its mtime must predate this test run.

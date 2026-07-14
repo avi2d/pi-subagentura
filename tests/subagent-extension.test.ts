@@ -10,6 +10,11 @@ describe("extension registration", () => {
     };
 
     expect(() => registerExtension(api as any)).not.toThrow();
+    expect(api.registerMessageRenderer).toHaveBeenCalledOnce();
+    expect(api.registerMessageRenderer).toHaveBeenCalledWith(
+      "subagent-notify",
+      expect.any(Function),
+    );
 
     const names = api.registerTool.mock.calls
       .map(([tool]: any[]) => tool.name)
@@ -38,5 +43,38 @@ describe("extension registration", () => {
         "workflow",
       ].sort(),
     );
+  });
+
+  it("registers only protocol hooks in child mode", () => {
+    const previous = process.env.PI_SUBAGENTURA_CHILD;
+    const previousArtifactDir = process.env.ARTIFACT_DIR;
+    process.env.PI_SUBAGENTURA_CHILD = "1";
+    process.env.ARTIFACT_DIR = "/tmp/pi-subagentura-extension-test";
+    const api = {
+      registerTool: vi.fn(),
+      registerMessageRenderer: vi.fn(),
+      on: vi.fn(),
+    };
+
+    try {
+      registerExtension(api as any);
+    } finally {
+      if (previous === undefined) delete process.env.PI_SUBAGENTURA_CHILD;
+      else process.env.PI_SUBAGENTURA_CHILD = previous;
+      if (previousArtifactDir === undefined) delete process.env.ARTIFACT_DIR;
+      else process.env.ARTIFACT_DIR = previousArtifactDir;
+    }
+
+    expect(api.registerTool).not.toHaveBeenCalled();
+    expect(api.registerMessageRenderer).not.toHaveBeenCalled();
+    expect(api.on.mock.calls.map(([event]) => event)).toEqual([
+      "before_agent_start",
+      "turn_start",
+      "before_provider_request",
+      "tool_execution_start",
+      "tool_execution_end",
+      "agent_end",
+      "agent_settled",
+    ]);
   });
 });

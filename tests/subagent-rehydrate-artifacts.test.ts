@@ -105,9 +105,14 @@ describe("rehydrateInteractiveSubagents", () => {
       mux: "tmux",
       artifactDir: artDir,
       sessionFile: "/tmp/sess.jsonl",
+      eventByteCursor: 0,
+      sessionByteCursor: 0,
+      pendingDeliveries: [],
+      deliveryReceipts: [],
+      lifecycle: { startedAt: 1000 },
     });
 
-    // Write events: first event's ts becomes startedAt
+    // Event history remains available without being reparsed during rehydrate.
     const art = artifactPath(cwd, id);
     appendEvent(art, { ts: 1000, type: "started", status: "running" });
     appendEvent(art, { ts: 2000, type: "done", status: "done", exitCode: 0 });
@@ -117,7 +122,7 @@ describe("rehydrateInteractiveSubagents", () => {
     const rehydrated = interactiveSubagentRegistry.get(id);
     expect(rehydrated).toBeDefined();
     expect(rehydrated?.name).toBe("my-agent"); // from prompt file label
-    expect(rehydrated?.startedAt).toBe(1000); // from first event's ts
+    expect(rehydrated?.startedAt).toBe(1000);
   });
 
   it("falls back to id for name and 0 for startedAt when artifacts are missing", async () => {

@@ -9,7 +9,12 @@ permissions:
 
 jobs:
   test:
+    name: Test (Pi ${{ matrix.pi }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: [baseline-0.80.6, latest-0.80.x]
 
     steps:
       - name: Checkout
@@ -23,6 +28,17 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Install latest compatible Pi SDK
+        if: matrix.pi == 'latest-0.80.x'
+        run: >-
+          npm install --no-save --package-lock=false
+          '@earendil-works/pi-agent-core@>=0.80.6 <0.81.0'
+          '@earendil-works/pi-ai@>=0.80.6 <0.81.0'
+          '@earendil-works/pi-coding-agent@>=0.80.6 <0.81.0'
+          '@earendil-works/pi-tui@>=0.80.6 <0.81.0'
 
       - name: Install tmux
         run: |
@@ -31,8 +47,10 @@ jobs:
 
       - name: Type check
         run: npm run typecheck
-      - name: Run tests
-        run: npm test
+      - name: Run unit tests
+        run: npm run test:unit
+      - name: Run Pi session integration tests
+        run: npm run test:pi
 
       - name: Run tmux integration tests
         run: npm run test:tmux

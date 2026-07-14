@@ -24,17 +24,21 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
 import {
   appendInteractiveState,
+  appendCompletionEvent,
   artifactPath,
-  lastEvent,
+  newEventId,
   type SubagentEvent,
+  type PersistedDeliveryIntent,
+  type PersistedLifecycleFold,
   removeInteractiveState,
 } from "./artifact";
+import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
 import {
   getMux,
   NoMultiplexerAvailableError,
@@ -69,7 +73,9 @@ export function buildChildSubagentProtocol(artifactDir: string): string {
   const outputPath = `${artifactDir}/output.md`;
   return `You are running inside a Pi sub-agent launched by a parent agent. The parent agent reads your work from two files in your artifact directory and from one CLI command. You MUST follow this protocol or your work will be lost.
 
-BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary in step 3. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
+BE BRIEF. The parent does not need a play-by-play of your reasoning — it needs a concise final answer in output.md and a one-sentence summary after the lifecycle command succeeds. Skip the recap, the apology, and the "let me know if..." closer. Long preambles waste tokens and delay the done signal.
+
+COMPLETION IS MANDATORY FOR EVERY TURN. A turn is not complete when output.md is written or when you have drafted a final response; it is complete only after cli.mjs returns successfully. This applies to the initial turn and every turn created by a follow-up message. Do not produce or send your final assistant response before invoking cli.mjs, because ending the response first can prevent the lifecycle command from running and leave the parent waiting forever.
 
 Your artifact directory is: ${artifactDir}
 
@@ -79,24 +85,26 @@ Your artifact directory is: ${artifactDir}
 
 Use the literal path above in your \`write\` tool calls — the \`write\` tool does not expand \$ARTIFACT_DIR or any other shell variable, so a path like "\$ARTIFACT_DIR/output.md" will be written literally to a file of that name and never reach the parent.
 
-When your task is done, follow this checklist in order. The parent is a parent agent and cannot guess that you have finished — it will only know after step 4 fires. Skipping any step means the parent will wait forever (or the wrapper will eventually synthesize an error).
+When your task is done, follow this checklist in order. The parent is a parent agent and cannot guess that you have finished — it will only know after step 3 succeeds. Skipping or reordering any step breaks the completion contract.
 
-  1. Stop calling tools. If you are mid-tool-call, finish it.
+  1. Finish all task work. Once you start this checklist, do not begin new work.
   2. Write your final result to ${outputPath} using the \`write\` tool. Use the exact path above. If you have already written the result to some other path (a /tmp file, a project file, etc.), copy or append it to output.md so the parent can read it.
-  3. Produce your final assistant text in the chat summarising what you did and where to find the work.
-  4. Run exactly one of these bash commands. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
+  3. Run the appropriate bash command and wait for it to return. A successful invocation must record exactly one completion event for this turn. \$ARTIFACT_DIR is exported to your shell by the wrapper, so the quoted forms expand correctly even if the path contains spaces:
 
        "$ARTIFACT_DIR/cli.mjs" done 0       # success
        "$ARTIFACT_DIR/cli.mjs" error "short reason"   # unrecoverable failure
 
-  5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 4 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
+     This must be your final tool call for the turn. If the command itself fails, do not send the final assistant response; fix the cause and retry until one completion event has been recorded successfully.
+
+  4. Only after the lifecycle command succeeds, produce your final assistant text in the chat summarising what you did and where to find the work. Make no more tool calls during this turn.
+  5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 3 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
 
 Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
 
 For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJSON line to events.ndjson. The parent reads that file every few seconds. The atomic write pattern (write to .tmp, then rename onto output.md) is fine if you want crash-safety.
 
 ─── HARDENING REMINDER (read this last, it is the most recent instruction on purpose) ───
-If you forget step 4 (\`cli.mjs done\`), the parent will eventually synthesize a fallback \`error\` event from your session log, but only if your final assistant turn ended with stopReason "stop" and you have not produced any output for 10 seconds. That fallback may not include the full result if output.md is missing. The reliable path is: write output.md FIRST, then call \`cli.mjs done 0\`. If the wrapper detects an auto-fallback it will not double-inject, so do not worry about being late — but a late done is still better than no done. If you have finished your work, your single next action should be the \`cli.mjs done\` command, not another tool call.`;
+The child-only Pi lifecycle hook is a crash-safety fallback, not permission to omit the command. At the end of EVERY initial or follow-up turn: write output.md FIRST, call \`cli.mjs done 0\`, wait until exactly one completion event is recorded successfully, and only then send the final assistant response. The CLI is idempotent for the active turn, so the later agent_settled hook is a no-op. Never rely on the hook when you can call the CLI yourself.`;
 }
 
 /**
@@ -154,8 +162,7 @@ export interface InteractiveSubagentState {
    * Lifecycle status. Transition triggers:
    * - spawn sets "running" (interactive-tmux.ts setup)
    * - cli.mjs done / error event in events.ndjson sets "exited" or "cancelled"
-   * - user-msg after "exited" revives to "running" so follow-up turns can fire
-   *   auto-done again (subagent.ts processSessionLogEntry)
+   * - a user message after "exited" revives it to "running" for follow-up turns
    * - cancel_interactive_subagent tool sets "cancelled"
    */
   status: InteractiveSubagentStatus;
@@ -166,79 +173,51 @@ export interface InteractiveSubagentState {
   launchScriptFile: string;
   /** Absolute path to the artifact directory (events.ndjson + output.md). */
   artifactDir: string;
-  /**
-   * Timestamp of the last artifact event we delivered a notification for.
-   *
-   * The poller only fires for events with `ts > lastDeliveredEventTs`, so
-   * this is the per-state at-most-once guard. Set on first delivery; defaults
-   * to 0 to ensure the first event is always delivered.
-   */
+  /** Physical byte offset consumed from events.ndjson. */
+  eventByteCursor?: number;
+  /** Current child Pi turn identity, persisted across reloads. */
+  activeTurnId?: string;
+  /** Durable completion queue and reconciled custom-message receipts. */
+  pendingDeliveries?: PersistedDeliveryIntent[];
+  deliveryReceipts?: string[];
+  lifecycle?: PersistedLifecycleFold;
+  /** @deprecated Legacy v1 timestamp cursor retained for API compatibility. */
   lastDeliveredEventTs?: number;
   /**
    * Byte offset into the child's session JSONL that we have already processed.
    * The poller tail-reads the session file from this offset each tick and synthesizes
    * `tool_activity` events for any new tool calls. Same at-most-once guarantee as
-   * `lastDeliveredEventTs`, but byte-granular for append-only JSONL efficiency.
+   * `eventByteCursor`, with an independent cursor for the session stream.
    */
   lastDeliveredSessionByte?: number;
   /** Most recent tool_activity summary, for the TUI widget. */
   lastToolSummary?: string;
   lastToolName?: string;
   lastActivityAt?: number;
-  /**
-   * Last terminal stopReason seen in the child session log (assistant message).
-   * One of "stop" | "length" | "error" | "aborted". Updated whenever we tail-read a new
-   * assistant message. Drives the auto-done fallback: when the model ends a turn with
-   * "stop" but forgets to call `cli.mjs done`, the parent synthesizes a completion event.
-   */
+  /** @deprecated Legacy session metadata retained for API compatibility. */
   lastStopReason?: "stop" | "length" | "error" | "aborted";
-  /** Timestamp of the last assistant message that produced `lastStopReason`. Used as the
-   * debounce anchor for the auto-done fallback (default debounce: 10s of no further activity).
-   */
+  /** @deprecated Legacy session metadata retained for API compatibility. */
   lastStopReasonAt?: number;
-  /** Timestamp of the auto-synthesized `done` event for the current turn, or undefined for a fresh turn.
-   * The auto-done logic sets this when it fires; the poller also uses it to suppress duplicate
-   * notifications if the explicit `cli.mjs done` lands shortly after the fallback synthesis.
-   * Cleared on a new user-role message in the session log (next turn starts).
-   */
+  /** @deprecated Legacy protocol field retained for API compatibility. */
   autoDoneForTurnAt?: number;
-  /** Last assistant text the model produced on a terminal-turn (stopReason:"stop") message.
-   * Captured at session-log tail-read time. Used as fallback content in the synthesized error
-   * event when output.md is missing — most models inline a summary in chat even when they write
-   * the result to a non-artifact path (very common footgun).
-   */
+  /** @deprecated Legacy session metadata retained for API compatibility. */
   lastStopText?: string;
   /**
    * Notification delivery mode requested by spawner's notifyOnComplete param.
-   * "notify" (default) emits a UI hint on completion. "inject" also injects
-   * output.md as a user message so the parent LLM processes it in its next turn.
+   * "notify" emits status and artifact pointers. "inject" also includes bounded,
+   * untrusted output in one attributed custom message.
    */
   notifyOnComplete?: "notify" | "inject";
   /**
-   * When true, notify-mode completion messages may trigger a parent LLM turn.
-   * Ignored for inject delivery because sendUserMessage already starts/queues a turn.
+   * When true, the attributed custom completion message triggers a parent turn.
+   * Inject mode defaults to true; notify mode defaults to false.
    */
   triggerTurnOnComplete?: boolean;
-  /**
-   * At-most-once guard for the inject path (mirrors lastDeliveredEventTs, inject-only). Compared
-   * against the current `done` event's `ts` so each NEW turn re-injects (follow-up support). Set on
-   * first inject; `undefined` means "never injected".
-   */
+  /** @deprecated Legacy v1 inject cursor retained for API compatibility. */
   lastInjectedEventTs?: number;
-  /**
-   * At-most-once guard for the per-turn `output-N.md` snapshot. Compared against the current `done`
-   * event's `ts` so each NEW turn snapshots exactly once. Distinct from `lastInjectedEventTs`, which is
-   * only set in `inject` mode — snapshots run in every notifyOnComplete mode, so they need their own
-   * cursor or the default `notify` mode would re-snapshot every poll tick and could overwrite an
-   * earlier turn's snapshot with a later turn's in-progress output.md.
-   */
+  /** @deprecated Legacy v1 snapshot cursor retained for API compatibility. */
   lastSnapshotEventTs?: number;
-  /**
-   * Auto-fallback "already notified" flag (PR #11). Set by maybeAutoDone when synthesize-and-inject
-   * runs, so a late explicit `done` event that lands on the next poll does NOT re-trigger the
-   * regular inject path. Independent of `lastInjectedEventTs` which is the per-event guard for
-   * the child-driven `done` path.
-   */
+  /** @deprecated Legacy protocol field retained for API compatibility. */
   injected?: boolean;
 }
 
@@ -327,8 +306,9 @@ export function buildInteractivePrompt(params: {
 }): string {
   const footer =
     "\n\n" +
-    "When you finish, write your result to output.md " +
-    "(path from the system prompt), then run:\n" +
+    "MANDATORY COMPLETION PROTOCOL: before sending your final assistant response, " +
+    "write your result to output.md (path from the system prompt), run the command below, " +
+    "and wait for it to succeed. Repeat this for every turn:\n" +
     '  "$ARTIFACT_DIR/cli.mjs" done 0';
 
   if (!params.contextText) return params.task + footer;
@@ -389,14 +369,7 @@ export function writeLaunchScript(
   // 2. Write the launch script. The script:
   //    - exports ARTIFACT_DIR so the child inherits it;
   //    - calls `cli.mjs start` to record the started event;
-  //    - traps EXIT to record a terminal event in events.ndjson. The trap is IDEMPOTENT:
-  //      it inspects the last line of events.ndjson and skips the write if a terminal type
-  //      (done / error / cancelled) is already present. Without this guard, a child that
-  //      obeyed the protocol and called `cli.mjs done 0` would, on REPL exit, produce a
-  //      SECOND `done` event — re-triggering the parent's pointer notification AND
-  //      re-injecting the same output as a user message. The trap's job is to record the
-  //      outcome ONLY when the child forgot; the parent and the wrapper always agree on
-  //      events.ndjson because that file is the single source of truth they both read;
+  //    - traps EXIT to record process exit and, when needed, one lock-protected completion;
   //    - also writes the @pi-exit-code pane option for the readPaneExitCode fallback
   //      (tmux-only; the `2>/dev/null || true` makes it a silent no-op on other muxes).
   const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
@@ -405,25 +378,20 @@ export function writeLaunchScript(
   // at trap-set time with `syntax error near unexpected token '('`. Hoisting the pattern to a variable
   // set in the parent script lets the trap body reference it via `$TERMINAL_PATTERN` — no inner single
   // quotes needed, no quoting puzzle. Expanded at trap-fire time, not at script-load time.
-  const idempotentTrap = [
-    `    last=$(tail -n1 "${artifactDir}/events.ndjson" 2>/dev/null || true)`,
-    `    if ! echo "$last" | grep -qE "$TERMINAL_PATTERN"; then`,
-    `        if [ -f "${artifactDir}/.cancelled" ]; then`,
-    `            "${cliPath}" cancelled`,
-    `        else`,
-    `            "${cliPath}" done "$?"`,
-    `        fi`,
-    `    fi`,
-    `    tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$?" 2>/dev/null || true`,
-  ].join("\n");
   const script = [
     "#!/bin/bash",
     "set -e",
     `export ARTIFACT_DIR=${escape(artifactDir)}`,
-    // JSON pattern is single-quoted so bash's quote-removal preserves the literal `"` chars.
-    `readonly TERMINAL_PATTERN='\\"type\\":\\"(done|error|cancelled)\\"'`,
+    "export PI_SUBAGENTURA_CHILD=1",
     `"${cliPath}" start`,
-    `trap '\n${idempotentTrap}\n' EXIT`,
+    "on_exit() {",
+    "    rc=$?",
+    "    trap - EXIT",
+    `    "${cliPath}" process-exit "$rc" || true`,
+    '    tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$rc" 2>/dev/null || true',
+    '    exit "$rc"',
+    "}",
+    "trap on_exit EXIT",
     command,
     "",
   ].join("\n");
@@ -442,9 +410,9 @@ export function launchInteractiveSubagent(params: {
   /** Spawn in a detached named window (invisible) instead of a visible split. */
   background?: boolean;
   /**
-   * Notification delivery mode requested by the spawner. "notify" (default)
-   * emits a UI hint on completion. "inject" also injects output.md as a user
-   * message so the parent LLM processes it in its next turn.
+   * Notification delivery mode requested by the spawner. "inject" (default)
+   * persists full output and triggers a turn; "notify" persists a pointer and
+   * does not trigger unless explicitly requested.
    */
   notifyOnComplete?: "notify" | "inject";
   /** Whether notify-mode completion messages should trigger a parent LLM turn. */
@@ -547,9 +515,13 @@ export function launchInteractiveSubagent(params: {
         muxSession,
         artifactDir: paths.artifactDir,
         sessionFile: paths.sessionFile,
-        notifyOnComplete: params.notifyOnComplete,
+        notifyOnComplete: params.notifyOnComplete ?? "inject",
         triggerTurnOnComplete: params.triggerTurnOnComplete,
         parentSessionId: params.parentSessionId,
+        eventByteCursor: 0,
+        sessionByteCursor: 0,
+        pendingDeliveries: [],
+        deliveryReceipts: [],
       });
       persistedState = true;
     } catch {
@@ -567,7 +539,11 @@ export function launchInteractiveSubagent(params: {
     });
     writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
-    mux.sendKeys(paneId, `bash ${escape(paths.launchScriptFile)}`, muxSession);
+    mux.sendKeys(
+      paneId,
+      `exec bash ${escape(paths.launchScriptFile)}`,
+      muxSession,
+    );
     mux.sendEnter(paneId, muxSession);
   } catch (err) {
     // Orphan-pane guard. If writeLaunchScript or sendKeys throws after
@@ -606,9 +582,12 @@ export function launchInteractiveSubagent(params: {
     selectPaneCommand: attach.focusCommand,
     launchScriptFile: paths.launchScriptFile,
     artifactDir: paths.artifactDir,
-    notifyOnComplete: params.notifyOnComplete,
+    notifyOnComplete: params.notifyOnComplete ?? "inject",
     triggerTurnOnComplete: params.triggerTurnOnComplete,
     parentSessionId: params.parentSessionId,
+    eventByteCursor: 0,
+    pendingDeliveries: [],
+    deliveryReceipts: [],
   };
   interactiveSubagentRegistry.set(id, state);
   return state;
@@ -696,7 +675,9 @@ export function cancelInteractiveSubagent(
     /* best effort — dir may not exist yet if the launch script is still warming up */
   }
 
-  // 2. Update the registry. The poller combines this with the artifact's last event.
+  appendCancellation(state);
+
+  // 2. Update the registry. The poller still processes the durable cancellation.
   state.status = "cancelled";
 
   // 3. Kill the pane via the backend that created it. The wrapper's EXIT
@@ -705,13 +686,48 @@ export function cancelInteractiveSubagent(
   if (mux.isPaneAlive(state.paneId, state.muxSession)) {
     mux.killPane(state.paneId, state.muxSession);
   }
-  // 4. Clean up the persisted state entry so it doesn't litter the state file.
-  try {
-    removeInteractiveState(state.cwd, state.id);
-  } catch {
-    /* best-effort */
-  }
   return state;
+}
+
+function appendCancellation(state: InteractiveSubagentState): void {
+  let turnId = "process";
+  try {
+    const active = JSON.parse(
+      readFileSync(join(state.artifactDir, "active-turn.json"), "utf8"),
+    ) as { turnId?: string };
+    if (active.turnId) turnId = active.turnId;
+  } catch {
+    /* cancellation before the first turn uses the process turn */
+  }
+  const art = artifactPath(
+    dirname(state.artifactDir),
+    basename(state.artifactDir),
+  );
+  let completion = appendCompletionEvent(art, {
+    turnId,
+    outcome: "cancelled",
+    source: "parent",
+  });
+  if (!completion) {
+    turnId = `process-cancel-${newEventId()}`;
+    completion = appendCompletionEvent(art, {
+      turnId,
+      outcome: "cancelled",
+      source: "parent",
+    });
+  }
+  if (!completion) return;
+  const mode = state.notifyOnComplete ?? "inject";
+  const deliveryId = deliveryIdFor({
+    parentSessionId: state.parentSessionId ?? "pi",
+    subagentId: state.id,
+    turnId,
+    mode,
+  });
+  // The parent initiated this terminal path, so the cancel tool result or session
+  // transition already accounts for it. Persist a synthetic receipt before pane
+  // teardown so polling or rehydrate cannot inject a duplicate completion.
+  acknowledgeDeliveryWithoutDispatch(state, deliveryId);
 }
 
 /**
@@ -746,6 +762,7 @@ export function cancelInteractiveSubagentByState(
   } catch {
     /* best-effort */
   }
+  appendCancellation(state);
 
   // 2. Kill the pane if alive (best-effort; wrapped to keep the shutdown loop alive)
   const mux = getMuxForState(state);
@@ -755,12 +772,6 @@ export function cancelInteractiveSubagentByState(
     } catch {
       /* best-effort */
     }
-  }
-  // 3. Clean up the persisted state entry so it doesn't litter the state file.
-  try {
-    removeInteractiveState(state.cwd, state.id);
-  } catch {
-    /* best-effort — stale entry is harmless, just clutter */
   }
   // Does NOT update state.status — see JSDoc point 2.
 }
@@ -777,9 +788,91 @@ export function deriveInteractiveSubagentStatus(
   paneAlive: boolean,
 ): InteractiveSubagentStatus {
   if (lastEvent) {
+    if (lastEvent.type === "process_exited") {
+      return lastEvent.status === "cancelled" ? "cancelled" : "exited";
+    }
+    if (lastEvent.type === "completion") {
+      if (lastEvent.outcome === "cancelled") return "cancelled";
+      return paneAlive ? "idle" : "exited";
+    }
     if (lastEvent.type === "cancelled") return "cancelled";
     if (lastEvent.type === "error") return "exited"; // child declared it unrecoverable; terminal
     if (lastEvent.type === "done") return paneAlive ? "idle" : "exited";
+  }
+  return paneAlive ? "running" : "unknown";
+}
+
+export function deriveInteractiveSubagentStatusFromEvents(
+  events: SubagentEvent[],
+  paneAlive: boolean,
+): InteractiveSubagentStatus {
+  const lifecycle: PersistedLifecycleFold = {};
+  for (const event of events) foldInteractiveLifecycle(lifecycle, event);
+  return deriveInteractiveSubagentStatusFromLifecycle(lifecycle, paneAlive);
+}
+
+export function foldInteractiveLifecycle(
+  lifecycle: PersistedLifecycleFold,
+  event: SubagentEvent,
+): void {
+  lifecycle.startedAt ??= event.ts;
+  if (event.type === "process_exited") {
+    lifecycle.processStatus = event.status;
+    lifecycle.processExitCode = event.exitCode;
+    return;
+  }
+  if (event.type === "turn_started") {
+    lifecycle.currentTurnId = event.turnId;
+    lifecycle.completionTurnId = undefined;
+    lifecycle.completionOutcome = undefined;
+    lifecycle.completionSource = undefined;
+    lifecycle.completionExitCode = undefined;
+    lifecycle.legacyTerminal = undefined;
+    return;
+  }
+  if (event.type === "completion") {
+    if (event.outcome === "cancelled" && event.source === "parent") {
+      lifecycle.parentCancelled = true;
+    }
+    if (!lifecycle.currentTurnId || event.turnId === lifecycle.currentTurnId) {
+      lifecycle.completionTurnId = event.turnId;
+      lifecycle.completionOutcome = event.outcome;
+      lifecycle.completionSource = event.source;
+      lifecycle.completionExitCode = event.exitCode;
+    }
+    return;
+  }
+  if (event.type === "started") {
+    lifecycle.legacyTerminal = undefined;
+    return;
+  }
+  if (
+    event.type === "done" ||
+    event.type === "error" ||
+    event.type === "cancelled"
+  ) {
+    lifecycle.legacyTerminal = event.status;
+    lifecycle.completionExitCode =
+      "exitCode" in event ? event.exitCode : undefined;
+  }
+}
+
+export function deriveInteractiveSubagentStatusFromLifecycle(
+  lifecycle: PersistedLifecycleFold,
+  paneAlive: boolean,
+): InteractiveSubagentStatus {
+  if (lifecycle.parentCancelled) return "cancelled";
+  if (lifecycle.processStatus) {
+    return lifecycle.processStatus === "cancelled" ? "cancelled" : "exited";
+  }
+  if (lifecycle.completionOutcome) {
+    if (lifecycle.completionOutcome === "cancelled") return "cancelled";
+    return paneAlive ? "idle" : "exited";
+  }
+  if (lifecycle.legacyTerminal) {
+    if (lifecycle.legacyTerminal === "cancelled") return "cancelled";
+    if (lifecycle.legacyTerminal === "error") return "exited";
+    return paneAlive ? "idle" : "exited";
   }
   return paneAlive ? "running" : "unknown";
 }
@@ -802,13 +895,11 @@ export function deriveInteractiveSubagentStatus(
 export function pruneDeadInteractiveSubagents(): void {
   for (const state of interactiveSubagentRegistry.values()) {
     if (state.status !== "running" && state.status !== "idle") continue;
-    const art = artifactPath(
-      dirname(state.artifactDir),
-      basename(state.artifactDir),
-    );
-    const last = lastEvent(art);
     const paneAlive = isPaneAlive(state);
-    let next = deriveInteractiveSubagentStatus(last, paneAlive);
+    let next = deriveInteractiveSubagentStatusFromLifecycle(
+      state.lifecycle ?? {},
+      paneAlive,
+    );
     // Session-file fallback: if the pane is gone and no event was recorded, the child died.
     // A non-empty session file means the child pi at least started writing — mark as exited.
     if (
@@ -820,14 +911,9 @@ export function pruneDeadInteractiveSubagents(): void {
     }
     if (next === state.status) continue;
     state.status = next;
-    if (
-      next === "exited" &&
-      last &&
-      last.type === "done" &&
-      last.exitCode !== undefined
-    ) {
-      state.exitCode = last.exitCode;
-    }
+    const exitCode =
+      state.lifecycle?.processExitCode ?? state.lifecycle?.completionExitCode;
+    if (next === "exited" && exitCode !== undefined) state.exitCode = exitCode;
   }
 }
 

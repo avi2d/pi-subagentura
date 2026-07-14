@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { deriveInteractiveSubagentStatus } from "../src/interactive-tmux";
+import {
+  deriveInteractiveSubagentStatus,
+  deriveInteractiveSubagentStatusFromEvents,
+} from "../src/interactive-tmux";
 import {
   mkdtempSync,
   readFileSync,
@@ -288,23 +291,19 @@ describe("interactive-tmux", () => {
     }
   });
 
-  it("pruneDeadInteractiveSubagents reads from the artifact", async () => {
+  it("pruneDeadInteractiveSubagents uses the incremental lifecycle fold", async () => {
     process.env.PI_CODING_AGENT_SESSION_DIR = makeTmp();
     process.env.TMUX = makeArgs().TMUX;
 
     const mod = await importFresh<typeof import("../src/interactive-tmux")>(
       "../src/interactive-tmux",
     );
-    const { appendEvent, artifactPath } = await import("../src/artifact");
     const { mkdirSync } = await import("node:fs");
 
     // Case 1: artifact has a `done` event → "exited" with code 0.
     {
       const dir = join(makeTmp(), "a1");
       mkdirSync(dir, { recursive: true });
-      const art = artifactPath(join(dir, ".."), "a1");
-      appendEvent(art, { ts: 1, type: "started", status: "running" });
-      appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
       const state: import("../src/interactive-tmux").InteractiveSubagentState =
         {
           id: "a1",
@@ -320,6 +319,11 @@ describe("interactive-tmux", () => {
           selectPaneCommand: "",
           launchScriptFile: "/dev/null",
           artifactDir: dir,
+          lifecycle: {
+            completionOutcome: "done",
+            completionSource: "explicit",
+            completionExitCode: 0,
+          },
         };
       mod.interactiveSubagentRegistry.set(state.id, state);
       mod.pruneDeadInteractiveSubagents();
@@ -331,8 +335,6 @@ describe("interactive-tmux", () => {
     {
       const dir = join(makeTmp(), "a2");
       mkdirSync(dir, { recursive: true });
-      const art = artifactPath(join(dir, ".."), "a2");
-      appendEvent(art, { ts: 1, type: "cancelled", status: "cancelled" });
       const state: import("../src/interactive-tmux").InteractiveSubagentState =
         {
           id: "a2",
@@ -348,6 +350,7 @@ describe("interactive-tmux", () => {
           selectPaneCommand: "",
           launchScriptFile: "/dev/null",
           artifactDir: dir,
+          lifecycle: { parentCancelled: true },
         };
       mod.interactiveSubagentRegistry.set(state.id, state);
       mod.pruneDeadInteractiveSubagents();
@@ -379,6 +382,25 @@ describe("interactive-tmux", () => {
       type: "cancelled" as const,
       status: "cancelled" as const,
     };
+    const v2ErrorCompletion = {
+      version: 2 as const,
+      eventId: "event-error",
+      turnId: "turn-error",
+      ts: 5,
+      type: "completion" as const,
+      status: "error" as const,
+      outcome: "error" as const,
+      source: "agent_end" as const,
+    };
+    const processExited = {
+      version: 2 as const,
+      eventId: "event-exit",
+      turnId: "turn-error",
+      ts: 6,
+      type: "process_exited" as const,
+      status: "error" as const,
+      exitCode: 1,
+    };
 
     it("started event + pane alive → 'running' (mid-turn)", () => {
       expect(deriveInteractiveSubagentStatus(startedEv, true)).toBe("running");
@@ -397,6 +419,81 @@ describe("interactive-tmux", () => {
     });
     it("error event + pane dead → 'exited'", () => {
       expect(deriveInteractiveSubagentStatus(errorEv, false)).toBe("exited");
+    });
+    it("v2 error completion + pane alive → 'idle' for follow-up", () => {
+      expect(deriveInteractiveSubagentStatus(v2ErrorCompletion, true)).toBe(
+        "idle",
+      );
+    });
+    it("process_exited + pane alive → 'exited' terminal", () => {
+      expect(deriveInteractiveSubagentStatus(processExited, true)).toBe(
+        "exited",
+      );
+    });
+    it("trailing activity cannot mask current-turn completion", () => {
+      expect(
+        deriveInteractiveSubagentStatusFromEvents(
+          [
+            {
+              version: 2,
+              eventId: "start",
+              turnId: "turn-error",
+              ts: 1,
+              type: "turn_started",
+              status: "running",
+            },
+            v2ErrorCompletion,
+            {
+              version: 2,
+              eventId: "activity",
+              turnId: "turn-error",
+              ts: 3,
+              type: "tool_activity",
+              status: "running",
+              phase: "end",
+            },
+          ],
+          true,
+        ),
+      ).toBe("idle");
+    });
+    it("trailing activity cannot mask process exit", () => {
+      expect(
+        deriveInteractiveSubagentStatusFromEvents(
+          [
+            processExited,
+            {
+              version: 2,
+              eventId: "activity",
+              turnId: "turn-error",
+              ts: 7,
+              type: "tool_activity",
+              status: "running",
+              phase: "end",
+            },
+          ],
+          true,
+        ),
+      ).toBe("exited");
+    });
+    it("parent process cancellation is terminal without turn_started", () => {
+      expect(
+        deriveInteractiveSubagentStatusFromEvents(
+          [
+            {
+              version: 2,
+              eventId: "cancel",
+              turnId: "process-cancel-id",
+              ts: 1,
+              type: "completion",
+              status: "cancelled",
+              outcome: "cancelled",
+              source: "parent",
+            },
+          ],
+          true,
+        ),
+      ).toBe("cancelled");
     });
     it("cancelled event + pane alive → 'cancelled' (terminal regardless of pane)", () => {
       expect(deriveInteractiveSubagentStatus(cancelledEv, true)).toBe(
@@ -471,7 +568,7 @@ describe("interactive-tmux", () => {
       expect(protocol).toMatch(/do not call .\/exit.|press Ctrl-D/i);
     });
 
-    it("tells the child to be brief (avoid verbose preambles, short summary in step 3)", async () => {
+    it("tells the child to be brief after lifecycle completion", async () => {
       const { buildChildSubagentProtocol } = await importFresh<
         typeof import("../src/interactive-tmux")
       >("../src/interactive-tmux");
@@ -480,6 +577,30 @@ describe("interactive-tmux", () => {
       // high attention. We match the literal "BE BRIEF" token so the exact
       // wording can be tuned without breaking the test.
       expect(protocol).toMatch(/BE BRIEF/);
+    });
+
+    it("requires done before the final assistant response on every turn", async () => {
+      const { buildChildSubagentProtocol } = await importFresh<
+        typeof import("../src/interactive-tmux")
+      >("../src/interactive-tmux");
+      const protocol = buildChildSubagentProtocol(FIXTURE_DIR);
+
+      expect(protocol).toMatch(/A turn is not complete.*cli\.mjs.*returns/i);
+      expect(protocol).toMatch(/every turn.*follow-up/i);
+      expect(protocol).toMatch(
+        /do not (?:produce|send|emit).*final assistant.*before.*cli\.mjs/i,
+      );
+      expect(protocol).toMatch(/final tool call/i);
+      expect(protocol).toMatch(
+        /if the command.*fails.*do not.*final assistant.*retry/i,
+      );
+
+      const doneCommand = protocol.indexOf('"$ARTIFACT_DIR/cli.mjs" done 0');
+      const finalResponse = protocol.indexOf(
+        "Only after the lifecycle command succeeds",
+      );
+      expect(doneCommand).toBeGreaterThanOrEqual(0);
+      expect(finalResponse).toBeGreaterThan(doneCommand);
     });
 
     it("embeds the literal artifact dir in the rendered prompt", async () => {
@@ -491,6 +612,19 @@ describe("interactive-tmux", () => {
       // Sanity: the fixture from a different call must not appear here.
       expect(protocol).not.toContain("/tmp/pi-subagentura-fixture");
     });
+  });
+
+  it("repeats the mandatory completion contract in the initial task prompt", async () => {
+    const { buildInteractivePrompt } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
+    const prompt = buildInteractivePrompt({ task: "inspect the project" });
+
+    expect(prompt).toMatch(/^inspect the project/);
+    expect(prompt).toMatch(/mandatory completion protocol/i);
+    expect(prompt).toMatch(/before sending your final assistant response/i);
+    expect(prompt).toContain('"$ARTIFACT_DIR/cli.mjs" done 0');
+    expect(prompt).toMatch(/every turn/i);
   });
 
   describe("system prompt is always written", () => {
@@ -642,7 +776,7 @@ describe("interactive-tmux", () => {
       vi.doUnmock("node:fs");
     });
 
-    it("is undefined on the state when notifyOnComplete is not passed to launchInteractiveSubagent", async () => {
+    it("defaults the state to inject when notifyOnComplete is omitted", async () => {
       const tmp = makeTmp();
       process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
       process.env.TMUX = makeArgs().TMUX;
@@ -664,8 +798,7 @@ describe("interactive-tmux", () => {
         cwd: tmp,
       });
 
-      // Default: no notification mode requested. The poller falls back to notify.
-      expect(state.notifyOnComplete).toBeUndefined();
+      expect(state.notifyOnComplete).toBe("inject");
       expect(state.lastInjectedEventTs).toBeUndefined();
     });
 

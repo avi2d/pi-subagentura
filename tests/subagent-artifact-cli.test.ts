@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { CLI_SOURCE, writeCliScript } from "../src/subagent-artifact-cli";
 
 function makeTmp(): string {
@@ -93,7 +93,8 @@ describe("subagent-artifact CLI", () => {
       const ev = JSON.parse(
         readFileSync(join(tmp, "events.ndjson"), "utf8").trim(),
       );
-      expect(ev.type).toBe("done");
+      expect(ev.type).toBe("completion");
+      expect(ev.outcome).toBe("done");
       expect(ev.status).toBe("done");
       expect(ev.exitCode).toBe(0);
     });
@@ -106,6 +107,47 @@ describe("subagent-artifact CLI", () => {
       expect(ev.status).toBe("error");
       expect(ev.exitCode).toBe(1);
     });
+
+    it("serializes concurrent completion writers for one turn", async () => {
+      const cliPath = join(tmp, "cli.mjs");
+      writeCliScript(cliPath);
+      writeFileSync(
+        join(tmp, "active-turn.json"),
+        JSON.stringify({ turnId: "shared-turn", startedAt: Date.now() }),
+      );
+      writeFileSync(join(tmp, "output.md"), "stable output");
+
+      const commands = Array.from({ length: 16 }, (_, index) =>
+        index % 3 === 0 ? ["cancelled"] : ["done", "0"],
+      );
+      await Promise.all(
+        commands.map(
+          (args) =>
+            new Promise<void>((resolve, reject) => {
+              const child = spawn("node", [cliPath, ...args], {
+                env: { ...process.env, ARTIFACT_DIR: tmp },
+              });
+              child.once("error", reject);
+              child.once("exit", (code) => {
+                if (code === 0) resolve();
+                else reject(new Error(`completion writer exited ${code}`));
+              });
+            }),
+        ),
+      );
+
+      const events = readFileSync(join(tmp, "events.ndjson"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "completion" && event.turnId === "shared-turn",
+        ),
+      ).toHaveLength(1);
+      expect(existsSync(join(tmp, "outputs"))).toBe(true);
+    });
   });
 
   describe("error", () => {
@@ -114,7 +156,8 @@ describe("subagent-artifact CLI", () => {
       const ev = JSON.parse(
         readFileSync(join(tmp, "events.ndjson"), "utf8").trim(),
       );
-      expect(ev.type).toBe("error");
+      expect(ev.type).toBe("completion");
+      expect(ev.outcome).toBe("error");
       expect(ev.status).toBe("error");
       expect(ev.message).toBe("boom");
     });
@@ -126,7 +169,8 @@ describe("subagent-artifact CLI", () => {
       const ev = JSON.parse(
         readFileSync(join(tmp, "events.ndjson"), "utf8").trim(),
       );
-      expect(ev.type).toBe("cancelled");
+      expect(ev.type).toBe("completion");
+      expect(ev.outcome).toBe("cancelled");
       expect(ev.status).toBe("cancelled");
     });
   });

@@ -3,9 +3,8 @@
  *
  * Reads <cwd>/.pi/subagentura-state.json, reconstructs each
  * InteractiveSubagentState, sets its status via the existing
- * deriveInteractiveSubagentStatus matrix (lastEvent + isPaneAlive), registers
- * it, and resets runtime cursors so the existing poller backlog-catch-up path
- * replays any events that landed during downtime.
+ * persisted lifecycle fold plus pane liveness, restores
+ * persisted cursors and delivery receipts, and registers it.
  *
  * Idempotent — skips ids already in the registry. Designed to be called from
  * the session_start handler. The first poll tick after this returns sees
@@ -13,18 +12,14 @@
  */
 
 import { readdirSync } from "node:fs";
-import { basename, dirname } from "node:path";
-
 import {
-  artifactPath,
-  lastEvent,
   loadInteractiveStates,
-  readEvents,
-  type InteractiveSubagentPersistedStateV1,
+  type InteractiveSubagentPersistedStateV2,
 } from "./artifact";
+import { reconcileDeliveryReceipts } from "./delivery";
 import {
   buildAttachCommandsForState,
-  deriveInteractiveSubagentStatus,
+  deriveInteractiveSubagentStatusFromLifecycle,
   interactiveSubagentRegistry,
   isPaneAlive,
   type InteractiveSubagentState,
@@ -33,6 +28,7 @@ import {
 export function rehydrateInteractiveSubagents(
   cwd: string,
   currentSessionId?: string,
+  sessionEntries: unknown[] = [],
 ): {
   total: number;
   alive: number;
@@ -46,7 +42,7 @@ export function rehydrateInteractiveSubagents(
 
   for (const entry of Object.values(
     payload.states,
-  ) as Array<InteractiveSubagentPersistedStateV1>) {
+  ) as Array<InteractiveSubagentPersistedStateV2>) {
     if (currentSessionId && entry.parentSessionId !== currentSessionId) {
       continue;
     }
@@ -54,11 +50,6 @@ export function rehydrateInteractiveSubagents(
 
     // Recovery is best-effort and must never throw; on missing files we
     // fall back to placeholder values (entry.id for name, 0 for startedAt).
-    const art = artifactPath(
-      dirname(entry.artifactDir),
-      basename(entry.artifactDir),
-    );
-
     let recoveredName: string;
     try {
       const files = readdirSync(entry.artifactDir);
@@ -70,13 +61,7 @@ export function rehydrateInteractiveSubagents(
       recoveredName = entry.id;
     }
 
-    let startedAt: number;
-    try {
-      const events = readEvents(art);
-      startedAt = events.length > 0 ? events[0].ts : 0;
-    } catch {
-      startedAt = 0;
-    }
+    const startedAt = entry.lifecycle?.startedAt ?? 0;
 
     const attach = (() => {
       try {
@@ -105,9 +90,14 @@ export function rehydrateInteractiveSubagents(
       notifyOnComplete: entry.notifyOnComplete,
       triggerTurnOnComplete: entry.triggerTurnOnComplete,
       parentSessionId: entry.parentSessionId ?? "pi",
-      // All runtime cursors reset (replay-all semantics).
-      lastDeliveredEventTs: 0,
-      lastDeliveredSessionByte: 0,
+      eventByteCursor: entry.eventByteCursor,
+      lastDeliveredSessionByte: entry.sessionByteCursor,
+      activeTurnId: entry.activeTurnId,
+      pendingDeliveries: [...entry.pendingDeliveries],
+      deliveryReceipts: [...entry.deliveryReceipts],
+      lifecycle: entry.lifecycle ? { ...entry.lifecycle } : {},
+      // Legacy timestamp fields remain for API compatibility only.
+      lastDeliveredEventTs: undefined,
       lastInjectedEventTs: undefined,
       lastSnapshotEventTs: undefined,
       injected: undefined,
@@ -117,17 +107,13 @@ export function rehydrateInteractiveSubagents(
       lastStopText: undefined,
     };
 
-    const last = lastEvent(art);
     const paneAlive = isPaneAlive(rehydrated);
-    const next = deriveInteractiveSubagentStatus(last, paneAlive);
+    const next = deriveInteractiveSubagentStatusFromLifecycle(
+      rehydrated.lifecycle ?? {},
+      paneAlive,
+    );
     rehydrated.status = next;
-    // Deliberately do NOT suppress re-injection here. The inject-mode path
-    // fires on every NEW `done` event (line 682, `lastInjectedEventTs !== last.ts`).
-    // On rehydrate, cursors are reset to 0 and lastInjectedEventTs starts as undefined,
-    // so the first poll will re-inject the latest terminal event for inject-mode orphans.
-    // This means exactly one extra inject per sub-agent on parent reload, which is
-    // acceptable — it's better than silently dropping a result that completed during
-    // the reload downtime (the pre-fix behavior).
+    reconcileDeliveryReceipts(rehydrated, sessionEntries);
     if (next === "exited" || next === "cancelled") terminal++;
     else if (next === "running" || next === "idle") alive++;
     interactiveSubagentRegistry.set(entry.id, rehydrated);

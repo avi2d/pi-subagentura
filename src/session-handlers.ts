@@ -8,6 +8,8 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deleteInteractiveStatesFile } from "./artifact";
 import { pollArtifactChanges } from "./artifact-poller";
+import { flushDeliveries } from "./delivery";
+import { flushInProcessDeliveries } from "./notifications";
 import { jobRegistry } from "./helpers";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
 import {
@@ -24,13 +26,23 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   const g2 = getGlobalState() as any;
 
   g2.__piSubagenturaPiRef = pi;
-  g2.__piSubagenturaInjectCount = 0;
+  g2.__piSubagenturaParentStreaming = false;
+
+  pi.on("agent_start", () => {
+    g2.__piSubagenturaParentStreaming = true;
+  });
+  pi.on("agent_settled", () => {
+    g2.__piSubagenturaParentStreaming = false;
+    flushDeliveries(pi, g2.__piSubagenturaUi);
+    flushInProcessDeliveries();
+  });
 
   // Capture ctx.ui for the artifact poller (it runs from a setInterval and has no ctx).
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
   pi.on("session_start", (event, ctx) => {
     g2.__piSubagenturaUi = ctx.ui;
+    g2.__piSubagenturaSessionManager = ctx.sessionManager;
     // Rehydrate on startup (resumed session after quit), reload, and resume.
     // The session ID filter ensures only subagents created in this specific session
     // are rehydrated. On 'new' and 'fork' we skip — those are explicit fresh starts.
@@ -43,6 +55,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         rehydrateInteractiveSubagents(
           ctx.cwd,
           ctx.sessionManager?.getSessionId?.(),
+          ctx.sessionManager?.getEntries?.() ?? [],
         );
       } catch {
         /* best effort — rehydrate is a recovery path; failures fall back to empty registry */
@@ -58,7 +71,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // Register notification renderer before any tools
   // One global interval for the whole session. Each tick walks the artifact dir of
   // every running interactive sub-agent and fires pointer notifications for new events.
-  // The poller survives parent restarts (artifacts on disk + per-state lastDeliveredEventTs).
+  // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
     const handle = setInterval(() => pollArtifactChanges(pi), 5000);
     // Don't pin the event loop on a long-lived parent. unref() lets the process exit
@@ -87,13 +100,13 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         g2.__piSubagenturaInteractivePollerHandle = undefined;
       }
 
-      // Snapshot running state objects BEFORE clearing. On /new and quit we
-      // kill their panes after the registry is empty. On reload/resume we
-      // intentionally preserve panes so the next session_start can rehydrate
-      // them from the state file.
+      // Snapshot live state objects before clearing. Non-preserving shutdowns
+      // kill their panes; reload/resume/quit leave them for rehydration.
       const runningStates: InteractiveSubagentState[] = [];
       for (const state of interactiveSubagentRegistry.values()) {
-        if (state.status === "running") runningStates.push(state);
+        if (state.status === "running" || state.status === "idle") {
+          runningStates.push(state);
+        }
       }
 
       // Drop in-memory state FIRST. An in-flight poll tick (dequeued from
@@ -135,7 +148,8 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
 
       jobRegistry.clear();
       g2.__piSubagenturaPiRef = undefined;
-      g2.__piSubagenturaInjectCount = 0;
+      g2.__piSubagenturaSessionManager = undefined;
+      g2.__piSubagenturaParentStreaming = false;
       // Clean-slate the state file on /new. On quit/reload/resume we KEEP the file so the
       // next session_start can rehydrate the sub-agents (their panes survive).
       if (event?.reason === "new" && ctx?.cwd) {

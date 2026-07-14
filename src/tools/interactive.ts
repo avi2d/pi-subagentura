@@ -12,9 +12,11 @@ import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
   lastEvent,
+  listOutputHistory,
   listOutputTurns,
   readEvents,
   readOutput,
+  readOutputForTurnId,
   readOutputForTurn,
   type SubagentArtifact,
 } from "../artifact";
@@ -29,11 +31,17 @@ import {
   type InteractiveSubagentState,
 } from "../interactive-tmux";
 import { debugLog } from "../helpers";
+import {
+  completionTriggersTurn,
+  formatCompletionDeliveryBehavior,
+} from "../notifications";
 import { InteractiveParams } from "../schemas";
 
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
+const FOLLOWUP_COMPLETION_REMINDER =
+  ' [MANDATORY COMPLETION PROTOCOL FOR EVERY FOLLOW-UP TURN: Before sending your final assistant response, write the result to output.md; make "$ARTIFACT_DIR/cli.mjs" done 0 your final tool call and wait for success. If it fails, do not send the final response; fix the cause and retry until completion is recorded. Do not rely on the lifecycle hook.]';
 
 function formatFollowupPreview(message: string): string {
   if (message.length <= MAX_FOLLOWUP_PREVIEW_CHARS) return message;
@@ -109,6 +117,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
       "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
+      "Both completion modes show the user a notification.",
+      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
     ].join("\n"),
     parameters: InteractiveParams,
 
@@ -137,6 +147,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
       const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
       const targetCwd = params.cwd ?? ctx.cwd;
+      const completionMode = params.notifyOnComplete ?? "inject";
+      const triggerTurn = completionTriggersTurn(
+        completionMode,
+        params.triggerTurnOnComplete,
+      );
 
       try {
         const state = launchInteractiveSubagent({
@@ -147,8 +162,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           cwd: targetCwd,
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
-          notifyOnComplete: params.notifyOnComplete ?? "inject",
-          triggerTurnOnComplete: params.triggerTurnOnComplete === true,
+          notifyOnComplete: completionMode,
+          triggerTurnOnComplete: params.triggerTurnOnComplete,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
@@ -161,7 +176,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+              text:
+                `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
+                `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
+                `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
             },
           ],
           details: { ...state, status: "started" },
@@ -272,7 +290,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
-    description: "Kill the tmux pane for an interactive sub-agent by ID.",
+    description:
+      "Kill an interactive sub-agent pane. The tool result acknowledges parent-initiated cancellation, so artifacts are retained without injecting a duplicate cancellation completion into LLM context.",
     parameters: Type.Object({
       jobId: Type.String({
         description:
@@ -280,8 +299,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       }),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       const state = cancelInteractiveSubagent(params.jobId);
+      let userNotification: string;
       if (!state) {
         return {
           content: [
@@ -294,11 +314,22 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      userNotification =
+        `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
+        `Artifacts retained at ${state.artifactDir}.`;
+      try {
+        ctx.ui.notify(userNotification, "warning");
+      } catch {
+        /* cancellation succeeded; a stale UI must not turn it into a tool failure */
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Interactive sub-agent ${params.jobId} cancelled.`,
+            text:
+              `Interactive sub-agent ${params.jobId} cancelled. ` +
+              `No separate cancellation completion will be injected into the parent LLM. ` +
+              `Artifacts retained at ${state.artifactDir}.`,
           },
         ],
         details: { ...state },
@@ -416,7 +447,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       // pane is gone (e.g. the child exited between the status check and now).
       // Wrap so the parent gets a structured error instead of an exception trace.
       try {
-        sendCommandToPane(state, params.message);
+        sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -470,8 +501,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     description: [
       "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
       "if present, the sub-agent's output.md (the latest turn's content) or a specific turn's snapshot.",
-      "Use `since` (unix ms) to fetch only events newer than your last read. Use `turn` to read a",
-      "specific historical turn's output-N.md instead of the latest output.md.",
+      "Use `since` (unix ms) to fetch only events newer than your last read. Use `turnId` for a",
+      "protocol-v2 Pi turn, or legacy numeric `turn` for an output-N.md snapshot.",
     ].join("\n"),
     parameters: Type.Object({
       id: Type.String({
@@ -495,6 +526,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             "Read a specific turn's output-N.md snapshot. Omit to read the latest output.md.",
         }),
       ),
+      turnId: Type.Optional(
+        Type.String({
+          description:
+            "Read a protocol-v2 immutable output by its Pi-derived turnId.",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params): Promise<any> {
@@ -509,6 +546,18 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             },
           ],
           details: { id: params.id, status: "invalid_id" },
+          isError: true,
+        };
+      }
+      if (params.turn !== undefined && params.turnId !== undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Pass either turn or turnId, not both.",
+            },
+          ],
+          details: { id: params.id, status: "invalid_selector" },
           isError: true,
         };
       }
@@ -529,14 +578,18 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
         };
       }
       const events = readEvents(art, params.since);
-      // `turn` reads a specific output-N.md snapshot; otherwise read the latest output.md. The turn
-      // param implies includeOutput (you can't read a turn without wanting its content).
+      // Historical selectors imply includeOutput: selecting a turn without its
+      // immutable content would be surprising and provides no useful mapping.
       const wantsOutput =
-        params.includeOutput !== false || params.turn !== undefined;
+        params.includeOutput !== false ||
+        params.turn !== undefined ||
+        params.turnId !== undefined;
       const output = wantsOutput
-        ? params.turn !== undefined
-          ? readOutputForTurn(art, params.turn)
-          : readOutput(art)
+        ? params.turnId !== undefined
+          ? readOutputForTurnId(art, params.turnId)
+          : params.turn !== undefined
+            ? readOutputForTurn(art, params.turn)
+            : readOutput(art)
         : null;
       const lastEventValue =
         events.length > 0 ? events[events.length - 1] : null;
@@ -545,7 +598,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       // already exited (the common case: model finished without writing).
       let outputText: string;
       if (output === null) {
-        if (params.turn !== undefined) {
+        if (params.turnId !== undefined) {
+          outputText = `(no immutable snapshot for turnId ${params.turnId})`;
+        } else if (params.turn !== undefined) {
           outputText = `(no snapshot for turn ${params.turn} — the poller may not have run yet, or this turn number is past the history)`;
         } else {
           const exited =
@@ -564,9 +619,16 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       }
       // Available turns summary so the caller knows what history exists.
       const availableTurns = listOutputTurns(art);
+      const outputHistory = listOutputHistory(art);
       const turnsLine =
         availableTurns.length > 0
           ? `Available turns: [${availableTurns.join(", ")}]\n`
+          : "";
+      const historyLine =
+        outputHistory.length > 0
+          ? `Protocol-v2 outputs: ${outputHistory
+              .map(({ turnId, eventId }) => `${turnId} → ${eventId}`)
+              .join(", ")}\n`
           : "";
       return {
         content: [
@@ -578,7 +640,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
               (params.turn !== undefined
                 ? `Reading turn: ${params.turn}\n`
                 : "") +
+              (params.turnId !== undefined
+                ? `Reading turnId: ${params.turnId}\n`
+                : "") +
               turnsLine +
+              historyLine +
               `Output: ${outputText}`,
           },
         ],
@@ -589,6 +655,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           output,
           lastEvent: lastEventValue,
           availableTurns,
+          outputHistory,
         },
       };
     },

@@ -134,16 +134,33 @@ export function renderAsyncSpawn(
 // ── Notification TUI Renderer ──────────────────────────────────
 
 export function renderSubagentNotify(
-  message: { content?: string; details?: unknown },
+  message: {
+    content?: string | Array<{ type: string; text?: string }>;
+    details?: unknown;
+  },
   options: { expanded?: boolean },
   theme: Theme,
 ): Text {
   const details = message.details as
-    | { mode?: string; result?: SubagentResult }
+    | {
+        mode?: string;
+        status?: "done" | "error" | "cancelled";
+        error?: boolean;
+        result?: SubagentResult;
+      }
     | undefined;
   const isInject = details?.mode === "inject";
-  const isError = details?.result?.isError;
-  const text = message.content ?? "";
+  const isError =
+    details?.error === true ||
+    details?.status === "error" ||
+    details?.result?.isError === true;
+  const isCancelled = details?.status === "cancelled";
+  const text =
+    typeof message.content === "string"
+      ? message.content
+      : (message.content ?? [])
+          .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+          .join("");
 
   let line: string;
   if (!options.expanded) {
@@ -152,11 +169,13 @@ export function renderSubagentNotify(
     const output = sanitizeOutput(
       (details?.result?.output ?? "").slice(0, 500).replace(/\s+/g, " "),
     );
-    const header = isInject
-      ? theme.fg("accent", "⚡ Injected Sub-agent Result")
-      : isError
-        ? theme.fg("error", "❌ Sub-agent Failed")
-        : theme.fg("success", "✅ Sub-agent Completed");
+    const header = isError
+      ? theme.fg("error", "❌ Sub-agent Failed")
+      : isCancelled
+        ? theme.fg("warning", "🚫 Sub-agent Cancelled")
+        : isInject
+          ? theme.fg("accent", "⚡ Injected Sub-agent Result")
+          : theme.fg("success", "✅ Sub-agent Completed");
     const body = theme.fg("dim", text);
     line = `${header}\n${body}\n${output}`;
   }

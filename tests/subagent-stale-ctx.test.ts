@@ -18,7 +18,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEvent, artifactPath, writeOutput } from "../src/artifact";
+import {
+  appendCompletionEvent,
+  artifactPath,
+  writeOutput,
+} from "../src/artifact";
 import { importFresh } from "./test-utils";
 
 function makeTmp(): string {
@@ -75,7 +79,7 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     g.__piSubagenturaInjectCount = 0;
   });
 
-  it("swallows sendUserMessage throwing 'This extension ctx is stale ...' (stale pi after session reload)", async () => {
+  it("keeps a custom-message delivery queued when stale Pi throws", async () => {
     // The exact assertion error message produced by the loader's assertActive.
     // If the loader ever changes the wording this test should be updated to
     // match — the regression we care about is the try/catch, not the message.
@@ -89,8 +93,7 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     // stale after a session reload — the global ref is also stale, but the
     // belt-and-suspenders pattern is: any pi, however stale, must not crash.)
     const brokenPi = {
-      sendMessage: vi.fn(),
-      sendUserMessage: vi.fn(() => {
+      sendMessage: vi.fn(() => {
         throw staleErr;
       }),
     };
@@ -102,21 +105,18 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     state.notifyOnComplete = "inject";
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
-    appendEvent(art, { ts: 1, type: "started", status: "running" });
-    appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
     writeOutput(art, "the answer");
+    appendCompletionEvent(art, {
+      turnId: "turn-1",
+      outcome: "done",
+      source: "agent_end",
+    });
 
     // The call must NOT throw — that's the entire point of the fix.
     expect(() => mod.pollArtifactChanges(brokenPi as any)).not.toThrow();
 
-    // sendUserMessage was attempted and threw.
-    expect(brokenPi.sendUserMessage).toHaveBeenCalledTimes(1);
-
-    // The `finally` block MUST have run: decrementInjectCount took the count
-    // back to 0 (we started at 0, increment pushed it to 1, finally dropped
-    // it back). If the `finally` had been swallowed by a missing catch, the
-    // count would stay at 1 and the inject cap would fill up over time.
-    expect(mod.getInjectCount()).toBe(0);
+    expect(brokenPi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(state.pendingDeliveries?.[0].state).toBe("queued");
   });
 
   it("top-level try/catch absorbs unexpected throws from anywhere in the poller", async () => {
@@ -136,11 +136,15 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
-    // Default notify mode — the pointer path runs, the inject path doesn't.
+    state.notifyOnComplete = "inject";
     mod.interactiveSubagentRegistry.set(state.id, state);
     const art = artifactPath(join(artifactDir, ".."), state.id);
-    appendEvent(art, { ts: 1, type: "started", status: "running" });
-    appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    appendCompletionEvent(art, {
+      turnId: "turn-1",
+      outcome: "error",
+      source: "agent_end",
+      errorMessage: "boom",
+    });
 
     // The call must NOT throw.
     expect(() => mod.pollArtifactChanges(brokenPi as any)).not.toThrow();

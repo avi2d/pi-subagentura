@@ -2,13 +2,11 @@
  * Tests for the launch script's EXIT trap behavior.
  *
  * The launch script is the bash wrapper that runs the child pi process. Its EXIT
- * trap records a terminal event in `events.ndjson` so the parent can observe the
- * child's outcome. The trap must be idempotent: if the child already called
- * `cli.mjs done` (or `error`) before exiting, the trap must NOT write a second
- * terminal event. A second event would re-trigger the parent's notification +
- * inject path and re-prompt the user with the same output.
+ * trap always records one `process_exited` event and creates a completion only
+ * when the child did not already publish one. Completion is idempotent even
+ * when later activity rows follow the explicit completion.
  *
- * See: AGENTS.md "cli.mjs done is the contract for interactive sub-agents"
+ * See: AGENTS.md "cli.mjs done is the contract for interactive sub-agents".
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -73,6 +71,15 @@ function countEvents(
   return readEvents(dir).filter((e) => e.type === type);
 }
 
+function countCompletions(
+  dir: string,
+  outcome: string,
+): Array<Record<string, unknown>> {
+  return readEvents(dir).filter(
+    (event) => event.type === "completion" && event.outcome === outcome,
+  );
+}
+
 describe("launch script EXIT trap (idempotency)", () => {
   let tmp: string;
 
@@ -84,19 +91,24 @@ describe("launch script EXIT trap (idempotency)", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("writes exactly one `done` event when the child calls `cli.mjs done` and then exits cleanly (REPL exit after success)", () => {
+  it("preserves explicit completion and appends one process_exited event", () => {
     const artDir = join(tmp, "artifacts", "abc12345");
     const launchScript = join(artDir, "launch.sh");
 
     // Simulate the child obeying the protocol: it called `cli.mjs done 0`, then
     // the user exited the REPL, which made the bash script exit 0.
     const childBody = `"${join(artDir, "cli.mjs")}" done 0\nexit 0`;
-    runLaunchScript(artDir, launchScript, childBody);
+    expect(runLaunchScript(artDir, launchScript, childBody)).toBe(0);
 
-    expect(countEvents(artDir, "done")).toHaveLength(1);
+    const completions = countCompletions(artDir, "done");
+    const exits = countEvents(artDir, "process_exited");
+    expect(completions).toHaveLength(1);
+    expect(completions[0].exitCode).toBe(0);
+    expect(exits).toHaveLength(1);
+    expect(exits[0].exitCode).toBe(0);
   });
 
-  it("writes exactly one `done` event when the child exits the REPL with a non-zero code WITHOUT calling done", () => {
+  it("preserves a non-zero wrapper rc in completion and process_exited", () => {
     const artDir = join(tmp, "artifacts", "abc12346");
     const launchScript = join(artDir, "launch.sh");
 
@@ -104,13 +116,15 @@ describe("launch script EXIT trap (idempotency)", () => {
     // the terminal event in this case — it must still fire so the parent learns
     // the child is gone.
     const childBody = `exit 1`;
-    runLaunchScript(artDir, launchScript, childBody);
+    expect(runLaunchScript(artDir, launchScript, childBody)).toBe(1);
 
-    const doneEvents = countEvents(artDir, "done");
+    const doneEvents = countCompletions(artDir, "error");
+    const exits = countEvents(artDir, "process_exited");
     expect(doneEvents).toHaveLength(1);
-    // The trap wrote the only `done` event with the script's exit code.
     expect(doneEvents[0].status).toBe("error");
     expect(doneEvents[0].exitCode).toBe(1);
+    expect(exits).toHaveLength(1);
+    expect(exits[0].exitCode).toBe(1);
   });
 
   it("writes exactly one `cancelled` event when the .cancelled flag is present and the child did not call done", () => {
@@ -124,10 +138,16 @@ describe("launch script EXIT trap (idempotency)", () => {
     const childBody = `exit 0`;
     runLaunchScript(artDir, launchScript, childBody);
 
-    expect(countEvents(artDir, "cancelled")).toHaveLength(1);
+    expect(countCompletions(artDir, "cancelled")).toHaveLength(1);
+    expect(countEvents(artDir, "process_exited")).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        exitCode: 0,
+      }),
+    ]);
   });
 
-  it("does NOT overwrite an explicit `error` event with a trap-emitted `done` (child declared failure, then exited)", () => {
+  it("does not duplicate an explicit error completion when the child exits", () => {
     const artDir = join(tmp, "artifacts", "abc12348");
     const launchScript = join(artDir, "launch.sh");
 
@@ -137,12 +157,15 @@ describe("launch script EXIT trap (idempotency)", () => {
     const childBody = `"${join(artDir, "cli.mjs")}" error "boom"\nexit 0`;
     runLaunchScript(artDir, launchScript, childBody);
 
-    expect(countEvents(artDir, "error")).toHaveLength(1);
-    expect(countEvents(artDir, "done")).toHaveLength(0);
-    expect(countEvents(artDir, "error")[0].message).toBe("boom");
+    expect(countCompletions(artDir, "error")).toHaveLength(1);
+    expect(countCompletions(artDir, "done")).toHaveLength(0);
+    expect(countCompletions(artDir, "error")[0].message).toBe("boom");
+    expect(countEvents(artDir, "process_exited")).toEqual([
+      expect.objectContaining({ exitCode: 0 }),
+    ]);
   });
 
-  it("does NOT write a `cancelled` event when the child already called `done` and the .cancelled flag is set later", () => {
+  it("does not replace explicit completion when cancellation is flagged later", () => {
     // Edge case: child finished a turn, then the parent cancelled (e.g. to clean up
     // the pane). The .cancelled flag is set AFTER the child's explicit `done`. The
     // trap should observe the existing `done` and not emit a second terminal event —
@@ -159,8 +182,28 @@ describe("launch script EXIT trap (idempotency)", () => {
       `exit 0`;
     runLaunchScript(artDir, launchScript, childBody);
 
-    expect(countEvents(artDir, "done")).toHaveLength(1);
-    expect(countEvents(artDir, "cancelled")).toHaveLength(0);
+    expect(countCompletions(artDir, "done")).toHaveLength(1);
+    expect(countCompletions(artDir, "cancelled")).toHaveLength(0);
+    expect(countEvents(artDir, "process_exited")).toHaveLength(1);
+  });
+
+  it("does not duplicate explicit completion after trailing activity", () => {
+    const artDir = join(tmp, "artifacts", "abc12350");
+    const launchScript = join(artDir, "launch.sh");
+    const childBody =
+      `"${join(artDir, "cli.mjs")}" done 0\n` +
+      `printf '%s\\n' '{"ts":2,"type":"tool_activity","status":"running"}' >> "${join(artDir, "events.ndjson")}"\n` +
+      `exit 7`;
+
+    expect(runLaunchScript(artDir, launchScript, childBody)).toBe(7);
+
+    expect(countCompletions(artDir, "done")).toEqual([
+      expect.objectContaining({ exitCode: 0 }),
+    ]);
+    expect(countEvents(artDir, "tool_activity")).toHaveLength(1);
+    expect(countEvents(artDir, "process_exited")).toEqual([
+      expect.objectContaining({ exitCode: 7 }),
+    ]);
   });
 });
 
@@ -171,8 +214,10 @@ describe("launch script EXIT trap (idempotency)", () => {
 // leave orphan tmux windows behind (test pollution).
 function installTmuxMock() {
   vi.resetModules();
+  const calls: string[][] = [];
   vi.doMock("node:child_process", () => ({
     execFileSync: (_file: string, args: string[]) => {
+      calls.push(args);
       // new-window / new-session / split-window return a pane id; everything
       // else is a no-op (display-message would otherwise throw).
       if (
@@ -188,14 +233,16 @@ function installTmuxMock() {
       return "";
     },
   }));
+  return calls;
 }
 
 describe("spawn-time state persistence", () => {
   let cwd: string;
+  let tmuxCalls: string[][];
   const SESSION = "019e500a-bae9-783a-869a-ac7c106b4ab7";
 
   beforeEach(() => {
-    installTmuxMock();
+    tmuxCalls = installTmuxMock();
     cwd = mkdtempSync(join(tmpdir(), "pi-subagentura-spawn-persist-"));
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     process.env.TMUX_PANE = "%1";
@@ -234,6 +281,17 @@ describe("spawn-time state persistence", () => {
     >("../src/interactive-tmux");
     launchInteractiveSubagent({ name: "Demo", task: "t", cwd });
     expect(existsSync(stateFilePath(cwd))).toBe(false);
+  });
+
+  it("execs the wrapper so child exit cannot leave a shell target", async () => {
+    const { launchInteractiveSubagent } = await importFresh<
+      typeof import("../src/interactive-tmux")
+    >("../src/interactive-tmux");
+    launchInteractiveSubagent({ name: "Demo", task: "t", cwd });
+
+    const sendKeys = tmuxCalls.find((args) => args[0] === "send-keys");
+    expect(sendKeys).toBeDefined();
+    expect(sendKeys?.join(" ")).toContain("exec bash");
   });
 
   it("the persisted entry records windowName, mux, and artifactDir", async () => {
