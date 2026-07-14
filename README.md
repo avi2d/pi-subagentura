@@ -4,7 +4,17 @@
 
 > **Note:** The `docs/` folder is managed by the [`pi-docs`](https://github.com/lmn451/pi-docs) package.
 
-A public [Pi](https://pi.dev) package that adds in-process and attachable sub-agent tools:
+A public [Pi](https://pi.dev) package that combines lightweight in-process
+delegation with observable, attachable interactive sub-agents.
+
+**Interactive sub-agents are the standout feature.** `subagent_interactive`
+launches a real, separate Pi session in a tmux or zellij pane. Watch its Pi TUI
+and tool activity in real time, focus the pane from your current multiplexer,
+attach from another terminal, and send follow-up prompts into the same child
+context. Every turn also writes durable lifecycle and output artifacts, so the
+work remains inspectable after detach, reload, or parent restart.
+
+Available tools:
 
 - `subagent_with_context` — spawn a sub-agent that inherits the full conversation history
 - `subagent_isolated` — spawn a sub-agent with a fresh, empty context window
@@ -12,25 +22,30 @@ A public [Pi](https://pi.dev) package that adds in-process and attachable sub-ag
 - `get_subagent_result` — block until an async job completes and return the final output
 - `cancel_subagent` — abort a running async job
 - `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-- `subagent_interactive` — spawn an attachable mux-backed Pi session (tmux/zellij) with artifact-based progress
+- `subagent_interactive` — spawn an attachable Pi session in a tmux/zellij pane
 - `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
 - `cancel_interactive_subagent` — kill an attachable interactive sub-agent pane
-- `send_interactive_subagent_message` — send a follow-up into a live sub-agent's REPL (preserves child context)
+- `send_interactive_subagent_message` — send a follow-up into a live child REPL without losing context
 - `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
-- `list_subagent_artifacts` — list all known interactive sub-agents (in-session and on-disk)
-  The default sub-agents run inside the current Pi process, stream live progress back to the UI, and inherit the active model by default. Async sub-agents run in the background — the main agent continues immediately while you poll for progress and collect results when ready. Interactive sub-agents run as separate `pi --session ...` processes in tmux or zellij panes so you can attach and continue follow-ups directly there, and write structured progress to a per-sub-agent artifact directory on disk.
+- `list_subagent_artifacts` — list known interactive sub-agents and artifact locations
 
-Interactive sub-agents support **follow-up turns**: the parent can push a new prompt into the same child REPL via `send_interactive_subagent_message`. The child is `idle` (not exited) between turns, model context is preserved, and each completion maps its Pi `turnId` to an immutable `outputs/<eventId>.md` snapshot recoverable through `read_subagent_artifact`.
+For quick delegated work, in-process sub-agents stream progress in the current
+Pi process. With `async: true`, they run in the background while the main agent
+continues, and can be polled, collected, or cancelled by job id.
+
+Interactive children remain `idle` between turns instead of exiting. Follow-ups
+preserve model context, and each completion maps its Pi `turnId` to an immutable
+`outputs/<eventId>.md` snapshot recoverable through `read_subagent_artifact`.
 
 ## Why use it?
 
-- Delegate focused side-tasks without leaving the current session
-- Compare context-aware vs isolated reasoning
-- Keep tool feedback lightweight with live status updates
-- Run sub-agents in the background while continuing the main conversation
+- Watch a real child Pi session and its tool activity live in tmux or zellij
+- Focus a pane locally or attach from another terminal at any time
+- Continue true follow-up turns without losing the child's model context
+- Inspect durable per-turn outputs and lifecycle events after detach or restart
+- Run lightweight sub-agents in-process or in the background
+- Compare context-aware and isolated reasoning
 - Poll, collect, or cancel background jobs on demand
-- Get live previews of running sub-agents (current turn, active tool, usage)
-- Attach to interactive sub-agent sessions for direct follow-ups and debugging
 
 ![Sub-agent demo](working.png)
 
@@ -73,7 +88,7 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only
+- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only. Both modes show a user-facing completion notification.
 - `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
@@ -95,9 +110,12 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only
+- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only. Both modes show a user-facing completion notification.
 - `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
 - `maxAge` — optional TTL in ms for completed job retention (async only)
+
+Async spawn results state whether completion output will be injected into the
+parent LLM and whether delivery will automatically start a new parent turn.
 
 Best for:
 
@@ -140,7 +158,13 @@ Remove all completed and failed subagent jobs from the registry. Running and can
 
 ### Interactive Sub-agent Tools
 
-Use these when observability and manual follow-up matter more than in-process execution. They require a terminal multiplexer (tmux or zellij). If the parent Pi session is not running inside one, the sub-agent is automatically spawned in a new detached session that you attach to later. Interactive sub-agents write their progress to a per-sub-agent artifact directory on disk; the pane is for live monitoring, the artifact is the source of truth.
+Observability and attachability are the primary design goals of interactive
+sub-agents—not debugging afterthoughts. Each child is a separate Pi process in a
+tmux or zellij pane: watch it live, focus it from the current mux, attach from
+another terminal, or send follow-ups through the parent while preserving child
+context. If the parent is outside a mux, the child starts in a detached session
+and returns an attach command. The pane is the live view; durable artifacts are
+the source of truth.
 
 #### `subagent_interactive`
 
@@ -164,8 +188,11 @@ Parameters:
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `notifyOnComplete` — `"inject"` (default) persists full output; `"notify"` persists a pointer-only message.
+- `notifyOnComplete` — `"inject"` (default) persists full output; `"notify"` persists only an artifact pointer. Both modes show a user-facing completion notification.
 - `triggerTurnOnComplete` — optional override. Notify defaults to `false`; inject defaults to `true`.
+
+The spawn result states whether completion output will be injected into the parent
+LLM and whether delivery will automatically start a new parent turn.
 
 The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts — sub-agents that finish while you're away are picked up on the next poll.
 
@@ -194,8 +221,8 @@ that were created in the current session are restored.
 Protocol-v2 byte cursors, pending delivery intents, and receipts are restored so
 reload does not unconditionally replay already-dispatched completions.
 
-See the [state file gotcha](AGENTS.md#rehydrate-state-file-cwdpisubagentura-state-json)
-in AGENTS.md for the crash-safety ordering and inject-mode flood fix.
+Implementation details for crash-safe ordering and delivery recovery are in the
+[state-file invariants in the source repository](https://github.com/lmn451/pi-subagentura/blob/master/AGENTS.md#rehydrate-state-file-cwdpisubagentura-state-json).
 
 #### Sub-agent completion protocol
 
@@ -243,7 +270,11 @@ inspection in the artifact directory.
 
 #### Completion notifications: notify vs inject
 
-Interactive sub-agents deliver their completion to the parent through one of two modes (selected via `notifyOnComplete`):
+Completion delivery has two independent settings. `notifyOnComplete` controls
+the payload saved for parent LLM context (full output versus artifact pointer);
+`triggerTurnOnComplete` independently controls whether delivery starts a parent
+LLM turn. Both payload modes display the same user-facing notification;
+`notifyOnComplete` does not control toast behavior.
 
 - `"inject"` (**default**, including async in-process tools) persists one attributed custom
   completion message and triggers a turn by default. Explicit
@@ -264,6 +295,26 @@ conversation, but the LLM does not react immediately. The pointer becomes
 available to the model when the user starts the next parent turn. It is not a
 visual-only notification and the completion is not discarded.
 
+Both modes also show a user notification (`ui.notify`) after successful delivery. The notification
+explicitly states whether completion output was injected into the parent LLM and
+whether a new parent turn will start automatically. Async in-process and
+interactive spawn results state the same behavior in future tense before work
+begins. Errors use an error notification, cancellations use a warning, and
+successful completions use an informational notification.
+
+In the TUI, a normal completion therefore produces two visually separate
+elements (exact colors depend on the active theme):
+
+1. A user-notification status line (`ui.notify`). This is UI-only and is never
+   added to session or LLM context.
+2. A custom-message block beginning with `[Sub-agent ...]`. This is the
+   separately persisted LLM-facing delivery: full output in `inject` mode, or
+   only status and artifact pointers in `notify` mode.
+
+Parent-initiated cancellation is the exception: the cancel tool result already
+acknowledges it to the LLM, so cancellation shows the UI notification without
+adding a duplicate custom-message block.
+
 LLM-facing completions wait while the parent streams and flush as one bounded
 message after `agent_settled`. The durable FIFO is limited to 32 records / 256 KiB,
 with 32 KiB output per record and 64 KiB per flush. Overflow keeps status and
@@ -276,9 +327,25 @@ can still duplicate one completion.
 
 Lists tracked interactive sub-agents, attach/select commands, and session paths. It intentionally does **not** capture pane output to avoid consuming model context.
 
+Parameters:
+
+- `jobId` — optional interactive sub-agent id; omit it to list all tracked sessions
+
 #### `cancel_interactive_subagent`
 
-Kills the mux pane for an interactive sub-agent by id. Writes a `cancelled` event to the artifact before killing the pane so the artifact log is self-describing.
+Kills the mux pane for an interactive sub-agent by id. Writes a `cancelled`
+event and immutable output snapshot before killing the pane, so artifacts remain
+self-describing. Because the cancel tool result already acknowledges the action
+to the parent LLM, parent-initiated cancellation also shows a warning via
+`ui.notify` and persists a delivery receipt without injecting a duplicate
+cancellation completion. The receipt is written before the pane is killed, so a
+later poll or restart cannot replay that cancellation into LLM context.
+Child-originated or otherwise unacknowledged cancellations still use the normal
+completion-delivery path.
+
+Parameters:
+
+- `jobId` — required interactive sub-agent id returned by `subagent_interactive`
 
 #### `send_interactive_subagent_message`
 
@@ -292,7 +359,9 @@ Parameters:
 
 #### `list_subagent_artifacts`
 
-Lists all known interactive sub-agents: id, name, status, and last-update timestamp. Use this to discover sub-agents that finished while the parent was away.
+Lists all known interactive sub-agents: id, name, status, artifact directory, and
+last-update timestamp. Use this to discover sub-agents that finished while the
+parent was away.
 
 #### `read_subagent_artifact`
 
@@ -328,7 +397,9 @@ Parameters:
 - “Spawn a context-aware sub-agent to continue debugging while we keep planning here.”
 - “Run a sub-agent in the background to run the test suite, then notify me when done.”
 - “Spawn two isolated async sub-agents to review this code from different angles, then collect both results.”
-- “Start an interactive sub-agent in tmux for investigating the auth bug; I’ll attach and guide it.”
+- “Start an interactive sub-agent in tmux for investigating the auth bug; give me the attach command.”
+- “Open an interactive sub-agent in a visible zellij pane so I can watch its tool calls live.”
+- “Attach to the existing interactive sub-agent and send it a follow-up without losing context.”
 
 ## Development
 

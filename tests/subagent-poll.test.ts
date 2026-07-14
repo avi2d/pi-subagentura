@@ -56,17 +56,7 @@ function makeState(): {
 function installDeliverySpies() {
   const sendMessage = vi.fn();
   (globalThis as any).__piSubagenturaUi = {
-    notify: vi.fn((content: string) =>
-      sendMessage(
-        {
-          customType: "subagent-notify",
-          content,
-          display: true,
-          details: { mode: "notify" },
-        },
-        { deliverAs: "followUp", triggerTurn: false },
-      ),
-    ),
+    notify: vi.fn(),
     setStatus: vi.fn(),
     setWidget: vi.fn(),
   };
@@ -95,7 +85,7 @@ describe("pollArtifactChanges", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it("delivers one cancellation appended before the pane is killed", async () => {
+  it("acknowledges parent cancellation before killing the pane without injecting it", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const interactive = await import("../src/interactive-tmux");
@@ -112,6 +102,7 @@ describe("pollArtifactChanges", () => {
     );
     let completionsAtKill = 0;
     let persistedIntentsAtKill = 0;
+    let persistedReceiptsAtKill = 0;
     appendInteractiveState(state.cwd, {
       id: state.id,
       paneId: state.paneId,
@@ -138,9 +129,9 @@ describe("pollArtifactChanges", () => {
               event.outcome === "cancelled" &&
               event.turnId === "cancel-turn",
           ).length;
-        persistedIntentsAtKill =
-          loadInteractiveStates(state.cwd)?.states[state.id]?.pendingDeliveries
-            .length ?? 0;
+        const persisted = loadInteractiveStates(state.cwd)?.states[state.id];
+        persistedIntentsAtKill = persisted?.pendingDeliveries.length ?? 0;
+        persistedReceiptsAtKill = persisted?.deliveryReceipts.length ?? 0;
       },
     } as any);
     interactive.interactiveSubagentRegistry.set(state.id, state);
@@ -148,16 +139,16 @@ describe("pollArtifactChanges", () => {
 
     interactive.cancelInteractiveSubagent(state.id);
     expect(completionsAtKill).toBe(1);
-    expect(persistedIntentsAtKill).toBe(1);
+    expect(persistedIntentsAtKill).toBe(0);
+    expect(persistedReceiptsAtKill).toBe(1);
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
-    expect(state.pendingDeliveries).toHaveLength(1);
-    expect(state.pendingDeliveries?.[0]).toMatchObject({
-      turnId: "cancel-turn",
-      mode: "inject",
-      status: "cancelled",
-    });
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    const sendMessage = vi.fn();
+    mod.pollArtifactChanges({ sendMessage } as any);
+    mod.pollArtifactChanges({ sendMessage } as any);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(state.pendingDeliveries).toEqual([]);
+    expect(state.deliveryReceipts).toHaveLength(1);
     multiplexer.__setTmuxMultiplexer(undefined);
   });
 
@@ -195,12 +186,8 @@ describe("pollArtifactChanges", () => {
       source: "parent",
     });
     expect(completions[1].turnId).toMatch(/^process-cancel-/);
-    expect(state.pendingDeliveries).toEqual([
-      expect.objectContaining({
-        turnId: completions[1].turnId,
-        status: "cancelled",
-      }),
-    ]);
+    expect(state.pendingDeliveries).toEqual([]);
+    expect(state.deliveryReceipts).toHaveLength(1);
     multiplexer.__setTmuxMultiplexer(undefined);
   });
 
@@ -251,7 +238,7 @@ describe("pollArtifactChanges", () => {
     expect(state.eventByteCursor).toBe(eventLogEndOffset(art));
   });
 
-  it("fires on error and cancelled too", async () => {
+  it("delivers unacknowledged error and cancellation events normally", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();

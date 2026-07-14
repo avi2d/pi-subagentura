@@ -374,12 +374,14 @@ describe("artifact protocol v2 delivery", () => {
       [state.id, state],
     ]);
     const sendMessage = vi.fn();
+    const notify = vi.fn();
+    const ui = { notify } as any;
     (globalThis as any).__piSubagenturaParentStreaming = true;
-    flushDeliveries({ sendMessage } as any, undefined);
+    flushDeliveries({ sendMessage } as any, ui);
     expect(sendMessage).not.toHaveBeenCalled();
 
     (globalThis as any).__piSubagenturaParentStreaming = false;
-    flushDeliveries({ sendMessage } as any, undefined);
+    flushDeliveries({ sendMessage } as any, ui);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0][0].details.deliveryIds).toEqual([
       deliveryId,
@@ -388,6 +390,15 @@ describe("artifact protocol v2 delivery", () => {
       "<untrusted-subagent-output>",
     );
     expect(sendMessage.mock.calls[0][0].content).toContain("result");
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "A new parent turn will start automatically after the injection",
+    );
   });
 
   it("bounds the first envelope with huge identifiers and malformed message", () => {
@@ -448,7 +459,9 @@ describe("artifact protocol v2 delivery", () => {
       [state.id, state],
     ]);
     const sendMessage = vi.fn();
-    flushDeliveries({ sendMessage } as any, undefined);
+    const notify = vi.fn();
+    const ui = { notify } as any;
+    flushDeliveries({ sendMessage } as any, ui);
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage.mock.calls[0][0].content).not.toContain(
@@ -456,6 +469,15 @@ describe("artifact protocol v2 delivery", () => {
     );
     expect(sendMessage.mock.calls[0][0].content).toContain("Output:");
     expect(sendMessage.mock.calls[0][1]).toMatchObject({ triggerTurn: true });
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was not injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "A new parent turn will start automatically after the pointer delivery",
+    );
   });
 
   it("rejects traversal paths from output metadata", () => {

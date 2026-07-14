@@ -38,7 +38,7 @@ import {
   type PersistedLifecycleFold,
   removeInteractiveState,
 } from "./artifact";
-import { deliveryIdFor, enqueueDelivery } from "./delivery";
+import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
 import {
   getMux,
   NoMultiplexerAvailableError,
@@ -718,27 +718,16 @@ function appendCancellation(state: InteractiveSubagentState): void {
   }
   if (!completion) return;
   const mode = state.notifyOnComplete ?? "inject";
-  const triggerTurn =
-    mode === "inject"
-      ? state.triggerTurnOnComplete !== false
-      : state.triggerTurnOnComplete === true;
-  enqueueDelivery(state, {
-    deliveryId: deliveryIdFor({
-      parentSessionId: state.parentSessionId ?? "pi",
-      subagentId: state.id,
-      turnId,
-      mode,
-    }),
+  const deliveryId = deliveryIdFor({
+    parentSessionId: state.parentSessionId ?? "pi",
     subagentId: state.id,
     turnId,
-    eventId: completion.eventId,
     mode,
-    triggerTurn,
-    status: "cancelled",
-    artifactDir: state.artifactDir,
-    output: completion.output,
-    state: "queued",
   });
+  // The parent initiated this terminal path, so the cancel tool result or session
+  // transition already accounts for it. Persist a synthetic receipt before pane
+  // teardown so polling or rehydrate cannot inject a duplicate completion.
+  acknowledgeDeliveryWithoutDispatch(state, deliveryId);
 }
 
 /**

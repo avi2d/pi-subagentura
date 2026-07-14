@@ -104,7 +104,15 @@ describe("Pi session delivery integration", () => {
       (globalThis as any).__piSubagenturaUi,
     );
 
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was not injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "No new parent turn will start automatically",
+    );
     expect(sendMessage).toHaveBeenCalledOnce();
     const message = sendMessage.mock.calls[0][0] as any;
     expect(message.content).toContain("Output:");
@@ -122,13 +130,22 @@ describe("Pi session delivery integration", () => {
   });
 
   it("idle inject triggers one attributed provider turn by default", async () => {
-    const { harness } = await setup("inject", true);
+    const { harness, notify } = await setup("inject", true);
 
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "A new parent turn will start automatically after the injection",
+    );
 
     expect(
       harness.sessionManager
@@ -195,7 +212,15 @@ describe("Pi session delivery integration", () => {
       expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
     );
 
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was not injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "No new parent turn will start automatically",
+    );
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(
       harness.sessionManager
@@ -234,13 +259,22 @@ describe("Pi session delivery integration", () => {
   });
 
   it("idle inject with trigger=false enters context without a provider call", async () => {
-    const { harness, sendMessage } = await setup("inject", false);
+    const { harness, notify, sendMessage } = await setup("inject", false);
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(harness.contexts).toHaveLength(0);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was injected into the parent LLM",
+      ),
+      "info",
+    );
+    expect(notify.mock.calls[0][0]).toContain(
+      "No new parent turn will start automatically",
+    );
   });
 
   it("streaming inject with trigger=false waits then does not continue", async () => {

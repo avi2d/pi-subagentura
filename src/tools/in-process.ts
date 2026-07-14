@@ -26,7 +26,11 @@ import {
   type SubagentResult,
   type Usage,
 } from "../helpers";
-import { deliverNotification } from "../notifications";
+import {
+  completionTriggersTurn,
+  deliverNotification,
+  formatCompletionDeliveryBehavior,
+} from "../notifications";
 import { interactiveSubagentRegistry } from "../interactive-tmux";
 import { renderSubagentCall, renderSubagentResult } from "../rendering";
 import {
@@ -147,7 +151,8 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "For async (background) execution, the main agent continues immediately.",
       "Use async only if user asked to do so or is willing to continue the conversation.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
-      "Set triggerTurnOnComplete: true to make notify-mode completions wake the parent LLM.",
+      "Both modes show the user a completion notification.",
+      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -270,7 +275,15 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.\n\n` +
+                formatCompletionDeliveryBehavior(
+                  jobState.notifyOnComplete ?? "inject",
+                  completionTriggersTurn(
+                    jobState.notifyOnComplete ?? "inject",
+                    jobState.triggerTurnOnComplete,
+                  ),
+                  "planned",
+                ) +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -357,7 +370,8 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       "",
       "For async (background) execution, the main agent continues immediately.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
-      "Set triggerTurnOnComplete: true to make notify-mode completions wake the parent LLM.",
+      "Both modes show the user a completion notification.",
+      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -461,7 +475,15 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
             {
               type: "text",
               text:
-                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.` +
+                `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.\n\n` +
+                formatCompletionDeliveryBehavior(
+                  jobState.notifyOnComplete ?? "inject",
+                  completionTriggersTurn(
+                    jobState.notifyOnComplete ?? "inject",
+                    jobState.triggerTurnOnComplete,
+                  ),
+                  "planned",
+                ) +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],

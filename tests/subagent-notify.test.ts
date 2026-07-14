@@ -293,12 +293,19 @@ describe("notifyOnComplete", () => {
             mockJobResult(jobId, control.jobPromise),
           );
 
-          await toolDef.execute(
+          const spawnResult = await toolDef.execute(
             "call-1",
             { async: true, task: "test", notifyOnComplete: "notify" },
             undefined,
             undefined,
             getCtx(),
+          );
+
+          expect(spawnResult.content[0].text).toContain(
+            "Completion output will not be injected into the parent LLM",
+          );
+          expect(spawnResult.content[0].text).toContain(
+            "No new parent turn will start automatically",
           );
 
           control.resolve(SUCCESS_RESULT);
@@ -316,7 +323,15 @@ describe("notifyOnComplete", () => {
             deliverAs: "followUp",
             triggerTurn: false,
           });
-          expect(api.notify).not.toHaveBeenCalled();
+          expect(api.notify).toHaveBeenCalledWith(
+            expect.stringContaining(
+              "Completion output was not injected into the parent LLM",
+            ),
+            "info",
+          );
+          expect(api.notify.mock.calls[0][0]).toContain(
+            "No new parent turn will start automatically",
+          );
           expect(api.sendUserMessage).not.toHaveBeenCalled();
         });
 
@@ -360,12 +375,18 @@ describe("notifyOnComplete", () => {
             mockJobResult(jobId, control.jobPromise),
           );
 
-          await toolDef.execute(
+          const spawnResult = await toolDef.execute(
             "call-default-inject",
             { async: true, task: "test" },
             undefined,
             undefined,
             getCtx(),
+          );
+          expect(spawnResult.content[0].text).toContain(
+            "Completion output will be injected into the parent LLM",
+          );
+          expect(spawnResult.content[0].text).toContain(
+            "A new parent turn will start automatically after the injection",
           );
           control.resolve(SUCCESS_RESULT);
 
@@ -420,6 +441,15 @@ describe("notifyOnComplete", () => {
             "get_subagent_result",
           );
           expect(api.sendUserMessage).not.toHaveBeenCalled();
+          expect(api.notify).toHaveBeenCalledWith(
+            expect.stringContaining(
+              "Completion output was not injected into the parent LLM",
+            ),
+            "info",
+          );
+          expect(api.notify.mock.calls[0][0]).toContain(
+            "A new parent turn will start automatically after the pointer delivery",
+          );
         });
 
         it("injects full result in one attributed custom message", async () => {
@@ -457,6 +487,15 @@ describe("notifyOnComplete", () => {
             triggerTurn: true,
           });
           expect(api.sendUserMessage).not.toHaveBeenCalled();
+          expect(api.notify).toHaveBeenCalledWith(
+            expect.stringContaining(
+              "Completion output was injected into the parent LLM",
+            ),
+            "info",
+          );
+          expect(api.notify.mock.calls[0][0]).toContain(
+            "A new parent turn will start automatically after the injection",
+          );
         });
 
         it("delivers notification when job promise rejects", async () => {
@@ -520,7 +559,12 @@ describe("notifyOnComplete", () => {
       expect(content).toContain("✅");
       expect(content).not.toContain(SUCCESS_RESULT.output);
       expect(sentMessageOptsAt(api, 0).triggerTurn).toBe(false);
-      expect(api.notify).not.toHaveBeenCalled();
+      expect(api.notify).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Completion output was not injected into the parent LLM",
+        ),
+        "info",
+      );
       expect(api.sendUserMessage).not.toHaveBeenCalled();
     });
 
@@ -590,6 +634,15 @@ describe("notifyOnComplete", () => {
         triggerTurn: true,
       });
       expect(api.sendUserMessage).not.toHaveBeenCalled();
+      expect(api.notify).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Completion output was injected into the parent LLM",
+        ),
+        "info",
+      );
+      expect(api.notify.mock.calls[0][0]).toContain(
+        "A new parent turn will start automatically after the injection",
+      );
     });
 
     it("holds inject completion while the parent is streaming", async () => {

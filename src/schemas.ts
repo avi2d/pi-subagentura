@@ -30,23 +30,23 @@ export const BaseParams = Type.Object({
       [
         Type.Literal("notify", {
           description:
-            "Persist a pointer-only completion message in parent context without triggering by default.",
+            "Show a user notification and persist a pointer-only completion message without injecting output into the parent LLM. Does not trigger a turn by default.",
         }),
         Type.Literal("inject", {
           description:
-            "Queue one attributed, bounded custom completion message. Triggers a turn by default; false explicitly disables triggering.",
+            "Show a user notification and inject one attributed, bounded completion message with output into the parent LLM. Triggers a turn by default.",
         }),
       ],
       {
         description:
-          'How to deliver async completion. Defaults to "inject" when async is true.',
+          'Controls the payload saved for parent LLM context, independently of triggerTurnOnComplete. Both modes show the same user-facing notification. The spawn result explains the selected behavior. Defaults to "inject" when async is true.',
       },
     ),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Override parent-turn triggering. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
     }),
   ),
   maxAge: Type.Optional(
@@ -117,13 +117,13 @@ export const InteractiveParams = Type.Object({
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
-        'How to surface completion. "inject" (default) persists full output and triggers by default. "notify" persists a pointer-only message without triggering. Streaming parents flush a bounded FIFO after agent_settled.',
+        'Controls the payload saved for parent LLM context, independently of triggerTurnOnComplete. Both modes show the same user-facing notification, and the spawn result explains what will happen. "inject" (default) sends full output; "notify" persists only an artifact pointer.',
     }),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Override parent-turn triggering. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
     }),
   ),
   mux: Type.Optional(

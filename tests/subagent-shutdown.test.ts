@@ -366,7 +366,7 @@ describe("session_shutdown handler", () => {
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledOnce();
 
     // 2. Shutdown handler runs.
 
@@ -381,7 +381,7 @@ describe("session_shutdown handler", () => {
     tick();
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledOnce();
   });
 
   afterEach(() => {

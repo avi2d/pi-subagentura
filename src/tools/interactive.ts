@@ -31,6 +31,10 @@ import {
   type InteractiveSubagentState,
 } from "../interactive-tmux";
 import { debugLog } from "../helpers";
+import {
+  completionTriggersTurn,
+  formatCompletionDeliveryBehavior,
+} from "../notifications";
 import { InteractiveParams } from "../schemas";
 
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
@@ -113,6 +117,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
       "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
+      "Both completion modes show the user a notification.",
+      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
     ].join("\n"),
     parameters: InteractiveParams,
 
@@ -141,6 +147,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
       const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
       const targetCwd = params.cwd ?? ctx.cwd;
+      const completionMode = params.notifyOnComplete ?? "inject";
+      const triggerTurn = completionTriggersTurn(
+        completionMode,
+        params.triggerTurnOnComplete,
+      );
 
       try {
         const state = launchInteractiveSubagent({
@@ -151,7 +162,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           cwd: targetCwd,
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
-          notifyOnComplete: params.notifyOnComplete ?? "inject",
+          notifyOnComplete: completionMode,
           triggerTurnOnComplete: params.triggerTurnOnComplete,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
@@ -165,7 +176,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\nArtifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+              text:
+                `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
+                `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
+                `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
             },
           ],
           details: { ...state, status: "started" },
@@ -276,7 +290,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
-    description: "Kill the tmux pane for an interactive sub-agent by ID.",
+    description:
+      "Kill an interactive sub-agent pane. The tool result acknowledges parent-initiated cancellation, so artifacts are retained without injecting a duplicate cancellation completion into LLM context.",
     parameters: Type.Object({
       jobId: Type.String({
         description:
@@ -284,8 +299,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       }),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       const state = cancelInteractiveSubagent(params.jobId);
+      let userNotification: string;
       if (!state) {
         return {
           content: [
@@ -298,11 +314,22 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      userNotification =
+        `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
+        `Artifacts retained at ${state.artifactDir}.`;
+      try {
+        ctx.ui.notify(userNotification, "warning");
+      } catch {
+        /* cancellation succeeded; a stale UI must not turn it into a tool failure */
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Interactive sub-agent ${params.jobId} cancelled.`,
+            text:
+              `Interactive sub-agent ${params.jobId} cancelled. ` +
+              `No separate cancellation completion will be injected into the parent LLM. ` +
+              `Artifacts retained at ${state.artifactDir}.`,
           },
         ],
         details: { ...state },

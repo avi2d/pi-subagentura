@@ -96,10 +96,10 @@ function mergeJobOverflowSemantics(
   collapsed: PendingJobCompletion,
 ): void {
   const mode = collapsed.jobState.notifyOnComplete ?? "inject";
-  const trigger =
-    mode === "inject"
-      ? collapsed.jobState.triggerTurnOnComplete !== false
-      : collapsed.jobState.triggerTurnOnComplete === true;
+  const trigger = completionTriggersTurn(
+    mode,
+    collapsed.jobState.triggerTurnOnComplete,
+  );
   if (mode === "inject") summary.mode = "inject";
   if (trigger) summary.triggerTurn = true;
   if (collapsed.result.isError) summary.status = "error";
@@ -150,6 +150,83 @@ function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
 }
 
 // ── Notification Delivery ───────────────────────────────────────
+
+export type CompletionDeliveryStatus = "done" | "error" | "cancelled";
+
+interface CompletionNotificationUi {
+  notify(message: string, level: "info" | "warning" | "error"): void;
+}
+
+export interface CompletionDeliveryNotice {
+  label: string;
+  mode: NotifyOnComplete;
+  triggerTurn: boolean;
+  status: CompletionDeliveryStatus;
+}
+
+export function completionTriggersTurn(
+  mode: NotifyOnComplete,
+  override?: boolean,
+): boolean {
+  return mode === "inject" ? override !== false : override === true;
+}
+
+export function formatCompletionDeliveryBehavior(
+  mode: NotifyOnComplete,
+  triggerTurn: boolean,
+  phase: "planned" | "delivered",
+): string {
+  const injected =
+    mode === "inject"
+      ? phase === "planned"
+        ? "Completion output will be injected into the parent LLM."
+        : "Completion output was injected into the parent LLM."
+      : phase === "planned"
+        ? "Completion output will not be injected into the parent LLM; only an artifact pointer will be added to parent context."
+        : "Completion output was not injected into the parent LLM; only an artifact pointer was added to parent context.";
+  const timing =
+    phase === "planned" ? " Delivery will wait until the parent is idle." : "";
+  if (!triggerTurn) {
+    const visibility =
+      mode === "inject"
+        ? " The injected output will be visible to the LLM on its next turn."
+        : " The artifact pointer will be visible to the LLM on its next turn.";
+    return `${injected}${timing} No new parent turn will start automatically.${visibility}`;
+  }
+  const delivery = mode === "inject" ? "the injection" : "the pointer delivery";
+  return `${injected}${timing} A new parent turn will start automatically after ${delivery}.`;
+}
+
+export function notifyCompletionDelivery(
+  ui: CompletionNotificationUi | undefined,
+  notices: CompletionDeliveryNotice[],
+): void {
+  if (!ui || typeof ui.notify !== "function" || notices.length === 0) return;
+  const lines = notices.map((notice) => {
+    const behavior = formatCompletionDeliveryBehavior(
+      notice.mode,
+      notice.triggerTurn,
+      "delivered",
+    );
+    return `${notice.label} (${notice.status}). ${behavior}`;
+  });
+  const message =
+    lines.length === 1
+      ? lines[0]
+      : `${lines.length} sub-agent completions delivered:\n${lines
+          .map((line) => `- ${line}`)
+          .join("\n")}`;
+  const level = notices.some(({ status }) => status === "error")
+    ? "error"
+    : notices.some(({ status }) => status === "cancelled")
+      ? "warning"
+      : "info";
+  try {
+    ui.notify(message, level);
+  } catch {
+    /* stale UI context must not make durable completion delivery retry */
+  }
+}
 
 function buildNotifySummary(jobId: string, result: SubagentResult): string {
   const status = result.isError ? "❌" : "✅";
@@ -258,10 +335,10 @@ export function flushInProcessDeliveries(): void {
     }
     const { jobState, result, deliveryId } = pending;
     const mode = jobState.notifyOnComplete ?? "inject";
-    const trigger =
-      mode === "inject"
-        ? jobState.triggerTurnOnComplete !== false
-        : jobState.triggerTurnOnComplete === true;
+    const trigger = completionTriggersTurn(
+      mode,
+      jobState.triggerTurnOnComplete,
+    );
     const summary = buildNotifySummary(jobState.id, result);
     const content =
       mode === "inject"
@@ -310,6 +387,18 @@ export function flushInProcessDeliveries(): void {
   } catch {
     return;
   }
+  notifyCompletionDelivery(
+    g.__piSubagenturaUi as CompletionNotificationUi | undefined,
+    llm.map(({ pending, mode, trigger, status }) => ({
+      label:
+        pending.kind === "completion"
+          ? `Job ${pending.jobState.id}`
+          : "In-process completion overflow",
+      mode,
+      triggerTurn: trigger,
+      status,
+    })),
+  );
   for (const { pending } of llm) {
     if (pending.kind === "overflow") markOverflowDelivered(pending);
     else pending.jobState.notificationDelivered = true;

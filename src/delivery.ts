@@ -21,7 +21,7 @@ import {
   type PersistedDeliveryIntent,
 } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
-import { sanitizeOutput } from "./notifications";
+import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
 
 export const MAX_DELIVERY_RECORDS = 32;
 export const MAX_DELIVERY_QUEUE_BYTES = 256 * 1024;
@@ -199,6 +199,20 @@ export function enqueueDelivery(
   persistState(state);
 }
 
+/** Mark a completion as handled by the parent tool without sending it to LLM context. */
+export function acknowledgeDeliveryWithoutDispatch(
+  state: InteractiveSubagentState,
+  deliveryId: string,
+): void {
+  state.pendingDeliveries = (state.pendingDeliveries ?? []).filter(
+    (intent) => intent.deliveryId !== deliveryId,
+  );
+  if (!state.deliveryReceipts?.includes(deliveryId)) {
+    (state.deliveryReceipts ??= []).push(deliveryId);
+  }
+  persistState(state);
+}
+
 function readBoundedOutput(intent: PersistedDeliveryIntent): string | null {
   if (!intent.output) return null;
   const expected = resolve(
@@ -268,7 +282,7 @@ function formatIntent(intent: PersistedDeliveryIntent): string {
 
 export function flushDeliveries(
   pi: ExtensionAPI,
-  _ui: ExtensionUIContext | undefined,
+  ui: ExtensionUIContext | undefined,
 ): void {
   const g = globalThis as any;
   if (g.__piSubagenturaParentStreaming) return;
@@ -323,6 +337,15 @@ export function flushDeliveries(
   } catch {
     return;
   }
+  notifyCompletionDelivery(
+    ui,
+    selected.map(({ intent }) => ({
+      label: `Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}`,
+      mode: intent.mode,
+      triggerTurn: intent.triggerTurn,
+      status: intent.status,
+    })),
+  );
   for (const { state, intent } of selected) {
     intent.state = "dispatchAttempted";
     persistState(state);

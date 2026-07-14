@@ -572,7 +572,12 @@ describe("session-log tail-read", () => {
     mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledOnce();
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was injected into the parent LLM",
+      ),
+      "error",
+    );
     const content = sendMessage.mock.calls[0][0].content as string;
 
     // done: pointer only, no body.
@@ -610,7 +615,12 @@ describe("session-log tail-read", () => {
     };
     mod.pollArtifactChanges({ sendMessage } as any);
 
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Completion output was injected into the parent LLM",
+      ),
+      "error",
+    );
     const content = sendMessage.mock.calls[0][0].content as string;
     // The "x".repeat(2000) portion must be capped.
     const match = content.match(/x+/);
