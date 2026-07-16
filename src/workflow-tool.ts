@@ -26,6 +26,11 @@ import {
 } from "./workflow-worker";
 import { sanitizeOutput } from "./notifications";
 import { showWorkflowTree } from "./workflow-tree-ui";
+import {
+  WorkflowPickerComponent,
+  type WorkflowPickerAction,
+  type WorkflowPickerChoice,
+} from "./workflow-picker-ui";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -714,6 +719,51 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       return { job, meta };
     };
 
+    const selectSavedWorkflow = async (
+      ui: ExtensionCommandContext["ui"],
+      choices: WorkflowPickerChoice[],
+    ): Promise<WorkflowPickerAction | undefined> => {
+      const custom = (ui as any).custom;
+      if (typeof custom === "function") {
+        return custom.call(
+          ui,
+          (
+            _tui: unknown,
+            theme: unknown,
+            _kb: unknown,
+            done: (action: WorkflowPickerAction) => void,
+          ) => new WorkflowPickerComponent(choices, theme as any, done),
+        ) as Promise<WorkflowPickerAction | undefined>;
+      }
+      const deleteLabel = "🗑  Delete a workflow…";
+      const labels = choices.map(
+        (choice) =>
+          `${choice.name} — ${choice.description || "(no description)"}`,
+      );
+      const selected = await ui.select("Select workflow:", [
+        ...labels,
+        "──────────────",
+        deleteLabel,
+      ]);
+      if (!selected) return undefined;
+      if (selected === deleteLabel) {
+        const toDelete = await ui.select("Select workflow to delete:", labels);
+        if (!toDelete) return undefined;
+        const choice = choices.find(
+          (candidate) =>
+            `${candidate.name} — ${candidate.description || "(no description)"}` ===
+            toDelete,
+        );
+        return choice ? { kind: "delete", name: choice.name } : undefined;
+      }
+      const choice = choices.find(
+        (candidate) =>
+          `${candidate.name} — ${candidate.description || "(no description)"}` ===
+          selected,
+      );
+      return choice ? { kind: "run", name: choice.name } : undefined;
+    };
+
     const runSavedWorkflowCommand = async (
       rawArgs: string,
       ctx: ExtensionCommandContext,
@@ -721,11 +771,9 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       const items = listSavedWorkflows();
       const parsed = parseWorkflowCommandArgs(rawArgs);
 
-      const DELETE_LABEL = "🗑  Delete a workflow…";
-
       const choices = items.map((w) => ({
         name: w.name,
-        label: `${w.name} — ${w.description || "(no description)"}`,
+        description: w.description || "(no description)",
       }));
 
       if (items.length === 0) {
@@ -737,53 +785,23 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }
 
       // If name was provided inline, try run it directly
-      let name = parsed.name;
-      if (name) {
-        await runNamedWorkflow(name, parsed, ctx);
+      const inlineName = parsed.name;
+      if (inlineName) {
+        await runNamedWorkflow(inlineName, parsed, ctx);
         return;
       }
 
-      // Show the picker with delete option
-      const pickerLabels = [
-        ...choices.map((c) => c.label),
-        "──────────────",
-        DELETE_LABEL,
-      ];
-
-      const selected = await ctx.ui.select("Select workflow:", pickerLabels);
-      if (!selected) return;
-
-      if (selected === DELETE_LABEL) {
-        // Delete mode: pick a workflow to delete
-        const deleteLabels = choices.map((c) => c.label);
-        const toDelete = await ctx.ui.select(
-          "Select workflow to delete:",
-          deleteLabels,
-        );
-        if (!toDelete) return;
-        const choice = choices.find((c) => c.label === toDelete);
-        if (!choice) return;
-        deleteWorkflowScript(choice.name);
-        const text = `Deleted workflow "${choice.name}".`;
+      const action = await selectSavedWorkflow(ctx.ui, choices);
+      if (!action || action.kind === "cancel") return;
+      if (action.kind === "delete") {
+        deleteWorkflowScript(action.name);
+        const text = `Deleted workflow "${action.name}".`;
         ctx.ui.notify(text);
         sendCommandMessage(text);
         return;
       }
 
-      // Run mode
-      const choice = choices.find((c) => c.label === selected);
-      if (!choice) return;
-      name = choice.name;
-
-      const known = items.some((w) => w.name === name);
-      if (!known) {
-        const text = `No saved workflow named "${name}".`;
-        ctx.ui.notify(text);
-        sendCommandMessage(text);
-        return;
-      }
-
-      await runNamedWorkflow(name, parsed, ctx);
+      await runNamedWorkflow(action.name, parsed, ctx);
     };
 
     async function runNamedWorkflow(

@@ -56,6 +56,7 @@
     "src/workflow-jobs.ts",
     "src/workflow-ui.ts",
     "src/workflow-tree-ui.ts",
+    "src/workflow-picker-ui.ts",
     "src/workflow-tool.ts"
   ],
   "engines": {
