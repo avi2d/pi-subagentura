@@ -17,6 +17,7 @@ import {
   renderProgress,
   registerWorkflowTool,
   retryPendingWorkflowNotifications,
+  getWorkflowCompletionPresentation,
   MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
   type WorkflowAgentRunner,
   type WorkflowProgress,
@@ -613,6 +614,17 @@ describe("saved workflows", () => {
 });
 
 describe("background workflow jobs", () => {
+  it("presents resolved agent errors as a warning", () => {
+    expect(getWorkflowCompletionPresentation("done", 2)).toEqual({
+      label: "completed with errors",
+      icon: "⚠",
+    });
+    expect(getWorkflowCompletionPresentation("error", 0)).toEqual({
+      label: "error",
+      icon: "",
+    });
+  });
+
   it("runs in the background and exposes status + result", async () => {
     const script = `export const meta = { name: "bg", description: "d" };\nreturn await agent("done");`;
     const job = startWorkflowJob("bg", script, { runAgent: echoRunner() });
@@ -1261,6 +1273,31 @@ describe("registerWorkflowTool", () => {
     expect(result.content[0].text).toContain("Could not save workflow");
     expect(result.isError).toBe(true);
   });
+
+  it("lists workflows and rejects an invalid delete name", async () => {
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+
+    const list = tools.find((tool) => tool.name === "list_workflows")!;
+    const listed = await list.execute();
+    expect(listed.details.status).toBe("ok");
+    expect(Array.isArray(listed.details.workflows)).toBe(true);
+
+    const remove = tools.find((tool) => tool.name === "delete_workflow")!;
+    const deleted = await remove.execute("", { name: "../invalid" });
+    expect(deleted).toMatchObject({
+      isError: true,
+      details: { status: "error" },
+    });
+    expect(deleted.content[0].text).toContain("Could not delete workflow");
+  });
+
   it("notifies the current parent and triggers a turn when a background workflow completes", async () => {
     const tools: Array<{ name: string; execute: Function }> = [];
     const staleSendMessage = vi.fn();

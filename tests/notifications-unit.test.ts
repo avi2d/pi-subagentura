@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JobState, SubagentResult } from "../src/helpers";
 import {
+  deliverArtifactNotification,
   deliverNotification,
   flushInProcessDeliveries,
+  getInjectCount,
+  sanitizeOutput,
+  shouldNotify,
 } from "../src/notifications";
 
 const SUCCESS_RESULT: SubagentResult = {
@@ -138,5 +142,168 @@ describe("in-process completion delivery queue", () => {
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(job.notificationDelivered).toBe(true);
+  });
+});
+
+describe("artifact notification compatibility", () => {
+  const state = {
+    id: "child-1",
+    name: "Reviewer",
+    artifactDir: "/tmp/artifacts/child-1",
+    notifyOnComplete: "notify",
+    triggerTurnOnComplete: true,
+  } as any;
+
+  it("retains the deprecated zero inject-count API", () => {
+    expect(getInjectCount()).toBe(0);
+  });
+
+  it("sanitizes secrets and identifies terminal notification events", () => {
+    expect(sanitizeOutput(`token sk-${"a".repeat(24)}`)).toBe(
+      "token [REDACTED]",
+    );
+    expect(shouldNotify({ type: "started", ts: 1, status: "running" })).toBe(
+      false,
+    );
+    expect(
+      shouldNotify({
+        version: 2,
+        eventId: "event-1",
+        turnId: "turn-1",
+        ts: 2,
+        type: "completion",
+        status: "done",
+        outcome: "done",
+        source: "agent_settled",
+      }),
+    ).toBe(true);
+  });
+
+  it("builds and sends pointer notifications for legacy terminal events", () => {
+    const sendMessage = vi.fn();
+    const pi = { sendMessage };
+
+    expect(
+      deliverArtifactNotification(pi as any, state, {
+        type: "done",
+        ts: 2,
+        status: "done",
+        exitCode: 0,
+      }),
+    ).toBe(true);
+    expect(sendMessage.mock.calls[0][0].content).toContain(
+      "✅ Reviewer (child-1) — done (exit 0)",
+    );
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+
+    expect(
+      deliverArtifactNotification(pi as any, state, {
+        type: "error",
+        ts: 3,
+        status: "error",
+        message: `failed with sk-${"b".repeat(24)}`,
+      }),
+    ).toBe(true);
+    expect(sendMessage.mock.calls[1][0].content).toContain("[REDACTED]");
+  });
+
+  it("formats protocol-v2 and process lifecycle pointers", () => {
+    const sendMessage = vi.fn();
+    const pi = { sendMessage };
+    const events = [
+      {
+        version: 2,
+        eventId: "turn-started",
+        turnId: "turn-1",
+        ts: 4,
+        type: "turn_started",
+        status: "running",
+      },
+      {
+        version: 2,
+        eventId: "completion",
+        turnId: "turn-1",
+        ts: 5,
+        type: "completion",
+        status: "cancelled",
+        outcome: "cancelled",
+        source: "parent",
+      },
+      {
+        version: 2,
+        eventId: "process-exit",
+        ts: 6,
+        type: "process_exited",
+        status: "error",
+        exitCode: 1,
+      },
+      { type: "started", ts: 7, status: "running" },
+      {
+        type: "tool_activity",
+        ts: 8,
+        status: "running",
+        tool: "read",
+      },
+      { type: "done", ts: 9, status: "done", exitCode: 1 },
+      {
+        version: 2,
+        eventId: "completion-error",
+        turnId: "turn-2",
+        ts: 10,
+        type: "completion",
+        status: "error",
+        outcome: "error",
+        source: "agent_settled",
+      },
+      {
+        version: 2,
+        eventId: "process-success",
+        ts: 11,
+        type: "process_exited",
+        status: "done",
+        exitCode: 0,
+      },
+      { type: "error", ts: 12, status: "error" },
+    ];
+
+    for (const event of events) {
+      expect(deliverArtifactNotification(pi as any, state, event as any)).toBe(
+        true,
+      );
+    }
+
+    expect(sendMessage.mock.calls.map((call) => call[0].content)).toEqual([
+      expect.stringContaining("▶ Reviewer (child-1) — started"),
+      expect.stringContaining("🚫 Reviewer (child-1) — cancelled"),
+      expect.stringContaining("❌ Reviewer (child-1) — process exited (1)"),
+      expect.stringContaining("▶ Reviewer (child-1) — started"),
+      expect.stringContaining("▶ Reviewer (child-1) — activity"),
+      expect.stringContaining("❌ Reviewer (child-1) — done (exit 1)"),
+      expect.stringContaining("❌ Reviewer (child-1) — error"),
+      expect.stringContaining("✅ Reviewer (child-1) — process exited (0)"),
+      expect.stringContaining("❌ Reviewer (child-1) — error"),
+    ]);
+  });
+
+  it("returns false for stale contexts and unsupported events", () => {
+    expect(
+      deliverArtifactNotification(
+        {
+          sendMessage: () => {
+            throw new Error("stale context");
+          },
+        } as any,
+        state,
+        { type: "cancelled", ts: 4, status: "cancelled" },
+      ),
+    ).toBe(false);
+    expect(
+      deliverArtifactNotification({ sendMessage: vi.fn() } as any, state, {
+        type: "unsupported",
+      } as any),
+    ).toBe(false);
   });
 });
