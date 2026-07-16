@@ -71,8 +71,7 @@ function setupExtension() {
   // We want the LAST one — the one that runs clearInterval, the cancel
   // loop, and the registry clear.
   let shutdownHandler:
-    | ((event?: { reason?: string }, ctx?: { cwd?: string }) => void)
-    | undefined;
+    ((event?: { reason?: string }, ctx?: { cwd?: string }) => void) | undefined;
   for (const [event, handler] of (api.on as any).mock.calls) {
     if (event === "session_shutdown") {
       shutdownHandler = handler as (

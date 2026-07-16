@@ -178,8 +178,7 @@ declare global {
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
   var __piSubagenturaSessionManager:
-    | { getEntries?: () => unknown[] }
-    | undefined;
+    { getEntries?: () => unknown[] } | undefined;
   var __piSubagenturaInjectCount: number | undefined;
   var __piSubagenturaInteractivePollerHandle:
     ReturnType<typeof setInterval> | undefined;
