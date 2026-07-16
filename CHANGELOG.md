@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-07-05
+## [3.0.0] - 2026-07-16
 
 ### Breaking
 
@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Opt-in orchestrator guidance (`--orchestrator` or `PI_ORCHESTRATOR=1`) with parent-orchestrator routing defaults (scout/plan, review loops, oracle checks).
+- Appendable parent-orchestrator guidance with routing defaults for scouting, planning, review loops, and oracle checks.
 - Workflow tool modularization: split runtime into `workflow-core`, `workflow-worker`, `workflow-jobs`, `workflow-tool`, and `workflow-ui`.
 - Workflow progress exposes `runningCount` and model visibility; workflow timeout aborts in-flight agents.
 - CI coverage thresholds (`npm run coverage:check`) and branch preview release workflow.
