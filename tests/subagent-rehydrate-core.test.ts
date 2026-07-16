@@ -23,16 +23,17 @@ describe("rehydrateInteractiveSubagents", () => {
 
   beforeEach(() => {
     cwd = makeTmp();
-    // Install a tmux mock so isPaneAlive returns false for fake pane IDs.
-    // Without this, tmux 3.6b treats unknown pane IDs as "alive" (succeeds with empty output),
-    // making the alive/terminal counts environment-dependent.
     vi.resetModules();
-    vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string) => {
-        // Only handle display-message used by isPaneAlive; throw for all others
-        // (new-window, etc.) so they don't accidentally succeed.
-        throw new Error("mock: child_process unavailable");
-      },
+    vi.doMock("../src/multiplexer", () => ({
+      getMux: () => ({
+        name: "tmux",
+        isPaneAlive: () => false,
+        buildAttachCommands: (state: { windowName?: string }) => ({
+          attachCommand: `tmux attach -t ${state.windowName ?? "session"}`,
+          focusCommand: `tmux select-window -t ${state.windowName ?? "session"}`,
+        }),
+      }),
+      NoMultiplexerAvailableError: class extends Error {},
     }));
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
@@ -41,7 +42,7 @@ describe("rehydrateInteractiveSubagents", () => {
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
-    vi.doUnmock("node:child_process");
+    vi.doUnmock("../src/multiplexer");
   });
 
   it("returns { total: 0 } when the state file is missing", async () => {
@@ -77,20 +78,6 @@ describe("rehydrateInteractiveSubagents", () => {
   });
 
   it("rebuilds attach and focus commands on rehydrate", async () => {
-    vi.resetModules();
-    vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") {
-          if (
-            args.includes("#{session_name}\t#{window_index}\t#{pane_index}")
-          ) {
-            return "demo\t1\t0\n";
-          }
-          return Buffer.from("%42");
-        }
-        return "";
-      },
-    }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const state = makeState(cwd, "abc12345");
