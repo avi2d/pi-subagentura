@@ -221,6 +221,8 @@ describe("notifyOnComplete", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
@@ -667,7 +669,9 @@ describe("notifyOnComplete", () => {
       );
 
       control.resolve(SUCCESS_RESULT);
-      await Promise.resolve();
+      await vi.waitFor(() => {
+        expect(jobRegistry.get(jobId)?.status).toBe("done");
+      });
       expect(api.sendMessage).not.toHaveBeenCalled();
       expect(api.sendUserMessage).not.toHaveBeenCalled();
       (globalThis as any).__piSubagenturaParentStreaming = false;
@@ -1283,6 +1287,8 @@ describe("read_subagent_artifact (invalid id)", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),
@@ -1355,6 +1361,8 @@ describe("read_subagent_artifact (output reporting)", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),

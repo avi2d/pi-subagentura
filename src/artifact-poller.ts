@@ -32,16 +32,23 @@ import {
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
+import { debugLog } from "./helpers";
 import { formatActivityRow } from "./rendering";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
 
+import { getRunningWorkflowCount, workflowJobRegistry } from "./workflow-jobs";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
 const WIDGET_KEY = "subagentura-activity";
+const WORKFLOW_FOOTER_KEY = "subagentura-workflows";
+const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 
+/** Maximum widget rows before truncation with "… and N more". */
+const MAX_WIDGET_ROWS = 10;
+const MAX_WORKFLOW_WIDGET_ROWS = 5;
 // ── Poller ─────────────────────────────────────────────────────────────
 
 /**
@@ -199,6 +206,13 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       }
     }
 
+    // Cap widget rows to prevent TUI overflow.
+    if (widgetRows.length > MAX_WIDGET_ROWS) {
+      const extra = widgetRows.length - MAX_WIDGET_ROWS;
+      widgetRows.length = MAX_WIDGET_ROWS;
+      widgetRows.push(`… and ${extra} more`);
+    }
+
     // Paint footer + widget. Both are TUI-only — never reach the LLM.
     if (ui) {
       try {
@@ -222,10 +236,65 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
       } catch {
         /* ui stale */
       }
+      // Workflow TUI footer + widget: show running async workflows.
+      try {
+        const wfCount = getRunningWorkflowCount();
+        const workflowRows = formatWorkflowWidgetRows(Date.now());
+        ui.setStatus(
+          WORKFLOW_FOOTER_KEY,
+          wfCount > 0
+            ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
+            : undefined,
+        );
+        ui.setWidget(
+          WORKFLOW_WIDGET_KEY,
+          workflowRows.length > 0 ? workflowRows : undefined,
+          { placement: "belowEditor" },
+        );
+      } catch {
+        /* ui stale */
+      }
     }
-  } catch {
+  } catch (err) {
+    debugLog("error", "poller_error", {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      registryIds: [...interactiveSubagentRegistry.keys()],
+    });
     /* defensive: never let one bad poll tick crash the parent process */
   }
+}
+
+function formatWorkflowWidgetRows(now: number): string[] {
+  const rows: string[] = [];
+  for (const st of workflowJobRegistry.values()) {
+    if (st.status !== "running") continue;
+    const s = st.snapshot;
+    const parts = [
+      `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
+      `${s.runningCount ?? 0} running`,
+      `${s.tokensSpent} tokens`,
+      formatWorkflowElapsed(now - st.startedAt),
+    ];
+    if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
+    const last = s.lastMessage ? ` — ${s.lastMessage}` : "";
+    rows.push(`◇ ${st.name} (${st.id}): ${parts.join(" · ")}${last}`);
+  }
+  if (rows.length > MAX_WORKFLOW_WIDGET_ROWS) {
+    const extra = rows.length - MAX_WORKFLOW_WIDGET_ROWS;
+    rows.length = MAX_WORKFLOW_WIDGET_ROWS;
+    rows.push(`… and ${extra} more workflow${extra === 1 ? "" : "s"}`);
+  }
+  return rows;
+}
+
+function formatWorkflowElapsed(ms: number): string {
+  if (ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 // ── Session-log parsing state ─────────────────────────────────────────
@@ -419,8 +488,7 @@ function processSessionLogEntry(
     }
     for (const rawBlock of msg.content) {
       const block = rawBlock as
-        | { type?: string; name?: string; arguments?: unknown }
-        | undefined;
+        { type?: string; name?: string; arguments?: unknown } | undefined;
       if (!block || block.type !== "toolCall") continue;
       const summary = summarizeToolCall(block.name ?? "", block.arguments);
       if (!summary) continue;

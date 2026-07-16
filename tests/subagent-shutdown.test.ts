@@ -26,6 +26,7 @@ import * as interactiveTmux from "../src/interactive-tmux";
 import type { InteractiveSubagentState } from "../src/interactive-tmux";
 import { appendEvent, artifactPath } from "../src/artifact";
 import { jobRegistry } from "../src/helpers";
+import { workflowJobRegistry } from "../src/workflow";
 import registerExtension, { pollArtifactChanges } from "../src/subagent";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -56,6 +57,8 @@ function setupExtension() {
   const api = {
     registerTool: vi.fn(),
     registerMessageRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn().mockReturnValue(false),
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
     on: vi.fn(),
@@ -68,8 +71,7 @@ function setupExtension() {
   // We want the LAST one — the one that runs clearInterval, the cancel
   // loop, and the registry clear.
   let shutdownHandler:
-    | ((event?: { reason?: string }, ctx?: { cwd?: string }) => void)
-    | undefined;
+    ((event?: { reason?: string }, ctx?: { cwd?: string }) => void) | undefined;
   for (const [event, handler] of (api.on as any).mock.calls) {
     if (event === "session_shutdown") {
       shutdownHandler = handler as (
@@ -100,6 +102,7 @@ describe("session_shutdown handler", () => {
     g.__piSubagenturaInteractiveRegistry?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     jobRegistry.clear();
+    workflowJobRegistry.clear();
 
     // Stub the global timers. setInterval returns a fake handle with a
     // vi.fn() unref method; clearInterval is a no-op spy.
@@ -237,6 +240,34 @@ describe("session_shutdown handler", () => {
     shutdownHandler!();
 
     expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
+  });
+
+  it("aborts, suppresses, and clears background workflows on session_shutdown", () => {
+    const abort = new AbortController();
+    const abortSpy = vi.spyOn(abort, "abort");
+    const workflow = {
+      id: "wf-shutdown",
+      name: "shutdown-test",
+      status: "running" as const,
+      startedAt: Date.now(),
+      promise: new Promise<never>(() => {}),
+      abort,
+      suppressCompletionNotification: false,
+      snapshot: {
+        agentsSpawned: 0,
+        errorCount: 0,
+        tokensSpent: 0,
+        phases: [],
+      },
+    };
+    workflowJobRegistry.set(workflow.id, workflow);
+
+    const { shutdownHandler } = setupExtension();
+    shutdownHandler!();
+
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(workflow.suppressCompletionNotification).toBe(true);
+    expect(workflowJobRegistry.size).toBe(0);
   });
 
   // ── Bug A regression tests (duplicate notification on shutdown) ──

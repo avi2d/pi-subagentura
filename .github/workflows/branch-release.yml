@@ -1,0 +1,158 @@
+name: Branch Preview Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to package. Defaults to the selected workflow ref.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: branch-preview-release-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release ref
+        id: release_ref
+        shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          DEFAULT_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          raw_ref="$INPUT_REF"
+          if [ -z "$raw_ref" ]; then
+            raw_ref="$DEFAULT_REF"
+          fi
+
+          safe_ref=$(printf '%s' "$raw_ref" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's#[^a-z0-9._-]+#-#g; s#^-+##; s#-+$##')
+
+          if [ -z "$safe_ref" ]; then
+            echo "Could not derive a safe release tag from ref: $raw_ref" >&2
+            exit 1
+          fi
+
+          delimiter="release_ref_${BASHPID}_$(date +%s%N)"
+          {
+            printf 'ref<<%s\n' "$delimiter"
+            printf '%s\n' "$raw_ref"
+            printf '%s\n' "$delimiter"
+            printf 'safe_ref=%s\n' "$safe_ref"
+            printf 'tag=branch-%s\n' "$safe_ref"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release_ref.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve checked-out commit
+        id: release_sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify package can be packed
+        run: npm run pack:check
+
+      - name: Pack release asset
+        id: pack
+        shell: bash
+        env:
+          SHORT_SHA: ${{ steps.release_sha.outputs.short_sha }}
+          SAFE_REF: ${{ steps.release_ref.outputs.safe_ref }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          packed=$(npm pack --pack-destination dist --silent | tail -n 1)
+          short_sha="$SHORT_SHA"
+          asset="pi-subagentura-${SAFE_REF}-$short_sha.tgz"
+
+          mv "dist/$packed" "dist/$asset"
+          (cd dist && shasum -a 256 "$asset" > SHA256SUMS)
+
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Move branch release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_ref.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$RELEASE_TAG" "$RELEASE_SHA"
+          git push --force origin "refs/tags/$RELEASE_TAG"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_ref.outputs.tag }}
+          RAW_REF: ${{ steps.release_ref.outputs.ref }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SHORT_SHA: ${{ steps.pack.outputs.short_sha }}
+          RELEASE_SHA: ${{ steps.release_sha.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes=$(mktemp)
+
+          cat > "$notes" <<EOF
+          Branch preview for \`$RAW_REF\` at \`$RELEASE_SHA\`.
+
+          Pi consumes this preview through the git tag, not the attached tarball:
+
+          \`\`\`bash
+          pi install git:github.com/$GITHUB_REPOSITORY@$RELEASE_TAG
+          pi -e git:github.com/$GITHUB_REPOSITORY@$RELEASE_TAG
+          \`\`\`
+
+          Attached files:
+          - \`$ASSET\` — output of \`npm pack\` for inspection or manual download
+          - \`SHA256SUMS\` — checksum for the attached tarball
+          EOF
+
+          title="Branch preview: $RAW_REF ($SHORT_SHA)"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$notes" --prerelease
+          else
+            gh release create "$RELEASE_TAG" --title "$title" --notes-file "$notes" --prerelease
+          fi
+
+          gh release upload "$RELEASE_TAG" "dist/$ASSET" "dist/SHA256SUMS" --clobber

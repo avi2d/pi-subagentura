@@ -1,7 +1,7 @@
 # Plan — Rehydrate interactive sub-agents on parent reload
 
 Branch: `fix/interactive-reload-visibility`
-Cwd: `/Users/applesucks/dev/pi-workflow-v2-worktrees/interactive-reload-visibility`
+Cwd: `<worktree>`
 Locked: 2026-06-19
 
 ---
@@ -237,9 +237,7 @@ export function launchInteractiveSubagent(params: {
 }): InteractiveSubagentState {
   // ... existing code up through the state object construction at :486 ...
 
-  const state: InteractiveSubagentState = {
-    /* ... existing ... */
-  };
+  const state: InteractiveSubagentState = {/* ... existing ... */};
 
   // NEW: persist before in-memory. Crash between these two lines is safe —
   // rehydrate on next reload will read the file and rebuild the state.

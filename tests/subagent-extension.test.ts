@@ -1,13 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/subagent";
 
+function mockApi(overrides: Record<string, any> = {}) {
+  return {
+    registerTool: vi.fn(),
+    registerMessageRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn().mockReturnValue(false),
+    on: vi.fn(),
+    ...overrides,
+  };
+}
+
 describe("extension registration", () => {
   it("registers the expected tools without throwing", () => {
-    const api = {
-      registerTool: vi.fn(),
-      registerMessageRenderer: vi.fn(),
-      on: vi.fn(),
-    };
+    const api = mockApi();
 
     expect(() => registerExtension(api as any)).not.toThrow();
     expect(api.registerMessageRenderer).toHaveBeenCalledOnce();
@@ -24,6 +31,7 @@ describe("extension registration", () => {
         "cancel_interactive_subagent",
         "cancel_subagent",
         "cancel_workflow",
+        "delete_workflow",
         "cleanup_subagent_artifacts",
         "get_interactive_subagent_status",
         "get_subagent_result",
@@ -43,6 +51,32 @@ describe("extension registration", () => {
         "workflow",
       ].sort(),
     );
+  });
+
+  it("registers the --orchestrator flag", () => {
+    const api = mockApi();
+
+    registerExtension(api as any);
+
+    expect(api.registerFlag).toHaveBeenCalledWith("orchestrator", {
+      description: "Append the bundled orchestration system prompt",
+      type: "boolean",
+      default: false,
+    });
+  });
+
+  it("appends the bundled prompt when --orchestrator is enabled", async () => {
+    const api = mockApi({ getFlag: vi.fn().mockReturnValue(true) });
+
+    registerExtension(api as any);
+
+    const beforeAgentStart = api.on.mock.calls.find(
+      ([event]: any[]) => event === "before_agent_start",
+    )?.[1];
+    const result = await beforeAgentStart({ systemPrompt: "base prompt" }, {});
+
+    expect(result.systemPrompt).toContain("# Orchestrator System Prompt");
+    expect(result.systemPrompt.startsWith("base prompt\n\n")).toBe(true);
   });
 
   it("registers only protocol hooks in child mode", () => {

@@ -117,11 +117,7 @@ The child-only Pi lifecycle hook is a crash-safety fallback, not permission to o
  * - "unknown"  — can't determine (rare; pane dead but no recorded event)
  */
 export type InteractiveSubagentStatus =
-  | "running"
-  | "idle"
-  | "cancelled"
-  | "exited"
-  | "unknown";
+  "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
   id: string;
@@ -223,8 +219,7 @@ export interface InteractiveSubagentState {
 
 declare global {
   var __piSubagenturaInteractiveRegistry:
-    | Map<string, InteractiveSubagentState>
-    | undefined;
+    Map<string, InteractiveSubagentState> | undefined;
 }
 
 if (!globalThis.__piSubagenturaInteractiveRegistry) {
@@ -504,7 +499,8 @@ export function launchInteractiveSubagent(params: {
   });
   let persistedState = false;
   // Persist as soon as the pane is addressable. A crash after this point is
-  // recoverable on reload. The catch path below removes it on launch failure.
+  // recoverable on reload. If persistence itself fails, abort and kill the
+  // pane; otherwise the child would be invisible to rehydrate after a restart.
   if (params.parentSessionId) {
     try {
       appendInteractiveState(stateCwd, {
@@ -524,8 +520,13 @@ export function launchInteractiveSubagent(params: {
         deliveryReceipts: [],
       });
       persistedState = true;
-    } catch {
-      /* best effort — disk full, permission denied, etc. In-memory still works. */
+    } catch (err) {
+      try {
+        mux.killPane(paneId, muxSession);
+      } catch {
+        /* best effort — preserve the original persistence error */
+      }
+      throw err;
     }
   }
   try {
@@ -921,8 +922,10 @@ export function formatInteractiveState(
   state: InteractiveSubagentState,
 ): string {
   const elapsed = Math.floor((Date.now() - state.startedAt) / 1000);
+  const taskPreview = state.task.replace(/\s+/g, " ").slice(0, 80);
   const lines: string[] = [
     `${state.name} (${state.id}) — ${state.status}, ${elapsed}s`,
+    `Task: ${taskPreview}${state.task.length > 80 ? "…" : ""}`,
     `Mux: ${state.mux}`,
     `Pane: ${state.paneId}`,
   ];

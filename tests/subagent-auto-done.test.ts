@@ -785,9 +785,11 @@ describe("no parent-side timeout completion synthesis", () => {
   // runs against a tmp artifactDir. The production dir is never written to.
   it("regression: notdone.jsonl does not create a parent-inferred completion", async () => {
     const fs = await import("node:fs");
-    const sourceSession =
-      "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/2026-06-11T19-25-31-403Z-fb57cd05.jsonl";
-    if (!fs.existsSync(sourceSession)) {
+    const sourceSession = process.env.PI_SUBAGENTURA_NOTDONE_JSONL;
+    if (!sourceSession || !fs.existsSync(sourceSession)) {
+      console.warn(
+        "skip: set PI_SUBAGENTURA_NOTDONE_JSONL to replay a real notdone session",
+      );
       return;
     }
 
@@ -875,14 +877,17 @@ describe("no parent-side timeout completion synthesis", () => {
       ),
     ).toEqual([]);
 
-    // Defensive: confirm we did NOT touch the production dir. If
-    // events.ndjson exists there, its mtime must predate this test run.
+    // Defensive: if the caller provided the original artifact dir, confirm we
+    // did NOT touch it. If events.ndjson exists there, its mtime must predate
+    // this test run.
     const productionArtifactDir =
-      "/Users/applesucks/.pi/agent/sessions/subagentura/pi-agents-workflow-impl-ef3eab/artifacts/fb57cd05";
-    const productionEvents = join(productionArtifactDir, "events.ndjson");
-    if (fs.existsSync(productionEvents)) {
-      const stat = fs.statSync(productionEvents);
-      expect(stat.mtimeMs).toBeLessThan(Date.now() - 1000);
+      process.env.PI_SUBAGENTURA_NOTDONE_ARTIFACT_DIR;
+    if (productionArtifactDir) {
+      const productionEvents = join(productionArtifactDir, "events.ndjson");
+      if (fs.existsSync(productionEvents)) {
+        const stat = fs.statSync(productionEvents);
+        expect(stat.mtimeMs).toBeLessThan(Date.now() - 1000);
+      }
     }
   });
 });

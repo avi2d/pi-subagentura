@@ -299,7 +299,7 @@ The user wants to create a branch for the zellij support work. They want to star
 > 🛠️ Tool call: **bash**
 > Arguments: ```json
 {
-  "command": "cd /Users/applesucks/dev/pi-agents && git checkout -b feat/zellij-multiplexer-support 2>&1 | tail -3 && git --no-pager log --oneline -1"
+  "command": "cd <repo> && git checkout -b feat/zellij-multiplexer-support 2>&1 | tail -3 && git --no-pager log --oneline -1"
 }
 ````
 

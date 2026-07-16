@@ -212,8 +212,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme) {
       const details = result.details as
-        | Partial<InteractiveSubagentState>
-        | undefined;
+        Partial<InteractiveSubagentState> | undefined;
       if ((result as any).isError) {
         const first = result.content?.[0];
         const text =
@@ -681,6 +680,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
         return {
           id: s.id,
           name: s.name,
+          task: s.task,
           status: s.status,
           lastEvent: last,
           lastUpdate: last?.ts,
@@ -697,10 +697,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       }
       const lines = summary.map((s) => {
         const ev = s.lastEvent;
+        const taskPreview = (s.task ?? "").replace(/\s+/g, " ").slice(0, 60);
         const evStr = ev
           ? `last: ${ev.type}${ev.message ? ` (${ev.message.slice(0, 60)})` : ""}`
           : "no events yet";
-        return `${s.id}  ${s.name}  ${s.status}  ${evStr}`;
+        return `${s.id}  ${s.name}  [${s.status}]  ${taskPreview} — ${evStr}`;
       });
       return {
         content: [{ type: "text", text: lines.join("\n") }],

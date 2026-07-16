@@ -107,10 +107,13 @@ function localImports(source: string): string[] {
   return out;
 }
 
-/** Local module `./foo` resolves to either `./foo.ts` or `./foo/index.ts`. */
+/** Local module `./foo` resolves to `./foo.ts`, `./foo.mjs`, or `./foo/index.ts`. */
 function resolvesInTarball(mod: string, entries: string[]): boolean {
+  if (entries.includes(`src/${mod}`)) return true;
   return (
-    entries.includes(`src/${mod}.ts`) || entries.includes(`src/${mod}/index.ts`)
+    entries.includes(`src/${mod}.ts`) ||
+    entries.includes(`src/${mod}.mjs`) ||
+    entries.includes(`src/${mod}/index.ts`)
   );
 }
 
@@ -222,8 +225,10 @@ describe("published tarball", () => {
     });
 
     function resolvesInFiles(mod: string): boolean {
+      if (PKG.files.includes(`src/${mod}`)) return true;
       return (
         PKG.files.includes(`src/${mod}.ts`) ||
+        PKG.files.includes(`src/${mod}.mjs`) ||
         PKG.files.includes(`src/${mod}/index.ts`)
       );
     }

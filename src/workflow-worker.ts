@@ -1,0 +1,534 @@
+import { Worker } from "node:worker_threads";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { readEvents, readOutput } from "./artifact";
+import { debugLog } from "./helpers";
+import type { SubagentResult, Usage } from "./helpers";
+import {
+  INTERACTIVE_DEAD_GRACE_TICKS,
+  INTERACTIVE_POLL_MS,
+  MAX_ITEMS_PER_CALL,
+  MAX_TOTAL_AGENTS,
+  MAX_WORKFLOW_DEPTH,
+  SCHEMA_RETRIES,
+  WORKFLOW_SYNC_TIMEOUT_MS,
+  WORKFLOW_WALL_TIMEOUT_MS,
+  createSemaphore,
+  defaultConcurrency,
+  defaultProcessConcurrency,
+  extractJson,
+  validateSchema,
+  type RunWorkflowOptions,
+  type Semaphore,
+  type WorkflowAgentOpts,
+  type WorkflowAgentRunner,
+  type WorkflowMeta,
+  type WorkflowProgress,
+  type WorkflowRunResult,
+  zeroUsage,
+} from "./workflow-core";
+import { workflowStringify } from "./workflow-script";
+import {
+  cancelInteractiveSubagent,
+  isPaneAlive,
+  type InteractiveSubagentState,
+} from "./interactive-tmux";
+
+// ── Engine (shared across nested workflows) ──────────────────────────
+
+interface Engine {
+  runAgent: WorkflowAgentRunner;
+  abort: AbortController;
+  signal: AbortSignal;
+  closed: boolean;
+  onProgress?: (p: WorkflowProgress) => void;
+  sem: Semaphore;
+  processSem: Semaphore;
+  loadWorkflow?: (name: string) => string | null;
+  budgetTotal: number | null;
+  workflowTimeoutMs: number;
+  counters: {
+    agentsSpawned: number;
+    errorCount: number;
+    tokensSpent: number;
+    runningCount: number;
+  };
+  phases: string[];
+}
+
+export async function runWorkflow(
+  script: string,
+  opts: RunWorkflowOptions,
+): Promise<WorkflowRunResult> {
+  const abort = new AbortController();
+  const forwardAbort = () => abort.abort();
+  if (opts.signal?.aborted) {
+    abort.abort();
+  } else {
+    opts.signal?.addEventListener("abort", forwardAbort, { once: true });
+  }
+  const engine: Engine = {
+    runAgent: opts.runAgent,
+    abort,
+    signal: abort.signal,
+    closed: false,
+    onProgress: opts.onProgress,
+    sem: createSemaphore(opts.concurrency ?? defaultConcurrency()),
+    processSem: createSemaphore(
+      opts.processConcurrency ?? defaultProcessConcurrency(),
+    ),
+    loadWorkflow: opts.loadWorkflow,
+    budgetTotal: opts.budgetTotal ?? null,
+    counters: {
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      runningCount: 0,
+    },
+    workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
+    phases: [],
+  };
+  try {
+    const { meta, result } = await executeScript(script, engine, opts.args, 0);
+    return {
+      meta,
+      result,
+      agentsSpawned: engine.counters.agentsSpawned,
+      errorCount: engine.counters.errorCount,
+      tokensSpent: engine.counters.tokensSpent,
+      phases: engine.phases,
+    };
+  } finally {
+    opts.signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+type WorkerRpcRequest = { id: number; method: string; payload: any };
+type WorkerRpcResponse = {
+  id: number;
+  ok: boolean;
+  value?: unknown;
+  error?: string;
+};
+
+async function executeScript(
+  script: string,
+  engine: Engine,
+  args: unknown,
+  _depth: number,
+): Promise<{ meta: WorkflowMeta; result: unknown }> {
+  const emit = (
+    p: Omit<
+      WorkflowProgress,
+      "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
+    >,
+  ) => {
+    if (engine.closed) return;
+    if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
+    engine.onProgress?.({
+      ...p,
+      agentsSpawned: engine.counters.agentsSpawned,
+      errorCount: engine.counters.errorCount,
+      tokensSpent: engine.counters.tokensSpent,
+      runningCount: engine.counters.runningCount,
+    });
+  };
+
+  const runAgentCall = async (payload: {
+    prompt: unknown;
+    opts?: WorkflowAgentOpts;
+  }): Promise<{ value: unknown; tokensDelta: number }> => {
+    const prompt = payload.prompt;
+    const agentOpts = payload.opts ?? {};
+    if (engine.signal?.aborted) throw new Error("Workflow aborted.");
+    if (typeof prompt !== "string" || prompt.trim() === "") {
+      throw new Error("agent(prompt): prompt must be a non-empty string.");
+    }
+    if (
+      engine.budgetTotal != null &&
+      engine.budgetTotal - engine.counters.tokensSpent <= 0
+    ) {
+      throw new Error("Workflow token budget exhausted.");
+    }
+
+    const hasSchema = agentOpts.schema != null;
+    const isolation = agentOpts.isolation ?? "process";
+    const isProcess = isolation !== "in-process";
+    const sem = isProcess ? engine.processSem : engine.sem;
+    await sem.acquire();
+    let tokensDelta = 0;
+    try {
+      let lastErr = "";
+      const attempts = hasSchema ? SCHEMA_RETRIES : 1;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (engine.signal?.aborted) throw new Error("Workflow aborted.");
+        if (engine.counters.agentsSpawned >= MAX_TOTAL_AGENTS) {
+          throw new Error(
+            `Workflow exceeded the ${MAX_TOTAL_AGENTS}-agent lifetime cap.`,
+          );
+        }
+        engine.counters.agentsSpawned++;
+        engine.counters.runningCount++;
+        try {
+          // Emit *before* awaiting runAgent so status polling sees in-flight process agents.
+          emit({
+            kind: "agent_start",
+            label: agentOpts.label,
+            phase: agentOpts.phase,
+            model: agentOpts.model,
+          });
+          const finalPrompt = hasSchema
+            ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
+            : prompt;
+          const res = await engine.runAgent({
+            prompt: finalPrompt,
+            persona: agentOpts.persona,
+            model: agentOpts.model,
+            signal: engine.signal,
+            isolation,
+            label: agentOpts.label,
+            onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
+          });
+          const outTokens = res.usage?.output ?? 0;
+          tokensDelta += outTokens;
+          engine.counters.tokensSpent += outTokens;
+
+          if (res.isError) {
+            engine.counters.errorCount++;
+            return { value: null, tokensDelta };
+          }
+          if (!hasSchema) return { value: res.output, tokensDelta };
+
+          const raw = extractJson(res.output);
+          if (raw != null) {
+            try {
+              const parsed = JSON.parse(raw);
+              const verrs = validateSchema(parsed, agentOpts.schema);
+              if (verrs.length === 0) return { value: parsed, tokensDelta };
+              lastErr = verrs.slice(0, 5).join("; ");
+            } catch (e) {
+              lastErr = `JSON parse error: ${e instanceof Error ? e.message : String(e)}`;
+            }
+          } else {
+            lastErr = "no JSON object/array found in output";
+          }
+        } finally {
+          engine.counters.runningCount--;
+          emit({
+            kind: "agent_done",
+            label: agentOpts.label,
+            phase: agentOpts.phase,
+            model: agentOpts.model,
+          });
+        }
+      }
+
+      engine.counters.errorCount++;
+      emit({
+        kind: "log",
+        message: `agent(schema) failed after ${attempts} attempts: ${lastErr}`,
+      });
+      return { value: null, tokensDelta };
+    } finally {
+      sem.release();
+    }
+  };
+
+  return runWorkflowWorker(script, args, engine, emit, runAgentCall);
+}
+
+function loadWorkflowRef(nameOrRef: unknown, engine: Engine): string | null {
+  if (typeof nameOrRef === "string") {
+    return engine.loadWorkflow ? engine.loadWorkflow(nameOrRef) : null;
+  }
+  throw new Error(
+    "workflow(nameOrRef): expected a saved-workflow name string.",
+  );
+}
+
+function runWorkflowWorker(
+  script: string,
+  args: unknown,
+  engine: Engine,
+  emit: (
+    p: Omit<WorkflowProgress, "agentsSpawned" | "errorCount" | "tokensSpent">,
+  ) => void,
+  runAgentCall: (payload: {
+    prompt: unknown;
+    opts?: WorkflowAgentOpts;
+  }) => Promise<{ value: unknown; tokensDelta: number }>,
+): Promise<{ meta: WorkflowMeta; result: unknown }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(
+      new URL("./workflow-worker-thread.mjs", import.meta.url),
+    );
+    const terminateWorker = () => {
+      try {
+        worker.postMessage({ type: "abort" });
+      } catch {
+        /* worker may already be dead */
+      }
+      worker.terminate().catch(() => {});
+    };
+    const fail = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      engine.closed = true;
+      cleanup();
+      terminateWorker();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const done = (value: { meta: WorkflowMeta; result: unknown }) => {
+      if (settled) return;
+      settled = true;
+      engine.closed = true;
+      cleanup();
+      terminateWorker();
+      resolve(value);
+    };
+    const onAbort = () => fail(new Error("Workflow aborted."));
+    const timeout = setTimeout(() => {
+      const err = new Error(
+        `Workflow timed out after ${engine.workflowTimeoutMs}ms; the worker was terminated.`,
+      );
+      fail(err);
+      engine.abort.abort(err);
+    }, engine.workflowTimeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      engine.signal.removeEventListener("abort", onAbort);
+      worker.removeAllListeners();
+    };
+
+    engine.signal?.addEventListener("abort", onAbort, { once: true });
+    if (engine.signal?.aborted) {
+      onAbort();
+      return;
+    }
+
+    worker.on("message", (msg: WorkerRpcRequest | WorkerRpcResponse | any) => {
+      if (settled || !msg || typeof msg !== "object") return;
+      if (msg.type === "result") {
+        done(msg.value);
+        return;
+      }
+      if (msg.type === "error") {
+        fail(new Error(String(msg.error ?? "Workflow worker failed.")));
+        return;
+      }
+      if (msg.type === "progress") {
+        emit(msg.payload);
+        return;
+      }
+      if (typeof msg.id !== "number" || typeof msg.method !== "string") return;
+      handleWorkerRpc(
+        msg as WorkerRpcRequest,
+        worker,
+        engine,
+        runAgentCall,
+      ).catch((err) => {
+        const error = err instanceof Error ? err.message : String(err);
+        postWorkerResponse(worker, { id: msg.id, ok: false, error });
+      });
+    });
+    worker.on("error", fail);
+    worker.on("exit", (code) => {
+      if (!settled && code !== 0)
+        fail(new Error(`Workflow worker exited with code ${code}.`));
+    });
+    worker.postMessage({
+      type: "init",
+      script,
+      args,
+      budgetTotal: engine.budgetTotal,
+      syncTimeoutMs: WORKFLOW_SYNC_TIMEOUT_MS,
+      maxItemsPerCall: MAX_ITEMS_PER_CALL,
+      maxWorkflowDepth: MAX_WORKFLOW_DEPTH,
+    });
+  });
+}
+
+async function handleWorkerRpc(
+  msg: WorkerRpcRequest,
+  worker: Worker,
+  engine: Engine,
+  runAgentCall: (payload: {
+    prompt: unknown;
+    opts?: WorkflowAgentOpts;
+  }) => Promise<{ value: unknown; tokensDelta: number }>,
+): Promise<void> {
+  if (msg.method === "agent") {
+    const value = await runAgentCall(msg.payload);
+    postWorkerResponse(worker, { id: msg.id, ok: true, value });
+    return;
+  }
+  if (msg.method === "loadWorkflow") {
+    const script = loadWorkflowRef(msg.payload, engine);
+    if (script == null && typeof msg.payload === "string") {
+      throw new Error(`workflow(): no saved workflow named "${msg.payload}".`);
+    }
+    postWorkerResponse(worker, { id: msg.id, ok: true, value: script });
+    return;
+  }
+  throw new Error(`Unknown workflow worker RPC method: ${msg.method}`);
+}
+
+function postWorkerResponse(worker: Worker, msg: WorkerRpcResponse): void {
+  try {
+    worker.postMessage(msg);
+  } catch {
+    /* worker may already be terminated after cancellation */
+  }
+}
+
+export function stringify(x: unknown): string {
+  return workflowStringify(x);
+}
+
+function buildSchemaPrompt(
+  prompt: string,
+  schema: unknown,
+  attempt: number,
+  lastErr: string,
+): string {
+  const schemaText = JSON.stringify(schema, null, 2);
+  const retry =
+    attempt > 0
+      ? `\n\nYour previous response did not satisfy the schema (${lastErr}). Return corrected JSON only.`
+      : "";
+  return (
+    `${prompt}\n\n` +
+    `Respond with ONLY a single JSON value that conforms to this JSON Schema. ` +
+    `No prose, no markdown fences, no commentary.\n\nJSON Schema:\n${schemaText}${retry}`
+  );
+}
+
+// ── tmux/zellij process-backed agents ────────────────────────────────
+
+/** Build a SubagentArtifact view over an interactive sub-agent's on-disk artifact dir. */
+function artifactFor(state: InteractiveSubagentState) {
+  return {
+    id: state.id,
+    dir: state.artifactDir,
+    statusFile: join(state.artifactDir, "events.ndjson"),
+    outputFile: join(state.artifactDir, "output.md"),
+  };
+}
+
+/**
+ * Parse token usage from a child Pi's session JSONL file.
+ * Reads assistant messages with `usage` data and aggregates them,
+ * mirroring the in-process path in helpers.ts.
+ * Returns zeroUsage() if the file is missing, unparseable, or has no usage data.
+ */
+function parseUsageFromSessionFile(sessionFile: string | undefined): Usage {
+  try {
+    if (!sessionFile || !existsSync(sessionFile)) return zeroUsage();
+    const raw = readFileSync(sessionFile, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim());
+    const usage: Usage = { ...zeroUsage() };
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.type !== "message") continue;
+        const msg = entry.message;
+        if (msg?.role !== "assistant" || !msg?.usage) continue;
+        const u = msg.usage;
+        usage.turns++;
+        usage.input += u.input ?? 0;
+        usage.output += u.output ?? 0;
+        usage.cacheRead += u.cacheRead ?? 0;
+        usage.cacheWrite += u.cacheWrite ?? 0;
+        if (u.cost?.total != null) usage.cost += u.cost.total;
+      } catch {
+        /* skip malformed lines */
+      }
+    }
+    return usage;
+  } catch {
+    return zeroUsage();
+  }
+}
+
+/**
+ * Await a process-backed (tmux/zellij) sub-agent's terminal event by polling its artifact dir,
+ * then read its output.md. Honors the abort signal and detects a dead pane that never completed.
+ */
+export async function awaitInteractiveResult(
+  state: InteractiveSubagentState,
+  signal: AbortSignal | undefined,
+  pollMs = INTERACTIVE_POLL_MS,
+): Promise<SubagentResult> {
+  const art = artifactFor(state);
+  let deadTicks = 0;
+  for (;;) {
+    if (signal?.aborted) {
+      try {
+        cancelInteractiveSubagent(state.id);
+      } catch {
+        /* best effort */
+      }
+      return {
+        isError: true,
+        output: "",
+        usage: zeroUsage(),
+        model: undefined,
+        errorMessage: "aborted",
+      };
+    }
+    const events = readEvents(art);
+    const terminal = [...events]
+      .reverse()
+      .find(
+        (e) =>
+          e.type === "done" || e.type === "error" || e.type === "cancelled",
+      );
+    if (terminal) {
+      const output = readOutput(art) ?? "(no output)";
+      if (terminal.type === "done") {
+        return {
+          isError: false,
+          output,
+          usage: parseUsageFromSessionFile(state.sessionFile),
+          model: state.model ?? "process",
+        };
+      }
+      return {
+        isError: true,
+        output,
+        usage: parseUsageFromSessionFile(state.sessionFile),
+        model: undefined,
+        errorMessage:
+          terminal.message ?? `interactive sub-agent ${terminal.type}`,
+      };
+    }
+    // No terminal event yet — if the pane has died, give it a few grace ticks for a final flush.
+    let alive = true;
+    try {
+      alive = isPaneAlive(state);
+    } catch {
+      alive = false;
+    }
+    if (!alive) {
+      deadTicks++;
+      debugLog("warn", "interactive_dead_pane", {
+        deadTicks,
+        graceLimit: INTERACTIVE_DEAD_GRACE_TICKS,
+      });
+      if (deadTicks >= INTERACTIVE_DEAD_GRACE_TICKS) {
+        const output = readOutput(art) ?? "(no output)";
+        return {
+          isError: true,
+          output,
+          usage: zeroUsage(),
+          model: undefined,
+          errorMessage: "interactive sub-agent pane exited before completing",
+        };
+      }
+    } else {
+      deadTicks = 0;
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}

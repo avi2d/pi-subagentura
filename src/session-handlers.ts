@@ -17,6 +17,7 @@ import {
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import { workflowJobRegistry } from "./workflow-jobs";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -146,7 +147,15 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
+      // Workflow workers are bound to this parent context. Suppress completion
+      // before aborting so late settlement cannot notify a replacement session.
+      for (const workflow of workflowJobRegistry.values()) {
+        workflow.suppressCompletionNotification = true;
+        if (workflow.status === "running") workflow.abort.abort();
+      }
+
       jobRegistry.clear();
+      workflowJobRegistry.clear();
       g2.__piSubagenturaPiRef = undefined;
       g2.__piSubagenturaSessionManager = undefined;
       g2.__piSubagenturaParentStreaming = false;

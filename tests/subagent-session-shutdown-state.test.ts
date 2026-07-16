@@ -30,6 +30,8 @@ describe("session_shutdown clean-slate on /new and quit", () => {
     const api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
       on: vi.fn(),

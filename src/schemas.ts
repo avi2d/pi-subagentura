@@ -22,7 +22,7 @@ export const BaseParams = Type.Object({
   async: Type.Optional(
     Type.Boolean({
       description:
-        "Run subagent in background. Returns a jobId immediately instead of blocking. Use get_subagent_status to poll progress and get_subagent_result to retrieve output when ready. The main agent continues execution immediately — it does NOT wait for async sub-agents to complete. Use only if users asks to",
+        "Run subagent in background. Returns a jobId immediately instead of blocking. Async jobs inject their result by default when complete. Poll with get_subagent_status or collect with get_subagent_result only when requested or when manual follow-up is needed. The main agent continues execution immediately — it does NOT wait for async sub-agents to complete. Use only if users asks to",
     }),
   ),
   notifyOnComplete: Type.Optional(

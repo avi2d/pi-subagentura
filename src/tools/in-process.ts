@@ -77,6 +77,58 @@ function updateRunningFooter(ctx: RunningFooterContext): void {
   }
 }
 
+function createAsyncJobErrorResult(error: unknown): SubagentResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    output: `Sub-agent crashed: ${message}`,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 0,
+    },
+    model: undefined,
+    isError: true,
+    errorMessage: message,
+  };
+}
+
+function settleAsyncJob(
+  jobId: string,
+  jobState: JobState,
+  result: SubagentResult,
+  ctx: RunningFooterContext,
+): void {
+  if (jobState.status === "cancelled") return;
+  jobState.status = result.isError ? "error" : "done";
+  jobState.result = result;
+  scheduleJobCleanup(jobId, false, jobState.maxAge);
+
+  if (
+    jobState.notifyOnComplete &&
+    !jobState.notificationDelivered &&
+    !jobState.resultRetrieved
+  ) {
+    deliverNotification(jobState, result);
+  }
+
+  updateRunningFooter(ctx);
+}
+
+function attachAsyncJobSettlement(
+  jobId: string,
+  jobState: JobState,
+  ctx: RunningFooterContext,
+): void {
+  const settledPromise = jobState.promise.catch(createAsyncJobErrorResult);
+  jobState.promise = settledPromise;
+  void settledPromise.then((result) => {
+    settleAsyncJob(jobId, jobState, result, ctx);
+  });
+}
+
 async function runSubagent(
   task: string,
   persona: string | undefined,
@@ -149,6 +201,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
       "",
       "For async (background) execution, the main agent continues immediately.",
+      'Async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
       "Use async only if user asked to do so or is willing to continue the conversation.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
       "Both modes show the user a completion notification.",
@@ -232,43 +285,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         jobRegistry.set(jobId, jobState);
         updateRunningFooter(ctx);
 
-        jobPromise.then(
-          (result) => {
-            if (jobState.status === "cancelled") return;
-            jobState.status = result.isError ? "error" : "done";
-            jobState.result = result;
-            scheduleJobCleanup(jobId, false, jobState.maxAge);
-
-            if (
-              jobState.notifyOnComplete &&
-              !jobState.notificationDelivered &&
-              !jobState.resultRetrieved
-            ) {
-              deliverNotification(jobState, result);
-            }
-
-            updateRunningFooter(ctx);
-          },
-          (error) => {
-            if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
-              deliverNotification(jobState, {
-                output: `Sub-agent crashed: ${error instanceof Error ? error.message : String(error)}`,
-                usage: {
-                  input: 0,
-                  output: 0,
-                  cacheRead: 0,
-                  cacheWrite: 0,
-                  cost: 0,
-                  turns: 0,
-                },
-                model: undefined,
-                isError: true,
-                errorMessage:
-                  error instanceof Error ? error.message : String(error),
-              });
-            }
-          },
-        );
+        attachAsyncJobSettlement(jobId, jobState, ctx);
 
         return {
           content: [
@@ -432,43 +449,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         jobRegistry.set(jobId, jobState);
         updateRunningFooter(ctx);
 
-        jobPromise.then(
-          (result) => {
-            if (jobState.status === "cancelled") return;
-            jobState.status = result.isError ? "error" : "done";
-            jobState.result = result;
-            scheduleJobCleanup(jobId, false, jobState.maxAge);
-
-            if (
-              jobState.notifyOnComplete &&
-              !jobState.notificationDelivered &&
-              !jobState.resultRetrieved
-            ) {
-              deliverNotification(jobState, result);
-            }
-
-            updateRunningFooter(ctx);
-          },
-          (error) => {
-            if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
-              deliverNotification(jobState, {
-                output: `Sub-agent crashed: ${error instanceof Error ? error.message : String(error)}`,
-                usage: {
-                  input: 0,
-                  output: 0,
-                  cacheRead: 0,
-                  cacheWrite: 0,
-                  cost: 0,
-                  turns: 0,
-                },
-                model: undefined,
-                isError: true,
-                errorMessage:
-                  error instanceof Error ? error.message : String(error),
-              });
-            }
-          },
-        );
+        attachAsyncJobSettlement(jobId, jobState, ctx);
 
         return {
           content: [
@@ -789,8 +770,7 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme, _context) {
       const details = result.details as
-        | (InProcessSubagentDetails & { jobId?: string })
-        | undefined;
+        (InProcessSubagentDetails & { jobId?: string }) | undefined;
       const jobId = String(details?.jobId ?? "unknown");
       const cancelled = details?.status === "cancelled";
       const firstContent = result.content?.[0];
