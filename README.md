@@ -80,10 +80,10 @@ pi install git:github.com/lmn451/pi-subagentura
 
 ## Bundled orchestration defaults
 
-The package also ships parent-only orchestration guidance for common multi-agent workflows. It is kept in `ORCHESTRATOR_SYSTEM_PROMPT.md` at the repo root because it is an appendable system prompt, not a Pi skill. Enable it explicitly with Pi's built-in append-system-prompt flag:
+The package also ships parent-only orchestration guidance for common multi-agent workflows in `ORCHESTRATOR_SYSTEM_PROMPT.md`. Enable it with the extension's `--orchestrator` flag:
 
 ```bash
-pi --append-system-prompt "$(cat ./ORCHESTRATOR_SYSTEM_PROMPT.md)"
+pi --orchestrator
 ```
 
 The guidance gives the parent agent reasonable default behavior when the user asks for things like:

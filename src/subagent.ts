@@ -18,6 +18,7 @@
  * @module pi-subagentura
  */
 
+import { readFileSync } from "node:fs";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   type JobState,
@@ -62,6 +63,11 @@ export type SubagentDetails =
   | { status: "cancelled" | "not_found" }
   | { status: "invalid_id"; id: string };
 
+const ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
+  new URL("../ORCHESTRATOR_SYSTEM_PROMPT.md", import.meta.url),
+  "utf8",
+).trim();
+
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENTURA_CHILD === "1") {
     registerChildProtocol(pi);
@@ -72,6 +78,17 @@ export default function (pi: ExtensionAPI) {
       "pi-subagentura requires Pi >= 0.80.6 with agent_settled and custom message renderer support",
     );
   }
+  pi.registerFlag("orchestrator", {
+    description: "Append the bundled orchestration system prompt",
+    type: "boolean",
+    default: false,
+  });
+  pi.on("before_agent_start", (event) => {
+    if (pi.getFlag("orchestrator") !== true) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${ORCHESTRATOR_SYSTEM_PROMPT}`,
+    };
+  });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
   registerSessionHandlers(pi);
   registerWorkflowTool(pi);

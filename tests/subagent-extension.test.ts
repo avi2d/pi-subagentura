@@ -53,6 +53,32 @@ describe("extension registration", () => {
     );
   });
 
+  it("registers the --orchestrator flag", () => {
+    const api = mockApi();
+
+    registerExtension(api as any);
+
+    expect(api.registerFlag).toHaveBeenCalledWith("orchestrator", {
+      description: "Append the bundled orchestration system prompt",
+      type: "boolean",
+      default: false,
+    });
+  });
+
+  it("appends the bundled prompt when --orchestrator is enabled", async () => {
+    const api = mockApi({ getFlag: vi.fn().mockReturnValue(true) });
+
+    registerExtension(api as any);
+
+    const beforeAgentStart = api.on.mock.calls.find(
+      ([event]: any[]) => event === "before_agent_start",
+    )?.[1];
+    const result = await beforeAgentStart({ systemPrompt: "base prompt" }, {});
+
+    expect(result.systemPrompt).toContain("# Orchestrator System Prompt");
+    expect(result.systemPrompt.startsWith("base prompt\n\n")).toBe(true);
+  });
+
   it("registers only protocol hooks in child mode", () => {
     const previous = process.env.PI_SUBAGENTURA_CHILD;
     const previousArtifactDir = process.env.ARTIFACT_DIR;
