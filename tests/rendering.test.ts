@@ -870,54 +870,54 @@ describe("formatActivityRow", () => {
   });
 });
 
-describe("renderSubagentNotify interactive branch", () => {
+describe("renderSubagentNotify protocol-v2 details", () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  it("renders expanded interactive notification with body only (no header/output)", () => {
+  it("renders an expanded pointer completion with a success header", () => {
     const result = renderSubagentNotify(
       {
         content: "Artifact pointer",
-        details: { event: { type: "done" } },
+        details: { mode: "notify", status: "done" },
       },
       { expanded: true },
       testTheme,
     );
+
     expect(result).toBeInstanceOf(MockText);
-    const text = t(result);
-    // Interactive branch: body only, no header, no output
-    expect(text).toBe("Artifact pointer");
-    expect(text).not.toContain("Sub-agent");
-    expect(text).not.toContain("✅");
-    expect(text).not.toContain("❌");
+    expect(t(result)).toContain("✅ Sub-agent Completed");
+    expect(t(result)).toContain("Artifact pointer");
   });
 
-  it("renders expanded interactive error notification with body only", () => {
+  it("renders protocol-v2 errors with the failure header", () => {
     const result = renderSubagentNotify(
       {
         content: "Error artifact pointer",
-        details: { event: { type: "error" } },
+        details: { mode: "notify", status: "error", error: true },
       },
       { expanded: true },
       testTheme,
     );
-    const text = t(result);
-    expect(text).toBe("Error artifact pointer");
-    expect(text).not.toContain("Sub-agent Failed");
+
+    expect(t(result)).toContain("❌ Sub-agent Failed");
+    expect(t(result)).toContain("Error artifact pointer");
   });
 
-  it("still renders collapsed interactive notification with text", () => {
+  it("joins text blocks in collapsed custom-message content", () => {
     const result = renderSubagentNotify(
       {
-        content: "Collapsed content",
-        details: { event: { type: "done" } },
+        content: [
+          { type: "text", text: "Collapsed " },
+          { type: "image" },
+          { type: "text", text: "content" },
+        ],
+        details: { mode: "notify", status: "done" },
       },
       { expanded: false },
       testTheme,
     );
-    const text = t(result);
-    // Collapsed: uses accent color (no isError), just text
-    expect(text).toBe("Collapsed content");
+
+    expect(t(result)).toBe("Collapsed content");
   });
 });

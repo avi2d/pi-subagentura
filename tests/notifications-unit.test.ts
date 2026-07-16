@@ -1,21 +1,9 @@
-/**
- * Direct unit tests for deliverNotification from src/notifications.ts.
- *
- * Tests the return value and edge cases that aren't covered through the
- * higher-level subagent tool integration tests in subagent-notify.test.ts.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JobState, SubagentResult } from "../src/helpers";
-
-// ── Imports after global setup ─────────────────────────────────────────
 import {
   deliverNotification,
-  getInjectCount,
-  incrementInjectCount,
-  MAX_INJECT,
+  flushInProcessDeliveries,
 } from "../src/notifications";
-
-// ── Fixtures ───────────────────────────────────────────────────────────
 
 const SUCCESS_RESULT: SubagentResult = {
   output: "All tests pass",
@@ -55,136 +43,100 @@ function makeJobState(overrides?: Partial<JobState>): JobState {
   };
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────
-
 function cleanGlobals() {
-  (globalThis as any).__piSubagenturaPiRef = undefined;
-  (globalThis as any).__piSubagenturaInjectCount = 0;
+  const globalState = globalThis as any;
+  globalState.__piSubagenturaPiRef = undefined;
+  globalState.__piSubagenturaUi = undefined;
+  globalState.__piSubagenturaParentStreaming = false;
+  globalState.__piSubagenturaPendingJobDeliveries = [];
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
+describe("in-process completion delivery queue", () => {
+  beforeEach(cleanGlobals);
+  afterEach(cleanGlobals);
 
-describe("deliverNotification return value", () => {
-  beforeEach(() => {
-    cleanGlobals();
-  });
-
-  afterEach(() => {
-    cleanGlobals();
-  });
-
-  it("returns false when pi ref is missing", () => {
+  it("does nothing when the extension context is unavailable", () => {
     const job = makeJobState();
-    const result = deliverNotification(job, SUCCESS_RESULT);
-    expect(result).toBe(false);
-  });
 
-  it("returns true on successful notify delivery", () => {
-    const pi = { sendMessage: vi.fn() };
-    (globalThis as any).__piSubagenturaPiRef = pi;
-
-    const job = makeJobState({ notifyOnComplete: "notify" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
-
-    expect(result).toBe(true);
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(job.notificationDelivered).toBe(true);
-  });
-
-  it("returns false when sendMessage throws in notify mode", () => {
-    const pi = {
-      sendMessage: vi.fn().mockImplementation(() => {
-        throw new Error("stale context");
-      }),
-    };
-    (globalThis as any).__piSubagenturaPiRef = pi;
-
-    const job = makeJobState({ notifyOnComplete: "notify" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
-
-    expect(result).toBe(false);
+    expect(deliverNotification(job, SUCCESS_RESULT)).toBeUndefined();
     expect(job.notificationDelivered).toBeFalsy();
   });
 
-  it("returns false when sendUserMessage is not a function in inject mode", () => {
-    const pi = { sendMessage: vi.fn() };
-    (globalThis as any).__piSubagenturaPiRef = pi;
+  it("delivers notify mode as a pointer-only custom message", () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    const job = makeJobState({ notifyOnComplete: "notify" });
 
-    const job = makeJobState({ notifyOnComplete: "inject" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
+    deliverNotification(job, SUCCESS_RESULT);
 
-    expect(result).toBe(false);
-    expect(pi.sendMessage).not.toHaveBeenCalled();
-    expect(getInjectCount()).toBe(0);
-  });
-
-  it("returns true on successful inject delivery", () => {
-    const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn() };
-    (globalThis as any).__piSubagenturaPiRef = pi;
-
-    const job = makeJobState({ notifyOnComplete: "inject" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
-
-    expect(result).toBe(true);
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(job.notificationDelivered).toBe(true);
-    expect(getInjectCount()).toBe(0); // decremented in finally
-  });
-
-  it("returns false when sendUserMessage throws in inject mode", () => {
-    const pi = {
-      sendMessage: vi.fn(),
-      sendUserMessage: vi.fn().mockImplementation(() => {
-        throw new Error("injection failed");
-      }),
-    };
-    (globalThis as any).__piSubagenturaPiRef = pi;
-
-    const job = makeJobState({ notifyOnComplete: "inject" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
-
-    expect(result).toBe(false);
-    expect(getInjectCount()).toBe(0); // still decremented in finally
-  });
-
-  it("degrades to notify and returns true when inject cap exceeded", () => {
-    const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn() };
-    (globalThis as any).__piSubagenturaPiRef = pi;
-
-    // Set inject count at the cap
-    for (let i = 0; i < MAX_INJECT; i++) incrementInjectCount();
-
-    const job = makeJobState({ notifyOnComplete: "inject" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
-
-    expect(result).toBe(true);
-    // Should NOT call sendUserMessage (degraded to notify)
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
-    // Should call sendMessage with degrade message
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendMessage.mock.calls[0][0].content).toContain(
-      "Inject cap exceeded",
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).not.toContain(
+      SUCCESS_RESULT.output,
     );
-    expect(pi.sendMessage.mock.calls[0][0].details.mode).toBe("notify");
+    expect(sendMessage.mock.calls[0][0].details.mode).toBe("notify");
+    expect(job.notificationDelivered).toBe(true);
   });
 
-  it("returns false when sendMessage throws in inject-cap degrade path", () => {
-    const pi = {
-      sendMessage: vi.fn().mockImplementation(() => {
-        throw new Error("send failed");
-      }),
-      sendUserMessage: vi.fn(),
+  it("retains a failed dispatch and retries it with a fresh context", () => {
+    const staleSend = vi.fn(() => {
+      throw new Error("stale context");
+    });
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage: staleSend };
+    const job = makeJobState();
+
+    deliverNotification(job, SUCCESS_RESULT);
+    expect(staleSend).toHaveBeenCalledOnce();
+    expect(job.notificationDelivered).toBeFalsy();
+
+    const freshSend = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage: freshSend };
+    flushInProcessDeliveries();
+
+    expect(freshSend).toHaveBeenCalledOnce();
+    expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("delivers inject mode in one attributed custom message", () => {
+    const sendMessage = vi.fn();
+    const sendUserMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage,
+      sendUserMessage,
     };
-    (globalThis as any).__piSubagenturaPiRef = pi;
+    const job = makeJobState({
+      notifyOnComplete: "inject",
+      triggerTurnOnComplete: true,
+    });
 
-    // Set inject count at the cap
-    for (let i = 0; i < MAX_INJECT; i++) incrementInjectCount();
+    deliverNotification(job, SUCCESS_RESULT);
 
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toContain(
+      SUCCESS_RESULT.output,
+    );
+    expect(sendMessage.mock.calls[0][0].details.mode).toBe("inject");
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("waits for the parent to become idle before dispatching", () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    (globalThis as any).__piSubagenturaParentStreaming = true;
     const job = makeJobState({ notifyOnComplete: "inject" });
-    const result = deliverNotification(job, SUCCESS_RESULT);
 
-    expect(result).toBe(false);
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    deliverNotification(job, SUCCESS_RESULT);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBeFalsy();
+
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    flushInProcessDeliveries();
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(job.notificationDelivered).toBe(true);
   });
 });

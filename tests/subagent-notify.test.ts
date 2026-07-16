@@ -669,7 +669,9 @@ describe("notifyOnComplete", () => {
       );
 
       control.resolve(SUCCESS_RESULT);
-      await Promise.resolve();
+      await vi.waitFor(() => {
+        expect(jobRegistry.get(jobId)?.status).toBe("done");
+      });
       expect(api.sendMessage).not.toHaveBeenCalled();
       expect(api.sendUserMessage).not.toHaveBeenCalled();
       (globalThis as any).__piSubagenturaParentStreaming = false;
