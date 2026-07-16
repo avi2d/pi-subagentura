@@ -35,6 +35,7 @@
     "src/child-protocol.ts",
     "src/delivery.ts",
     "src/helpers.ts",
+    "src/pi-sdk-compat.ts",
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
     "src/interactive-tmux.ts",

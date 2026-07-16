@@ -14,15 +14,19 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import {
-  AuthStorage,
   createAgentSession,
-  ModelRegistry,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
+  type ModelRegistry,
   type ExtensionAPI,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionOptions,
+  copyProviderConfig,
+  createCompatibleSessionRuntime,
+} from "./pi-sdk-compat";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -380,8 +384,7 @@ export async function startSubagentJob(
   }
 
   const jobId = generateJobId();
-  const authStorage = AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
+  const sessionRuntime = await createCompatibleSessionRuntime();
 
   // Resolve model: exact match only, fallback to default
   // Uses parent's modelRegistry to find extension-added models (e.g. minimax)
@@ -390,6 +393,13 @@ export async function startSubagentJob(
     defaultModel,
     parentModelRegistry,
   );
+  if (targetModel) {
+    copyProviderConfig(
+      sessionRuntime,
+      parentModelRegistry,
+      targetModel.provider,
+    );
+  }
   const modelLabel = targetModel
     ? `${targetModel.provider}/${targetModel.id}`
     : undefined;
@@ -460,14 +470,15 @@ export async function startSubagentJob(
     model: modelLabel ?? "default",
     cwd,
   });
+  const sessionOptions = buildSessionOptions(sessionRuntime, {
+    sessionManager: SessionManager.inMemory(),
+    model: targetModel,
+    cwd,
+  });
   const session = (
-    await createAgentSession({
-      sessionManager: SessionManager.inMemory(),
-      authStorage,
-      modelRegistry,
-      model: targetModel,
-      cwd,
-    })
+    await createAgentSession(
+      sessionOptions as unknown as Parameters<typeof createAgentSession>[0],
+    )
   ).session;
   debugLog("info", "session_created", {
     jobId,

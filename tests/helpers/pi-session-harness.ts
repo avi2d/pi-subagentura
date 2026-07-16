@@ -1,12 +1,16 @@
 import {
-  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
-  ModelRegistry,
   SessionManager,
   SettingsManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionOptions,
+  createCompatibleSessionRuntime,
+  findModel,
+  registerProvider,
+} from "../../src/pi-sdk-compat";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,14 +62,17 @@ export async function createPiSessionHarness(
     };
   } = {},
 ): Promise<PiSessionHarness> {
-  const authStorage = AuthStorage.inMemory({
-    "subagentura-faux": { type: "api_key", key: "test" },
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-subagentura-session-"));
+  const sessionRuntime = await createCompatibleSessionRuntime({
+    agentDir,
+    authStorageData: {
+      "subagentura-faux": { type: "api_key", key: "test" },
+    },
   });
-  const modelRegistry = ModelRegistry.create(authStorage);
   const contexts: Context[] = [];
   const pending: Array<ReturnType<typeof createAssistantMessageEventStream>> =
     [];
-  modelRegistry.registerProvider("subagentura-faux", {
+  registerProvider(sessionRuntime, "subagentura-faux", {
     api: "subagentura-faux",
     apiKey: "test",
     baseUrl: "http://127.0.0.1.invalid",
@@ -86,17 +93,16 @@ export async function createPiSessionHarness(
         maxTokens: 4_096,
       },
     ],
-    streamSimple: (_model, context) => {
+    streamSimple: (_model: unknown, context: Context) => {
       contexts.push(context);
       const stream = createAssistantMessageEventStream();
       pending.push(stream);
       return stream;
     },
   });
-  const model = modelRegistry.find("subagentura-faux", "faux-model");
+  const model = findModel(sessionRuntime, "subagentura-faux", "faux-model");
   if (!model) throw new Error("faux model registration failed");
   const sessionManager = options.sessionManager ?? SessionManager.inMemory();
-  const agentDir = mkdtempSync(join(tmpdir(), "pi-subagentura-session-"));
   const settingsManager = SettingsManager.create(cwd, agentDir);
   if (options.retrySettings) {
     settingsManager.getRetrySettings = () => options.retrySettings!;
@@ -127,17 +133,18 @@ export async function createPiSessionHarness(
     if (previousArtifactDir === undefined) delete process.env.ARTIFACT_DIR;
     else process.env.ARTIFACT_DIR = previousArtifactDir;
   }
-  const { session } = await createAgentSession({
+  const sessionOptions = buildSessionOptions(sessionRuntime, {
     cwd,
     agentDir,
-    authStorage,
-    modelRegistry,
     model,
     sessionManager,
     settingsManager,
     resourceLoader,
     noTools: "all",
   });
+  const { session } = await createAgentSession(
+    sessionOptions as unknown as Parameters<typeof createAgentSession>[0],
+  );
   return {
     session,
     sessionManager,
