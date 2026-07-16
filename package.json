@@ -1,6 +1,6 @@
 {
   "name": "pi-subagentura",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Public Pi package that adds in-process sub-agents via the SDK",
   "author": "lmn451",
   "license": "MIT",
