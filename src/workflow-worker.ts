@@ -33,8 +33,12 @@ import {
   type WorkflowMeta,
   type WorkflowProgress,
   type WorkflowProgressUpdate,
-  type WorkflowRunResult,
+  type WorkflowRunResultWithUsage,
+  WorkflowExecutionError,
+  type WorkflowUsage,
+  addWorkflowUsage,
   zeroUsage,
+  zeroWorkflowUsage,
 } from "./workflow-core";
 import { workflowStringify } from "./workflow-script";
 import {
@@ -61,35 +65,62 @@ interface Engine {
   counters: {
     agentsSpawned: number;
     errorCount: number;
+    /** @deprecated Output-token count; use usage.totalTokens. */
     tokensSpent: number;
     runningCount: number;
   };
+  usage: WorkflowUsage;
+  failureCause?: unknown;
   phases: string[];
 }
 
 function withProgressCounters(
   progress: WorkflowProgressUpdate,
   counters: Engine["counters"],
+  usage: WorkflowUsage,
 ): WorkflowProgress {
   switch (progress.kind) {
     case "phase":
     case "log":
     case "agent_start":
     case "agent_done":
-      return { ...progress, ...counters };
+      return { ...progress, ...counters, usage: { ...usage } };
     default:
       return assertNever(progress);
   }
 }
 
+function usageIfPresent(usage: WorkflowUsage): WorkflowUsage | undefined {
+  if (usage.totalTokens === 0 && usage.costUsd === 0 && usage.turns === 0) {
+    return undefined;
+  }
+  return { ...usage };
+}
+
+function workflowFailureCause(
+  error: unknown,
+  engine: Engine,
+  signal: AbortSignal | undefined,
+): unknown {
+  if (signal?.aborted && signal.reason !== undefined) return signal.reason;
+  const candidate = engine.failureCause;
+  if (candidate !== undefined) {
+    const message =
+      candidate instanceof Error ? candidate.message : String(candidate);
+    if (error instanceof Error && error.message.includes(message))
+      return candidate;
+  }
+  return error;
+}
+
 export async function runWorkflow(
   script: string,
   opts: RunWorkflowOptions,
-): Promise<WorkflowRunResult> {
+): Promise<WorkflowRunResultWithUsage> {
   const abort = new AbortController();
-  const forwardAbort = () => abort.abort();
+  const forwardAbort = () => abort.abort(opts.signal?.reason);
   if (opts.signal?.aborted) {
-    abort.abort();
+    abort.abort(opts.signal.reason);
   } else {
     opts.signal?.addEventListener("abort", forwardAbort, { once: true });
   }
@@ -112,6 +143,7 @@ export async function runWorkflow(
       tokensSpent: 0,
       runningCount: 0,
     },
+    usage: zeroWorkflowUsage(),
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
   };
@@ -123,8 +155,17 @@ export async function runWorkflow(
       agentsSpawned: engine.counters.agentsSpawned,
       errorCount: engine.counters.errorCount,
       tokensSpent: engine.counters.tokensSpent,
-      phases: engine.phases,
+      usage: { ...engine.usage },
+      phases: [...engine.phases],
     };
+  } catch (error) {
+    if (error instanceof WorkflowExecutionError && error.usage) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new WorkflowExecutionError(
+      message,
+      usageIfPresent(engine.usage),
+      workflowFailureCause(error, engine, opts.signal),
+    );
   } finally {
     opts.signal?.removeEventListener("abort", forwardAbort);
   }
@@ -147,7 +188,7 @@ async function executeScript(
   const emit = (p: WorkflowProgressUpdate) => {
     if (engine.closed) return;
     if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
-    engine.onProgress?.(withProgressCounters(p, engine.counters));
+    engine.onProgress?.(withProgressCounters(p, engine.counters, engine.usage));
   };
 
   const runAgentCall = async (payload: {
@@ -220,11 +261,13 @@ async function executeScript(
               },
             });
           } catch (error) {
+            engine.failureCause = error;
             if (!engine.signal.aborted) engine.counters.errorCount++;
             throw error;
           }
           const outTokens = res.usage?.output ?? 0;
           tokensDelta += outTokens;
+          engine.usage = addWorkflowUsage(engine.usage, res.usage);
           engine.counters.tokensSpent += outTokens;
 
           if (res.isError) {
