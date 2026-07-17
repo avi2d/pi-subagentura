@@ -169,6 +169,8 @@ export interface JobState {
   notificationDelivered?: boolean;
   /** Set true by get_subagent_result to suppress redundant notification */
   resultRetrieved?: boolean;
+  /** Active get_subagent_result waits suppress settlement notifications. */
+  activeResultWaits?: number;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
   /** Most recent cancellation snapshot receipt, when snapshots are enabled. */

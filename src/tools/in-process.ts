@@ -121,7 +121,8 @@ function settleAsyncJob(
   if (
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
-    !jobState.resultRetrieved
+    !jobState.resultRetrieved &&
+    (jobState.activeResultWaits ?? 0) === 0
   ) {
     deliverNotification(jobState, result);
   }
@@ -687,8 +688,15 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         };
       }
 
-      // Race job.promise against the abort signal
-      const waitResult = await abortableWait(job.promise, signal);
+      // Active waits suppress settlement notifications without treating an
+      // aborted wait as a retrieved result.
+      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
+      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
+      try {
+        waitResult = await abortableWait(job.promise, signal);
+      } finally {
+        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
+      }
       if (waitResult.aborted) {
         return {
           content: [
