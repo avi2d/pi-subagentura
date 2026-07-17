@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  isArtifactOutputSettled,
   lastEvent,
   listOutputHistory,
   listOutputTurns,
@@ -603,10 +604,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           outputText = `(no snapshot for turn ${params.turn} — the poller may not have run yet, or this turn number is past the history)`;
         } else {
           const exited =
-            lastEventValue &&
-            (lastEventValue.type === "done" ||
-              lastEventValue.type === "error" ||
-              lastEventValue.type === "cancelled");
+            lastEventValue && isArtifactOutputSettled(lastEventValue);
           outputText = exited
             ? `(sub-agent exited without writing output.md — last event: ${lastEventValue.type} @ ${lastEventValue.ts})`
             : `(${events.length} events, last: ${lastEventValue ? `${lastEventValue.type} @ ${lastEventValue.ts}` : "(none)"} — output.md not written yet)`;

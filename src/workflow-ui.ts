@@ -1,4 +1,5 @@
 import type { WorkflowProgress } from "./workflow-core";
+import { assertNever } from "./artifact";
 
 // ── Workflow progress renderer ───────────────────────────────────────
 export function renderProgress(p: WorkflowProgress): string {
@@ -7,15 +8,20 @@ export function renderProgress(p: WorkflowProgress): string {
   if (p.errorCount > 0) parts.push(`⚠ ${p.errorCount} error(s)`);
   parts.push(`${p.tokensSpent} tokens`);
   const head = parts.join(", ");
-  if (p.kind === "phase") return `${head}\n  ◆ phase: ${p.phase}`;
-  if (p.kind === "log") return `${head}\n  ${p.message}`;
-  if (p.kind === "agent_start") {
-    const tag = p.model ? ` @${p.model}` : "";
-    return `${head}\n  → started${p.label ? ` ${p.label}` : ""}${tag}`;
+  switch (p.kind) {
+    case "phase":
+      return `${head}\n  ◆ phase: ${p.phase}`;
+    case "log":
+      return `${head}\n  ${p.message}`;
+    case "agent_start": {
+      const tag = p.model ? ` @${p.model}` : "";
+      return `${head}\n  → started${p.label ? ` ${p.label}` : ""}${tag}`;
+    }
+    case "agent_done": {
+      const tag = p.model ? ` @${p.model}` : "";
+      return `${head}\n  → done${p.label ? ` ${p.label}` : ""}${tag}`;
+    }
+    default:
+      return assertNever(p);
   }
-  if (p.kind === "agent_done") {
-    const tag = p.model ? ` @${p.model}` : "";
-    return `${head}\n  → done${p.label ? ` ${p.label}` : ""}${tag}`;
-  }
-  return head;
 }

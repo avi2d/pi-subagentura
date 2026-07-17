@@ -17,9 +17,13 @@ import type {
 import {
   artifactPath,
   appendEvent,
+  assertNever,
+  isCompletionEvent,
   readEventBatch,
   removeInteractiveState,
   updateInteractiveState,
+  type CompletionEvent,
+  type CompletionOutcome,
   type SubagentArtifact,
   type SubagentEvent,
 } from "./artifact";
@@ -49,6 +53,22 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+
+/** Derive delivery status from an already narrowed completion event. */
+function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
+  switch (ev.type) {
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    case "completion":
+      return ev.outcome;
+    default:
+      return assertNever(ev);
+  }
+}
 // ── Poller ─────────────────────────────────────────────────────────────
 
 /**
@@ -97,11 +117,8 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         if ("version" in ev && ev.version === 2 && ev.type === "turn_started") {
           state.activeTurnId = ev.turnId;
         }
-        if (!shouldNotify(ev)) continue;
-        const v2 =
-          "version" in ev && ev.version === 2 && ev.type === "completion"
-            ? ev
-            : null;
+        if (!shouldNotify(ev) || !isCompletionEvent(ev)) continue;
+        const v2 = ev.type === "completion" ? ev : undefined;
         const mode = state.notifyOnComplete ?? "inject";
         const triggerTurn =
           mode === "inject"
@@ -112,13 +129,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           v2?.eventId ??
           (ev as unknown as { eventId?: string }).eventId ??
           `legacy-${record.startOffset}`;
-        const status =
-          v2?.outcome ??
-          (ev.type === "error"
-            ? "error"
-            : ev.type === "cancelled"
-              ? "cancelled"
-              : "done");
+        const status = deliveryStatusFromEvent(ev);
         enqueueDelivery(state, {
           deliveryId: deliveryIdFor({
             parentSessionId: state.parentSessionId ?? "pi",

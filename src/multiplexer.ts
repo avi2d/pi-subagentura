@@ -26,6 +26,7 @@
 import { execFileSync, type ExecSyncOptions } from "node:child_process";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 import { ZellijMultiplexer } from "./multiplexer-zellij";
+import { assertNever } from "./artifact";
 
 /** Names of the supported multiplexer backends. Kept narrow on purpose. */
 export type MuxName = "tmux" | "zellij";
@@ -193,24 +194,31 @@ export function getMux(opts: GetMuxOptions = {}): Multiplexer {
   const zellij = getOrCreate("zellij", () => new ZellijMultiplexer());
 
   const preference = opts.preference ?? "auto";
-  if (preference === "tmux") return tmux;
-  if (preference === "zellij") return zellij;
+  switch (preference) {
+    case "tmux":
+      return tmux;
+    case "zellij":
+      return zellij;
+    case "auto": {
+      // Prefer the mux already attached to this process. We check env vars
+      // (cheap) before probing availability (one exec call each). If both env
+      // vars are set (e.g., nested sessions — exotic but possible), zellij wins
+      // (it's the more specific signal — ZELLIJ_SESSION_NAME is a single session
+      // name, TMUX can be inherited through nested tmux-in-tmux shells).
+      if (process.env.ZELLIJ_SESSION_NAME && zellij.isAvailable())
+        return zellij;
+      if (process.env.TMUX && tmux.isAvailable()) return tmux;
 
-  // Auto: prefer the mux already attached to this process. We check env vars
-  // (cheap) before probing availability (one exec call each). If both env
-  // vars are set (e.g., nested sessions — exotic but possible), zellij wins
-  // (it's the more specific signal — ZELLIJ_SESSION_NAME is a single session
-  // name, TMUX can be inherited through nested tmux-in-tmux shells).
-  if (process.env.ZELLIJ_SESSION_NAME && zellij.isAvailable()) return zellij;
-  if (process.env.TMUX && tmux.isAvailable()) return tmux;
+      // Neither env var matched. Fall back to whichever backend is available;
+      // tmux first to preserve existing user setups.
+      if (tmux.isAvailable()) return tmux;
+      if (zellij.isAvailable()) return zellij;
 
-  // Neither env var matched. Fall back to whichever backend is available;
-  // tmux first to preserve existing user setups that rely on `tmux` being
-  // on PATH even when the parent isn't attached.
-  if (tmux.isAvailable()) return tmux;
-  if (zellij.isAvailable()) return zellij;
-
-  throw new NoMultiplexerAvailableError();
+      throw new NoMultiplexerAvailableError();
+    }
+    default:
+      return assertNever(preference);
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

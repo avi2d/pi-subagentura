@@ -126,7 +126,6 @@ export type CompletionEventV2 = Extract<
   SubagentEventV2,
   { type: "completion" }
 >;
-
 export type SubagentEvent =
   | { ts: number; type: "started"; status: "running"; message?: string }
   | {
@@ -154,6 +153,88 @@ export type SubagentEvent =
     }
   | { ts: number; type: "cancelled"; status: "cancelled"; message?: string }
   | SubagentEventV2;
+
+export type LegacyCompletionEvent = Extract<
+  SubagentEvent,
+  { type: "done" | "error" | "cancelled" }
+>;
+export type TurnTerminalEvent = LegacyCompletionEvent | CompletionEventV2;
+export type CompletionEvent = TurnTerminalEvent;
+
+// ── Exhaustive event classification helpers ────────────────────────
+
+/** Exhaustiveness checker for discriminated unions. */
+export function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${String(value)}`);
+}
+
+/**
+ * Workflow-waiting semantics: authoritative turn completions are legacy
+ * done/error/cancelled events or a v2 completion. A process_exited event is
+ * excluded so the pane-death grace period can observe a final completion flush.
+ */
+export function isTurnTerminal(
+  event: SubagentEvent,
+): event is TurnTerminalEvent {
+  switch (event.type) {
+    case "done":
+    case "error":
+    case "cancelled":
+    case "completion":
+      return true;
+    case "started":
+    case "tool_activity":
+    case "turn_started":
+    case "process_exited":
+      return false;
+    default:
+      return assertNever(event);
+  }
+}
+
+/**
+ * Output-reporting semantics: these events establish that output is no longer
+ * pending for the current observed turn or process.
+ */
+export function isArtifactOutputSettled(event: SubagentEvent): boolean {
+  switch (event.type) {
+    case "done":
+    case "error":
+    case "cancelled":
+    case "completion":
+    case "process_exited":
+      return true;
+    case "started":
+    case "tool_activity":
+    case "turn_started":
+      return false;
+    default:
+      return assertNever(event);
+  }
+}
+
+/**
+ * Notification semantics: only completion/error/cancelled events should trigger
+ * a wakeup notification to the parent. process_exited and activity events do not.
+ */
+export function isCompletionEvent(
+  event: SubagentEvent,
+): event is CompletionEvent {
+  switch (event.type) {
+    case "completion":
+    case "done":
+    case "error":
+    case "cancelled":
+      return true;
+    case "started":
+    case "tool_activity":
+    case "turn_started":
+    case "process_exited":
+      return false;
+    default:
+      return assertNever(event);
+  }
+}
 
 export interface EventRecord {
   event: SubagentEvent;

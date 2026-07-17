@@ -10,7 +10,7 @@ import type {
   Usage,
 } from "./helpers";
 import { formatUsage, jobRegistry } from "./helpers";
-import type { SubagentEvent } from "./artifact";
+import { isCompletionEvent, type SubagentEvent } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 
 /**
@@ -435,12 +435,7 @@ function markOverflowDelivered(pending: PendingJobOverflow): void {
 
 /** True when the event should trigger a wakeup notification to the parent. */
 export function shouldNotify(event: SubagentEvent): boolean {
-  return (
-    event.type === "completion" ||
-    event.type === "done" ||
-    event.type === "error" ||
-    event.type === "cancelled"
-  );
+  return isCompletionEvent(event);
 }
 
 export function sanitizeOutput(text: string): string {

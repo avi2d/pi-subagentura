@@ -54,6 +54,20 @@ export interface WorkflowAgentOpts {
   agentType?: string;
 }
 
+export type WorkflowAgentProgress =
+  | {
+      kind: "phase";
+      phase: string;
+      message?: string;
+      label?: string;
+    }
+  | {
+      kind: "log";
+      message: string;
+      phase?: string;
+      label?: string;
+    };
+
 /** Injectable spawn function — the real one wraps startSubagentJob / launchInteractiveSubagent. */
 export type WorkflowAgentRunner = (req: {
   prompt: string;
@@ -66,12 +80,7 @@ export type WorkflowAgentRunner = (req: {
    * Optional callback for emitting progress events from inside the runner.
    * Used to surface fallback warnings and forward mid-agent live status.
    */
-  onProgress?: (event: {
-    kind: "log" | "phase";
-    message?: string;
-    phase?: string;
-    label?: string;
-  }) => void;
+  onProgress?: (event: WorkflowAgentProgress) => void;
 }) => Promise<SubagentResult>;
 
 export interface WorkflowMeta {
@@ -82,19 +91,58 @@ export interface WorkflowMeta {
   [k: string]: unknown;
 }
 
-export interface WorkflowProgress {
-  // "agent_start" fires the moment an agent is launched (counter is incremented), so UIs see
-  // mid-run progress. "agent_done" fires after the agent finishes (success, error, or schema fail).
-  kind: "phase" | "log" | "agent_start" | "agent_done";
-  phase?: string;
-  message?: string;
-  label?: string;
-  agentsSpawned: number;
-  errorCount: number;
-  tokensSpent: number;
-  runningCount: number;
-  model?: string;
-}
+export type WorkflowProgress =
+  | {
+      kind: "phase";
+      phase: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      tokensSpent: number;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "log";
+      phase?: string;
+      message: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      tokensSpent: number;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "agent_start";
+      phase?: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      tokensSpent: number;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "agent_done";
+      phase?: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      tokensSpent: number;
+      runningCount: number;
+      model?: string;
+    };
+
+export type WorkflowProgressUpdate = {
+  [K in WorkflowProgress["kind"]]: Omit<
+    Extract<WorkflowProgress, { kind: K }>,
+    "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
+  >;
+}[WorkflowProgress["kind"]];
 
 export interface WorkflowRunResult {
   meta: WorkflowMeta;
