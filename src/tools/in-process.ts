@@ -323,6 +323,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
             jobId,
             status: "started",
             contextMessages: messages.length,
+            thinkingLevel,
           },
         };
       }
@@ -493,6 +494,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
             jobId,
             status: "started",
             contextMessages: 0,
+            thinkingLevel,
           },
         };
       }
