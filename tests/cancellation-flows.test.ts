@@ -156,8 +156,7 @@ describe("abortableWait shared helper", () => {
       Promise.resolve("hello"),
       new AbortController().signal,
     );
-    expect(result.aborted).toBe(false);
-    expect(result.value).toBe("hello");
+    expect(result).toEqual({ aborted: false, value: "hello" });
   });
 
   it("returns aborted when signal fires before promise resolves", async () => {
@@ -181,6 +180,13 @@ describe("abortableWait shared helper", () => {
     await expect(
       abortableWait(Promise.reject(err), new AbortController().signal),
     ).rejects.toThrow("real error");
+  });
+
+  it("propagates an underlying AbortError rejection", async () => {
+    const err = new DOMException("underlying failure", "AbortError");
+    await expect(
+      abortableWait(Promise.reject(err), new AbortController().signal),
+    ).rejects.toBe(err);
   });
 
   it("cleans up abort listener after normal completion", async () => {
@@ -426,7 +432,7 @@ describe("get_workflow_result abort-aware wait", () => {
     workflowJobRegistry.set("wf-test-3", {
       id: "wf-test-3",
       status: "error",
-      promise: Promise.reject(new Error("worker crashed")),
+      promise: Promise.reject(new DOMException("worker crashed", "AbortError")),
       abort: new AbortController(),
     } as any);
 
@@ -598,39 +604,62 @@ describe("shortcut and command registration", () => {
     expect(commands["cancel-all-flows"].description).toMatch(/cancel/i);
   });
 
-  it("shortcut handler calls ctx.abort() after cancelling flows", async () => {
+  it("calls ctx.abort() before awaiting child cancellation", async () => {
     const { registerCancelAllFlows } =
       await import("../src/cancel-all-flows-registration");
-
+    const cancelAllFlowsModule = await import("../src/cancel-all-flows");
+    const events: string[] = [];
     let shortcutHandler: any;
+    let commandHandler: any;
+
     const api = {
       registerShortcut: (_key: string, opts: any) => {
         shortcutHandler = opts.handler;
       },
-      registerCommand: vi.fn(),
+      registerCommand: (_name: string, opts: any) => {
+        commandHandler = opts.handler;
+      },
     };
-
     registerCancelAllFlows(api as any);
 
-    // Mock cancelAllFlows to return some counts
-    const cancelAllFlowsModule = await import("../src/cancel-all-flows");
-    vi.spyOn(cancelAllFlowsModule, "cancelAllFlows").mockResolvedValue({
-      jobsAborted: 2,
-      workflowsAborted: 1,
+    const result = {
+      jobsAborted: 1,
+      workflowsAborted: 0,
       interactiveKilled: 0,
       interactivePreserved: 0,
+    };
+    const cancelSpy = vi.spyOn(cancelAllFlowsModule, "cancelAllFlows");
+    const mockNotify = vi.fn();
+    const mockAbort = vi.fn(() => events.push("abort"));
+    const ctx = { ui: { notify: mockNotify }, abort: mockAbort };
+
+    let resolveCancellation!: (value: typeof result) => void;
+    const pendingCancellation = new Promise<typeof result>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    cancelSpy.mockImplementationOnce(() => {
+      events.push("cancel-start");
+      return pendingCancellation;
     });
 
-    const mockAbort = vi.fn();
-    const mockNotify = vi.fn();
-    const ctx = {
-      ui: { notify: mockNotify },
-      abort: mockAbort,
-    };
+    const shortcutPromise = shortcutHandler(ctx);
+    expect(events).toEqual(["abort", "cancel-start"]);
+    resolveCancellation(result);
+    await shortcutPromise;
 
-    await shortcutHandler(ctx);
+    events.length = 0;
+    let resolveCommandCancellation!: (value: typeof result) => void;
+    const pendingCommandCancellation = new Promise<typeof result>((resolve) => {
+      resolveCommandCancellation = resolve;
+    });
+    cancelSpy.mockImplementationOnce(() => {
+      events.push("cancel-start");
+      return pendingCommandCancellation;
+    });
 
-    // ctx.abort() should be called to interrupt the foreground agent
-    expect(mockAbort).toHaveBeenCalledOnce();
+    const commandPromise = commandHandler("", ctx);
+    expect(events).toEqual(["abort", "cancel-start"]);
+    resolveCommandCancellation(result);
+    await commandPromise;
   });
 });

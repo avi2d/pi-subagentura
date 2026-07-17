@@ -14,6 +14,10 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
       description:
         "Cancel all active sub-agent flows (jobs, workflows, running interactive agents)",
       handler: async (ctx) => {
+        // Stop foreground token use before waiting on child cancellations
+        if (typeof ctx.abort === "function") {
+          ctx.abort();
+        }
         const result = await cancelAllFlows();
         const parts: string[] = [];
         if (result.jobsAborted > 0) parts.push(`${result.jobsAborted} job(s)`);
@@ -28,11 +32,6 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
           ctx.ui.notify("No active flows to cancel.", "info");
         } else {
           ctx.ui.notify(`Cancelled: ${parts.join(", ")}`, "warning");
-        }
-
-        // Interrupt the foreground agent turn so Escape-like UX is consistent
-        if (typeof ctx.abort === "function") {
-          ctx.abort();
         }
       },
     });
@@ -44,6 +43,10 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
       description:
         "Cancel all active sub-agent flows (jobs, workflows, running interactive agents)",
       handler: async (_args, ctx) => {
+        // Stop foreground token use before waiting on child cancellations
+        if (typeof ctx.abort === "function") {
+          ctx.abort();
+        }
         const result = await cancelAllFlows();
         const parts: string[] = [];
         if (result.jobsAborted > 0) parts.push(`${result.jobsAborted} job(s)`);
@@ -58,11 +61,6 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
           ctx.ui.notify("No active flows to cancel.", "info");
         } else {
           ctx.ui.notify(`Cancelled: ${parts.join(", ")}`, "warning");
-        }
-
-        // Interrupt the foreground agent turn so Escape-like UX is consistent
-        if (typeof ctx.abort === "function") {
-          ctx.abort();
         }
       },
     });

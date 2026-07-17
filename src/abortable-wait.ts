@@ -9,10 +9,13 @@
  * the race/catch/cleanup pattern.
  */
 
-export interface AbortableWaitResult<T> {
-  aborted: boolean;
-  value?: T;
-}
+const ABORT_SENTINEL = Symbol("abortable-wait-abort");
+
+export type AbortableWaitResult<T> =
+  | {
+      aborted: true;
+    }
+  | { aborted: false; value: T };
 
 export async function abortableWait<T>(
   promise: Promise<T>,
@@ -28,19 +31,15 @@ export async function abortableWait<T>(
 
   let abortHandler: (() => void) | undefined;
   try {
-    const abortPromise = new Promise<never>((_, reject) => {
-      abortHandler = () => {
-        reject(new DOMException("Aborted", "AbortError"));
-      };
+    const abortPromise = new Promise<typeof ABORT_SENTINEL>((resolve) => {
+      abortHandler = () => resolve(ABORT_SENTINEL);
       signal.addEventListener("abort", abortHandler, { once: true });
     });
-    const value = await Promise.race([promise, abortPromise]);
-    return { aborted: false, value };
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
+    const result = await Promise.race([promise, abortPromise]);
+    if (result === ABORT_SENTINEL) {
       return { aborted: true };
     }
-    throw err;
+    return { aborted: false, value: result as T };
   } finally {
     if (abortHandler) {
       signal.removeEventListener("abort", abortHandler);
