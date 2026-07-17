@@ -4,9 +4,11 @@ import {
   workflowJobRegistry,
   type WorkflowJobState,
 } from "./workflow-jobs";
+import { formatWorkflowUsage } from "./workflow-core";
 
 export type WorkflowTreeAction =
-  { kind: "cancel"; workflowId: string } | { kind: "close" };
+  | { kind: "cancel"; workflowId: string }
+  | { kind: "close" };
 
 type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 
@@ -204,7 +206,8 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
     `${s.runningCount ?? 0} running`,
   ];
   if (errorCount > 0) parts.push(`${errorCount} errors`);
-  parts.push(`${s.tokensSpent} tokens`);
+  parts.push(`${s.tokensSpent} output tokens`);
+  if (s.usage) parts.push(formatWorkflowUsage(s.usage));
   if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
   return parts.join(" · ");
 }

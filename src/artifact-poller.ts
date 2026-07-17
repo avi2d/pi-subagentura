@@ -38,6 +38,7 @@ import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
 import { debugLog } from "./helpers";
 import { formatActivityRow } from "./rendering";
+import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
@@ -284,7 +285,8 @@ function formatWorkflowWidgetRows(now: number): string[] {
     const parts = [
       `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
       `${s.runningCount ?? 0} running`,
-      `${s.tokensSpent} tokens`,
+      `${s.tokensSpent} output tokens`,
+      ...(s.usage ? [formatWorkflowUsage(s.usage)] : []),
       formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);

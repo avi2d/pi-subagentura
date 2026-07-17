@@ -40,6 +40,60 @@ export function zeroUsage(): Usage {
   };
 }
 
+export interface WorkflowUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  costUsd: number;
+  turns: number;
+}
+
+export function zeroWorkflowUsage(): WorkflowUsage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    turns: 0,
+  };
+}
+
+/** Return a new aggregate; callers never share mutable accounting state. */
+export function addWorkflowUsage(
+  total: WorkflowUsage,
+  usage: Usage | undefined,
+): WorkflowUsage {
+  const input = total.input + (usage?.input ?? 0);
+  const output = total.output + (usage?.output ?? 0);
+  const cacheRead = total.cacheRead + (usage?.cacheRead ?? 0);
+  const cacheWrite = total.cacheWrite + (usage?.cacheWrite ?? 0);
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens: input + output + cacheRead + cacheWrite,
+    costUsd: total.costUsd + (usage?.cost ?? 0),
+    turns: total.turns + (usage?.turns ?? 0),
+  };
+}
+
+function formatWorkflowCost(costUsd: number): string {
+  if (!Number.isFinite(costUsd)) return String(costUsd);
+  return costUsd.toLocaleString("en-US", {
+    useGrouping: false,
+    maximumFractionDigits: 15,
+  });
+}
+
+export function formatWorkflowUsage(usage: WorkflowUsage): string {
+  return `${usage.totalTokens} total tokens, $${formatWorkflowCost(usage.costUsd)}`;
+}
+
 // ── Public types ─────────────────────────────────────────────────────
 
 /** Options accepted by the injected `agent()` helper. */
@@ -107,7 +161,9 @@ export type WorkflowProgress =
       label?: string;
       agentsSpawned: number;
       errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
       tokensSpent: number;
+      usage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -118,7 +174,9 @@ export type WorkflowProgress =
       label?: string;
       agentsSpawned: number;
       errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
       tokensSpent: number;
+      usage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -129,7 +187,9 @@ export type WorkflowProgress =
       label?: string;
       agentsSpawned: number;
       errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
       tokensSpent: number;
+      usage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -140,7 +200,9 @@ export type WorkflowProgress =
       label?: string;
       agentsSpawned: number;
       errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
       tokensSpent: number;
+      usage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     };
@@ -148,21 +210,40 @@ export type WorkflowProgress =
 export type WorkflowProgressUpdate = {
   [K in WorkflowProgress["kind"]]: Omit<
     Extract<WorkflowProgress, { kind: K }>,
-    "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
+    "agentsSpawned" | "errorCount" | "tokensSpent" | "usage" | "runningCount"
   >;
 }[WorkflowProgress["kind"]];
 
+/** Legacy-compatible public result shape; v3.0.x producers populate `usage`. */
 export interface WorkflowRunResult {
   meta: WorkflowMeta;
   result: unknown;
   agentsSpawned: number;
   errorCount: number;
+  /** @deprecated Output-token count; use usage.totalTokens. */
   tokensSpent: number;
+  usage?: WorkflowUsage;
   phases: string[];
+}
+
+/** Result produced by `runWorkflow`; unlike the legacy boundary, usage is present. */
+export type WorkflowRunResultWithUsage = WorkflowRunResult & {
+  usage: WorkflowUsage;
+};
+
+export class WorkflowExecutionError extends Error {
+  readonly usage?: WorkflowUsage;
+
+  constructor(message: string, usage?: WorkflowUsage, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "WorkflowExecutionError";
+    this.usage = usage;
+  }
 }
 
 export interface RunWorkflowOptions {
   args?: unknown;
+  /** Soft completed-output-token target; in-flight parallel calls may overshoot. */
   budgetTotal?: number | null;
   runAgent: WorkflowAgentRunner;
   signal?: AbortSignal;
