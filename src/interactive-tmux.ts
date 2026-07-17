@@ -45,6 +45,11 @@ import {
   type MuxName,
   type Multiplexer,
 } from "./multiplexer";
+import {
+  snapshotInteractiveContext,
+  type CancellationSnapshotReceipt,
+  type CancellationSnapshotSource,
+} from "./cancellation-snapshots";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
@@ -162,6 +167,8 @@ export interface InteractiveSubagentState {
    * - cancel_interactive_subagent tool sets "cancelled"
    */
   status: InteractiveSubagentStatus;
+  /** Receipt for the latest parent cancellation snapshot. */
+  cancellationSnapshot?: CancellationSnapshotReceipt;
   /** Captured child pi exit code (0 = success). Undefined while still running. */
   exitCode?: number;
   attachCommand: string;
@@ -663,9 +670,22 @@ export function sendCommandToTmuxPane(paneId: string, command: string): void {
 
 export function cancelInteractiveSubagent(
   id: string,
+  source: CancellationSnapshotSource = "cancel_interactive_subagent",
 ): InteractiveSubagentState | undefined {
   const state = interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
+
+  const snapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source,
+  });
+  state.cancellationSnapshot = snapshot;
 
   // 1. Drop a `.cancelled` flag file in the artifact dir. The wrapper's EXIT trap
   //    checks for this before writing the `done` event; if present, it writes
@@ -675,14 +695,12 @@ export function cancelInteractiveSubagent(
   } catch {
     /* best effort — dir may not exist yet if the launch script is still warming up */
   }
-
   appendCancellation(state);
 
   // 2. Update the registry. The poller still processes the durable cancellation.
   state.status = "cancelled";
 
-  // 3. Kill the pane via the backend that created it. The wrapper's EXIT
-  //    trap fires and records the event.
+  // 3. Kill the pane via the backend that created it. The wrapper's EXIT trap fires and records the event.
   const mux = getMuxForState(state);
   if (mux.isPaneAlive(state.paneId, state.muxSession)) {
     mux.killPane(state.paneId, state.muxSession);
@@ -757,6 +775,18 @@ function appendCancellation(state: InteractiveSubagentState): void {
 export function cancelInteractiveSubagentByState(
   state: InteractiveSubagentState,
 ): void {
+  const snapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source: "session_shutdown",
+  });
+  state.cancellationSnapshot = snapshot;
+
   // 1. Write .cancelled flag (best-effort)
   try {
     writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });

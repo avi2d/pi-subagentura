@@ -33,6 +33,7 @@ import {
   isPaneAlive,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 
 // ── Engine (shared across nested workflows) ──────────────────────────
 
@@ -42,6 +43,7 @@ interface Engine {
   signal: AbortSignal;
   closed: boolean;
   onProgress?: (p: WorkflowProgress) => void;
+  onCancellationSnapshot?: RunWorkflowOptions["onCancellationSnapshot"];
   sem: Semaphore;
   processSem: Semaphore;
   loadWorkflow?: (name: string) => string | null;
@@ -73,6 +75,7 @@ export async function runWorkflow(
     signal: abort.signal,
     closed: false,
     onProgress: opts.onProgress,
+    onCancellationSnapshot: opts.onCancellationSnapshot,
     sem: createSemaphore(opts.concurrency ?? defaultConcurrency()),
     processSem: createSemaphore(
       opts.processConcurrency ?? defaultProcessConcurrency(),
@@ -187,6 +190,7 @@ async function executeScript(
             signal: engine.signal,
             isolation,
             label: agentOpts.label,
+            onCancellationSnapshot: engine.onCancellationSnapshot,
             onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
           });
           const outTokens = res.usage?.output ?? 0;
@@ -459,13 +463,17 @@ export async function awaitInteractiveResult(
   state: InteractiveSubagentState,
   signal: AbortSignal | undefined,
   pollMs = INTERACTIVE_POLL_MS,
+  onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void,
 ): Promise<SubagentResult> {
   const art = artifactFor(state);
   let deadTicks = 0;
   for (;;) {
     if (signal?.aborted) {
       try {
-        cancelInteractiveSubagent(state.id);
+        const cancelled = cancelInteractiveSubagent(state.id, "workflow");
+        if (cancelled?.cancellationSnapshot) {
+          onCancellationSnapshot?.(cancelled.cancellationSnapshot);
+        }
       } catch {
         /* best effort */
       }

@@ -27,6 +27,7 @@ import {
   type Usage,
 } from "../helpers";
 import { abortableWait } from "../abortable-wait";
+import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
   completionTriggersTurn,
   deliverNotification,
@@ -42,6 +43,7 @@ import {
 } from "../schemas";
 
 interface RunningFooterContext {
+  cwd?: string;
   ui: {
     setStatus(key: string, value?: string): void;
   };
@@ -270,6 +272,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           liveStatus,
           session,
           startedAt: Date.now(),
+          cwd: targetCwd,
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
@@ -434,6 +437,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           liveStatus,
           session,
           startedAt: Date.now(),
+          cwd: targetCwd,
           promise: jobPromise,
           modelLabel,
           notifyOnComplete:
@@ -775,19 +779,32 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
         };
       }
 
+      job.cancellationSnapshot = snapshotInProcessSession({
+        kind: "in-process",
+        jobId: job.id,
+        session: job.session,
+        cwd: ctx.cwd ?? process.cwd(),
+        model: job.modelLabel,
+        activeTool: job.liveStatus.activeTool,
+        partialOutput: job.liveStatus.output,
+        source: "cancel_subagent",
+      });
       try {
         await job.session.abort();
       } catch {
         /* Session may already be disposed; abort is best-effort */
       }
-
       job.status = "cancelled";
       scheduleJobCleanup(params.jobId, true);
       updateRunningFooter(ctx);
 
       return {
         content: [{ type: "text", text: `Job ${params.jobId} cancelled.` }],
-        details: { jobId: params.jobId, status: "cancelled" },
+        details: {
+          jobId: params.jobId,
+          status: "cancelled",
+          snapshot: job.cancellationSnapshot,
+        },
       };
     },
 

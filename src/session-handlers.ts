@@ -11,6 +11,7 @@ import { pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
 import { flushInProcessDeliveries } from "./notifications";
 import { jobRegistry } from "./helpers";
+import { snapshotInProcessSession } from "./cancellation-snapshots";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
 import {
   cancelInteractiveSubagentByState,
@@ -136,6 +137,20 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
+      // Snapshot all in-process jobs before any abort can wait for idle.
+      for (const job of jobRegistry.values()) {
+        if (job.status !== "running") continue;
+        job.cancellationSnapshot = snapshotInProcessSession({
+          kind: "in-process",
+          jobId: job.id,
+          session: job.session,
+          cwd: job.cwd ?? ctx?.cwd ?? process.cwd(),
+          model: job.modelLabel,
+          activeTool: job.liveStatus?.activeTool,
+          partialOutput: job.liveStatus?.output,
+          source: "session_shutdown",
+        });
+      }
       // Abort all running subagent sessions before clearing
       for (const job of jobRegistry.values()) {
         if (job.status === "running") {

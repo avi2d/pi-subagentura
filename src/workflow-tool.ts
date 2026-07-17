@@ -60,6 +60,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       isolation,
       label,
       onProgress,
+      onCancellationSnapshot,
     }) => {
       // Track last update time per agent label to throttle mid-agent previews
 
@@ -86,7 +87,12 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             contextText: null,
             background: true,
           });
-          const result = await awaitInteractiveResult(state, signal);
+          const result = await awaitInteractiveResult(
+            state,
+            signal,
+            undefined,
+            onCancellationSnapshot,
+          );
           return result;
         } catch (err) {
           // tmux/zellij unavailable — fall back to in-process, with visible warning.
@@ -122,6 +128,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         },
         defaultModel: ctx.model,
         parentModelRegistry: ctx.modelRegistry,
+        onCancellationSnapshot,
+        cancellationSource: "workflow",
       });
       return jobPromise;
     };
@@ -600,6 +608,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           status: "cancelled",
           workflowId: st.id,
           cancelled: true,
+          snapshots: [...(st.cancellationSnapshots ?? [])],
         },
       };
     },

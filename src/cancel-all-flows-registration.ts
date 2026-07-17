@@ -7,6 +7,19 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cancelAllFlows } from "./cancel-all-flows";
 
+function snapshotSummary(
+  result: Awaited<ReturnType<typeof cancelAllFlows>>,
+): string {
+  const receipts = result.snapshots ?? [];
+  if (receipts.length === 0) return "";
+  return receipts
+    .map((receipt) => {
+      const suffix = receipt.path ?? receipt.error ?? "no receipt path";
+      return `Snapshot ${receipt.status}: ${suffix}`;
+    })
+    .join("\n");
+}
+
 export function registerCancelAllFlows(pi: ExtensionAPI): void {
   // ── ctrl+alt+x shortcut ────────────────────────────────────────────
   if (typeof pi.registerShortcut === "function") {
@@ -31,7 +44,13 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
         if (parts.length === 0) {
           ctx.ui.notify("No active flows to cancel.", "info");
         } else {
-          ctx.ui.notify(`Cancelled: ${parts.join(", ")}`, "warning");
+          const message = [
+            `Cancelled: ${parts.join(", ")}`,
+            snapshotSummary(result),
+          ]
+            .filter(Boolean)
+            .join("\n");
+          ctx.ui.notify(message, "warning");
         }
       },
     });
@@ -60,7 +79,13 @@ export function registerCancelAllFlows(pi: ExtensionAPI): void {
         if (parts.length === 0) {
           ctx.ui.notify("No active flows to cancel.", "info");
         } else {
-          ctx.ui.notify(`Cancelled: ${parts.join(", ")}`, "warning");
+          const message = [
+            `Cancelled: ${parts.join(", ")}`,
+            snapshotSummary(result),
+          ]
+            .filter(Boolean)
+            .join("\n");
+          ctx.ui.notify(message, "warning");
         }
       },
     });
