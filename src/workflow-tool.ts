@@ -4,6 +4,7 @@ import { startSubagentJob, debugLog } from "./helpers";
 import { launchInteractiveSubagent } from "./interactive-tmux";
 import {
   MAX_ITEMS_PER_CALL,
+  INTERACTIVE_POLL_MS,
   MAX_TOTAL_AGENTS,
   listSavedWorkflows,
   loadWorkflowScript,
@@ -37,6 +38,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -46,6 +48,26 @@ function workflowNotFoundMessage(workflowId: string): string {
     `Workflow ${workflowId} not found in the current parent session. ` +
     "It may have been created in another session or removed by reload/resume/new/quit."
   );
+}
+
+const CANCELLATION_RECEIPT_GRACE_MS = INTERACTIVE_POLL_MS + 250;
+
+async function waitForCancellationReceipts(
+  state: WorkflowJobState,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = state.promise.then(
+    () => undefined,
+    () => undefined,
+  );
+  const grace = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, CANCELLATION_RECEIPT_GRACE_MS);
+  });
+  try {
+    await Promise.race([settled, grace]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function registerWorkflowTool(pi: ExtensionAPI): void {
@@ -60,6 +82,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       isolation,
       label,
       onProgress,
+      onCancellationSnapshot,
     }) => {
       // Track last update time per agent label to throttle mid-agent previews
 
@@ -86,7 +109,12 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             contextText: null,
             background: true,
           });
-          const result = await awaitInteractiveResult(state, signal);
+          const result = await awaitInteractiveResult(
+            state,
+            signal,
+            undefined,
+            onCancellationSnapshot,
+          );
           return result;
         } catch (err) {
           // tmux/zellij unavailable — fall back to in-process, with visible warning.
@@ -122,6 +150,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         },
         defaultModel: ctx.model,
         parentModelRegistry: ctx.modelRegistry,
+        onCancellationSnapshot,
+        cancellationSource: "workflow",
       });
       return jobPromise;
     };
@@ -594,12 +624,16 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }
       st.abort.abort();
       st.status = "cancelled";
+      if (cancellationSnapshotsEnabled()) {
+        await waitForCancellationReceipts(st);
+      }
       return {
         content: [{ type: "text", text: `Workflow ${st.id} cancelled.` }],
         details: {
           status: "cancelled",
           workflowId: st.id,
           cancelled: true,
+          snapshots: [...(st.cancellationSnapshots ?? [])],
         },
       };
     },

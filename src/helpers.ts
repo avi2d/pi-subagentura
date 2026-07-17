@@ -27,6 +27,11 @@ import {
   copyProviderConfig,
   createCompatibleSessionRuntime,
 } from "./pi-sdk-compat";
+import {
+  snapshotInProcessSession,
+  type CancellationSnapshotReceipt,
+  type CancellationSnapshotSource,
+} from "./cancellation-snapshots";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -139,6 +144,7 @@ export interface JobState {
   result?: SubagentResult;
   session: AgentSession;
   startedAt: number;
+  cwd?: string;
   promise: Promise<SubagentResult>;
   modelLabel?: string;
   /** Notification mode requested by spawner's notifyOnComplete param */
@@ -153,6 +159,8 @@ export interface JobState {
   activeResultWaits?: number;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
+  /** Most recent cancellation snapshot receipt, when snapshots are enabled. */
+  cancellationSnapshot?: CancellationSnapshotReceipt;
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -344,6 +352,8 @@ export interface StartSubagentJobParams {
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
+  onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void;
+  cancellationSource?: CancellationSnapshotSource;
 }
 
 export interface StartSubagentJobResult {
@@ -378,6 +388,8 @@ export async function startSubagentJob(
     onUpdate,
     defaultModel,
     parentModelRegistry,
+    onCancellationSnapshot,
+    cancellationSource,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -493,6 +505,17 @@ export async function startSubagentJob(
   if (signal) {
     handleAbort = () => {
       debugLog("warn", "job_abort", { jobId });
+      const receipt = snapshotInProcessSession({
+        kind: "in-process",
+        jobId,
+        session,
+        cwd,
+        model: modelLabel,
+        activeTool: liveStatus.activeTool,
+        partialOutput: liveStatus.output,
+        source: cancellationSource ?? "signal",
+      });
+      onCancellationSnapshot?.(receipt);
       session.abort().catch(() => {});
     };
     if (signal.aborted) {
