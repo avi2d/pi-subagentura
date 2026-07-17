@@ -12,8 +12,12 @@ permissions:
 
 jobs:
   test:
-    name: Test (latest Pi)
+    name: Test (Pi ${{ matrix.pi-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version: ["0.80.6", "latest"]
 
     steps:
       - name: Checkout
@@ -30,15 +34,17 @@ jobs:
       - name: Check formatting
         run: npm run format:check
 
-      - name: Install latest Pi SDK
+      - name: Install selected Pi SDK
+        env:
+          PI_VERSION: ${{ matrix.pi-version }}
         run: >-
           npm install --no-save --package-lock=false
-          '@earendil-works/pi-agent-core@latest'
-          '@earendil-works/pi-ai@latest'
-          '@earendil-works/pi-coding-agent@latest'
-          '@earendil-works/pi-tui@latest'
+          "@earendil-works/pi-agent-core@${PI_VERSION}"
+          "@earendil-works/pi-ai@${PI_VERSION}"
+          "@earendil-works/pi-coding-agent@${PI_VERSION}"
+          "@earendil-works/pi-tui@${PI_VERSION}"
 
-      - name: Verify extension loads in latest Pi
+      - name: Verify extension loads in selected Pi
         run: |
           npx --no-install pi --version
           PI_OFFLINE=1 npx --no-install pi --offline --no-session \

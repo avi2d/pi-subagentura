@@ -255,7 +255,7 @@ Implementation details for crash-safe ordering and delivery recovery are in the
 #### Sub-agent completion protocol
 
 Every interactive child runs protocol-only Pi lifecycle hooks and therefore
-requires Pi SDK `>=0.80.6 <0.81.0`. `before_agent_start` creates a provisional
+requires Pi SDK `>=0.80.6`. `before_agent_start` creates a provisional
 turn, the first `turn_start` binds it to the persisted Pi user-entry id, tool
 hooks record activity, and `agent_settled` records the authoritative completion
 after retries, compaction, and queued continuations. When Pi accepts Enter while
