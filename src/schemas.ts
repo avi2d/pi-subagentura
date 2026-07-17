@@ -46,7 +46,7 @@ export const BaseParams = Type.Object({
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
     }),
   ),
   maxAge: Type.Optional(
@@ -123,7 +123,7 @@ export const InteractiveParams = Type.Object({
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
     }),
   ),
   mux: Type.Optional(

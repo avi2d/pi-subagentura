@@ -185,7 +185,11 @@ export function formatCompletionDeliveryBehavior(
         ? "Completion output will not be injected into the parent LLM; only an artifact pointer will be added to parent context."
         : "Completion output was not injected into the parent LLM; only an artifact pointer was added to parent context.";
   const timing =
-    phase === "planned" ? " Delivery will wait until the parent is idle." : "";
+    phase !== "planned"
+      ? ""
+      : triggerTurn
+        ? " Delivery uses Pi's native follow-up queue if the parent is busy."
+        : " Delivery will wait until the parent is idle.";
   if (!triggerTurn) {
     const visibility =
       mode === "inject"
@@ -296,12 +300,25 @@ export function deliverNotification(
       collapseOldestJobDelivery(queue);
     }
   }
-  flushInProcessDeliveries();
+  requestInProcessDeliveryFlush();
+}
+
+function requestInProcessDeliveryFlush(): void {
+  const g = globalThis as any;
+  if (!g.__piSubagenturaParentStreaming) {
+    flushInProcessDeliveries();
+    return;
+  }
+  if (g.__piSubagenturaInProcessFlushScheduled) return;
+  g.__piSubagenturaInProcessFlushScheduled = true;
+  queueMicrotask(() => {
+    g.__piSubagenturaInProcessFlushScheduled = false;
+    flushInProcessDeliveries();
+  });
 }
 
 export function flushInProcessDeliveries(): void {
   const g = globalThis as any;
-  if (g.__piSubagenturaParentStreaming) return;
   const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return;
   const queue = pendingJobDeliveries();
@@ -359,6 +376,8 @@ export function flushInProcessDeliveries(): void {
     index++;
   }
   if (llm.length === 0) return;
+  const triggersTurn = llm.some(({ trigger }) => trigger);
+  if (g.__piSubagenturaParentStreaming && !triggersTurn) return;
   const deliveryIds = llm.map(({ pending }) => pending.deliveryId);
   try {
     pi.sendMessage(
@@ -381,7 +400,7 @@ export function flushInProcessDeliveries(): void {
       },
       {
         deliverAs: "followUp",
-        triggerTurn: llm.some(({ trigger }) => trigger),
+        triggerTurn: triggersTurn,
       },
     );
   } catch {
