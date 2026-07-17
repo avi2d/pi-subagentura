@@ -369,11 +369,16 @@ export function reconcileDeliveryReceipts(
     }
   }
   let changed = false;
+  const canRetryUncommittedDispatch = !(globalThis as any)
+    .__piSubagenturaParentStreaming;
   for (const intent of state.pendingDeliveries ?? []) {
     if (seen.has(intent.deliveryId)) {
       (state.deliveryReceipts ??= []).push(intent.deliveryId);
       changed = true;
-    } else if (intent.state === "dispatchAttempted") {
+    } else if (
+      intent.state === "dispatchAttempted" &&
+      canRetryUncommittedDispatch
+    ) {
       intent.state = "queued";
       changed = true;
     }

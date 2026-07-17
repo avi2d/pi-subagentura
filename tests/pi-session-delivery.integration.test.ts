@@ -81,7 +81,7 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
   };
   interactiveSubagentRegistry.set(state.id, state);
   enqueueDelivery(state, {
-    deliveryId: `${mode}-${triggerTurn}`,
+    deliveryId: `${mode}-${triggerTurn}-${harnesses.length}`,
     subagentId: state.id,
     turnId: "turn-1",
     eventId: "event-1",
@@ -178,18 +178,21 @@ describe("Pi session delivery integration", () => {
   });
 
   it("queues one streaming inject before its provider turn", async () => {
-    const { harness, state } = await setup("inject", true);
+    const { harness, sendMessage, state } = await setup("inject", true);
     const firstTurn = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    (globalThis as any).__piSubagenturaSessionManager = harness.sessionManager;
 
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
+    expect(sendMessage).toHaveBeenCalledOnce();
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
+    expect(sendMessage).toHaveBeenCalledOnce();
     expect(state.pendingDeliveries).toHaveLength(1);
     expect(harness.contexts).toHaveLength(1);
 
@@ -201,12 +204,12 @@ describe("Pi session delivery integration", () => {
     expect(
       harness.sessionManager
         .getEntries()
-        .some(
+        .filter(
           (entry: any) =>
             entry.type === "custom_message" &&
             entry.customType === "subagent-notify",
         ),
-    ).toBe(true);
+    ).toHaveLength(1);
     harness.completeNext("follow-up done");
     await vi.waitFor(() =>
       expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
