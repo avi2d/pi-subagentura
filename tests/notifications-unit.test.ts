@@ -53,6 +53,7 @@ function cleanGlobals() {
   globalState.__piSubagenturaUi = undefined;
   globalState.__piSubagenturaParentStreaming = false;
   globalState.__piSubagenturaPendingJobDeliveries = [];
+  globalState.__piSubagenturaInProcessFlushScheduled = false;
 }
 
 describe("in-process completion delivery queue", () => {
@@ -127,13 +128,30 @@ describe("in-process completion delivery queue", () => {
     expect(job.notificationDelivered).toBe(true);
   });
 
-  it("waits for the parent to become idle before dispatching", () => {
+  it("dispatches triggering completion through native followUp while streaming", async () => {
     const sendMessage = vi.fn();
     (globalThis as any).__piSubagenturaPiRef = { sendMessage };
     (globalThis as any).__piSubagenturaParentStreaming = true;
     const job = makeJobState({ notifyOnComplete: "inject" });
 
     deliverNotification(job, SUCCESS_RESULT);
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+    expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("waits for idle when completion must not trigger a turn", async () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const job = makeJobState({ notifyOnComplete: "notify" });
+
+    deliverNotification(job, SUCCESS_RESULT);
+    await Promise.resolve();
     expect(sendMessage).not.toHaveBeenCalled();
     expect(job.notificationDelivered).toBeFalsy();
 
@@ -141,6 +159,10 @@ describe("in-process completion delivery queue", () => {
     flushInProcessDeliveries();
 
     expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: false,
+    });
     expect(job.notificationDelivered).toBe(true);
   });
 });

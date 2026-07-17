@@ -11,7 +11,10 @@ import { resolve } from "node:path";
 import { getModel, getProviders } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
 
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type {
+  AgentToolResult,
+  ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 
 import {
   createAgentSession,
@@ -27,6 +30,11 @@ import {
   copyProviderConfig,
   createCompatibleSessionRuntime,
 } from "./pi-sdk-compat";
+import {
+  snapshotInProcessSession,
+  type CancellationSnapshotReceipt,
+  type CancellationSnapshotSource,
+} from "./cancellation-snapshots";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -109,12 +117,19 @@ export interface Usage {
 }
 
 export type SubagentResult =
-  | { isError: false; output: string; usage: Usage; model?: string }
+  | {
+      isError: false;
+      output: string;
+      usage: Usage;
+      model?: string;
+      thinkingLevel?: ThinkingLevel;
+    }
   | {
       isError: true;
       output: string;
       usage: Usage;
       model?: undefined;
+      thinkingLevel?: ThinkingLevel;
       errorMessage: string;
     };
 
@@ -123,6 +138,8 @@ export interface SubagentLiveStatus {
   activeTool?: { name: string; args: Record<string, unknown> };
   output: string;
   usage: Usage;
+  /** Effective level after Pi's model-capability clamping. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 // ── Async Job Types ─────────────────────────────────────────────────
@@ -139,8 +156,11 @@ export interface JobState {
   result?: SubagentResult;
   session: AgentSession;
   startedAt: number;
+  cwd?: string;
   promise: Promise<SubagentResult>;
   modelLabel?: string;
+  /** Effective level after Pi's model-capability clamping. */
+  thinkingLevel?: ThinkingLevel;
   /** Notification mode requested by spawner's notifyOnComplete param */
   notifyOnComplete?: NotifyOnComplete;
   /** Whether completion notifications should trigger a parent LLM turn. */
@@ -149,8 +169,12 @@ export interface JobState {
   notificationDelivered?: boolean;
   /** Set true by get_subagent_result to suppress redundant notification */
   resultRetrieved?: boolean;
+  /** Active get_subagent_result waits suppress settlement notifications. */
+  activeResultWaits?: number;
   /** Optional TTL in ms for completed job retention */
   maxAge?: number;
+  /** Most recent cancellation snapshot receipt, when snapshots are enabled. */
+  cancellationSnapshot?: CancellationSnapshotReceipt;
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -324,6 +348,7 @@ export function buildLiveUpdate(
       status: "running",
       subagentStatus: status,
       model,
+      thinkingLevel: status.thinkingLevel,
     },
   };
 }
@@ -342,6 +367,10 @@ export interface StartSubagentJobParams {
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
+  onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void;
+  cancellationSource?: CancellationSnapshotSource;
+  /** Thinking/reasoning level. Pass through to createAgentSession. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface StartSubagentJobResult {
@@ -350,6 +379,8 @@ export interface StartSubagentJobResult {
   session: AgentSession;
   liveStatus: SubagentLiveStatus;
   modelLabel?: string;
+  /** Effective session level after model-capability clamping. */
+  thinkingLevel?: ThinkingLevel;
   /** Warning when modelOverride was specified but not found — lists available models */
   modelWarning?: string;
 }
@@ -376,6 +407,9 @@ export async function startSubagentJob(
     onUpdate,
     defaultModel,
     parentModelRegistry,
+    onCancellationSnapshot,
+    cancellationSource,
+    thinkingLevel,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -474,12 +508,16 @@ export async function startSubagentJob(
     sessionManager: SessionManager.inMemory(),
     model: targetModel,
     cwd,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
   });
   const session = (
     await createAgentSession(
       sessionOptions as unknown as Parameters<typeof createAgentSession>[0],
     )
   ).session;
+  const effectiveThinkingLevel =
+    thinkingLevel === undefined ? undefined : session.thinkingLevel;
+  liveStatus.thinkingLevel = effectiveThinkingLevel;
   debugLog("info", "session_created", {
     jobId,
     sessionModel: session.model
@@ -491,6 +529,17 @@ export async function startSubagentJob(
   if (signal) {
     handleAbort = () => {
       debugLog("warn", "job_abort", { jobId });
+      const receipt = snapshotInProcessSession({
+        kind: "in-process",
+        jobId,
+        session,
+        cwd,
+        model: modelLabel,
+        activeTool: liveStatus.activeTool,
+        partialOutput: liveStatus.output,
+        source: cancellationSource ?? "signal",
+      });
+      onCancellationSnapshot?.(receipt);
       session.abort().catch(() => {});
     };
     if (signal.aborted) {
@@ -653,6 +702,7 @@ export async function startSubagentJob(
           output: finalOutput || "(no output)",
           usage,
           model: undefined,
+          thinkingLevel: effectiveThinkingLevel,
           errorMessage: session.agent.state.errorMessage,
         };
       } else {
@@ -663,6 +713,7 @@ export async function startSubagentJob(
           model: session.model
             ? `${session.model.provider}/${session.model.id}`
             : undefined,
+          thinkingLevel: effectiveThinkingLevel,
         };
       }
     } catch (err) {
@@ -685,6 +736,7 @@ export async function startSubagentJob(
           turns: 0,
         },
         model: undefined,
+        thinkingLevel: effectiveThinkingLevel,
         isError: true,
         errorMessage: msg,
       };
@@ -710,5 +762,13 @@ export async function startSubagentJob(
     return result;
   })();
 
-  return { jobId, jobPromise, session, liveStatus, modelLabel, modelWarning };
+  return {
+    jobId,
+    jobPromise,
+    session,
+    liveStatus,
+    modelLabel,
+    thinkingLevel: effectiveThinkingLevel,
+    modelWarning,
+  };
 }

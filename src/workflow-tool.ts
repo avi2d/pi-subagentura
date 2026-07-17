@@ -1,8 +1,10 @@
 import { Type } from "typebox";
+import { abortableWait } from "./abortable-wait";
 import { startSubagentJob, debugLog } from "./helpers";
 import { launchInteractiveSubagent } from "./interactive-tmux";
 import {
   MAX_ITEMS_PER_CALL,
+  INTERACTIVE_POLL_MS,
   MAX_TOTAL_AGENTS,
   listSavedWorkflows,
   loadWorkflowScript,
@@ -10,7 +12,11 @@ import {
   saveWorkflowScript,
   deleteWorkflowScript,
   type WorkflowAgentRunner,
+  WorkflowExecutionError,
   type WorkflowMeta,
+  type WorkflowRunResult,
+  type WorkflowUsage,
+  formatWorkflowUsage,
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
@@ -35,6 +41,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -44,6 +51,58 @@ function workflowNotFoundMessage(workflowId: string): string {
     `Workflow ${workflowId} not found in the current parent session. ` +
     "It may have been created in another session or removed by reload/resume/new/quit."
   );
+}
+
+const CANCELLATION_RECEIPT_GRACE_MS = INTERACTIVE_POLL_MS + 250;
+
+async function waitForCancellationReceipts(
+  state: WorkflowJobState,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = state.promise.then(
+    () => undefined,
+    () => undefined,
+  );
+  const grace = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, CANCELLATION_RECEIPT_GRACE_MS);
+  });
+  try {
+    await Promise.race([settled, grace]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function presentWorkflowUsage(
+  usage: WorkflowUsage | undefined,
+): WorkflowUsage | undefined {
+  if (
+    !usage ||
+    (usage.totalTokens === 0 && usage.costUsd === 0 && usage.turns === 0)
+  ) {
+    return undefined;
+  }
+  return usage;
+}
+
+function workflowErrorUsage(error: unknown): WorkflowUsage | undefined {
+  return error instanceof WorkflowExecutionError
+    ? presentWorkflowUsage(error.usage)
+    : undefined;
+}
+
+export function formatWorkflowNotificationSummary(
+  job: WorkflowJobState,
+): string {
+  const run = job.result;
+  if (run) {
+    return (
+      `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ` +
+      `${run.tokensSpent} output tokens${run.usage ? ` (${formatWorkflowUsage(run.usage)})` : ""}.`
+    );
+  }
+  const usage = presentWorkflowUsage(job.snapshot.usage);
+  return `${job.error ?? "Workflow did not produce a result."}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`;
 }
 
 export function registerWorkflowTool(pi: ExtensionAPI): void {
@@ -57,7 +116,9 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       signal,
       isolation,
       label,
+      thinkingLevel,
       onProgress,
+      onCancellationSnapshot,
     }) => {
       // Track last update time per agent label to throttle mid-agent previews
 
@@ -83,8 +144,14 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             cwd: ctx.cwd,
             contextText: null,
             background: true,
+            thinkingLevel,
           });
-          const result = await awaitInteractiveResult(state, signal);
+          const result = await awaitInteractiveResult(
+            state,
+            signal,
+            undefined,
+            onCancellationSnapshot,
+          );
           return result;
         } catch (err) {
           // tmux/zellij unavailable — fall back to in-process, with visible warning.
@@ -120,6 +187,9 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         },
         defaultModel: ctx.model,
         parentModelRegistry: ctx.modelRegistry,
+        onCancellationSnapshot,
+        cancellationSource: "workflow",
+        thinkingLevel,
       });
       return jobPromise;
     };
@@ -145,9 +215,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       errorCount,
     );
     const icon = presentation.icon || (job.status === "done" ? "✅" : "❌");
-    const rawSummary = run
-      ? `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens.`
-      : (job.error ?? "Workflow did not produce a result.");
+    const rawSummary = formatWorkflowNotificationSummary(job);
     const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
     let content = `${icon} Workflow "${job.name}" (${job.id}) ${presentation.label} — ${summary}`;
     if (run) {
@@ -164,6 +232,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             workflowId: job.id,
             status: job.status,
             presentationStatus: presentation.label,
+            usage: run?.usage ?? job.snapshot.usage,
           },
         },
         { deliverAs: "followUp", triggerTurn: true },
@@ -197,7 +266,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "",
       "Injected helpers/globals:",
       "  agent(prompt, opts?)   -> spawn one isolated sub-agent. opts: { schema?, label?, phase?,",
-      "                            model?, persona?, isolation? }. Without schema returns the final text;",
+      "                            model?, persona?, isolation?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
       "                            with schema returns a value validated against the supported JSON Schema",
       "                            subset (type, enum, required/properties, additionalProperties, items,",
       "                            minItems, maxItems), or null after retries. Returns null on error",
@@ -207,7 +276,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  parallel(thunks)       -> run `() => Promise` thunks concurrently (barrier); failures -> null.",
       "  pipeline(items, ...st) -> stream each item through stages, no barrier between stages.",
       "  workflow(name, args?)  -> run a saved workflow inline (one level deep).",
-      "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> token accounting.",
+      "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> soft completed-output-token target; parallel in-flight calls may overshoot.",
       "",
       "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
       "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
@@ -234,7 +303,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       budget: Type.Optional(
         Type.Number({
           description:
-            "Optional total output-token target; agent() throws once exhausted.",
+            "Optional soft completed-output-token target; in-flight calls may overshoot it, especially in parallel.",
         }),
       ),
       async: Type.Optional(
@@ -336,6 +405,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
                   runningCount: p.runningCount,
                   errorCount: p.errorCount,
                   tokensSpent: p.tokensSpent,
+                  usage: p.usage,
                 },
               });
             } catch {
@@ -357,7 +427,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           : "complete";
         const summary =
           `${completionPrefix}Workflow "${run.meta.name}" ${completionLabel} — ` +
-          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens.`;
+          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens (${formatWorkflowUsage(run.usage)}).`;
         return {
           content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
           details: {
@@ -367,14 +437,22 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             agentsSpawned: run.agentsSpawned,
             errorCount: run.errorCount,
             tokensSpent: run.tokensSpent,
+            usage: run.usage,
             phases: run.phases,
           },
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        const usage = workflowErrorUsage(err);
+        const usageDetails = usage ? { usage } : {};
         return {
-          content: [{ type: "text", text: `Workflow failed: ${msg}` }],
-          details: { status: "error", error: msg },
+          content: [
+            {
+              type: "text",
+              text: `Workflow failed: ${msg}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`,
+            },
+          ],
+          details: { status: "error", error: msg, ...usageDetails },
           isError: true,
         };
       }
@@ -386,7 +464,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     name: "get_workflow_status",
     label: "Workflow Status",
     description:
-      "Poll a background workflow's live progress (agents spawned, errors, tokens, current phase).",
+      "Poll a background workflow's live progress (agents spawned, errors, output tokens, total usage, current phase).",
     parameters: Type.Object({
       workflowId: Type.String({
         description: "Workflow ID returned by an async `workflow` spawn.",
@@ -418,7 +496,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
               (st.snapshot.runningCount && st.snapshot.runningCount > 0
                 ? `, ${st.snapshot.runningCount} running`
                 : "") +
-              `, ${errorCount} error(s), ${st.snapshot.tokensSpent} tokens` +
+              `, ${errorCount} error(s), ${st.snapshot.tokensSpent} output tokens` +
+              (st.snapshot.usage
+                ? ` (${formatWorkflowUsage(st.snapshot.usage)})`
+                : "") +
               (st.snapshot.currentPhase
                 ? `, phase: ${st.snapshot.currentPhase}`
                 : "") +
@@ -448,7 +529,11 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         description: "Workflow ID returned by an async `workflow` spawn.",
       }),
     }),
-    async execute(_id: string, params: any): Promise<any> {
+    async execute(
+      _id: string,
+      params: any,
+      signal?: AbortSignal,
+    ): Promise<any> {
       const st = workflowJobRegistry.get(params.workflowId);
       if (!st) {
         return {
@@ -459,51 +544,92 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      try {
-        const run = await st.promise;
-        const resultText =
-          typeof run.result === "string" ? run.result : stringify(run.result);
-        const presentation = getWorkflowCompletionPresentation(
-          "done",
-          run.errorCount,
-        );
+
+      // If signal is already aborted, return immediately
+      if (signal?.aborted) {
         return {
           content: [
             {
               type: "text",
-              text: (() => {
-                const prefix = presentation.icon ? `${presentation.icon} ` : "";
-                const label = presentation.icon
-                  ? presentation.label
-                  : "complete";
-                return (
-                  `${prefix}Workflow "${run.meta.name}" ${label} — ` +
-                  `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} tokens.\n\n${resultText}`
-                );
-              })(),
+              text: `Wait for workflow ${st.id} cancelled.`,
             },
           ],
-          details: {
-            status: "done",
-            presentationStatus: presentation.label,
-            workflowId: st.id,
-            name: run.meta.name,
-            agentsSpawned: run.agentsSpawned,
-            errorCount: run.errorCount,
-            tokensSpent: run.tokensSpent,
-            phases: run.phases,
-          },
-        };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          content: [
-            { type: "text", text: `Workflow ${st.id} ${st.status}: ${msg}` },
-          ],
-          details: { status: st.status, workflowId: st.id, error: msg },
+          details: { status: "wait_cancelled", workflowId: st.id },
           isError: true,
         };
       }
+
+      // Race st.promise against the abort signal
+      let run: WorkflowRunResult;
+      try {
+        const waitResult = await abortableWait(st.promise, signal);
+        if (waitResult.aborted) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Wait for workflow ${st.id} cancelled.`,
+              },
+            ],
+            details: { status: "wait_cancelled", workflowId: st.id },
+            isError: true,
+          };
+        }
+        run = waitResult.value!;
+      } catch (err) {
+        // Non-abort errors preserve the original structured handling
+        const msg = err instanceof Error ? err.message : String(err);
+        const usage = presentWorkflowUsage(st.snapshot?.usage);
+        const usageDetails = usage ? { usage } : {};
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workflow ${st.id} ${st.status}: ${msg}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`,
+            },
+          ],
+          details: {
+            status: st.status,
+            workflowId: st.id,
+            error: msg,
+            ...usageDetails,
+          },
+          isError: true,
+        };
+      }
+
+      const resultText =
+        typeof run.result === "string" ? run.result : stringify(run.result);
+      const presentation = getWorkflowCompletionPresentation(
+        "done",
+        run.errorCount,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: (() => {
+              const prefix = presentation.icon ? `${presentation.icon} ` : "";
+              const label = presentation.icon ? presentation.label : "complete";
+              return (
+                `${prefix}Workflow "${run.meta.name}" ${label} — ` +
+                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens${run.usage ? ` (${formatWorkflowUsage(run.usage)})` : ""}.\n\n${resultText}`
+              );
+            })(),
+          },
+        ],
+        details: {
+          status: "done",
+          presentationStatus: presentation.label,
+          workflowId: st.id,
+          name: run.meta.name,
+          agentsSpawned: run.agentsSpawned,
+          errorCount: run.errorCount,
+          tokensSpent: run.tokensSpent,
+          usage: run.usage,
+          phases: run.phases,
+        },
+      };
     },
   });
 
@@ -558,12 +684,16 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }
       st.abort.abort();
       st.status = "cancelled";
+      if (cancellationSnapshotsEnabled()) {
+        await waitForCancellationReceipts(st);
+      }
       return {
         content: [{ type: "text", text: `Workflow ${st.id} cancelled.` }],
         details: {
           status: "cancelled",
           workflowId: st.id,
           cancelled: true,
+          snapshots: [...(st.cancellationSnapshots ?? [])],
         },
       };
     },
@@ -876,7 +1006,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
 
     pi.registerCommand("workflow-status", {
       description:
-        "List running and completed workflow jobs with status, agent counts, tokens, and elapsed time.",
+        "List running and completed workflow jobs with status, agent counts, output tokens, total usage, and elapsed time.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
         const text = renderWorkflowJobs();
         ctx.ui.notify("📋 Workflow status listed.");
@@ -1017,7 +1147,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         parts.push(`⚡ ${s.runningCount} running`);
       }
       if (errorCount > 0) parts.push(`⚠ ${errorCount} error(s)`);
-      parts.push(`${s.tokensSpent} tokens`);
+      parts.push(`${s.tokensSpent} output tokens`);
+      if (s.usage) parts.push(formatWorkflowUsage(s.usage));
       parts.push(elapsed);
       if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
       if (st.error) parts.push(`error: ${st.error}`);

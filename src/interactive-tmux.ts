@@ -23,6 +23,7 @@
  * of the codebase compiles unchanged.
  */
 
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -32,6 +33,7 @@ import {
   appendInteractiveState,
   appendCompletionEvent,
   artifactPath,
+  assertNever,
   newEventId,
   type SubagentEvent,
   type PersistedDeliveryIntent,
@@ -45,6 +47,11 @@ import {
   type MuxName,
   type Multiplexer,
 } from "./multiplexer";
+import {
+  snapshotInteractiveContext,
+  type CancellationSnapshotReceipt,
+  type CancellationSnapshotSource,
+} from "./cancellation-snapshots";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
@@ -162,6 +169,8 @@ export interface InteractiveSubagentState {
    * - cancel_interactive_subagent tool sets "cancelled"
    */
   status: InteractiveSubagentStatus;
+  /** Receipt for the latest parent cancellation snapshot. */
+  cancellationSnapshot?: CancellationSnapshotReceipt;
   /** Captured child pi exit code (0 = success). Undefined while still running. */
   exitCode?: number;
   attachCommand: string;
@@ -329,6 +338,7 @@ export function buildPiInteractiveCommand(params: {
   systemPromptFile?: string;
   model?: string;
   cwd: string;
+  thinkingLevel?: ThinkingLevel;
 }): string {
   const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const parts = [
@@ -340,6 +350,9 @@ export function buildPiInteractiveCommand(params: {
   ];
   if (params.model) {
     parts.push("--model", escape(params.model));
+  }
+  if (params.thinkingLevel) {
+    parts.push("--thinking", escape(params.thinkingLevel));
   }
   if (params.systemPromptFile) {
     parts.push("--append-system-prompt", escape(params.systemPromptFile));
@@ -425,6 +438,8 @@ export function launchInteractiveSubagent(params: {
    * If omitted, falls back to `cwd` (backward-compatible for tests).
    */
   parentCwd?: string;
+  /** Thinking/reasoning level for the child Pi process. */
+  thinkingLevel?: ThinkingLevel;
 }): InteractiveSubagentState {
   const id = randomBytes(4).toString("hex");
   const cwd = resolve(params.cwd);
@@ -537,6 +552,7 @@ export function launchInteractiveSubagent(params: {
       systemPromptFile,
       model: params.model,
       cwd,
+      thinkingLevel: params.thinkingLevel,
     });
     writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
@@ -612,6 +628,13 @@ export function isPaneAlive(state: InteractiveSubagentState): boolean {
   return getMuxForState(state).isPaneAlive(state.paneId, state.muxSession);
 }
 
+/** Probe pane liveness without blocking the parent event loop. */
+export function isPaneAliveAsync(
+  state: InteractiveSubagentState,
+): Promise<boolean> {
+  return getMuxForState(state).isPaneAliveAsync(state.paneId, state.muxSession);
+}
+
 /**
  * Send a command (text + Enter) to a pane, using the mux that created it.
  * Mux-agnostic — replaces `sendCommandToTmuxPane(paneId, command)`.
@@ -663,9 +686,22 @@ export function sendCommandToTmuxPane(paneId: string, command: string): void {
 
 export function cancelInteractiveSubagent(
   id: string,
+  source: CancellationSnapshotSource = "cancel_interactive_subagent",
 ): InteractiveSubagentState | undefined {
   const state = interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
+
+  const snapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source,
+  });
+  state.cancellationSnapshot = snapshot;
 
   // 1. Drop a `.cancelled` flag file in the artifact dir. The wrapper's EXIT trap
   //    checks for this before writing the `done` event; if present, it writes
@@ -675,14 +711,12 @@ export function cancelInteractiveSubagent(
   } catch {
     /* best effort — dir may not exist yet if the launch script is still warming up */
   }
-
   appendCancellation(state);
 
   // 2. Update the registry. The poller still processes the durable cancellation.
   state.status = "cancelled";
 
-  // 3. Kill the pane via the backend that created it. The wrapper's EXIT
-  //    trap fires and records the event.
+  // 3. Kill the pane via the backend that created it. The wrapper's EXIT trap fires and records the event.
   const mux = getMuxForState(state);
   if (mux.isPaneAlive(state.paneId, state.muxSession)) {
     mux.killPane(state.paneId, state.muxSession);
@@ -757,6 +791,18 @@ function appendCancellation(state: InteractiveSubagentState): void {
 export function cancelInteractiveSubagentByState(
   state: InteractiveSubagentState,
 ): void {
+  const snapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source: "session_shutdown",
+  });
+  state.cancellationSnapshot = snapshot;
+
   // 1. Write .cancelled flag (best-effort)
   try {
     writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
@@ -788,19 +834,28 @@ export function deriveInteractiveSubagentStatus(
   lastEvent: SubagentEvent | null,
   paneAlive: boolean,
 ): InteractiveSubagentStatus {
-  if (lastEvent) {
-    if (lastEvent.type === "process_exited") {
+  if (!lastEvent) return paneAlive ? "running" : "unknown";
+  switch (lastEvent.type) {
+    case "process_exited":
       return lastEvent.status === "cancelled" ? "cancelled" : "exited";
-    }
-    if (lastEvent.type === "completion") {
+    case "completion":
       if (lastEvent.outcome === "cancelled") return "cancelled";
       return paneAlive ? "idle" : "exited";
-    }
-    if (lastEvent.type === "cancelled") return "cancelled";
-    if (lastEvent.type === "error") return "exited"; // child declared it unrecoverable; terminal
-    if (lastEvent.type === "done") return paneAlive ? "idle" : "exited";
+    case "cancelled":
+      return "cancelled";
+    case "error":
+      // child declared it unrecoverable; terminal
+      return "exited";
+    case "done":
+      return paneAlive ? "idle" : "exited";
+    case "started":
+    case "tool_activity":
+    case "turn_started":
+      // Non-terminal activity events: still running if pane is alive.
+      return paneAlive ? "running" : "unknown";
+    default:
+      return assertNever(lastEvent);
   }
-  return paneAlive ? "running" : "unknown";
 }
 
 export function deriveInteractiveSubagentStatusFromEvents(
@@ -817,44 +872,53 @@ export function foldInteractiveLifecycle(
   event: SubagentEvent,
 ): void {
   lifecycle.startedAt ??= event.ts;
-  if (event.type === "process_exited") {
-    lifecycle.processStatus = event.status;
-    lifecycle.processExitCode = event.exitCode;
-    return;
-  }
-  if (event.type === "turn_started") {
-    lifecycle.currentTurnId = event.turnId;
-    lifecycle.completionTurnId = undefined;
-    lifecycle.completionOutcome = undefined;
-    lifecycle.completionSource = undefined;
-    lifecycle.completionExitCode = undefined;
-    lifecycle.legacyTerminal = undefined;
-    return;
-  }
-  if (event.type === "completion") {
-    if (event.outcome === "cancelled" && event.source === "parent") {
-      lifecycle.parentCancelled = true;
+  switch (event.type) {
+    case "process_exited": {
+      lifecycle.processStatus = event.status;
+      lifecycle.processExitCode = event.exitCode;
+      return;
     }
-    if (!lifecycle.currentTurnId || event.turnId === lifecycle.currentTurnId) {
-      lifecycle.completionTurnId = event.turnId;
-      lifecycle.completionOutcome = event.outcome;
-      lifecycle.completionSource = event.source;
-      lifecycle.completionExitCode = event.exitCode;
+    case "turn_started": {
+      lifecycle.currentTurnId = event.turnId;
+      lifecycle.completionTurnId = undefined;
+      lifecycle.completionOutcome = undefined;
+      lifecycle.completionSource = undefined;
+      lifecycle.completionExitCode = undefined;
+      lifecycle.legacyTerminal = undefined;
+      return;
     }
-    return;
-  }
-  if (event.type === "started") {
-    lifecycle.legacyTerminal = undefined;
-    return;
-  }
-  if (
-    event.type === "done" ||
-    event.type === "error" ||
-    event.type === "cancelled"
-  ) {
-    lifecycle.legacyTerminal = event.status;
-    lifecycle.completionExitCode =
-      "exitCode" in event ? event.exitCode : undefined;
+    case "completion": {
+      if (event.outcome === "cancelled" && event.source === "parent") {
+        lifecycle.parentCancelled = true;
+      }
+      if (
+        !lifecycle.currentTurnId ||
+        event.turnId === lifecycle.currentTurnId
+      ) {
+        lifecycle.completionTurnId = event.turnId;
+        lifecycle.completionOutcome = event.outcome;
+        lifecycle.completionSource = event.source;
+        lifecycle.completionExitCode = event.exitCode;
+      }
+      return;
+    }
+    case "started": {
+      lifecycle.legacyTerminal = undefined;
+      return;
+    }
+    case "done":
+    case "error":
+    case "cancelled": {
+      lifecycle.legacyTerminal = event.status;
+      lifecycle.completionExitCode =
+        "exitCode" in event ? event.exitCode : undefined;
+      return;
+    }
+    case "tool_activity":
+      // Activity events do not affect lifecycle state.
+      return;
+    default:
+      return assertNever(event);
   }
 }
 

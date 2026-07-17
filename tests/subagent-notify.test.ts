@@ -647,7 +647,7 @@ describe("notifyOnComplete", () => {
       );
     });
 
-    it("holds inject completion while the parent is streaming", async () => {
+    it("queues triggering inject completion through Pi while streaming", async () => {
       (globalThis as any).__piSubagenturaParentStreaming = true;
       const jobId = "inject-cap";
       const control = createJobControl();
@@ -671,9 +671,14 @@ describe("notifyOnComplete", () => {
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {
         expect(jobRegistry.get(jobId)?.status).toBe("done");
+        expect(api.sendMessage).toHaveBeenCalledOnce();
       });
-      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(api.sendMessage.mock.calls[0][1]).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
       expect(api.sendUserMessage).not.toHaveBeenCalled();
+
       (globalThis as any).__piSubagenturaParentStreaming = false;
       flushInProcessDeliveries();
       expect(api.sendMessage).toHaveBeenCalledOnce();
@@ -1334,7 +1339,11 @@ describe("read_subagent_artifact (output reporting)", () => {
     return mkdtempSync(join(tmpdir(), "pi-subagentura-read-out-"));
   }
 
-  function makeArtifactWithDone(id: string, parentDir: string) {
+  function makeArtifactWithDone(
+    id: string,
+    parentDir: string,
+    appendLegacyDone = true,
+  ) {
     const dir = join(parentDir, id);
     const state: import("../src/interactive-tmux").InteractiveSubagentState = {
       id,
@@ -1353,7 +1362,9 @@ describe("read_subagent_artifact (output reporting)", () => {
     };
     const art = artifactPath(parentDir, id);
     appendEvent(art, { ts: 1, type: "started", status: "running" });
-    appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    if (appendLegacyDone) {
+      appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+    }
     return { state, art, dir };
   }
 
@@ -1407,6 +1418,80 @@ describe("read_subagent_artifact (output reporting)", () => {
       expect(text).toContain("last event: done @ 2");
       expect(text).not.toContain("not written yet");
       expect(result.details.output).toBeNull();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a protocol-v2 completion as exited when output.md is missing", async () => {
+    const id = "ab12cd38";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      appendCompletionEvent(art, {
+        turnId: "turn-without-output",
+        eventId: "completion-without-output",
+        outcome: "done",
+        source: "agent_settled",
+        ts: 2,
+      });
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+      const readTool = makeReadTool(mod);
+
+      const result = await readTool.execute(
+        "call-v2-no-output",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
+      const text = result.content[0].text;
+
+      expect(text).toContain(
+        "Output: (sub-agent exited without writing output.md",
+      );
+      expect(text).toContain("last event: completion @ 2");
+      expect(text).not.toContain("not written yet");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a protocol-v2 process exit as exited when output.md is missing", async () => {
+    const id = "ab12cd39";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      appendEvent(art, {
+        version: 2,
+        eventId: "process-exit-without-output",
+        turnId: "turn-process-exit",
+        ts: 2,
+        type: "process_exited",
+        status: "done",
+        exitCode: 0,
+      });
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      mod.interactiveSubagentRegistry.set(id, state);
+      const readTool = makeReadTool(mod);
+
+      const result = await readTool.execute(
+        "call-v2-process-exit-no-output",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
+      const text = result.content[0].text;
+
+      expect(text).toContain(
+        "Output: (sub-agent exited without writing output.md",
+      );
+      expect(text).toContain("last event: process_exited @ 2");
+      expect(text).not.toContain("not written yet");
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }

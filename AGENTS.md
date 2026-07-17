@@ -6,7 +6,7 @@ A public [Pi](https://pi.dev) extension that adds in-process and attachable sub-
 
 - **npm package** `pi-subagentura` — published via OIDC trusted publishing on push of a `v*` tag.
 - **Pi extension** — single entry point: `./src/subagent.ts` (declared in `package.json#pi.extensions`).
-- **TypeScript, ESM, strict mode**, `target: ESNext`, Node ≥ 18, Pi SDK ≥ 0.80.6 and < 0.81.
+- **TypeScript, ESM, strict mode**, `target: ESNext`, Node ≥ 18, Pi SDK ≥ 0.80.6. CI verifies both the minimum and latest published Pi SDKs.
 - **Runtime deps** are minimal: `ndjson`, `is-path-inside`. Pi SDKs are peer dependencies.
 - **Tests** are `vitest` and live in `tests/` as `*.test.ts` (27 test files, ~12k lines of test code).
 - **CI** is a single GitHub Actions workflow: typecheck → tests → published-tarball smoke → pack dry-run.
@@ -37,7 +37,7 @@ The pre-commit hook (`simple-git-hooks` → `lint-staged` → `prettier --write`
 | `src/helpers.ts`               | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `formatUsage`, job registry and cleanup.                                                                                              |
 | `src/artifact.ts`              | Versioned artifact protocol, immutable `outputs/<eventId>.md`, byte readers, mixed-v1 compatibility, and state-v2 helpers.                                                                                        |
 | `src/child-protocol.ts`        | Child-only Pi lifecycle hooks selected by `PI_SUBAGENTURA_CHILD=1`.                                                                                                                                               |
-| `src/delivery.ts`              | Bounded durable idle-only delivery queue and deterministic delivery IDs.                                                                                                                                          |
+| `src/delivery.ts`              | Bounded durable trigger-aware delivery queue and deterministic delivery IDs.                                                                                                                                      |
 | `src/interactive-tmux.ts`      | `InteractiveSubagentState` and registry, launch-script builder, mux backend dispatch (is-alive, send-keys, kill-pane).                                                                                            |
 | `src/multiplexer*.ts`          | Pluggable multiplexer interface + tmux and zellij backends. Registry auto-detects available backend at runtime.                                                                                                   |
 | `src/subagent-artifact-cli.ts` | Tiny `cli.mjs` wrapper called by the child: `cli.mjs done N` / `cli.mjs error "msg"`.                                                                                                                             |

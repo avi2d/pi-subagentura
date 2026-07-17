@@ -84,8 +84,116 @@ describe("pollArtifactChanges", () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the event loop responsive while async liveness is pending", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const { state, artifactDir } = makeState();
+    mkdirSync(artifactDir, { recursive: true });
+    let resolveProbe!: (alive: boolean) => void;
+    let probeStarted = false;
+    let settled = false;
+    const probe = new Promise<boolean>((resolve) => {
+      resolveProbe = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAlive: () => {
+        throw new Error("sync liveness probe must not run");
+      },
+      isPaneAliveAsync: () => {
+        probeStarted = true;
+        return probe;
+      },
+    } as any);
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const polling = mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    void Promise.resolve(polling).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(probeStarted).toBe(true);
+    expect(settled).toBe(false);
+    let timerRan = false;
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timerRan = true;
+        resolve();
+      }, 0);
+    });
+    expect(timerRan).toBe(true);
+    expect(settled).toBe(false);
+    resolveProbe(true);
+    await polling;
+    expect(settled).toBe(true);
+    multiplexer.__setTmuxMultiplexer(undefined);
+  });
+
+  it("drops a pending poll when shutdown clears the registry", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const { state, artifactDir } = makeState();
+    mkdirSync(artifactDir, { recursive: true });
+    appendEvent(artifactPath(join(artifactDir, ".."), state.id), {
+      ts: 1,
+      type: "done",
+      status: "done",
+      exitCode: 0,
+    });
+    let resolveProbe!: (alive: boolean) => void;
+    const probe = new Promise<boolean>((resolve) => {
+      resolveProbe = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAlive: () => {
+        throw new Error("sync liveness probe must not run");
+      },
+      isPaneAliveAsync: () => probe,
+    } as any);
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const sendMessage = vi.fn();
+    const polling = mod.pollArtifactChanges({ sendMessage } as any);
+    await Promise.resolve();
+    mod.interactiveSubagentRegistry.clear();
+    resolveProbe(true);
+    await polling;
+    expect(state.eventByteCursor).toBeUndefined();
+    expect(sendMessage).not.toHaveBeenCalled();
+    multiplexer.__setTmuxMultiplexer(undefined);
+  });
+
+  it("does not overlap pending poll ticks", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const { state, artifactDir } = makeState();
+    mkdirSync(artifactDir, { recursive: true });
+    let probeCalls = 0;
+    let resolveProbe!: (alive: boolean) => void;
+    const probe = new Promise<boolean>((resolve) => {
+      resolveProbe = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAlive: () => {
+        throw new Error("sync liveness probe must not run");
+      },
+      isPaneAliveAsync: () => {
+        probeCalls++;
+        return probe;
+      },
+    } as any);
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const first = mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    const second = mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await Promise.resolve();
+    expect(probeCalls).toBe(1);
+    resolveProbe(true);
+    await Promise.all([first, second]);
+    multiplexer.__setTmuxMultiplexer(undefined);
   });
 
   it("paints workflow footer and widget for running workflows", async () => {
@@ -114,7 +222,7 @@ describe("pollArtifactChanges", () => {
     const setWidget = vi.fn();
     (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-workflows",
@@ -142,12 +250,12 @@ describe("pollArtifactChanges", () => {
       artifactDir: undefined,
     } as any);
 
-    expect(() =>
+    await expect(
       mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any),
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
 
     const logFile = join(
       logDir,
@@ -220,8 +328,8 @@ describe("pollArtifactChanges", () => {
 
     (globalThis as any).__piSubagenturaParentStreaming = false;
     const sendMessage = vi.fn();
-    mod.pollArtifactChanges({ sendMessage } as any);
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(state.pendingDeliveries).toEqual([]);
     expect(state.deliveryReceipts).toHaveLength(1);
@@ -277,7 +385,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     // Only done fires. started is silent (widget shows it).
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -307,7 +415,7 @@ describe("pollArtifactChanges", () => {
     });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     // Both are silent (started → TUI widget row; tool_activity → TUI widget only).
     expect(sendMessage).not.toHaveBeenCalled();
@@ -330,7 +438,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 3, type: "cancelled", status: "cancelled" });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage.mock.calls[0][0].content).toContain("error");
@@ -347,13 +455,13 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     // Only done fires (started is silent).
     expect(sendMessage).toHaveBeenCalledTimes(1);
 
     // Second poll: no new events, no new notifications.
     sendMessage.mockClear();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
@@ -372,7 +480,7 @@ describe("pollArtifactChanges", () => {
     state.eventByteCursor = readEventRecords(art)[0].endOffset;
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     // Should deliver done + cancelled, not started.
     expect(sendMessage).toHaveBeenCalledOnce();
@@ -390,6 +498,12 @@ describe("pollArtifactChanges", () => {
         if (args[0] === "display-message") return Buffer.from("#99");
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -399,7 +513,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.status).toBe("idle");
     // exitCode is NOT set on idle — child is still around.
     expect(state.exitCode).toBeUndefined();
@@ -412,6 +526,12 @@ describe("pollArtifactChanges", () => {
       execFileSync: () => {
         throw new Error("can't find pane: %99");
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(new Error("can't find pane: %99")),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -421,7 +541,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.status).toBe("exited");
     expect(state.exitCode).toBe(0);
   });
@@ -434,7 +554,7 @@ describe("pollArtifactChanges", () => {
     const art = artifactPath(join(artifactDir, ".."), state.id);
     appendEvent(art, { ts: 1, type: "cancelled", status: "cancelled" });
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.status).toBe("cancelled");
   });
 
@@ -448,7 +568,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 1, type: "done", status: "done", exitCode: 0 });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).toHaveBeenCalledOnce();
   });
 
@@ -466,6 +586,18 @@ describe("pollArtifactChanges", () => {
         }
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => {
+        paneProbeCount++;
+        callback(
+          paneProbeCount === 1 ? new Error("pane not ready yet") : null,
+          "#99",
+        );
+      },
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -475,11 +607,11 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(state.status).toBe("unknown");
 
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0][0].content).toContain("done");
@@ -507,7 +639,7 @@ describe("pollArtifactChanges", () => {
     appendEvent(art, { ts: 3, type: "done", status: "done", exitCode: 0 }); // follow-up turn
 
     const sendMessage = installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     // The new done event (ts=3) is delivered as a pointer notification.
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -536,7 +668,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][0].content).not.toContain(
@@ -563,7 +695,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       // Legacy completions are pointer-only even when the delivery mode is inject.
       expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -584,7 +716,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendUserMessage).not.toHaveBeenCalled();
@@ -603,7 +735,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][1]).toMatchObject({
@@ -627,7 +759,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][1]).toEqual({
@@ -655,7 +787,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][1]).toMatchObject({
@@ -678,14 +810,14 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendUserMessage).not.toHaveBeenCalled();
 
       // Second poll: no new events (cursor advanced), inject is gated by state.injected.
       sendMessage.mockClear();
       sendUserMessage.mockClear();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
       expect(sendMessage).not.toHaveBeenCalled();
       expect(sendUserMessage).not.toHaveBeenCalled();
     });
@@ -711,7 +843,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][0].content).not.toContain("answer v1");
       expect(sendMessage.mock.calls[0][0].content).toContain("Output:");
@@ -723,7 +855,7 @@ describe("pollArtifactChanges", () => {
 
       sendMessage.mockClear();
       sendUserMessage.mockClear();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(sendMessage.mock.calls[0][0].content).not.toContain("answer v2");
@@ -743,7 +875,7 @@ describe("pollArtifactChanges", () => {
 
       const sendMessage = installDeliverySpies();
       const sendUserMessage = vi.fn();
-      mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
+      await mod.pollArtifactChanges({ sendMessage, sendUserMessage } as any);
 
       expect(sendUserMessage).not.toHaveBeenCalled();
       expect(sendMessage).toHaveBeenCalledOnce();
@@ -771,7 +903,7 @@ describe("pollArtifactChanges", () => {
       appendEvent(art, { ts: 1, type: "started", status: "running" });
       appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
       writeOutput(art, "answer v1");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -779,7 +911,7 @@ describe("pollArtifactChanges", () => {
       // Turn 2.
       appendEvent(art, { ts: 3, type: "done", status: "done", exitCode: 0 });
       writeOutput(art, "answer v2");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -808,7 +940,7 @@ describe("pollArtifactChanges", () => {
       appendEvent(art, { ts: 1, type: "started", status: "running" });
       appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
       writeOutput(art, "answer v1");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -835,7 +967,7 @@ describe("pollArtifactChanges", () => {
       appendEvent(art, { ts: 1, type: "started", status: "running" });
       appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
       writeOutput(art, "answer v1");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -844,7 +976,7 @@ describe("pollArtifactChanges", () => {
       // Follow-up turn: the child overwrites output.md but its done event has NOT landed yet
       // (last event is still the turn-1 done@ts2). A poll lands in this window.
       writeOutput(art, "answer v2 in progress");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -854,7 +986,7 @@ describe("pollArtifactChanges", () => {
       // A second legacy completion remains pointer-only.
       appendEvent(art, { ts: 3, type: "done", status: "done", exitCode: 0 });
       writeOutput(art, "answer v2 final");
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -884,6 +1016,16 @@ describe("pollArtifactChanges", () => {
           }
           return "";
         },
+        execFile: (
+          _file: string,
+          args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) =>
+          callback(
+            args[3] === "%exited-pane" ? new Error("pane dead") : null,
+            "#99",
+          ),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -931,7 +1073,7 @@ describe("pollArtifactChanges", () => {
       const setWidget = vi.fn();
       (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -962,6 +1104,12 @@ describe("pollArtifactChanges", () => {
           if (args[0] === "-lc") return Buffer.from("");
           throw new Error("pane dead");
         },
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(new Error("pane dead")),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -987,7 +1135,7 @@ describe("pollArtifactChanges", () => {
       const setWidget = vi.fn();
       (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -1011,6 +1159,12 @@ describe("pollArtifactChanges", () => {
           if (args[0] === "display-message") return Buffer.from("#99");
           return "";
         },
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "#99"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1026,7 +1180,7 @@ describe("pollArtifactChanges", () => {
       const setWidget = vi.fn();
       (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-      mod.pollArtifactChanges({
+      await mod.pollArtifactChanges({
         sendMessage: vi.fn(),
         sendUserMessage: vi.fn(),
       } as any);
@@ -1103,7 +1257,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
     installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1130,7 +1284,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     (globalThis as any).__piSubagenturaSessionManager = {
       getEntries: () => entries,
     };
-    mod.pollArtifactChanges({
+    await mod.pollArtifactChanges({
       sendMessage: vi.fn((message) => {
         entries.push({ type: "custom_message", details: message.details });
       }),
@@ -1147,6 +1301,12 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
         if (args[0] === "display-message") return Buffer.from("#99");
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1156,7 +1316,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1170,6 +1330,12 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
         if (args[0] === "display-message") return Buffer.from("#99");
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1189,7 +1355,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     });
 
     installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     expect(state.status).toBe("idle");
     expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
@@ -1218,7 +1384,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
       exitCode: 1,
     });
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     expect(state.status).toBe("exited");
     expect(loadInteractiveStates(cwd)?.states[id]).toBeUndefined();
@@ -1238,7 +1404,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     });
 
     installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1256,7 +1422,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     appendEvent(art, { ts: 1, type: "cancelled", status: "cancelled" });
 
     installDeliverySpies();
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1288,7 +1454,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1297,6 +1463,16 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   });
 
   it("does NOT remove the state.json entry on tool_activity events (only terminals)", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => "",
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
+    }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { cwd, id, state } = makePersistedState();
@@ -1310,7 +1486,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
       summary: "ls",
     });
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[id]).toBeDefined();
@@ -1339,9 +1515,9 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     const art = artifactPath("/tmp", id);
     appendEvent(art, { ts: 1, type: "done", status: "done", exitCode: 0 });
 
-    expect(() =>
+    await expect(
       mod.pollArtifactChanges({ sendMessage: vi.fn() } as any),
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
   });
 
   it("advances eventByteCursor before removing the state entry", async () => {
@@ -1353,7 +1529,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
 
-    mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
 
     expect(state.eventByteCursor).toBe(eventLogEndOffset(art));
   });

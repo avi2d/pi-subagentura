@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  isArtifactOutputSettled,
   lastEvent,
   listOutputHistory,
   listOutputTurns,
@@ -167,6 +168,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
+          thinkingLevel: params.thinkingLevel,
         });
 
         const displayMode = state.windowName
@@ -182,7 +184,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
                 `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
             },
           ],
-          details: { ...state, status: "started" },
+          details: {
+            ...state,
+            status: "started",
+            thinkingLevel: params.thinkingLevel,
+          },
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -212,7 +218,13 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme) {
       const details = result.details as
-        Partial<InteractiveSubagentState> | undefined;
+        | (Partial<InteractiveSubagentState> & { thinkingLevel?: string })
+        | undefined;
+      const id = details?.id ?? "unknown";
+      const paneId = details?.paneId ?? "unknown";
+      const thinking = details?.thinkingLevel
+        ? ` · thinking: ${details.thinkingLevel}`
+        : "";
       if ((result as any).isError) {
         const first = result.content?.[0];
         const text =
@@ -221,12 +233,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             : "Failed to start interactive sub-agent";
         return new Text(theme.fg("error", text), 0, 0);
       }
-      const id = details?.id ?? "unknown";
-      const paneId = details?.paneId ?? "unknown";
       return new Text(
         theme.fg("accent", "⚡ ") +
           theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
-          theme.fg("dim", ` — pane ${paneId}`),
+          theme.fg("dim", ` — pane ${paneId}${thinking}`),
         0,
         0,
       );
@@ -313,9 +323,14 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      const snapshotText = state.cancellationSnapshot?.path
+        ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
+        : state.cancellationSnapshot?.error
+          ? ` Snapshot error: ${state.cancellationSnapshot.error}`
+          : "";
       userNotification =
         `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
-        `Artifacts retained at ${state.artifactDir}.`;
+        `Artifacts retained at ${state.artifactDir}.${snapshotText}`;
       try {
         ctx.ui.notify(userNotification, "warning");
       } catch {
@@ -328,7 +343,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             text:
               `Interactive sub-agent ${params.jobId} cancelled. ` +
               `No separate cancellation completion will be injected into the parent LLM. ` +
-              `Artifacts retained at ${state.artifactDir}.`,
+              `Artifacts retained at ${state.artifactDir}.` +
+              (state.cancellationSnapshot?.path
+                ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}.`
+                : state.cancellationSnapshot?.error
+                  ? ` Snapshot error: ${state.cancellationSnapshot.error}.`
+                  : ""),
           },
         ],
         details: { ...state },
@@ -603,10 +623,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           outputText = `(no snapshot for turn ${params.turn} — the poller may not have run yet, or this turn number is past the history)`;
         } else {
           const exited =
-            lastEventValue &&
-            (lastEventValue.type === "done" ||
-              lastEventValue.type === "error" ||
-              lastEventValue.type === "cancelled");
+            lastEventValue && isArtifactOutputSettled(lastEventValue);
           outputText = exited
             ? `(sub-agent exited without writing output.md — last event: ${lastEventValue.type} @ ${lastEventValue.ts})`
             : `(${events.length} events, last: ${lastEventValue ? `${lastEventValue.type} @ ${lastEventValue.ts}` : "(none)"} — output.md not written yet)`;

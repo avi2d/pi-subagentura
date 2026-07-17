@@ -5,7 +5,7 @@
  * registration and lifecycle management. This module owns the poll interval's per-tick
  * work: walking the artifact directory of every running interactive sub-agent, tail-reading
  * the child's session JSONL, appending legacy tool_activity events, and enqueueing
- * protocol completions for idle-only delivery.
+ * protocol completions for trigger-aware delivery.
  *
  * See src/subagent.ts for the interval setup / teardown and the rehydrate logic.
  */
@@ -17,9 +17,13 @@ import type {
 import {
   artifactPath,
   appendEvent,
+  assertNever,
+  isCompletionEvent,
   readEventBatch,
   removeInteractiveState,
   updateInteractiveState,
+  type CompletionEvent,
+  type CompletionOutcome,
   type SubagentArtifact,
   type SubagentEvent,
 } from "./artifact";
@@ -27,13 +31,14 @@ import {
   deriveInteractiveSubagentStatusFromLifecycle,
   foldInteractiveLifecycle,
   interactiveSubagentRegistry,
-  isPaneAlive,
+  isPaneAliveAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
 import { debugLog } from "./helpers";
 import { formatActivityRow } from "./rendering";
+import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
@@ -49,6 +54,23 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+
+/** Derive delivery status from an already narrowed completion event. */
+function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
+  switch (ev.type) {
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    case "completion":
+      return ev.outcome;
+    default:
+      return assertNever(ev);
+  }
+}
+let pollInFlight: Promise<void> | undefined;
 // ── Poller ─────────────────────────────────────────────────────────────
 
 /**
@@ -58,21 +80,52 @@ const MAX_WORKFLOW_WIDGET_ROWS = 5;
  * Backwards-compatible with sub-agents that finished during parent downtime:
  * we walk the artifact log in physical byte order and advance eventByteCursor.
  */
-export function pollArtifactChanges(pi: ExtensionAPI): void {
+export function pollArtifactChanges(pi: ExtensionAPI): Promise<void> {
+  if (pollInFlight) return pollInFlight;
+  const poll = runPollArtifactChanges(pi);
+  pollInFlight = poll;
+  return poll.finally(() => {
+    if (pollInFlight === poll) pollInFlight = undefined;
+  });
+}
+
+async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
   // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
   // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
   // pi ctx) try again. A stale extension context after session replacement is the most likely cause.
   try {
     const g2 = typeof global !== "undefined" ? global : globalThis;
+    const initialPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     const interactivePi =
       (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
     if (!interactivePi) return;
 
+    const states = [...interactiveSubagentRegistry.values()];
+    const liveness = await Promise.all(
+      states.map(async (state) => {
+        try {
+          return [state, await isPaneAliveAsync(state)] as const;
+        } catch (err) {
+          debugLog("error", "poller_liveness_error", {
+            stateId: state.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return [state, false] as const;
+        }
+      }),
+    );
+    const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
+    if (
+      (initialPiRef !== undefined && currentPiRef === undefined) ||
+      (currentPiRef !== undefined && currentPiRef !== interactivePi)
+    ) {
+      return;
+    }
     let runningCount = 0;
     const widgetRows: string[] = [];
     const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
-
-    for (const state of interactiveSubagentRegistry.values()) {
+    for (const [state, paneAlive] of liveness) {
+      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
       // the artifact log: a later done/error event must still reach the parent.
       // 'exited' is intentionally not skipped: a follow-up user entry can revive it to "running".
@@ -80,7 +133,6 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         dirname(state.artifactDir),
         basename(state.artifactDir),
       );
-      const paneAlive = isPaneAlive(state);
       // Tail-read the child's session log and synthesize tool_activity events.
       // TUI-widget only — the LLM never sees them.
       tailReadSessionLog(state, art);
@@ -97,11 +149,8 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         if ("version" in ev && ev.version === 2 && ev.type === "turn_started") {
           state.activeTurnId = ev.turnId;
         }
-        if (!shouldNotify(ev)) continue;
-        const v2 =
-          "version" in ev && ev.version === 2 && ev.type === "completion"
-            ? ev
-            : null;
+        if (!shouldNotify(ev) || !isCompletionEvent(ev)) continue;
+        const v2 = ev.type === "completion" ? ev : undefined;
         const mode = state.notifyOnComplete ?? "inject";
         const triggerTurn =
           mode === "inject"
@@ -112,13 +161,7 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
           v2?.eventId ??
           (ev as unknown as { eventId?: string }).eventId ??
           `legacy-${record.startOffset}`;
-        const status =
-          v2?.outcome ??
-          (ev.type === "error"
-            ? "error"
-            : ev.type === "cancelled"
-              ? "cancelled"
-              : "done");
+        const status = deliveryStatusFromEvent(ev);
         enqueueDelivery(state, {
           deliveryId: deliveryIdFor({
             parentSessionId: state.parentSessionId ?? "pi",
@@ -273,7 +316,8 @@ function formatWorkflowWidgetRows(now: number): string[] {
     const parts = [
       `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
       `${s.runningCount ?? 0} running`,
-      `${s.tokensSpent} tokens`,
+      `${s.tokensSpent} output tokens`,
+      ...(s.usage ? [formatWorkflowUsage(s.usage)] : []),
       formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);

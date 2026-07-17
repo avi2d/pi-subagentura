@@ -1,4 +1,19 @@
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+
+const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
+function thinkingLevelSchema(description: string) {
+  return StringEnum(THINKING_LEVELS, { description });
+}
 
 export const BaseParams = Type.Object({
   task: Type.String({ description: "Task to delegate to the sub-agent" }),
@@ -13,6 +28,11 @@ export const BaseParams = Type.Object({
       description:
         "Override model (e.g. 'anthropic/claude-sonnet-4-5'). Default: inherit from current session.",
     }),
+  ),
+  thinkingLevel: Type.Optional(
+    thinkingLevelSchema(
+      'Thinking/reasoning level. Default: from settings, else "medium". Higher levels use more tokens. Clamped to model capabilities automatically.',
+    ),
   ),
   cwd: Type.Optional(
     Type.String({
@@ -46,7 +66,7 @@ export const BaseParams = Type.Object({
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
     }),
   ),
   maxAge: Type.Optional(
@@ -99,6 +119,11 @@ export const InteractiveParams = Type.Object({
       description: "Optional model override for the child Pi process",
     }),
   ),
+  thinkingLevel: Type.Optional(
+    thinkingLevelSchema(
+      'Thinking/reasoning level for the child Pi process. Default: from settings, else "medium". Clamped to model capabilities.',
+    ),
+  ),
   cwd: Type.Optional(
     Type.String({ description: "Working directory for the child Pi process" }),
   ),
@@ -123,7 +148,7 @@ export const InteractiveParams = Type.Object({
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Delivery waits until the parent is idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
     }),
   ),
   mux: Type.Optional(

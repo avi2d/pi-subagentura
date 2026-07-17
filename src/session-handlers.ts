@@ -11,6 +11,7 @@ import { pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
 import { flushInProcessDeliveries } from "./notifications";
 import { jobRegistry } from "./helpers";
+import { snapshotInProcessSession } from "./cancellation-snapshots";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
 import {
   cancelInteractiveSubagentByState,
@@ -74,7 +75,11 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // every running interactive sub-agent and fires pointer notifications for new events.
   // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
-    const handle = setInterval(() => pollArtifactChanges(pi), 5000);
+    const handle = setInterval(() => {
+      void pollArtifactChanges(pi).catch((err) => {
+        console.error("[subagentura] artifact poll failed", err);
+      });
+    }, 5000);
     // Don't pin the event loop on a long-lived parent. unref() lets the process exit
     // cleanly when nothing else is keeping it alive (no other ref'd handles).
     handle.unref?.();
@@ -136,6 +141,20 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
+      // Snapshot all in-process jobs before any abort can wait for idle.
+      for (const job of jobRegistry.values()) {
+        if (job.status !== "running") continue;
+        job.cancellationSnapshot = snapshotInProcessSession({
+          kind: "in-process",
+          jobId: job.id,
+          session: job.session,
+          cwd: job.cwd ?? ctx?.cwd ?? process.cwd(),
+          model: job.modelLabel,
+          activeTool: job.liveStatus?.activeTool,
+          partialOutput: job.liveStatus?.output,
+          source: "session_shutdown",
+        });
+      }
       // Abort all running subagent sessions before clearing
       for (const job of jobRegistry.values()) {
         if (job.status === "running") {

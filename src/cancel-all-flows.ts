@@ -1,0 +1,125 @@
+/**
+ * Shared helper to cancel ALL active flows.
+ *
+ * Used by:
+ * - ctrl+alt+x shortcut
+ * - /cancel-all-flows command
+ *
+ * Preserves idle interactive panes (they consume no tokens).
+ * Preserves done/error/cancelled jobs and workflows.
+ */
+import { jobRegistry, scheduleJobCleanup } from "./helpers";
+import {
+  cancelInteractiveSubagent,
+  interactiveSubagentRegistry,
+} from "./interactive-tmux";
+import { workflowJobRegistry } from "./workflow-jobs";
+import {
+  snapshotInProcessSession,
+  snapshotInteractiveContext,
+  type CancellationSnapshotReceipt,
+} from "./cancellation-snapshots";
+
+export interface CancelAllResult {
+  jobsAborted: number;
+  workflowsAborted: number;
+  interactiveKilled: number;
+  interactivePreserved: number;
+  snapshots?: CancellationSnapshotReceipt[];
+}
+
+export async function cancelAllFlows(): Promise<CancelAllResult> {
+  const result: CancelAllResult = {
+    jobsAborted: 0,
+    workflowsAborted: 0,
+    interactiveKilled: 0,
+    interactivePreserved: 0,
+    snapshots: [],
+  };
+  const snapshots = result.snapshots;
+  const snapshotKeys = new Set<string>();
+  const addSnapshot = (receipt: CancellationSnapshotReceipt): void => {
+    if (!receipt.enabled || receipt.status === "disabled") return;
+    if (snapshotKeys.has(receipt.key)) return;
+    snapshotKeys.add(receipt.key);
+    snapshots!.push(receipt);
+  };
+
+  // Snapshot every known child before the first potentially slow abort.
+  const interactiveStates = [...interactiveSubagentRegistry.values()];
+  for (const state of interactiveStates) {
+    if (state.status !== "running") continue;
+    state.cancellationSnapshot = snapshotInteractiveContext({
+      kind: "interactive",
+      id: state.id,
+      parentSessionId: state.parentSessionId,
+      cwd: state.cwd,
+      sessionFile: state.sessionFile,
+      artifactDir: state.artifactDir,
+      startedAt: state.startedAt,
+      source: "cancel_all",
+    });
+    addSnapshot(state.cancellationSnapshot);
+  }
+  const jobs = [...jobRegistry.values()].filter(
+    (job) => job.status === "running",
+  );
+  for (const job of jobs) {
+    job.cancellationSnapshot = snapshotInProcessSession({
+      kind: "in-process",
+      jobId: job.id,
+      session: job.session,
+      cwd: job.cwd ?? process.cwd(),
+      model: job.modelLabel,
+      activeTool: job.liveStatus?.activeTool,
+      partialOutput: job.liveStatus?.output,
+      source: "cancel_all",
+    });
+    addSnapshot(job.cancellationSnapshot);
+  }
+  for (const job of jobs) {
+    try {
+      await job.session.abort();
+    } catch {
+      /* session may already be disposed */
+    }
+    job.status = "cancelled";
+    scheduleJobCleanup(job.id, true);
+    result.jobsAborted++;
+  }
+
+  // 2. Abort all running workflows
+  for (const workflow of workflowJobRegistry.values()) {
+    if (workflow.status === "running") {
+      workflow.suppressCompletionNotification = true;
+      workflow.abort.abort();
+      workflow.status = "cancelled";
+      for (const receipt of workflow.cancellationSnapshots ?? []) {
+        addSnapshot(receipt);
+      }
+      result.workflowsAborted++;
+    }
+  }
+
+  // 3. Kill running interactive agents; preserve idle ones
+  for (const state of interactiveStates) {
+    if (state.status === "running") {
+      try {
+        const cancelled = cancelInteractiveSubagent(state.id);
+        if (cancelled) {
+          result.interactiveKilled++;
+          if (cancelled.cancellationSnapshot) {
+            addSnapshot(cancelled.cancellationSnapshot);
+          }
+        }
+      } catch {
+        /* best effort */
+      }
+    } else if (state.status === "idle") {
+      // Idle panes consume no tokens — preserve them
+      result.interactivePreserved++;
+    }
+  }
+
+  return result;
+}

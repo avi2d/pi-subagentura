@@ -293,7 +293,7 @@ describe("artifact protocol v2 delivery", () => {
     ).toHaveLength(1);
   });
 
-  it("preserves and batches multiple immutable completions from one poll", () => {
+  it("preserves and batches multiple immutable completions from one poll", async () => {
     const art = makeArtifact();
     const state = makeState(art.dir);
     state.notifyOnComplete = "inject";
@@ -302,12 +302,15 @@ describe("artifact protocol v2 delivery", () => {
     interactiveSubagentRegistry.set(state.id, state);
     (globalThis as any).__piSubagenturaInteractiveRegistry =
       interactiveSubagentRegistry;
-    __setTmuxMultiplexer({ isPaneAlive: () => true } as any);
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
     const first = appendDeterministicTurn(art, 1, "first immutable result");
     const second = appendDeterministicTurn(art, 2, "second immutable result");
     const sendMessage = vi.fn();
 
-    pollArtifactChanges({ sendMessage } as any);
+    await pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage.mock.calls[0][0].details.deliveryIds).toHaveLength(2);
@@ -343,7 +346,7 @@ describe("artifact protocol v2 delivery", () => {
     expect(readEventRecords(art)).toHaveLength(1);
   });
 
-  it("queues while streaming and flushes one attributed custom message when idle", () => {
+  it("dispatches triggering delivery through native followUp while streaming", () => {
     const art = makeArtifact();
     writeOutput(art, "result");
     const event = appendCompletionEvent(art, {
@@ -377,15 +380,17 @@ describe("artifact protocol v2 delivery", () => {
     const notify = vi.fn();
     const ui = { notify } as any;
     (globalThis as any).__piSubagenturaParentStreaming = true;
-    flushDeliveries({ sendMessage } as any, ui);
-    expect(sendMessage).not.toHaveBeenCalled();
 
-    (globalThis as any).__piSubagenturaParentStreaming = false;
     flushDeliveries({ sendMessage } as any, ui);
+
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0][0].details.deliveryIds).toEqual([
       deliveryId,
     ]);
+    expect(sendMessage.mock.calls[0][1]).toMatchObject({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
     expect(sendMessage.mock.calls[0][0].content).toContain(
       "<untrusted-subagent-output>",
     );
@@ -399,6 +404,10 @@ describe("artifact protocol v2 delivery", () => {
     expect(notify.mock.calls[0][0]).toContain(
       "A new parent turn will start automatically after the injection",
     );
+
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    flushDeliveries({ sendMessage } as any, ui);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("bounds the first envelope with huge identifiers and malformed message", () => {

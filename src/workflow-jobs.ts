@@ -1,10 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { debugLog } from "./helpers";
+import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
   type RunWorkflowOptions,
   type WorkflowProgress,
   type WorkflowRunResult,
+  type WorkflowUsage,
+  zeroWorkflowUsage,
 } from "./workflow-core";
 
 // ── Background workflow-job registry ─────────────────────────────────
@@ -21,7 +24,9 @@ export interface WorkflowJobState {
   snapshot: {
     agentsSpawned: number;
     errorCount: number;
+    /** @deprecated Output-token count; use usage.totalTokens. */
     tokensSpent: number;
+    usage?: WorkflowUsage;
     phases: string[];
     lastMessage?: string;
     currentPhase?: string;
@@ -35,6 +40,8 @@ export interface WorkflowJobState {
   completionNotificationDelivered?: boolean;
   /** Set during parent shutdown so late settlement cannot notify a replacement session. */
   suppressCompletionNotification?: boolean;
+  /** Receipts captured by nested agents during workflow cancellation. */
+  cancellationSnapshots?: CancellationSnapshotReceipt[];
   /** Set when notification attempts are exhausted. Prevents re-logging. */
   _notificationExhausted?: boolean;
   /** Synchronous reentrant guard — set while the delivery callback is in flight. */
@@ -64,7 +71,10 @@ export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
 export function startWorkflowJob(
   name: string,
   script: string,
-  opts: Omit<RunWorkflowOptions, "signal" | "onProgress">,
+  opts: Omit<
+    RunWorkflowOptions,
+    "signal" | "onProgress" | "onCancellationSnapshot"
+  >,
   startedAt?: number,
   onComplete?: (job: WorkflowJobState) => boolean | void,
 ): WorkflowJobState {
@@ -99,11 +109,13 @@ export function startWorkflowJob(
       agentsSpawned: 0,
       errorCount: 0,
       tokensSpent: 0,
+      usage: zeroWorkflowUsage(),
       phases: [],
       runningCount: 0,
     },
     completionNotification: onComplete,
     completionNotificationDelivered: false,
+    cancellationSnapshots: [],
   };
   state.promise = runWorkflow(script, {
     ...opts,
@@ -112,6 +124,7 @@ export function startWorkflowJob(
       state.snapshot.agentsSpawned = p.agentsSpawned;
       state.snapshot.errorCount = p.errorCount;
       state.snapshot.tokensSpent = p.tokensSpent;
+      state.snapshot.usage = p.usage ? { ...p.usage } : state.snapshot.usage;
       state.snapshot.runningCount = p.runningCount;
       if (p.kind === "phase" && p.phase) {
         state.snapshot.currentPhase = p.phase;
@@ -124,6 +137,9 @@ export function startWorkflowJob(
       } else if (p.kind === "agent_done") {
         state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
       }
+    },
+    onCancellationSnapshot: (receipt) => {
+      (state.cancellationSnapshots ??= []).push(receipt);
     },
   })
     .then((r) => {

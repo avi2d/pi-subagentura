@@ -27,7 +27,7 @@
  *      targets it via `--session <name>`.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import type { Multiplexer } from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
 
@@ -254,6 +254,41 @@ export class ZellijMultiplexer implements Multiplexer {
     return this.listPanes(session).some(
       (p) => String(p.id) === target && p.exited !== true,
     );
+  }
+
+  isPaneAliveAsync(paneId: string, session?: string): Promise<boolean> {
+    const target = normalizePaneId(paneId);
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "zellij",
+          [...this.sessionFlag(session), "action", "list-panes", "--json"],
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            if (error) {
+              resolve(false);
+              return;
+            }
+            try {
+              const parsed = JSON.parse(stdout);
+              const panes = Array.isArray(parsed) ? parsed : [];
+              resolve(
+                panes.some(
+                  (pane: { id?: unknown; exited?: boolean }) =>
+                    String(pane.id) === target && pane.exited !== true,
+                ),
+              );
+            } catch {
+              // Malformed backend output is a failed liveness probe.
+              resolve(false);
+            }
+          },
+        );
+      } catch {
+        // A synchronous child-process setup failure is also a failed probe.
+        resolve(false);
+      }
+    });
   }
 
   /**

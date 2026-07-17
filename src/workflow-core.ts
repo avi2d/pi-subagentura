@@ -8,6 +8,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { SubagentResult, Usage } from "./helpers";
 
 // ── Limits ───────────────────────────────────────────────────────────
@@ -39,6 +40,60 @@ export function zeroUsage(): Usage {
   };
 }
 
+export interface WorkflowUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  costUsd: number;
+  turns: number;
+}
+
+export function zeroWorkflowUsage(): WorkflowUsage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    turns: 0,
+  };
+}
+
+/** Return a new aggregate; callers never share mutable accounting state. */
+export function addWorkflowUsage(
+  total: WorkflowUsage,
+  usage: Usage | undefined,
+): WorkflowUsage {
+  const input = total.input + (usage?.input ?? 0);
+  const output = total.output + (usage?.output ?? 0);
+  const cacheRead = total.cacheRead + (usage?.cacheRead ?? 0);
+  const cacheWrite = total.cacheWrite + (usage?.cacheWrite ?? 0);
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens: input + output + cacheRead + cacheWrite,
+    costUsd: total.costUsd + (usage?.cost ?? 0),
+    turns: total.turns + (usage?.turns ?? 0),
+  };
+}
+
+function formatWorkflowCost(costUsd: number): string {
+  if (!Number.isFinite(costUsd)) return String(costUsd);
+  return costUsd.toLocaleString("en-US", {
+    useGrouping: false,
+    maximumFractionDigits: 15,
+  });
+}
+
+export function formatWorkflowUsage(usage: WorkflowUsage): string {
+  return `${usage.totalTokens} total tokens, $${formatWorkflowCost(usage.costUsd)}`;
+}
+
 // ── Public types ─────────────────────────────────────────────────────
 
 /** Options accepted by the injected `agent()` helper. */
@@ -52,7 +107,23 @@ export interface WorkflowAgentOpts {
   isolation?: string;
   /** Accepted for fidelity but a no-op in v2. */
   agentType?: string;
+  /** Thinking/reasoning level for the sub-agent. Clamped to model capabilities. */
+  thinkingLevel?: ThinkingLevel;
 }
+
+export type WorkflowAgentProgress =
+  | {
+      kind: "phase";
+      phase: string;
+      message?: string;
+      label?: string;
+    }
+  | {
+      kind: "log";
+      message: string;
+      phase?: string;
+      label?: string;
+    };
 
 /** Injectable spawn function — the real one wraps startSubagentJob / launchInteractiveSubagent. */
 export type WorkflowAgentRunner = (req: {
@@ -62,16 +133,16 @@ export type WorkflowAgentRunner = (req: {
   signal?: AbortSignal;
   isolation?: string;
   label?: string;
+  /** Thinking/reasoning level for the sub-agent. */
+  thinkingLevel?: ThinkingLevel;
   /**
    * Optional callback for emitting progress events from inside the runner.
    * Used to surface fallback warnings and forward mid-agent live status.
    */
-  onProgress?: (event: {
-    kind: "log" | "phase";
-    message?: string;
-    phase?: string;
-    label?: string;
-  }) => void;
+  onProgress?: (event: WorkflowAgentProgress) => void;
+  onCancellationSnapshot?: (
+    receipt: import("./cancellation-snapshots").CancellationSnapshotReceipt,
+  ) => void;
 }) => Promise<SubagentResult>;
 
 export interface WorkflowMeta {
@@ -82,35 +153,104 @@ export interface WorkflowMeta {
   [k: string]: unknown;
 }
 
-export interface WorkflowProgress {
-  // "agent_start" fires the moment an agent is launched (counter is incremented), so UIs see
-  // mid-run progress. "agent_done" fires after the agent finishes (success, error, or schema fail).
-  kind: "phase" | "log" | "agent_start" | "agent_done";
-  phase?: string;
-  message?: string;
-  label?: string;
-  agentsSpawned: number;
-  errorCount: number;
-  tokensSpent: number;
-  runningCount: number;
-  model?: string;
-}
+export type WorkflowProgress =
+  | {
+      kind: "phase";
+      phase: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
+      tokensSpent: number;
+      usage?: WorkflowUsage;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "log";
+      phase?: string;
+      message: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
+      tokensSpent: number;
+      usage?: WorkflowUsage;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "agent_start";
+      phase?: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
+      tokensSpent: number;
+      usage?: WorkflowUsage;
+      runningCount: number;
+      model?: string;
+    }
+  | {
+      kind: "agent_done";
+      phase?: string;
+      message?: string;
+      label?: string;
+      agentsSpawned: number;
+      errorCount: number;
+      /** @deprecated Output-token count; use usage.totalTokens. */
+      tokensSpent: number;
+      usage?: WorkflowUsage;
+      runningCount: number;
+      model?: string;
+    };
 
+export type WorkflowProgressUpdate = {
+  [K in WorkflowProgress["kind"]]: Omit<
+    Extract<WorkflowProgress, { kind: K }>,
+    "agentsSpawned" | "errorCount" | "tokensSpent" | "usage" | "runningCount"
+  >;
+}[WorkflowProgress["kind"]];
+
+/** Legacy-compatible public result shape; v3.0.x producers populate `usage`. */
 export interface WorkflowRunResult {
   meta: WorkflowMeta;
   result: unknown;
   agentsSpawned: number;
   errorCount: number;
+  /** @deprecated Output-token count; use usage.totalTokens. */
   tokensSpent: number;
+  usage?: WorkflowUsage;
   phases: string[];
+}
+
+/** Result produced by `runWorkflow`; unlike the legacy boundary, usage is present. */
+export type WorkflowRunResultWithUsage = WorkflowRunResult & {
+  usage: WorkflowUsage;
+};
+
+export class WorkflowExecutionError extends Error {
+  readonly usage?: WorkflowUsage;
+
+  constructor(message: string, usage?: WorkflowUsage, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "WorkflowExecutionError";
+    this.usage = usage;
+  }
 }
 
 export interface RunWorkflowOptions {
   args?: unknown;
+  /** Soft completed-output-token target; in-flight parallel calls may overshoot. */
   budgetTotal?: number | null;
   runAgent: WorkflowAgentRunner;
   signal?: AbortSignal;
   onProgress?: (p: WorkflowProgress) => void;
+  onCancellationSnapshot?: (
+    receipt: import("./cancellation-snapshots").CancellationSnapshotReceipt,
+  ) => void;
   concurrency?: number;
   processConcurrency?: number;
   /** Resolve a saved workflow script by name, for `workflow(name, args)` composition. */

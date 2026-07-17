@@ -1,7 +1,15 @@
 import { Worker } from "node:worker_threads";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { readEvents, readOutput } from "./artifact";
+import {
+  assertNever,
+  isTurnTerminal,
+  readEvents,
+  readOutput,
+  readOutputForTurnId,
+  type SubagentEvent,
+  type TurnTerminalEvent,
+} from "./artifact";
 import { debugLog } from "./helpers";
 import type { SubagentResult, Usage } from "./helpers";
 import {
@@ -24,8 +32,13 @@ import {
   type WorkflowAgentRunner,
   type WorkflowMeta,
   type WorkflowProgress,
-  type WorkflowRunResult,
+  type WorkflowProgressUpdate,
+  type WorkflowRunResultWithUsage,
+  WorkflowExecutionError,
+  type WorkflowUsage,
+  addWorkflowUsage,
   zeroUsage,
+  zeroWorkflowUsage,
 } from "./workflow-core";
 import { workflowStringify } from "./workflow-script";
 import {
@@ -33,6 +46,7 @@ import {
   isPaneAlive,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 
 // ── Engine (shared across nested workflows) ──────────────────────────
 
@@ -42,6 +56,7 @@ interface Engine {
   signal: AbortSignal;
   closed: boolean;
   onProgress?: (p: WorkflowProgress) => void;
+  onCancellationSnapshot?: RunWorkflowOptions["onCancellationSnapshot"];
   sem: Semaphore;
   processSem: Semaphore;
   loadWorkflow?: (name: string) => string | null;
@@ -50,20 +65,62 @@ interface Engine {
   counters: {
     agentsSpawned: number;
     errorCount: number;
+    /** @deprecated Output-token count; use usage.totalTokens. */
     tokensSpent: number;
     runningCount: number;
   };
+  usage: WorkflowUsage;
+  failureCause?: unknown;
   phases: string[];
+}
+
+function withProgressCounters(
+  progress: WorkflowProgressUpdate,
+  counters: Engine["counters"],
+  usage: WorkflowUsage,
+): WorkflowProgress {
+  switch (progress.kind) {
+    case "phase":
+    case "log":
+    case "agent_start":
+    case "agent_done":
+      return { ...progress, ...counters, usage: { ...usage } };
+    default:
+      return assertNever(progress);
+  }
+}
+
+function usageIfPresent(usage: WorkflowUsage): WorkflowUsage | undefined {
+  if (usage.totalTokens === 0 && usage.costUsd === 0 && usage.turns === 0) {
+    return undefined;
+  }
+  return { ...usage };
+}
+
+function workflowFailureCause(
+  error: unknown,
+  engine: Engine,
+  signal: AbortSignal | undefined,
+): unknown {
+  if (signal?.aborted && signal.reason !== undefined) return signal.reason;
+  const candidate = engine.failureCause;
+  if (candidate !== undefined) {
+    const message =
+      candidate instanceof Error ? candidate.message : String(candidate);
+    if (error instanceof Error && error.message.includes(message))
+      return candidate;
+  }
+  return error;
 }
 
 export async function runWorkflow(
   script: string,
   opts: RunWorkflowOptions,
-): Promise<WorkflowRunResult> {
+): Promise<WorkflowRunResultWithUsage> {
   const abort = new AbortController();
-  const forwardAbort = () => abort.abort();
+  const forwardAbort = () => abort.abort(opts.signal?.reason);
   if (opts.signal?.aborted) {
-    abort.abort();
+    abort.abort(opts.signal.reason);
   } else {
     opts.signal?.addEventListener("abort", forwardAbort, { once: true });
   }
@@ -73,6 +130,7 @@ export async function runWorkflow(
     signal: abort.signal,
     closed: false,
     onProgress: opts.onProgress,
+    onCancellationSnapshot: opts.onCancellationSnapshot,
     sem: createSemaphore(opts.concurrency ?? defaultConcurrency()),
     processSem: createSemaphore(
       opts.processConcurrency ?? defaultProcessConcurrency(),
@@ -85,6 +143,7 @@ export async function runWorkflow(
       tokensSpent: 0,
       runningCount: 0,
     },
+    usage: zeroWorkflowUsage(),
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
   };
@@ -96,8 +155,17 @@ export async function runWorkflow(
       agentsSpawned: engine.counters.agentsSpawned,
       errorCount: engine.counters.errorCount,
       tokensSpent: engine.counters.tokensSpent,
-      phases: engine.phases,
+      usage: { ...engine.usage },
+      phases: [...engine.phases],
     };
+  } catch (error) {
+    if (error instanceof WorkflowExecutionError && error.usage) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new WorkflowExecutionError(
+      message,
+      usageIfPresent(engine.usage),
+      workflowFailureCause(error, engine, opts.signal),
+    );
   } finally {
     opts.signal?.removeEventListener("abort", forwardAbort);
   }
@@ -117,21 +185,10 @@ async function executeScript(
   args: unknown,
   _depth: number,
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
-  const emit = (
-    p: Omit<
-      WorkflowProgress,
-      "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
-    >,
-  ) => {
+  const emit = (p: WorkflowProgressUpdate) => {
     if (engine.closed) return;
     if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
-    engine.onProgress?.({
-      ...p,
-      agentsSpawned: engine.counters.agentsSpawned,
-      errorCount: engine.counters.errorCount,
-      tokensSpent: engine.counters.tokensSpent,
-      runningCount: engine.counters.runningCount,
-    });
+    engine.onProgress?.(withProgressCounters(p, engine.counters, engine.usage));
   };
 
   const runAgentCall = async (payload: {
@@ -180,17 +237,38 @@ async function executeScript(
           const finalPrompt = hasSchema
             ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
             : prompt;
-          const res = await engine.runAgent({
-            prompt: finalPrompt,
-            persona: agentOpts.persona,
-            model: agentOpts.model,
-            signal: engine.signal,
-            isolation,
-            label: agentOpts.label,
-            onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
-          });
+          let res: SubagentResult;
+          try {
+            res = await engine.runAgent({
+              prompt: finalPrompt,
+              persona: agentOpts.persona,
+              model: agentOpts.model,
+              signal: engine.signal,
+              isolation,
+              label: agentOpts.label,
+              onCancellationSnapshot: engine.onCancellationSnapshot,
+              thinkingLevel: agentOpts.thinkingLevel,
+              onProgress: (ev) => {
+                if (ev.kind === "phase") {
+                  if (ev.phase) {
+                    emit({
+                      ...ev,
+                      phase: agentOpts.phase ?? ev.phase,
+                    });
+                  }
+                  return;
+                }
+                emit({ ...ev, phase: agentOpts.phase });
+              },
+            });
+          } catch (error) {
+            engine.failureCause = error;
+            if (!engine.signal.aborted) engine.counters.errorCount++;
+            throw error;
+          }
           const outTokens = res.usage?.output ?? 0;
           tokensDelta += outTokens;
+          engine.usage = addWorkflowUsage(engine.usage, res.usage);
           engine.counters.tokensSpent += outTokens;
 
           if (res.isError) {
@@ -250,9 +328,7 @@ function runWorkflowWorker(
   script: string,
   args: unknown,
   engine: Engine,
-  emit: (
-    p: Omit<WorkflowProgress, "agentsSpawned" | "errorCount" | "tokensSpent">,
-  ) => void,
+  emit: (p: WorkflowProgressUpdate) => void,
   runAgentCall: (payload: {
     prompt: unknown;
     opts?: WorkflowAgentOpts;
@@ -451,6 +527,34 @@ function parseUsageFromSessionFile(sessionFile: string | undefined): Usage {
   }
 }
 
+function findCurrentTurnTerminal(
+  events: SubagentEvent[],
+): TurnTerminalEvent | null {
+  let latestTurnStart = -1;
+  let latestTurnId: string | undefined;
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    if (event.type === "turn_started") {
+      latestTurnStart = index;
+      latestTurnId = event.turnId;
+    }
+  }
+  if (latestTurnStart >= 0) {
+    for (let index = events.length - 1; index > latestTurnStart; index--) {
+      const event = events[index];
+      if (event.type === "completion" && event.turnId === latestTurnId) {
+        return event;
+      }
+    }
+    return null;
+  }
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (isTurnTerminal(event)) return event;
+  }
+  return null;
+}
+
 /**
  * Await a process-backed (tmux/zellij) sub-agent's terminal event by polling its artifact dir,
  * then read its output.md. Honors the abort signal and detects a dead pane that never completed.
@@ -459,13 +563,17 @@ export async function awaitInteractiveResult(
   state: InteractiveSubagentState,
   signal: AbortSignal | undefined,
   pollMs = INTERACTIVE_POLL_MS,
+  onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void,
 ): Promise<SubagentResult> {
   const art = artifactFor(state);
   let deadTicks = 0;
   for (;;) {
     if (signal?.aborted) {
       try {
-        cancelInteractiveSubagent(state.id);
+        const cancelled = cancelInteractiveSubagent(state.id, "workflow");
+        if (cancelled?.cancellationSnapshot) {
+          onCancellationSnapshot?.(cancelled.cancellationSnapshot);
+        }
       } catch {
         /* best effort */
       }
@@ -478,30 +586,56 @@ export async function awaitInteractiveResult(
       };
     }
     const events = readEvents(art);
-    const terminal = [...events]
-      .reverse()
-      .find(
-        (e) =>
-          e.type === "done" || e.type === "error" || e.type === "cancelled",
-      );
+    const terminal = findCurrentTurnTerminal(events);
     if (terminal) {
-      const output = readOutput(art) ?? "(no output)";
-      if (terminal.type === "done") {
-        return {
-          isError: false,
-          output,
-          usage: parseUsageFromSessionFile(state.sessionFile),
-          model: state.model ?? "process",
-        };
+      const usage = parseUsageFromSessionFile(state.sessionFile);
+      switch (terminal.type) {
+        case "completion":
+          switch (terminal.outcome) {
+            case "done":
+              return {
+                isError: false,
+                output:
+                  readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
+                usage,
+                model: state.model ?? "process",
+              };
+            case "error":
+            case "cancelled":
+              return {
+                isError: true,
+                output:
+                  readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
+                usage,
+                model: undefined,
+                errorMessage:
+                  terminal.errorMessage ??
+                  terminal.message ??
+                  `interactive sub-agent ${terminal.outcome}`,
+              };
+            default:
+              return assertNever(terminal.outcome);
+          }
+        case "done":
+          return {
+            isError: false,
+            output: readOutput(art) ?? "(no output)",
+            usage,
+            model: state.model ?? "process",
+          };
+        case "error":
+        case "cancelled":
+          return {
+            isError: true,
+            output: readOutput(art) ?? "(no output)",
+            usage,
+            model: undefined,
+            errorMessage:
+              terminal.message ?? `interactive sub-agent ${terminal.type}`,
+          };
+        default:
+          return assertNever(terminal);
       }
-      return {
-        isError: true,
-        output,
-        usage: parseUsageFromSessionFile(state.sessionFile),
-        model: undefined,
-        errorMessage:
-          terminal.message ?? `interactive sub-agent ${terminal.type}`,
-      };
     }
     // No terminal event yet — if the pane has died, give it a few grace ticks for a final flush.
     let alive = true;
