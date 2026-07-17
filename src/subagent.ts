@@ -19,6 +19,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   type JobState,
@@ -51,13 +52,24 @@ export { rehydrateInteractiveSubagents } from "./rehydrate";
  * - `"invalid_id"` — caller passed an unrecognised id
  */
 export type SubagentDetails =
-  | { status: "started"; jobId: string; contextMessages: number }
-  | { status: "running"; subagentStatus: SubagentLiveStatus; model?: string }
+  | {
+      status: "started";
+      jobId: string;
+      contextMessages: number;
+      thinkingLevel?: ThinkingLevel;
+    }
+  | {
+      status: "running";
+      subagentStatus: SubagentLiveStatus;
+      model?: string;
+      thinkingLevel?: ThinkingLevel;
+    }
   | {
       status: "done" | "error";
       usage: Usage;
       model?: string;
       usageSummary?: string;
+      thinkingLevel?: ThinkingLevel;
       contextMessages?: number;
     }
   | { status: "cancelled" | "not_found" }

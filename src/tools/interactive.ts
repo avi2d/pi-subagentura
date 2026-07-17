@@ -167,6 +167,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
+          thinkingLevel: params.thinkingLevel,
         });
 
         const displayMode = state.windowName
@@ -182,7 +183,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
                 `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
             },
           ],
-          details: { ...state, status: "started" },
+          details: {
+            ...state,
+            status: "started",
+            thinkingLevel: params.thinkingLevel,
+          },
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);

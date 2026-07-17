@@ -187,6 +187,7 @@ async function executeScript(
             signal: engine.signal,
             isolation,
             label: agentOpts.label,
+            thinkingLevel: agentOpts.thinkingLevel,
             onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
           });
           const outTokens = res.usage?.output ?? 0;
