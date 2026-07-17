@@ -335,6 +335,12 @@ LLM turn. Both payload modes display the same user-facing notification;
 | `notify` (default trigger behavior)       | Artifact pointer only       | No                              |
 | `notify` + `triggerTurnOnComplete: true`  | Artifact pointer only       | Yes                             |
 
+Triggering completions are handed to Pi's native `followUp` queue even while the
+parent is busy, so they run after the active turn without relying on extension-owned
+streaming state. Non-triggering completions wait until the parent is idle before
+delivery into parent context, which prevents them from accidentally starting a
+provider turn.
+
 Therefore plain `notify` records the completion for both the UI and the parent
 conversation, but the LLM does not react immediately. The pointer becomes
 available to the model when the user starts the next parent turn. It is not a

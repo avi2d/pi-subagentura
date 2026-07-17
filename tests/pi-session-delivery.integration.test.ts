@@ -81,7 +81,7 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
   };
   interactiveSubagentRegistry.set(state.id, state);
   enqueueDelivery(state, {
-    deliveryId: `${mode}-${triggerTurn}`,
+    deliveryId: `${mode}-${triggerTurn}-${harnesses.length}`,
     subagentId: state.id,
     turnId: "turn-1",
     eventId: "event-1",
@@ -163,15 +163,36 @@ describe("Pi session delivery integration", () => {
     expect(harness.contexts).toHaveLength(1);
   });
 
-  it("streaming inject waits for agent_settled before its provider turn", async () => {
-    const { harness, state } = await setup("inject", true);
-    const firstTurn = harness.session.prompt("parent turn");
-    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+  it("dispatches idle inject despite a stale streaming flag", async () => {
+    const { harness } = await setup("inject", true);
+    (globalThis as any).__piSubagenturaParentStreaming = true;
 
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
+
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    harness.completeNext();
+    await harness.session.waitForIdle();
+  });
+
+  it("queues one streaming inject before its provider turn", async () => {
+    const { harness, sendMessage, state } = await setup("inject", true);
+    const firstTurn = harness.session.prompt("parent turn");
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    (globalThis as any).__piSubagenturaSessionManager = harness.sessionManager;
+
+    flushDeliveries(
+      (globalThis as any).__piSubagenturaPiRef,
+      (globalThis as any).__piSubagenturaUi,
+    );
+    expect(sendMessage).toHaveBeenCalledOnce();
+    flushDeliveries(
+      (globalThis as any).__piSubagenturaPiRef,
+      (globalThis as any).__piSubagenturaUi,
+    );
+    expect(sendMessage).toHaveBeenCalledOnce();
     expect(state.pendingDeliveries).toHaveLength(1);
     expect(harness.contexts).toHaveLength(1);
 
@@ -183,12 +204,12 @@ describe("Pi session delivery integration", () => {
     expect(
       harness.sessionManager
         .getEntries()
-        .some(
+        .filter(
           (entry: any) =>
             entry.type === "custom_message" &&
             entry.customType === "subagent-notify",
         ),
-    ).toBe(true);
+    ).toHaveLength(1);
     harness.completeNext("follow-up done");
     await vi.waitFor(() =>
       expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
@@ -340,7 +361,7 @@ describe("Pi session delivery integration", () => {
     },
   );
 
-  it("batches an in-process burst into one custom provider turn", async () => {
+  it("batches a triggering burst despite a stale streaming flag", async () => {
     const harness = await createPiSessionHarness(repoRoot);
     harnesses.push(harness);
     (globalThis as any).__piSubagenturaParentStreaming = true;
@@ -370,9 +391,6 @@ describe("Pi session delivery integration", () => {
     };
     deliverNotification(first, result);
     deliverNotification(second, result);
-    expect(harness.contexts).toHaveLength(0);
-    (globalThis as any).__piSubagenturaParentStreaming = false;
-    flushInProcessDeliveries();
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(
       harness.sessionManager

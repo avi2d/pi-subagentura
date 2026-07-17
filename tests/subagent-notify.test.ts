@@ -647,7 +647,7 @@ describe("notifyOnComplete", () => {
       );
     });
 
-    it("holds inject completion while the parent is streaming", async () => {
+    it("queues triggering inject completion through Pi while streaming", async () => {
       (globalThis as any).__piSubagenturaParentStreaming = true;
       const jobId = "inject-cap";
       const control = createJobControl();
@@ -671,9 +671,14 @@ describe("notifyOnComplete", () => {
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {
         expect(jobRegistry.get(jobId)?.status).toBe("done");
+        expect(api.sendMessage).toHaveBeenCalledOnce();
       });
-      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(api.sendMessage.mock.calls[0][1]).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
       expect(api.sendUserMessage).not.toHaveBeenCalled();
+
       (globalThis as any).__piSubagenturaParentStreaming = false;
       flushInProcessDeliveries();
       expect(api.sendMessage).toHaveBeenCalledOnce();
