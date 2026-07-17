@@ -91,6 +91,7 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   // 2. Abort all running workflows
   for (const workflow of workflowJobRegistry.values()) {
     if (workflow.status === "running") {
+      workflow.suppressCompletionNotification = true;
       workflow.abort.abort();
       workflow.status = "cancelled";
       for (const receipt of workflow.cancellationSnapshots ?? []) {

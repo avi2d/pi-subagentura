@@ -77,6 +77,7 @@ import type { JobState, SubagentResult } from "../src/helpers";
 import { jobRegistry, scheduleJobCleanup } from "../src/helpers";
 import { registerInProcessSubagentTools } from "../src/tools/in-process";
 import { abortableWait } from "../src/abortable-wait";
+import { deliverNotification } from "../src/notifications";
 import {
   interactiveSubagentRegistry,
   cancelInteractiveSubagent,
@@ -325,6 +326,46 @@ describe("get_subagent_result abort-aware wait", () => {
     expect(removeSpy).toHaveBeenCalledWith("abort", expect.any(Function));
     expect(job.resultRetrieved).toBe(true);
   });
+
+  it("marks an active result wait before settlement notification", async () => {
+    const jobId = "active-result-wait";
+    let resolveJob!: (value: SubagentResult) => void;
+    const jobPromise = new Promise<SubagentResult>((resolve) => {
+      resolveJob = resolve;
+    });
+    mockStartSubagentJob.mockResolvedValue({
+      jobId,
+      jobPromise,
+      session: { abort: vi.fn() },
+      liveStatus: createJobState({ id: jobId }).liveStatus,
+      modelLabel: "test/model",
+    });
+    const spawnTool = getToolDef(api, "subagent_isolated");
+    await spawnTool.execute(
+      "spawn-call",
+      { task: "test", async: true, notifyOnComplete: "inject" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    const wait = toolDef.execute(
+      "result-call",
+      { jobId },
+      new AbortController().signal,
+      undefined,
+      mockCtx(),
+    );
+
+    resolveJob({
+      output: "done",
+      usage: createJobState({ id: jobId }).liveStatus.usage,
+      isError: false,
+    });
+    await wait;
+
+    expect(deliverNotification).not.toHaveBeenCalled();
+    expect(jobRegistry.get(jobId)?.resultRetrieved).toBe(true);
+  });
 });
 
 describe("get_workflow_result abort-aware wait", () => {
@@ -520,6 +561,12 @@ describe("cancelAllFlows helper", () => {
     expect(workflowJobRegistry.get("wf-1")!.status).toBe("cancelled");
     expect(workflowJobRegistry.get("wf-2")!.status).toBe("cancelled");
     expect(workflowJobRegistry.get("wf-3")!.status).toBe("done");
+    expect(
+      workflowJobRegistry.get("wf-1")!.suppressCompletionNotification,
+    ).toBe(true);
+    expect(
+      workflowJobRegistry.get("wf-2")!.suppressCompletionNotification,
+    ).toBe(true);
 
     workflowJobRegistry.clear();
   });
