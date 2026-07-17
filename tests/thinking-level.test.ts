@@ -137,11 +137,12 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 });
 
 import { registerInProcessSubagentTools } from "../src/tools/in-process";
+import { registerInteractiveSubagentTools } from "../src/tools/interactive";
 
 describe("in-process subagent thinkingLevel propagation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockStartSubagentJob.mockResolvedValue({
+    mockStartSubagentJob.mockImplementation(async (params) => ({
       jobId: "test-job",
       jobPromise: Promise.resolve({
         output: "done",
@@ -168,7 +169,8 @@ describe("in-process subagent thinkingLevel propagation", () => {
           turns: 0,
         },
       },
-    });
+      thinkingLevel: params.thinkingLevel,
+    }));
   });
 
   function mockCtx(overrides: Record<string, any> = {}) {
@@ -350,7 +352,7 @@ describe("in-process subagent thinkingLevel propagation", () => {
       },
     });
 
-    await toolDef.execute(
+    const result = await toolDef.execute(
       "call-1",
       { task: "test task", async: true, thinkingLevel: "high" },
       undefined,
@@ -361,6 +363,7 @@ describe("in-process subagent thinkingLevel propagation", () => {
     expect(mockStartSubagentJob).toHaveBeenCalled();
     const callArgs = mockStartSubagentJob.mock.calls[0][0];
     expect(callArgs.thinkingLevel).toBe("high");
+    expect(result.details.thinkingLevel).toBe("high");
   });
 
   it("subagent_isolated async:true passes thinkingLevel to startSubagentJob", async () => {
@@ -368,7 +371,7 @@ describe("in-process subagent thinkingLevel propagation", () => {
     const toolDef = getToolDef(api, "subagent_isolated");
     expect(toolDef).toBeDefined();
 
-    await toolDef.execute(
+    const result = await toolDef.execute(
       "call-1",
       { task: "test task", async: true, thinkingLevel: "xhigh" },
       undefined,
@@ -379,6 +382,35 @@ describe("in-process subagent thinkingLevel propagation", () => {
     expect(mockStartSubagentJob).toHaveBeenCalled();
     const callArgs = mockStartSubagentJob.mock.calls[0][0];
     expect(callArgs.thinkingLevel).toBe("xhigh");
+    expect(result.details.thinkingLevel).toBe("xhigh");
+  });
+});
+
+describe("interactive subagent thinkingLevel rendering", () => {
+  it("renders the requested thinking level in the spawn result", () => {
+    const api = { registerTool: vi.fn() };
+    registerInteractiveSubagentTools(api as any);
+    const toolDef = api.registerTool.mock.calls.find(
+      ([tool]: any[]) => tool.name === "subagent_interactive",
+    )?.[0];
+    const theme = {
+      fg: vi.fn((_color: string, text: string) => text),
+      bold: vi.fn((text: string) => text),
+    };
+
+    toolDef.renderResult(
+      {
+        content: [{ type: "text", text: "started" }],
+        details: { id: "agent-1", paneId: "%1", thinkingLevel: "high" },
+      },
+      {},
+      theme,
+    );
+
+    expect(theme.fg).toHaveBeenCalledWith(
+      "dim",
+      expect.stringContaining("thinking: high"),
+    );
   });
 });
 
