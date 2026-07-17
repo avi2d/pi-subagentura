@@ -124,11 +124,7 @@ The child-only Pi lifecycle hook is a crash-safety fallback, not permission to o
  * - "unknown"  — can't determine (rare; pane dead but no recorded event)
  */
 export type InteractiveSubagentStatus =
-  | "running"
-  | "idle"
-  | "cancelled"
-  | "exited"
-  | "unknown";
+  "running" | "idle" | "cancelled" | "exited" | "unknown";
 
 export interface InteractiveSubagentState {
   id: string;
@@ -232,8 +228,7 @@ export interface InteractiveSubagentState {
 
 declare global {
   var __piSubagenturaInteractiveRegistry:
-    | Map<string, InteractiveSubagentState>
-    | undefined;
+    Map<string, InteractiveSubagentState> | undefined;
 }
 
 if (!globalThis.__piSubagenturaInteractiveRegistry) {

@@ -330,7 +330,7 @@ export function flushInProcessDeliveries(): void {
     status: "done" | "error";
   }> = [];
   let bytes = 0;
-  for (let index = 0; index < queue.length; ) {
+  for (let index = 0; index < queue.length;) {
     const pending = queue[index];
     if (pending.kind === "overflow") {
       const content =
