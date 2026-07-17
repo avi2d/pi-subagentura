@@ -5,7 +5,7 @@
  * registration and lifecycle management. This module owns the poll interval's per-tick
  * work: walking the artifact directory of every running interactive sub-agent, tail-reading
  * the child's session JSONL, appending legacy tool_activity events, and enqueueing
- * protocol completions for idle-only delivery.
+ * protocol completions for trigger-aware delivery.
  *
  * See src/subagent.ts for the interval setup / teardown and the rehydrate logic.
  */

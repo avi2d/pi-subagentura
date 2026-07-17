@@ -285,7 +285,6 @@ export function flushDeliveries(
   ui: ExtensionUIContext | undefined,
 ): void {
   const g = globalThis as any;
-  if (g.__piSubagenturaParentStreaming) return;
   reconcileAllDeliveryReceipts();
   const llm: Array<{
     state: InteractiveSubagentState;
@@ -308,6 +307,8 @@ export function flushDeliveries(
     selected.push(item);
     bytes += separatorBytes + itemBytes;
   }
+  const triggersTurn = selected.some(({ intent }) => intent.triggerTurn);
+  if (g.__piSubagenturaParentStreaming && !triggersTurn) return;
   const deliveryIds = selected.map(({ intent }) => intent.deliveryId);
   try {
     pi.sendMessage(
@@ -331,7 +332,7 @@ export function flushDeliveries(
       },
       {
         deliverAs: "followUp",
-        triggerTurn: selected.some(({ intent }) => intent.triggerTurn),
+        triggerTurn: triggersTurn,
       },
     );
   } catch {
