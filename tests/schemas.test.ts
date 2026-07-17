@@ -128,6 +128,23 @@ describe("BaseParams", () => {
     expect(check(BaseParams)({ task: "t", model: 1 })).toBe(false);
   });
 
+  it("accepts Pi thinking levels and rejects unknown values", () => {
+    for (const thinkingLevel of [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]) {
+      expect(check(BaseParams)({ task: "t", thinkingLevel })).toBe(true);
+    }
+    expect(check(BaseParams)({ task: "t", thinkingLevel: "extreme" })).toBe(
+      false,
+    );
+  });
+
   /* ---------- optional `cwd` ---------- */
 
   it("accepts missing cwd", () => {
@@ -447,6 +464,23 @@ describe("InteractiveParams", () => {
 
   it("rejects model as array", () => {
     expect(check(InteractiveParams)({ task: "t", model: [] })).toBe(false);
+  });
+
+  it("accepts Pi thinking levels and rejects unknown values", () => {
+    for (const thinkingLevel of [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]) {
+      expect(check(InteractiveParams)({ task: "t", thinkingLevel })).toBe(true);
+    }
+    expect(
+      check(InteractiveParams)({ task: "t", thinkingLevel: "extreme" }),
+    ).toBe(false);
   });
 
   /* ---------- optional `cwd` ---------- */

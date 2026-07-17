@@ -167,6 +167,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
+          thinkingLevel: params.thinkingLevel,
         });
 
         const displayMode = state.windowName
@@ -182,7 +183,11 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
                 `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
             },
           ],
-          details: { ...state, status: "started" },
+          details: {
+            ...state,
+            status: "started",
+            thinkingLevel: params.thinkingLevel,
+          },
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -212,7 +217,13 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme) {
       const details = result.details as
-        Partial<InteractiveSubagentState> | undefined;
+        | (Partial<InteractiveSubagentState> & { thinkingLevel?: string })
+        | undefined;
+      const id = details?.id ?? "unknown";
+      const paneId = details?.paneId ?? "unknown";
+      const thinking = details?.thinkingLevel
+        ? ` · thinking: ${details.thinkingLevel}`
+        : "";
       if ((result as any).isError) {
         const first = result.content?.[0];
         const text =
@@ -221,12 +232,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             : "Failed to start interactive sub-agent";
         return new Text(theme.fg("error", text), 0, 0);
       }
-      const id = details?.id ?? "unknown";
-      const paneId = details?.paneId ?? "unknown";
       return new Text(
         theme.fg("accent", "⚡ ") +
           theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
-          theme.fg("dim", ` — pane ${paneId}`),
+          theme.fg("dim", ` — pane ${paneId}${thinking}`),
         0,
         0,
       );

@@ -191,6 +191,7 @@ async function executeScript(
             isolation,
             label: agentOpts.label,
             onCancellationSnapshot: engine.onCancellationSnapshot,
+            thinkingLevel: agentOpts.thinkingLevel,
             onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
           });
           const outTokens = res.usage?.output ?? 0;

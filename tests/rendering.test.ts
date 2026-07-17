@@ -127,6 +127,21 @@ describe("renderSubagentCall", () => {
     );
   });
 
+  it("renders the requested thinking level beside the model", () => {
+    const result = renderSubagentCall(
+      {
+        task: "analyze",
+        model: "anthropic/claude-sonnet-4-5",
+        thinkingLevel: "high",
+      },
+      testTheme,
+      "subagent_with_context",
+    );
+    expect(t(result)).toBe(
+      "subagent_with_context analyze @anthropic/claude-sonnet-4-5 · thinking: high",
+    );
+  });
+
   it("appends the [async] badge when args.async is truthy", () => {
     const result = renderSubagentCall(
       { task: "analyze", async: true },
@@ -186,6 +201,47 @@ describe("renderSubagentResult", () => {
     expect(result).toBeInstanceOf(MockText);
     expect(t(result)).toMatch(/⚡ Sub-agent started — job job-42/);
     expect(t(result)).toMatch(/get_subagent_status/);
+  });
+
+  it("renders the requested thinking level for an interactive spawn result", () => {
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "started" as const,
+          jobId: "job-43",
+          contextMessages: 0,
+          thinkingLevel: "high",
+        },
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(t(result)).toContain("· thinking: high");
+  });
+  it("renders the effective thinking level in a partial result", () => {
+    formatUsageMock.mockReturnValue("~1.0K tokens gpt-4");
+    const result = renderSubagentResult(
+      {
+        content: [],
+        details: {
+          status: "running" as const,
+          model: "gpt-4",
+          thinkingLevel: "low",
+          subagentStatus: {
+            turn: 1,
+            output: "progress",
+            usage: sampleUsage,
+            thinkingLevel: "low",
+          },
+        },
+      },
+      { expanded: false, isPartial: true },
+      testTheme,
+      undefined,
+    );
+    expect(t(result)).toContain("· thinking: low");
   });
 
   // ── Partial / running ─────────────────────────────────
@@ -402,6 +458,22 @@ describe("renderSubagentResult", () => {
     expect(result).toBeInstanceOf(MockText);
     // Only the header (✓ + usage) — no output body
     expect(t(result)).toBe("\u2713 ~1.5K tokens");
+  });
+
+  it("renders the effective thinking level in a final result", () => {
+    const result = renderSubagentResult(
+      {
+        content: [{ type: "text", text: "done" }],
+        details: {
+          usageSummary: "~1.5K tokens gpt-4",
+          thinkingLevel: "low",
+        },
+      },
+      { expanded: false, isPartial: false },
+      testTheme,
+      undefined,
+    );
+    expect(t(result)).toBe("✓ ~1.5K tokens gpt-4 · thinking: low");
   });
 
   it("renders final success result with usage expanded (header + full text)", () => {
