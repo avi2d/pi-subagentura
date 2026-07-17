@@ -36,6 +36,7 @@ import {
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
 import { registerChildProtocol } from "./child-protocol";
+import { registerCancelAllFlows } from "./cancel-all-flows-registration";
 import { renderSubagentNotify } from "./rendering";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
@@ -95,6 +96,9 @@ export default function (pi: ExtensionAPI) {
   registerInProcessSubagentTools(pi);
   registerInteractiveSubagentTools(pi);
   registerInProcessMaintenanceTools(pi);
+
+  // ── Cancel-all-flows shortcut and command ──────────────────────
+  registerCancelAllFlows(pi);
 }
 
 /**

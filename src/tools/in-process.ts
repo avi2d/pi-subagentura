@@ -26,6 +26,7 @@ import {
   type SubagentResult,
   type Usage,
 } from "../helpers";
+import { abortableWait } from "../abortable-wait";
 import {
   completionTriggersTurn,
   deliverNotification,
@@ -109,7 +110,8 @@ function settleAsyncJob(
   if (
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
-    !jobState.resultRetrieved
+    !jobState.resultRetrieved &&
+    (jobState.activeResultWaits ?? 0) === 0
   ) {
     deliverNotification(jobState, result);
   }
@@ -644,8 +646,45 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         };
       }
 
+      // If signal is already aborted, return immediately without setting resultRetrieved
+      if (signal?.aborted) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Wait for job ${params.jobId} cancelled.`,
+            },
+          ],
+          details: { jobId: params.jobId, status: "wait_cancelled" },
+          isError: true,
+        };
+      }
+
+      // Active waits suppress settlement notifications without treating an
+      // aborted wait as a retrieved result.
+      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
+      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
+      try {
+        waitResult = await abortableWait(job.promise, signal);
+      } finally {
+        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
+      }
+      if (waitResult.aborted) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Wait for job ${params.jobId} cancelled.`,
+            },
+          ],
+          details: { jobId: params.jobId, status: "wait_cancelled" },
+          isError: true,
+        };
+      }
+      const result = waitResult.value!;
+
+      // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
-      const result = await job.promise;
 
       if ((job.status as JobStatus) === "cancelled") {
         return {
