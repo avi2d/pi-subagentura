@@ -293,7 +293,7 @@ describe("artifact protocol v2 delivery", () => {
     ).toHaveLength(1);
   });
 
-  it("preserves and batches multiple immutable completions from one poll", () => {
+  it("preserves and batches multiple immutable completions from one poll", async () => {
     const art = makeArtifact();
     const state = makeState(art.dir);
     state.notifyOnComplete = "inject";
@@ -302,12 +302,15 @@ describe("artifact protocol v2 delivery", () => {
     interactiveSubagentRegistry.set(state.id, state);
     (globalThis as any).__piSubagenturaInteractiveRegistry =
       interactiveSubagentRegistry;
-    __setTmuxMultiplexer({ isPaneAlive: () => true } as any);
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
     const first = appendDeterministicTurn(art, 1, "first immutable result");
     const second = appendDeterministicTurn(art, 2, "second immutable result");
     const sendMessage = vi.fn();
 
-    pollArtifactChanges({ sendMessage } as any);
+    await pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage.mock.calls[0][0].details.deliveryIds).toHaveLength(2);

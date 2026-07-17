@@ -75,6 +75,12 @@ describe("session-log tail-read", () => {
         if (args[0] === "display-message") return Buffer.from("#99");
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
     }));
   });
 
@@ -121,7 +127,7 @@ describe("session-log tail-read", () => {
     writeFileSync(sessionFile, JSON.stringify(entry) + "\n");
 
     const sendMessage = vi.fn();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     // Should not have notified the LLM (tool_activity is silent).
     expect(sendMessage).not.toHaveBeenCalled();
@@ -176,7 +182,7 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
@@ -225,7 +231,7 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
@@ -256,7 +262,7 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
@@ -289,11 +295,11 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     const after1 = state.lastDeliveredSessionByte;
     expect(after1).toBeGreaterThan(0);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(after1); // unchanged
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
@@ -339,13 +345,13 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(e1) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Append second line.
     const { appendFileSync } = await import("node:fs");
     appendFileSync(state.sessionFile, JSON.stringify(e2) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
@@ -381,7 +387,7 @@ describe("session-log tail-read", () => {
     const partial = '{ "type": "mess';
     writeFileSync(state.sessionFile, complete + partial);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
@@ -422,7 +428,7 @@ describe("session-log tail-read", () => {
     writeFileSync(state.sessionFile, complete + partial);
     // First poll: ndjson parser buffers the partial internally. The cursor sweeps to the end of
     // the read window so the next tick only reads NEW bytes (not the buffered partial).
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(
       Buffer.byteLength(complete + partial, "utf8"),
     );
@@ -434,7 +440,7 @@ describe("session-log tail-read", () => {
       'age","message":{"role":"assistant","content":[{"type":"toolCall","id":"t2","name":"bash","arguments":{"command":"ls"}}]}}\n';
     appendFileSync(state.sessionFile, appended);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(
       Buffer.byteLength(complete + partial, "utf8") +
         Buffer.byteLength(appended, "utf8"),
@@ -453,7 +459,7 @@ describe("session-log tail-read", () => {
     });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    expect(() => mod.pollArtifactChanges({} as any)).not.toThrow();
+    await expect(mod.pollArtifactChanges({} as any)).resolves.toBeUndefined();
     expect(state.lastDeliveredSessionByte).toBeUndefined();
   });
 
@@ -480,7 +486,7 @@ describe("session-log tail-read", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     expect(state.lastToolName).toBe("bash");
     expect(state.lastToolSummary).toBe("rg TODO src/");
@@ -514,7 +520,7 @@ describe("session-log tail-read", () => {
     const setWidget = vi.fn();
     (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Footer status shows count.
     expect(setStatus).toHaveBeenCalledWith(
@@ -540,7 +546,7 @@ describe("session-log tail-read", () => {
     const setWidget = vi.fn();
     (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     expect(setStatus).toHaveBeenCalledWith("subagentura-running", undefined);
     expect(setWidget).toHaveBeenCalledWith("subagentura-activity", undefined, {
@@ -571,7 +577,7 @@ describe("session-log tail-read", () => {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(notify).toHaveBeenCalledWith(
@@ -615,7 +621,7 @@ describe("session-log tail-read", () => {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -638,11 +644,11 @@ describe("session-log tail-read", () => {
     mod.interactiveSubagentRegistry.set(state.id, state);
     // write 1KB of content, poll to advance cursor
     writeFileSync(state.sessionFile, "x".repeat(1024) + "\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(1025);
     // truncate to 0, then write new content
     writeFileSync(state.sessionFile, "new\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     // cursor should have been reset, so it now points past the new content
     expect(state.lastDeliveredSessionByte).toBe(4);
   });
@@ -653,11 +659,11 @@ describe("session-log tail-read", () => {
     mod.interactiveSubagentRegistry.set(state.id, state);
     // write 1KB of content, poll to advance cursor
     writeFileSync(state.sessionFile, "x".repeat(1024) + "\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(1025);
     // truncate to 0, then write new content
     writeFileSync(state.sessionFile, "new\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     // cursor should have been reset, so it now points past the new content
     expect(state.lastDeliveredSessionByte).toBe(4);
   });
@@ -695,7 +701,7 @@ describe("session-log tail-read", () => {
     writeFileSync(state.sessionFile, line + "\n");
 
     // First poll: ndjson reads up to 1 MiB (the defensive cap), buffers the rest internally.
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     const afterFirst = state.lastDeliveredSessionByte ?? 0;
     expect(afterFirst).toBe(1 * 1024 * 1024); // defensive cap was hit
 
@@ -708,7 +714,7 @@ describe("session-log tail-read", () => {
     // Second poll: cursor at 1 MiB, file has another ~0.5 MiB left. The ndjson parser combines the
     // buffered partial with the new bytes and emits the completed line. The cursor advances to the end
     // of the file. The OLD code would have re-read the same 1 MiB over and over and never advanced.
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBeGreaterThan(afterFirst);
     const activityAfterSecond = readEvents(art).filter(
       (e) => e.type === "tool_activity",
@@ -736,7 +742,7 @@ describe("session-log tail-read", () => {
       },
     };
     appendFileSync(state.sessionFile, JSON.stringify(nextEntry) + "\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     const activity = readEvents(art).filter((e) => e.type === "tool_activity");
     expect(activity).toHaveLength(2);
     expect(activity[1]).toMatchObject({ tool: "read", summary: "/tmp/x" });
@@ -768,7 +774,7 @@ describe("session-log tail-read", () => {
       state.sessionFile,
       "x".repeat(1024) + "\n" + JSON.stringify(initialEntry) + "\n",
     );
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     const cursorBeforeTruncation = state.lastDeliveredSessionByte;
     expect(cursorBeforeTruncation).toBeGreaterThan(1024);
 
@@ -792,7 +798,7 @@ describe("session-log tail-read", () => {
       },
     };
     writeFileSync(state.sessionFile, JSON.stringify(newEntry) + "\n");
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Cursor was reset to 0, then advanced to the end of the new content.
     const newSize = Buffer.byteLength(JSON.stringify(newEntry) + "\n", "utf8");
@@ -855,7 +861,7 @@ describe("session-log tail-read", () => {
         JSON.stringify(entry2) +
         "\n",
     );
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const activity = readEvents(art).filter((e) => e.type === "tool_activity");
@@ -909,7 +915,7 @@ describe("session-log tail-read", () => {
     writeFileSync(a.state.sessionFile, JSON.stringify(entryA) + "\n");
     writeFileSync(b.state.sessionFile, JSON.stringify(entryB) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const artA = artifactPath(join(a.artifactDir, ".."), a.state.id);
     const artB = artifactPath(join(b.artifactDir, ".."), b.state.id);

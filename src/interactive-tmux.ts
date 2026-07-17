@@ -633,6 +633,13 @@ export function isPaneAlive(state: InteractiveSubagentState): boolean {
   return getMuxForState(state).isPaneAlive(state.paneId, state.muxSession);
 }
 
+/** Probe pane liveness without blocking the parent event loop. */
+export function isPaneAliveAsync(
+  state: InteractiveSubagentState,
+): Promise<boolean> {
+  return getMuxForState(state).isPaneAliveAsync(state.paneId, state.muxSession);
+}
+
 /**
  * Send a command (text + Enter) to a pane, using the mux that created it.
  * Mux-agnostic — replaces `sendCommandToTmuxPane(paneId, command)`.

@@ -28,6 +28,7 @@ import { appendEvent, artifactPath } from "../src/artifact";
 import { jobRegistry } from "../src/helpers";
 import { workflowJobRegistry } from "../src/workflow";
 import registerExtension, { pollArtifactChanges } from "../src/subagent";
+import { __setTmuxMultiplexer } from "../src/multiplexer";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -71,7 +72,8 @@ function setupExtension() {
   // We want the LAST one — the one that runs clearInterval, the cancel
   // loop, and the registry clear.
   let shutdownHandler:
-    ((event?: { reason?: string }, ctx?: { cwd?: string }) => void) | undefined;
+    | ((event?: { reason?: string }, ctx?: { cwd?: string }) => void)
+    | undefined;
   for (const [event, handler] of (api.on as any).mock.calls) {
     if (event === "session_shutdown") {
       shutdownHandler = handler as (
@@ -103,6 +105,10 @@ describe("session_shutdown handler", () => {
     g.__piSubagenturaPiRef = undefined;
     jobRegistry.clear();
     workflowJobRegistry.clear();
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
 
     // Stub the global timers. setInterval returns a fake handle with a
     // vi.fn() unref method; clearInterval is a no-op spy.
@@ -297,7 +303,7 @@ describe("session_shutdown handler", () => {
     };
   }
 
-  it("AC-A1: setInterval tick after session_shutdown delivers zero notifications (race-reproducing)", () => {
+  it("AC-A1: setInterval tick after session_shutdown delivers zero notifications (race-reproducing)", async () => {
     // Empty tmp artifact dir; no events written.
 
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a1-"));
@@ -331,6 +337,7 @@ describe("session_shutdown handler", () => {
     // 1. Pre-shutdown tick: no artifact events, no notification.
 
     tick();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
 
@@ -355,11 +362,12 @@ describe("session_shutdown handler", () => {
     //    must deliver zero notifications because the registry is empty.
 
     tick();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(api.sendMessage).toHaveBeenCalledTimes(0);
   });
 
-  it("AC-A2: setInterval tick after shutdown does not re-deliver a done event already in the artifact", () => {
+  it("AC-A2: setInterval tick after shutdown does not re-deliver a done event already in the artifact", async () => {
     tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a2-"));
 
     const artifactDir = join(tmpRoot, "run-1");
@@ -375,6 +383,10 @@ describe("session_shutdown handler", () => {
     appendEvent(art, { ts: doneTs, type: "done", status: "done", exitCode: 0 });
 
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
 
     const { api, shutdownHandler } = setupExtension();
 
@@ -394,7 +406,8 @@ describe("session_shutdown handler", () => {
 
     // delivered. Exactly one notification.
 
-    tick();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await pollArtifactChanges(api as any);
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
     expect(notify).toHaveBeenCalledOnce();
@@ -410,9 +423,11 @@ describe("session_shutdown handler", () => {
     // notification count stays at 1 — no duplicate delivered.
 
     tick();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
     expect(notify).toHaveBeenCalledOnce();
+    __setTmuxMultiplexer(undefined);
   });
 
   afterEach(() => {

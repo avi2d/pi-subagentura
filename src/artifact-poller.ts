@@ -31,7 +31,7 @@ import {
   deriveInteractiveSubagentStatusFromLifecycle,
   foldInteractiveLifecycle,
   interactiveSubagentRegistry,
-  isPaneAlive,
+  isPaneAliveAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
@@ -70,6 +70,7 @@ function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
       return assertNever(ev);
   }
 }
+let pollInFlight: Promise<void> | undefined;
 // ── Poller ─────────────────────────────────────────────────────────────
 
 /**
@@ -79,21 +80,52 @@ function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
  * Backwards-compatible with sub-agents that finished during parent downtime:
  * we walk the artifact log in physical byte order and advance eventByteCursor.
  */
-export function pollArtifactChanges(pi: ExtensionAPI): void {
+export function pollArtifactChanges(pi: ExtensionAPI): Promise<void> {
+  if (pollInFlight) return pollInFlight;
+  const poll = runPollArtifactChanges(pi);
+  pollInFlight = poll;
+  return poll.finally(() => {
+    if (pollInFlight === poll) pollInFlight = undefined;
+  });
+}
+
+async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
   // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
   // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
   // pi ctx) try again. A stale extension context after session replacement is the most likely cause.
   try {
     const g2 = typeof global !== "undefined" ? global : globalThis;
+    const initialPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     const interactivePi =
       (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
     if (!interactivePi) return;
 
+    const states = [...interactiveSubagentRegistry.values()];
+    const liveness = await Promise.all(
+      states.map(async (state) => {
+        try {
+          return [state, await isPaneAliveAsync(state)] as const;
+        } catch (err) {
+          debugLog("error", "poller_liveness_error", {
+            stateId: state.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return [state, false] as const;
+        }
+      }),
+    );
+    const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
+    if (
+      (initialPiRef !== undefined && currentPiRef === undefined) ||
+      (currentPiRef !== undefined && currentPiRef !== interactivePi)
+    ) {
+      return;
+    }
     let runningCount = 0;
     const widgetRows: string[] = [];
     const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
-
-    for (const state of interactiveSubagentRegistry.values()) {
+    for (const [state, paneAlive] of liveness) {
+      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
       // the artifact log: a later done/error event must still reach the parent.
       // 'exited' is intentionally not skipped: a follow-up user entry can revive it to "running".
@@ -101,7 +133,6 @@ export function pollArtifactChanges(pi: ExtensionAPI): void {
         dirname(state.artifactDir),
         basename(state.artifactDir),
       );
-      const paneAlive = isPaneAlive(state);
       // Tail-read the child's session log and synthesize tool_activity events.
       // TUI-widget only — the LLM never sees them.
       tailReadSessionLog(state, art);

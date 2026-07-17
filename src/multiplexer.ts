@@ -103,6 +103,13 @@ export interface Multiplexer {
   isPaneAlive(paneId: string, session?: string): boolean;
 
   /**
+   * Asynchronously probe pane liveness without blocking the parent event loop.
+   * Used by the recurring artifact poller; implementations must resolve false
+   * on backend errors rather than throwing.
+   */
+  isPaneAliveAsync(paneId: string, session?: string): Promise<boolean>;
+
+  /**
    * Send literal text to the pane's shell input buffer, character-by-character.
    * Does NOT submit (no Enter). Callers that want to submit pair this with
    * a second call to `sendEnter`.
