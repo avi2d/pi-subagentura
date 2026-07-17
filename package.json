@@ -57,7 +57,10 @@
     "src/workflow-ui.ts",
     "src/workflow-tree-ui.ts",
     "src/workflow-picker-ui.ts",
-    "src/workflow-tool.ts"
+    "src/workflow-tool.ts",
+    "src/abortable-wait.ts",
+    "src/cancel-all-flows.ts",
+    "src/cancel-all-flows-registration.ts"
   ],
   "engines": {
     "node": ">=18.0.0"

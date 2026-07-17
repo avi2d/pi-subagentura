@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import { abortableWait } from "./abortable-wait";
 import { startSubagentJob, debugLog } from "./helpers";
 import { launchInteractiveSubagent } from "./interactive-tmux";
 import {
@@ -11,6 +12,7 @@ import {
   deleteWorkflowScript,
   type WorkflowAgentRunner,
   type WorkflowMeta,
+  type WorkflowRunResult,
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
@@ -448,7 +450,11 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         description: "Workflow ID returned by an async `workflow` spawn.",
       }),
     }),
-    async execute(_id: string, params: any): Promise<any> {
+    async execute(
+      _id: string,
+      params: any,
+      signal?: AbortSignal,
+    ): Promise<any> {
       const st = workflowJobRegistry.get(params.workflowId);
       if (!st) {
         return {
@@ -459,42 +465,40 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      try {
-        const run = await st.promise;
-        const resultText =
-          typeof run.result === "string" ? run.result : stringify(run.result);
-        const presentation = getWorkflowCompletionPresentation(
-          "done",
-          run.errorCount,
-        );
+
+      // If signal is already aborted, return immediately
+      if (signal?.aborted) {
         return {
           content: [
             {
               type: "text",
-              text: (() => {
-                const prefix = presentation.icon ? `${presentation.icon} ` : "";
-                const label = presentation.icon
-                  ? presentation.label
-                  : "complete";
-                return (
-                  `${prefix}Workflow "${run.meta.name}" ${label} — ` +
-                  `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} tokens.\n\n${resultText}`
-                );
-              })(),
+              text: `Wait for workflow ${st.id} cancelled.`,
             },
           ],
-          details: {
-            status: "done",
-            presentationStatus: presentation.label,
-            workflowId: st.id,
-            name: run.meta.name,
-            agentsSpawned: run.agentsSpawned,
-            errorCount: run.errorCount,
-            tokensSpent: run.tokensSpent,
-            phases: run.phases,
-          },
+          details: { status: "wait_cancelled", workflowId: st.id },
+          isError: true,
         };
+      }
+
+      // Race st.promise against the abort signal
+      let run: WorkflowRunResult;
+      try {
+        const waitResult = await abortableWait(st.promise, signal);
+        if (waitResult.aborted) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Wait for workflow ${st.id} cancelled.`,
+              },
+            ],
+            details: { status: "wait_cancelled", workflowId: st.id },
+            isError: true,
+          };
+        }
+        run = waitResult.value!;
       } catch (err) {
+        // Non-abort errors preserve the original structured handling
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [
@@ -504,6 +508,38 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+
+      const resultText =
+        typeof run.result === "string" ? run.result : stringify(run.result);
+      const presentation = getWorkflowCompletionPresentation(
+        "done",
+        run.errorCount,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: (() => {
+              const prefix = presentation.icon ? `${presentation.icon} ` : "";
+              const label = presentation.icon ? presentation.label : "complete";
+              return (
+                `${prefix}Workflow "${run.meta.name}" ${label} — ` +
+                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} tokens.\n\n${resultText}`
+              );
+            })(),
+          },
+        ],
+        details: {
+          status: "done",
+          presentationStatus: presentation.label,
+          workflowId: st.id,
+          name: run.meta.name,
+          agentsSpawned: run.agentsSpawned,
+          errorCount: run.errorCount,
+          tokensSpent: run.tokensSpent,
+          phases: run.phases,
+        },
+      };
     },
   });
 

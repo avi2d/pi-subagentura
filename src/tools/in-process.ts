@@ -26,6 +26,7 @@ import {
   type SubagentResult,
   type Usage,
 } from "../helpers";
+import { abortableWait } from "../abortable-wait";
 import {
   completionTriggersTurn,
   deliverNotification,
@@ -644,8 +645,38 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         };
       }
 
+      // If signal is already aborted, return immediately without setting resultRetrieved
+      if (signal?.aborted) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Wait for job ${params.jobId} cancelled.`,
+            },
+          ],
+          details: { jobId: params.jobId, status: "wait_cancelled" },
+          isError: true,
+        };
+      }
+
+      // Race job.promise against the abort signal
+      const waitResult = await abortableWait(job.promise, signal);
+      if (waitResult.aborted) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Wait for job ${params.jobId} cancelled.`,
+            },
+          ],
+          details: { jobId: params.jobId, status: "wait_cancelled" },
+          isError: true,
+        };
+      }
+      const result = waitResult.value!;
+
+      // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
-      const result = await job.promise;
 
       if ((job.status as JobStatus) === "cancelled") {
         return {
