@@ -75,7 +75,11 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // every running interactive sub-agent and fires pointer notifications for new events.
   // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
-    const handle = setInterval(() => pollArtifactChanges(pi), 5000);
+    const handle = setInterval(() => {
+      void pollArtifactChanges(pi).catch((err) => {
+        console.error("[subagentura] artifact poll failed", err);
+      });
+    }, 5000);
     // Don't pin the event loop on a long-lived parent. unref() lets the process exit
     // cleanly when nothing else is keeping it alive (no other ref'd handles).
     handle.unref?.();

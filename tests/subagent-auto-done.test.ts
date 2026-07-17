@@ -116,6 +116,12 @@ describe("no parent-side timeout completion synthesis", () => {
         if (args[0] === "display-message") return Buffer.from("%99");
         return "";
       },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "#99"),
     }));
     root = makeTmp();
     const g = globalThis as any;
@@ -137,7 +143,7 @@ describe("no parent-side timeout completion synthesis", () => {
     mod.interactiveSubagentRegistry.set(state.id, state);
 
     const sendMessage = vi.fn();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -154,7 +160,7 @@ describe("no parent-side timeout completion synthesis", () => {
       "Review complete. The findings file `/tmp/review-sec.md` contains 0 critical vulns.";
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -169,7 +175,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const { state } = makeState({ outputContent: null });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(state.artifactDir), state.id);
     const events = readEvents(art);
@@ -185,7 +191,7 @@ describe("no parent-side timeout completion synthesis", () => {
     state.lastStopReason = "toolUse" as unknown as "stop";
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -205,7 +211,7 @@ describe("no parent-side timeout completion synthesis", () => {
       state.lastStopReason = reason;
       mod.interactiveSubagentRegistry.set(state.id, state);
 
-      mod.pollArtifactChanges({} as any);
+      await mod.pollArtifactChanges({} as any);
 
       const art = artifactPath(dirname(artifactDir), state.id);
       const events = readEvents(art);
@@ -223,7 +229,7 @@ describe("no parent-side timeout completion synthesis", () => {
     state.lastStopReasonAt = Date.now() - 1_000; // legacy timestamp must not matter
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -249,7 +255,7 @@ describe("no parent-side timeout completion synthesis", () => {
       exitCode: 0,
     });
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const events = readEvents(art);
 
@@ -370,7 +376,7 @@ describe("no parent-side timeout completion synthesis", () => {
 
     const sendMessage = vi.fn();
 
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     const events = readEvents(art);
 
@@ -405,9 +411,9 @@ describe("no parent-side timeout completion synthesis", () => {
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
-    mod.pollArtifactChanges({} as any);
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -422,7 +428,7 @@ describe("no parent-side timeout completion synthesis", () => {
     mod.interactiveSubagentRegistry.set(state.id, state);
 
     const sendMessage = vi.fn();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
 
     const art = artifactPath(dirname(artifactDir), state.id);
@@ -433,7 +439,7 @@ describe("no parent-side timeout completion synthesis", () => {
       exitCode: 0,
     });
 
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
     expect(state.pendingDeliveries).toHaveLength(1);
   });
 
@@ -443,7 +449,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.autoDoneForTurnAt).toBeUndefined();
 
     const userMsg = {
@@ -456,7 +462,7 @@ describe("no parent-side timeout completion synthesis", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.autoDoneForTurnAt).toBeUndefined();
   });
 
@@ -466,7 +472,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const { state, artifactDir } = makeState({ outputContent: "result" });
     mod.interactiveSubagentRegistry.set(state.id, state);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     // Simulate a terminal previous turn. The user has now sent a follow-up;
     // we want to verify the user-role revival clears "exited" too.
     state.status = "exited";
@@ -481,7 +487,7 @@ describe("no parent-side timeout completion synthesis", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     // Status revived so child lifecycle events for the next turn are observed.
     expect(state.status).toBe("running");
   });
@@ -501,7 +507,7 @@ describe("no parent-side timeout completion synthesis", () => {
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
     state.status = "idle";
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.status).toBe("idle");
 
     const userMsg = {
@@ -514,7 +520,7 @@ describe("no parent-side timeout completion synthesis", () => {
     };
     writeFileSync(state.sessionFile, JSON.stringify(userMsg) + "\n");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
     expect(state.status).toBe("running");
   });
 
@@ -536,7 +542,7 @@ describe("no parent-side timeout completion synthesis", () => {
       "Done. Wrote the result.",
     );
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     expect(state.lastStopReason).toBe("stop");
     expect(state.lastStopReasonAt).toBe(ts);
@@ -560,7 +566,7 @@ describe("no parent-side timeout completion synthesis", () => {
       "I hit the token limit.",
     );
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     expect(state.lastStopReason).toBe("length");
     expect(state.lastStopText).toBeUndefined();
@@ -592,7 +598,7 @@ describe("no parent-side timeout completion synthesis", () => {
       { flag: "a" },
     );
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // All three per-turn fields must be cleared, matching the reset of
     // autoDoneForTurnAt on the same code path.
@@ -612,7 +618,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", longText);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const events = readEvents(
       artifactPath(dirname(state.artifactDir), state.id),
@@ -630,7 +636,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", shortText);
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const events = readEvents(
       artifactPath(dirname(state.artifactDir), state.id),
@@ -648,7 +654,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Legacy state remains untouched; protocol-v2 delivery receipts own deduplication.
     const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
@@ -665,7 +671,7 @@ describe("no parent-side timeout completion synthesis", () => {
     const ts = Date.now() - 11_000;
     writeAssistantTurn(state.sessionFile, ts, "stop", "Done.");
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Legacy state remains untouched in notify mode too.
     const after = mod.interactiveSubagentRegistry.get(state.id) as typeof state;
@@ -719,7 +725,7 @@ describe("no parent-side timeout completion synthesis", () => {
     );
 
     const sendMessage = vi.fn();
-    mod.pollArtifactChanges({ sendMessage } as any);
+    await mod.pollArtifactChanges({ sendMessage } as any);
 
     expect(state.lastStopReason).toBe("stop");
     expect(state.lastStopReasonAt).toBe(stopTs);
@@ -768,7 +774,7 @@ describe("no parent-side timeout completion synthesis", () => {
       }) + "\n",
     );
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     const art = artifactPath(dirname(artifactDir), state.id);
     const events = readEvents(art);
@@ -859,7 +865,7 @@ describe("no parent-side timeout completion synthesis", () => {
       artifactDir: replayArtifactDir,
     });
 
-    mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
 
     // Session text alone must not create a completion event.
     const eventsFile = join(replayArtifactDir, "events.ndjson");

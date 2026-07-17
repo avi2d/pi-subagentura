@@ -405,6 +405,7 @@ describe("Pi session delivery integration", () => {
     };
     interactiveSubagentRegistry.set(state.id, state);
     __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
       isPaneAlive: () => true,
     } as any);
     writeOutput(art, "immutable artifact result");
@@ -414,7 +415,7 @@ describe("Pi session delivery integration", () => {
       source: "explicit",
     });
 
-    pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(harness.contexts[0].messages.at(-1)).toMatchObject({ role: "user" });
     harness.completeNext();
@@ -698,7 +699,7 @@ describe("persisted delivery Pi session integration", () => {
       deliveryId,
     );
 
-    pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
 
     expect(harness.contexts).toHaveLength(0);
     expect(interactiveSubagentRegistry.get(art.id)?.pendingDeliveries).toEqual(
@@ -712,7 +713,7 @@ describe("persisted delivery Pi session integration", () => {
       expect.objectContaining({ state: "queued" }),
     ]);
 
-    pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
 
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(harness.contexts[0].messages.at(-1)).toMatchObject({ role: "user" });

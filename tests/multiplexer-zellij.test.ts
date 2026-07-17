@@ -308,6 +308,27 @@ describe("multiplexer-zellij", () => {
     expect(mux.isPaneAlive("42")).toBe(false);
   });
 
+  it("isPaneAliveAsync uses execFile rather than execFileSync", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        throw new Error("sync liveness probe must not run");
+      },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(null, JSON.stringify([{ id: 42 }])),
+    }));
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+    await expect(new ZellijMultiplexer().isPaneAliveAsync("42")).resolves.toBe(
+      true,
+    );
+  });
+
   /* ------------------------------------------------------------------ */
   /*  sendKeys + sendEnter                                               */
   /* ------------------------------------------------------------------ */
