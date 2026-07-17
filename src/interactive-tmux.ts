@@ -32,6 +32,7 @@ import {
   appendInteractiveState,
   appendCompletionEvent,
   artifactPath,
+  assertNever,
   newEventId,
   type SubagentEvent,
   type PersistedDeliveryIntent,
@@ -122,7 +123,11 @@ The child-only Pi lifecycle hook is a crash-safety fallback, not permission to o
  * - "unknown"  — can't determine (rare; pane dead but no recorded event)
  */
 export type InteractiveSubagentStatus =
-  "running" | "idle" | "cancelled" | "exited" | "unknown";
+  | "running"
+  | "idle"
+  | "cancelled"
+  | "exited"
+  | "unknown";
 
 export interface InteractiveSubagentState {
   id: string;
@@ -226,7 +231,8 @@ export interface InteractiveSubagentState {
 
 declare global {
   var __piSubagenturaInteractiveRegistry:
-    Map<string, InteractiveSubagentState> | undefined;
+    | Map<string, InteractiveSubagentState>
+    | undefined;
 }
 
 if (!globalThis.__piSubagenturaInteractiveRegistry) {
@@ -818,19 +824,28 @@ export function deriveInteractiveSubagentStatus(
   lastEvent: SubagentEvent | null,
   paneAlive: boolean,
 ): InteractiveSubagentStatus {
-  if (lastEvent) {
-    if (lastEvent.type === "process_exited") {
+  if (!lastEvent) return paneAlive ? "running" : "unknown";
+  switch (lastEvent.type) {
+    case "process_exited":
       return lastEvent.status === "cancelled" ? "cancelled" : "exited";
-    }
-    if (lastEvent.type === "completion") {
+    case "completion":
       if (lastEvent.outcome === "cancelled") return "cancelled";
       return paneAlive ? "idle" : "exited";
-    }
-    if (lastEvent.type === "cancelled") return "cancelled";
-    if (lastEvent.type === "error") return "exited"; // child declared it unrecoverable; terminal
-    if (lastEvent.type === "done") return paneAlive ? "idle" : "exited";
+    case "cancelled":
+      return "cancelled";
+    case "error":
+      // child declared it unrecoverable; terminal
+      return "exited";
+    case "done":
+      return paneAlive ? "idle" : "exited";
+    case "started":
+    case "tool_activity":
+    case "turn_started":
+      // Non-terminal activity events: still running if pane is alive.
+      return paneAlive ? "running" : "unknown";
+    default:
+      return assertNever(lastEvent);
   }
-  return paneAlive ? "running" : "unknown";
 }
 
 export function deriveInteractiveSubagentStatusFromEvents(
@@ -847,44 +862,53 @@ export function foldInteractiveLifecycle(
   event: SubagentEvent,
 ): void {
   lifecycle.startedAt ??= event.ts;
-  if (event.type === "process_exited") {
-    lifecycle.processStatus = event.status;
-    lifecycle.processExitCode = event.exitCode;
-    return;
-  }
-  if (event.type === "turn_started") {
-    lifecycle.currentTurnId = event.turnId;
-    lifecycle.completionTurnId = undefined;
-    lifecycle.completionOutcome = undefined;
-    lifecycle.completionSource = undefined;
-    lifecycle.completionExitCode = undefined;
-    lifecycle.legacyTerminal = undefined;
-    return;
-  }
-  if (event.type === "completion") {
-    if (event.outcome === "cancelled" && event.source === "parent") {
-      lifecycle.parentCancelled = true;
+  switch (event.type) {
+    case "process_exited": {
+      lifecycle.processStatus = event.status;
+      lifecycle.processExitCode = event.exitCode;
+      return;
     }
-    if (!lifecycle.currentTurnId || event.turnId === lifecycle.currentTurnId) {
-      lifecycle.completionTurnId = event.turnId;
-      lifecycle.completionOutcome = event.outcome;
-      lifecycle.completionSource = event.source;
-      lifecycle.completionExitCode = event.exitCode;
+    case "turn_started": {
+      lifecycle.currentTurnId = event.turnId;
+      lifecycle.completionTurnId = undefined;
+      lifecycle.completionOutcome = undefined;
+      lifecycle.completionSource = undefined;
+      lifecycle.completionExitCode = undefined;
+      lifecycle.legacyTerminal = undefined;
+      return;
     }
-    return;
-  }
-  if (event.type === "started") {
-    lifecycle.legacyTerminal = undefined;
-    return;
-  }
-  if (
-    event.type === "done" ||
-    event.type === "error" ||
-    event.type === "cancelled"
-  ) {
-    lifecycle.legacyTerminal = event.status;
-    lifecycle.completionExitCode =
-      "exitCode" in event ? event.exitCode : undefined;
+    case "completion": {
+      if (event.outcome === "cancelled" && event.source === "parent") {
+        lifecycle.parentCancelled = true;
+      }
+      if (
+        !lifecycle.currentTurnId ||
+        event.turnId === lifecycle.currentTurnId
+      ) {
+        lifecycle.completionTurnId = event.turnId;
+        lifecycle.completionOutcome = event.outcome;
+        lifecycle.completionSource = event.source;
+        lifecycle.completionExitCode = event.exitCode;
+      }
+      return;
+    }
+    case "started": {
+      lifecycle.legacyTerminal = undefined;
+      return;
+    }
+    case "done":
+    case "error":
+    case "cancelled": {
+      lifecycle.legacyTerminal = event.status;
+      lifecycle.completionExitCode =
+        "exitCode" in event ? event.exitCode : undefined;
+      return;
+    }
+    case "tool_activity":
+      // Activity events do not affect lifecycle state.
+      return;
+    default:
+      return assertNever(event);
   }
 }
 
