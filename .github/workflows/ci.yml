@@ -3,18 +3,17 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    name: Test (Pi ${{ matrix.pi }})
+    name: Test (latest Pi)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        pi: [baseline-0.80.6, latest-0.80.x]
 
     steps:
       - name: Checkout
@@ -31,14 +30,19 @@ jobs:
       - name: Check formatting
         run: npm run format:check
 
-      - name: Install latest compatible Pi SDK
-        if: matrix.pi == 'latest-0.80.x'
+      - name: Install latest Pi SDK
         run: >-
           npm install --no-save --package-lock=false
-          '@earendil-works/pi-agent-core@>=0.80.6 <0.81.0'
-          '@earendil-works/pi-ai@>=0.80.6 <0.81.0'
-          '@earendil-works/pi-coding-agent@>=0.80.6 <0.81.0'
-          '@earendil-works/pi-tui@>=0.80.6 <0.81.0'
+          '@earendil-works/pi-agent-core@latest'
+          '@earendil-works/pi-ai@latest'
+          '@earendil-works/pi-coding-agent@latest'
+          '@earendil-works/pi-tui@latest'
+
+      - name: Verify extension loads in latest Pi
+        run: |
+          npx --no-install pi --version
+          PI_OFFLINE=1 npx --no-install pi --offline --no-session \
+            -e ./src/subagent.ts --help
 
       - name: Install tmux
         run: |
