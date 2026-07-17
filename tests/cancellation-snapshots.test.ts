@@ -14,6 +14,8 @@ import { jobRegistry } from "../src/helpers";
 import { registerInProcessSubagentTools } from "../src/tools/in-process";
 import { cancelAllFlows } from "../src/cancel-all-flows";
 import { registerSessionHandlers } from "../src/session-handlers";
+import { registerWorkflowTool } from "../src/workflow-tool";
+import { workflowJobRegistry } from "../src/workflow-jobs";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -113,6 +115,7 @@ function setSnapshotEnv(dir: string, maxBytes?: number): void {
 
 beforeEach(() => {
   jobRegistry.clear();
+  workflowJobRegistry.clear();
 });
 
 afterEach(() => {
@@ -126,6 +129,7 @@ afterEach(() => {
     delete process.env.SUBAGENT_CANCEL_SNAPSHOT_MAX_BYTES;
   else process.env.SUBAGENT_CANCEL_SNAPSHOT_MAX_BYTES = originalEnv.maxBytes;
   vi.restoreAllMocks();
+  workflowJobRegistry.clear();
 });
 
 describe("cancellation snapshots", () => {
@@ -135,6 +139,24 @@ describe("cancellation snapshots", () => {
     const receipt = snapshotInProcessSession(inProcessInput());
     expect(receipt.status).toBe("disabled");
     expect(allFiles(root)).toHaveLength(0);
+  });
+
+  it("omits disabled receipts from cancel-all results", async () => {
+    delete process.env.SUBAGENT_CANCEL_SNAPSHOT;
+    const input = inProcessInput();
+    jobRegistry.set("job-disabled", {
+      id: "job-disabled",
+      status: "running",
+      session: { ...input.session, abort: vi.fn() },
+      liveStatus: { output: input.partialOutput, activeTool: input.activeTool },
+      cwd: input.cwd,
+      modelLabel: input.model,
+    } as any);
+
+    const result = await cancelAllFlows();
+
+    expect(result.jobsAborted).toBe(1);
+    expect(result.snapshots).toEqual([]);
   });
 
   it("writes a private full in-process snapshot with canonical context and partial state", () => {
@@ -349,6 +371,57 @@ describe("cancellation snapshots", () => {
     await Promise.resolve();
     controller.abort();
     await expect(promise).rejects.toThrow("Workflow aborted");
+  });
+
+  it("waits for asynchronous workflow snapshot receipts before returning", async () => {
+    setSnapshotEnv(mkdtempSync(join(tmpdir(), "workflow-receipt-wait-")));
+    const tools: Record<string, any> = {};
+    registerWorkflowTool({
+      registerTool: (tool: any) => {
+        tools[tool.name] = tool;
+      },
+    } as any);
+    const controller = new AbortController();
+    const receipt: CancellationSnapshotReceipt = {
+      schemaVersion: 1,
+      kind: "interactive",
+      status: "written",
+      enabled: true,
+      source: "workflow",
+      key: "async-workflow-receipt",
+      path: "/private/async-workflow-snapshot.json",
+    };
+    const state: any = {
+      id: "wf_snapshot_wait",
+      name: "snapshot-wait",
+      status: "running",
+      abort: controller,
+      cancellationSnapshots: [],
+      snapshot: { agentsSpawned: 1, runningCount: 1 },
+    };
+    state.promise = new Promise((_resolve, reject) => {
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          setTimeout(() => {
+            state.cancellationSnapshots.push(receipt);
+            reject(new Error("Workflow aborted."));
+          }, 0);
+        },
+        { once: true },
+      );
+    });
+    workflowJobRegistry.set(state.id, state);
+
+    const result = await tools.cancel_workflow.execute(
+      "cancel-call",
+      { workflowId: state.id },
+      undefined,
+      undefined,
+    );
+    await expect(state.promise).rejects.toThrow("Workflow aborted");
+
+    expect(result.details.snapshots).toContainEqual(receipt);
   });
 
   it("snapshots in-process jobs before session shutdown aborts them", async () => {

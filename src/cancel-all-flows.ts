@@ -39,6 +39,7 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   const snapshots = result.snapshots;
   const snapshotKeys = new Set<string>();
   const addSnapshot = (receipt: CancellationSnapshotReceipt): void => {
+    if (!receipt.enabled || receipt.status === "disabled") return;
     if (snapshotKeys.has(receipt.key)) return;
     snapshotKeys.add(receipt.key);
     snapshots!.push(receipt);
