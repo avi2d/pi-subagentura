@@ -557,7 +557,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       } catch (err) {
         // Non-abort errors preserve the original structured handling
         const msg = err instanceof Error ? err.message : String(err);
-        const usage = presentWorkflowUsage(st.snapshot.usage);
+        const usage = presentWorkflowUsage(st.snapshot?.usage);
         const usageDetails = usage ? { usage } : {};
         return {
           content: [
