@@ -71,11 +71,7 @@ export interface OutputHistoryEntry {
 
 export type CompletionOutcome = "done" | "error" | "cancelled";
 export type CompletionSource =
-  | "agent_settled"
-  | "agent_end"
-  | "explicit"
-  | "process_exit"
-  | "parent";
+  "agent_settled" | "agent_end" | "explicit" | "process_exit" | "parent";
 
 export type SubagentEventV2 =
   | {
@@ -720,8 +716,7 @@ function normalizeEvent(
           }
         : undefined;
     const rawOutputError = obj.outputError as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const outputError: OutputSnapshotError | undefined =
       rawOutputError?.code === "output_too_large" &&
       typeof rawOutputError.bytes === "number" &&
@@ -1205,8 +1200,7 @@ export interface PersistedLifecycleFold {
   legacyTerminal?: "done" | "error" | "cancelled";
 }
 
-export interface InteractiveSubagentPersistedStateV2
-  extends InteractiveSubagentPersistedStateV1 {
+export interface InteractiveSubagentPersistedStateV2 extends InteractiveSubagentPersistedStateV1 {
   eventByteCursor: number;
   sessionByteCursor: number;
   activeTurnId?: string;
@@ -1599,8 +1593,7 @@ export function saveInteractiveStates(
 export function appendInteractiveState(
   cwd: string,
   entry:
-    | InteractiveSubagentPersistedStateV1
-    | InteractiveSubagentPersistedStateV2,
+    InteractiveSubagentPersistedStateV1 | InteractiveSubagentPersistedStateV2,
 ): void {
   const current = loadInteractiveStates(cwd) ?? {
     schemaVersion: CURRENT_STATE_SCHEMA_VERSION,

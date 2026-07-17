@@ -101,8 +101,7 @@ export function renderSubagentResult(
       (c): c is { type: "text"; text: string } => c.type === "text",
     )?.text ?? "";
   const resultDetails = result.details as
-    | { usageSummary?: string; thinkingLevel?: ThinkingLevel }
-    | undefined;
+    { usageSummary?: string; thinkingLevel?: ThinkingLevel } | undefined;
 
   if (result.isError) {
     const thinking = thinkingSuffix(resultDetails?.thinkingLevel);
@@ -204,7 +203,7 @@ export function renderSubagentNotify(
     typeof message.content === "string"
       ? message.content
       : (message.content ?? [])
-          .map((part) => (part.type === "text" ? part.text ?? "" : ""))
+          .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
           .join("");
 
   let line: string;

@@ -7,8 +7,7 @@ import {
 import { formatWorkflowUsage } from "./workflow-core";
 
 export type WorkflowTreeAction =
-  | { kind: "cancel"; workflowId: string }
-  | { kind: "close" };
+  { kind: "cancel"; workflowId: string } | { kind: "close" };
 
 type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 
