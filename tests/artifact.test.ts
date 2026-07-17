@@ -21,6 +21,9 @@ import {
   deleteInteractiveStatesFile,
   ensureArtifactDir,
   eventLogEndOffset,
+  isArtifactOutputSettled,
+  isCompletionEvent,
+  isTurnTerminal,
   lastEvent,
   listArtifacts,
   listOutputTurns,
@@ -1041,5 +1044,67 @@ describe("persisted interactive state helpers", () => {
 
   it("deleteInteractiveStatesFile is a no-op when the file is absent", () => {
     expect(() => deleteInteractiveStatesFile(root)).not.toThrow();
+  });
+});
+
+describe("SubagentEvent classification matrix", () => {
+  const baseTs = 1000;
+  const events = {
+    started: { ts: baseTs, type: "started", status: "running" },
+    tool_activity: { ts: baseTs, type: "tool_activity", status: "running" },
+    done: { ts: baseTs, type: "done", status: "done" },
+    error: { ts: baseTs, type: "error", status: "error" },
+    cancelled: { ts: baseTs, type: "cancelled", status: "cancelled" },
+    turn_started: {
+      version: 2,
+      eventId: "e-turn",
+      turnId: "t-turn",
+      ts: baseTs,
+      type: "turn_started",
+      status: "running",
+    },
+    completion: {
+      version: 2,
+      eventId: "e-completion",
+      turnId: "t-completion",
+      ts: baseTs,
+      type: "completion",
+      status: "done",
+      outcome: "done",
+      source: "explicit",
+    },
+    process_exited: {
+      version: 2,
+      eventId: "e-exit",
+      turnId: "t-exit",
+      ts: baseTs,
+      type: "process_exited",
+      status: "done",
+      exitCode: 0,
+    },
+  } satisfies Record<SubagentEvent["type"], SubagentEvent>;
+
+  const expected = {
+    started: { terminal: false, completion: false, settled: false },
+    tool_activity: { terminal: false, completion: false, settled: false },
+    done: { terminal: true, completion: true, settled: true },
+    error: { terminal: true, completion: true, settled: true },
+    cancelled: { terminal: true, completion: true, settled: true },
+    turn_started: { terminal: false, completion: false, settled: false },
+    completion: { terminal: true, completion: true, settled: true },
+    process_exited: { terminal: false, completion: false, settled: true },
+  } satisfies Record<
+    SubagentEvent["type"],
+    { terminal: boolean; completion: boolean; settled: boolean }
+  >;
+
+  it("classifies every event discriminant", () => {
+    for (const type of Object.keys(events) as Array<SubagentEvent["type"]>) {
+      const event = events[type];
+      const result = expected[type];
+      expect(isTurnTerminal(event)).toBe(result.terminal);
+      expect(isCompletionEvent(event)).toBe(result.completion);
+      expect(isArtifactOutputSettled(event)).toBe(result.settled);
+    }
   });
 });

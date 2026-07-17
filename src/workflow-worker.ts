@@ -1,7 +1,15 @@
 import { Worker } from "node:worker_threads";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { readEvents, readOutput } from "./artifact";
+import {
+  assertNever,
+  isTurnTerminal,
+  readEvents,
+  readOutput,
+  readOutputForTurnId,
+  type SubagentEvent,
+  type TurnTerminalEvent,
+} from "./artifact";
 import { debugLog } from "./helpers";
 import type { SubagentResult, Usage } from "./helpers";
 import {
@@ -24,6 +32,7 @@ import {
   type WorkflowAgentRunner,
   type WorkflowMeta,
   type WorkflowProgress,
+  type WorkflowProgressUpdate,
   type WorkflowRunResult,
   zeroUsage,
 } from "./workflow-core";
@@ -56,6 +65,21 @@ interface Engine {
     runningCount: number;
   };
   phases: string[];
+}
+
+function withProgressCounters(
+  progress: WorkflowProgressUpdate,
+  counters: Engine["counters"],
+): WorkflowProgress {
+  switch (progress.kind) {
+    case "phase":
+    case "log":
+    case "agent_start":
+    case "agent_done":
+      return { ...progress, ...counters };
+    default:
+      return assertNever(progress);
+  }
 }
 
 export async function runWorkflow(
@@ -120,21 +144,10 @@ async function executeScript(
   args: unknown,
   _depth: number,
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
-  const emit = (
-    p: Omit<
-      WorkflowProgress,
-      "agentsSpawned" | "errorCount" | "tokensSpent" | "runningCount"
-    >,
-  ) => {
+  const emit = (p: WorkflowProgressUpdate) => {
     if (engine.closed) return;
     if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
-    engine.onProgress?.({
-      ...p,
-      agentsSpawned: engine.counters.agentsSpawned,
-      errorCount: engine.counters.errorCount,
-      tokensSpent: engine.counters.tokensSpent,
-      runningCount: engine.counters.runningCount,
-    });
+    engine.onProgress?.(withProgressCounters(p, engine.counters));
   };
 
   const runAgentCall = async (payload: {
@@ -183,17 +196,34 @@ async function executeScript(
           const finalPrompt = hasSchema
             ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
             : prompt;
-          const res = await engine.runAgent({
-            prompt: finalPrompt,
-            persona: agentOpts.persona,
-            model: agentOpts.model,
-            signal: engine.signal,
-            isolation,
-            label: agentOpts.label,
-            onCancellationSnapshot: engine.onCancellationSnapshot,
-            thinkingLevel: agentOpts.thinkingLevel,
-            onProgress: (ev) => emit({ ...ev, phase: agentOpts.phase }),
-          });
+          let res: SubagentResult;
+          try {
+            res = await engine.runAgent({
+              prompt: finalPrompt,
+              persona: agentOpts.persona,
+              model: agentOpts.model,
+              signal: engine.signal,
+              isolation,
+              label: agentOpts.label,
+              onCancellationSnapshot: engine.onCancellationSnapshot,
+              thinkingLevel: agentOpts.thinkingLevel,
+              onProgress: (ev) => {
+                if (ev.kind === "phase") {
+                  if (ev.phase) {
+                    emit({
+                      ...ev,
+                      phase: agentOpts.phase ?? ev.phase,
+                    });
+                  }
+                  return;
+                }
+                emit({ ...ev, phase: agentOpts.phase });
+              },
+            });
+          } catch (error) {
+            if (!engine.signal.aborted) engine.counters.errorCount++;
+            throw error;
+          }
           const outTokens = res.usage?.output ?? 0;
           tokensDelta += outTokens;
           engine.counters.tokensSpent += outTokens;
@@ -255,9 +285,7 @@ function runWorkflowWorker(
   script: string,
   args: unknown,
   engine: Engine,
-  emit: (
-    p: Omit<WorkflowProgress, "agentsSpawned" | "errorCount" | "tokensSpent">,
-  ) => void,
+  emit: (p: WorkflowProgressUpdate) => void,
   runAgentCall: (payload: {
     prompt: unknown;
     opts?: WorkflowAgentOpts;
@@ -456,6 +484,34 @@ function parseUsageFromSessionFile(sessionFile: string | undefined): Usage {
   }
 }
 
+function findCurrentTurnTerminal(
+  events: SubagentEvent[],
+): TurnTerminalEvent | null {
+  let latestTurnStart = -1;
+  let latestTurnId: string | undefined;
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    if (event.type === "turn_started") {
+      latestTurnStart = index;
+      latestTurnId = event.turnId;
+    }
+  }
+  if (latestTurnStart >= 0) {
+    for (let index = events.length - 1; index > latestTurnStart; index--) {
+      const event = events[index];
+      if (event.type === "completion" && event.turnId === latestTurnId) {
+        return event;
+      }
+    }
+    return null;
+  }
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (isTurnTerminal(event)) return event;
+  }
+  return null;
+}
+
 /**
  * Await a process-backed (tmux/zellij) sub-agent's terminal event by polling its artifact dir,
  * then read its output.md. Honors the abort signal and detects a dead pane that never completed.
@@ -487,30 +543,56 @@ export async function awaitInteractiveResult(
       };
     }
     const events = readEvents(art);
-    const terminal = [...events]
-      .reverse()
-      .find(
-        (e) =>
-          e.type === "done" || e.type === "error" || e.type === "cancelled",
-      );
+    const terminal = findCurrentTurnTerminal(events);
     if (terminal) {
-      const output = readOutput(art) ?? "(no output)";
-      if (terminal.type === "done") {
-        return {
-          isError: false,
-          output,
-          usage: parseUsageFromSessionFile(state.sessionFile),
-          model: state.model ?? "process",
-        };
+      const usage = parseUsageFromSessionFile(state.sessionFile);
+      switch (terminal.type) {
+        case "completion":
+          switch (terminal.outcome) {
+            case "done":
+              return {
+                isError: false,
+                output:
+                  readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
+                usage,
+                model: state.model ?? "process",
+              };
+            case "error":
+            case "cancelled":
+              return {
+                isError: true,
+                output:
+                  readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
+                usage,
+                model: undefined,
+                errorMessage:
+                  terminal.errorMessage ??
+                  terminal.message ??
+                  `interactive sub-agent ${terminal.outcome}`,
+              };
+            default:
+              return assertNever(terminal.outcome);
+          }
+        case "done":
+          return {
+            isError: false,
+            output: readOutput(art) ?? "(no output)",
+            usage,
+            model: state.model ?? "process",
+          };
+        case "error":
+        case "cancelled":
+          return {
+            isError: true,
+            output: readOutput(art) ?? "(no output)",
+            usage,
+            model: undefined,
+            errorMessage:
+              terminal.message ?? `interactive sub-agent ${terminal.type}`,
+          };
+        default:
+          return assertNever(terminal);
       }
-      return {
-        isError: true,
-        output,
-        usage: parseUsageFromSessionFile(state.sessionFile),
-        model: undefined,
-        errorMessage:
-          terminal.message ?? `interactive sub-agent ${terminal.type}`,
-      };
     }
     // No terminal event yet — if the pane has died, give it a few grace ticks for a final flush.
     let alive = true;
