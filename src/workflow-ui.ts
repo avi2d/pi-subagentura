@@ -1,4 +1,4 @@
-import type { WorkflowProgress } from "./workflow-core";
+import { formatWorkflowUsage, type WorkflowProgress } from "./workflow-core";
 import { assertNever } from "./artifact";
 
 // ── Workflow progress renderer ───────────────────────────────────────
@@ -6,7 +6,8 @@ export function renderProgress(p: WorkflowProgress): string {
   const parts = [`● workflow — ${p.agentsSpawned} agent(s)`];
   if (p.runningCount > 0) parts.push(`⚡ ${p.runningCount} running`);
   if (p.errorCount > 0) parts.push(`⚠ ${p.errorCount} error(s)`);
-  parts.push(`${p.tokensSpent} tokens`);
+  parts.push(`${p.tokensSpent} output tokens`);
+  if (p.usage) parts.push(formatWorkflowUsage(p.usage));
   const head = parts.join(", ");
   switch (p.kind) {
     case "phase":

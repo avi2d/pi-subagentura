@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SubagentResult } from "../src/helpers";
-import { validateSchema } from "../src/workflow-core";
-import { runWorkflow } from "../src/workflow";
+import { SCHEMA_RETRIES, validateSchema } from "../src/workflow-core";
+import { runWorkflow, type WorkflowProgress } from "../src/workflow";
 
 type Schema = Record<string, unknown>;
 
@@ -167,4 +167,89 @@ describe("workflow schema retries", () => {
     expect(result.result).toEqual({ value: 2 });
     expect(calls).toBe(2);
   });
+});
+
+describe("workflow schema usage accounting", () => {
+  it("sums usage from every schema attempt", async () => {
+    let calls = 0;
+    const script = `
+      export const meta = { name: "schema-usage", description: "test" };
+      return await agent("return the value", {
+        isolation: "in-process",
+        schema: { type: "object", properties: { value: { type: "number" } } },
+      });
+    `;
+    const result = await runWorkflow(script, {
+      runAgent: async () => {
+        calls++;
+        return {
+          ...ok(calls === 1 ? '{"value": "wrong"}' : '{"value": 2}'),
+          usage: {
+            input: 10,
+            output: 4,
+            cacheRead: 2,
+            cacheWrite: 1,
+            cost: 0.05,
+            turns: 1,
+          },
+        };
+      },
+    });
+
+    expect(result.result).toEqual({ value: 2 });
+    expect(calls).toBe(2);
+    expect(result.tokensSpent).toBe(8);
+    expect(result.usage).toEqual({
+      input: 20,
+      output: 8,
+      cacheRead: 4,
+      cacheWrite: 2,
+      totalTokens: 34,
+      costUsd: 0.1,
+      turns: 2,
+    });
+  });
+});
+
+it("aggregates all failed schema attempts in result and progress", async () => {
+  let calls = 0;
+  const progress: WorkflowProgress[] = [];
+  const script = `
+      export const meta = { name: "schema-all-fail", description: "test" };
+      return await agent("return the value", {
+        isolation: "in-process",
+        schema: { type: "object", properties: { value: { type: "number" } } },
+      });
+    `;
+  const result = await runWorkflow(script, {
+    runAgent: async () => {
+      calls++;
+      return {
+        ...ok('{"value": "wrong"}'),
+        usage: {
+          input: 3,
+          output: 2,
+          cacheRead: 1,
+          cacheWrite: 4,
+          cost: 0.1,
+          turns: 1,
+        },
+      };
+    },
+    onProgress: (event) => progress.push(event),
+  });
+
+  expect(calls).toBe(SCHEMA_RETRIES);
+  expect(result.result).toBeNull();
+  expect(result.errorCount).toBe(1);
+  expect(result.usage).toEqual({
+    input: 9,
+    output: 6,
+    cacheRead: 3,
+    cacheWrite: 12,
+    totalTokens: 30,
+    costUsd: 0.1 * 3,
+    turns: 3,
+  });
+  expect(progress.at(-1)?.usage).toEqual(result.usage);
 });

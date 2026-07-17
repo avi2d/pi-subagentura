@@ -15,11 +15,15 @@ import {
   workflowJobRegistry,
   awaitInteractiveResult,
   renderProgress,
+  formatWorkflowUsage,
   registerWorkflowTool,
   retryPendingWorkflowNotifications,
   getWorkflowCompletionPresentation,
   MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
   type WorkflowAgentRunner,
+  type WorkflowUsage,
+  type WorkflowRunResult,
+  type WorkflowRunResultWithUsage,
   type WorkflowProgress,
 } from "../src/workflow";
 import type { SubagentResult } from "../src/helpers";
@@ -30,6 +34,7 @@ import {
   writeOutput,
 } from "../src/artifact";
 import { spawnSync } from "node:child_process";
+import { formatWorkflowNotificationSummary } from "../src/workflow-tool";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -49,6 +54,37 @@ function ok(output: string, outTokens = 0): SubagentResult {
       turns: 1,
     },
     model: "test/model",
+  };
+}
+
+function richOk(
+  output: string,
+  usage = {
+    input: 11,
+    output: 7,
+    cacheRead: 5,
+    cacheWrite: 3,
+    cost: 0.125,
+    turns: 2,
+  },
+): SubagentResult {
+  return { ...ok(output), usage };
+}
+
+function richFail(msg: string): SubagentResult {
+  return {
+    isError: true,
+    output: "",
+    usage: {
+      input: 2,
+      output: 1,
+      cacheRead: 4,
+      cacheWrite: 6,
+      cost: 0.25,
+      turns: 1,
+    },
+    model: undefined,
+    errorMessage: msg,
   };
 }
 function fail(msg = "boom"): SubagentResult {
@@ -349,6 +385,35 @@ describe("agent() + budget", () => {
         },
       ),
     ).rejects.toThrow(/budget exhausted/i);
+  });
+  it("allows parallel in-flight calls to overshoot the soft output target", async () => {
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let bothStarted!: () => void;
+    const bothStartedPromise = new Promise<void>(
+      (resolve) => (bothStarted = resolve),
+    );
+    const runAgent: WorkflowAgentRunner = async () => {
+      started++;
+      if (started === 2) bothStarted();
+      await gate;
+      return ok("done", 4);
+    };
+
+    const completion = runWorkflow(
+      meta +
+        `return await parallel([` +
+        `() => agent("a", { isolation: "in-process" }), ` +
+        `() => agent("b", { isolation: "in-process" })]);`,
+      { runAgent, budgetTotal: 5 },
+    );
+    await bothStartedPromise;
+    release();
+
+    const result = await completion;
+    expect(result.tokensSpent).toBe(8);
+    expect(result.result).toEqual(["done", "done"]);
   });
 });
 
@@ -1335,7 +1400,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 2 agent(s)");
     expect(result).toContain("⚡ 1 running");
-    expect(result).toContain("100 tokens");
+    expect(result).toContain("100 output tokens");
     expect(result).toContain("◆ phase: Scanning");
   });
 
@@ -1351,7 +1416,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 3 agent(s)");
     expect(result).not.toContain("⚡");
-    expect(result).toContain("50 tokens");
+    expect(result).toContain("50 output tokens");
     expect(result).toContain("hello");
   });
 
@@ -1450,7 +1515,7 @@ describe("renderProgress", () => {
     expect(result).toContain("⚡ 2 running");
     expect(result).toContain("⚠ 3 error(s)");
     expect(result).toContain("10 agent(s)");
-    expect(result).toContain("500 tokens");
+    expect(result).toContain("500 output tokens");
   });
 });
 
@@ -2110,6 +2175,7 @@ describe("registerWorkflowTool", () => {
     );
     expect(result.details.status).toBe("error");
     expect(result.isError).toBe(true);
+    expect(result.details.usage).toBeUndefined();
     expect(result.content[0].text).toContain("Workflow failed");
   });
 
@@ -2272,6 +2338,247 @@ describe("WorkflowProgress classification matrix", () => {
       WorkflowProgress["kind"]
     >) {
       expect(renderProgress(samples[kind])).toContain(expected[kind]);
+    }
+  });
+});
+
+it("includes usage from returned error results", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: "usage-errors", description: "d" };\n` +
+      `return await parallel([() => agent("ok"), () => agent("error")]);`,
+    {
+      runAgent: async ({ prompt }) =>
+        prompt === "error" ? richFail("boom") : richOk(prompt),
+    },
+  );
+
+  expect(result.result).toEqual(["ok", null]);
+  expect(result.tokensSpent).toBe(8);
+  expect(result.usage).toEqual({
+    input: 13,
+    output: 8,
+    cacheRead: 9,
+    cacheWrite: 9,
+    totalTokens: 39,
+    costUsd: 0.375,
+    turns: 3,
+  });
+});
+
+it("preserves accumulated usage when a later workflow error rejects", async () => {
+  const usage: WorkflowUsage = {
+    input: 11,
+    output: 7,
+    cacheRead: 5,
+    cacheWrite: 3,
+    totalTokens: 26,
+    costUsd: 0.125,
+    turns: 2,
+  };
+  const rejected = runWorkflow(
+    `export const meta = { name: "late-error", description: "d" };\n` +
+      `await agent("hello"); throw new Error("later failure");`,
+    { runAgent: async ({ prompt }) => richOk(prompt) },
+  );
+
+  await expect(rejected).rejects.toMatchObject({ usage });
+});
+
+it("formats USD usage without floating-point artifacts", () => {
+  const usage: WorkflowUsage = {
+    input: 0,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 1,
+    costUsd: 0.1 + 0.2,
+    turns: 1,
+  };
+  expect(formatWorkflowUsage(usage)).toBe("1 total tokens, $0.3");
+});
+
+it("includes accumulated usage in async workflow error results", async () => {
+  const tools: Array<{ name: string; execute: Function }> = [];
+  const pi = {
+    registerTool: vi.fn((def: any) => tools.push(def)),
+    registerFlag: vi.fn(),
+    registerCommand: vi.fn(),
+    on: vi.fn(),
+  };
+  registerWorkflowTool(pi as any);
+  const job = startWorkflowJob(
+    "late-error",
+    `export const meta = { name: "late-error", description: "d" };\n` +
+      `await agent("hello"); throw new Error("later failure");`,
+    { runAgent: async ({ prompt }) => richOk(prompt) },
+  );
+  try {
+    await expect(job.promise).rejects.toThrow("later failure");
+    const getResult = tools.find(
+      (tool) => tool.name === "get_workflow_result",
+    )!;
+    const result = await getResult.execute("", { workflowId: job.id });
+    expect(result.isError).toBe(true);
+    expect(result.details.usage).toEqual({
+      input: 11,
+      output: 7,
+      cacheRead: 5,
+      cacheWrite: 3,
+      totalTokens: 26,
+      costUsd: 0.125,
+      turns: 2,
+    });
+    expect(result.content[0].text).toContain("26 total tokens");
+  } finally {
+    workflowJobRegistry.delete(job.id);
+  }
+});
+
+it("includes snapshot usage in failed completion notification summaries", async () => {
+  const job = startWorkflowJob(
+    "notify-late-error",
+    `export const meta = { name: "notify-late-error", description: "d" };\n` +
+      `await agent("hello"); throw new Error("later failure");`,
+    { runAgent: async ({ prompt }) => richOk(prompt) },
+  );
+  try {
+    await expect(job.promise).rejects.toThrow("later failure");
+    expect(formatWorkflowNotificationSummary(job)).toContain(
+      "26 total tokens, $0.125",
+    );
+  } finally {
+    workflowJobRegistry.delete(job.id);
+  }
+});
+
+it("preserves non-abort cause identity alongside accumulated usage", async () => {
+  const original = new Error("runner failure");
+  let calls = 0;
+  const rejected = runWorkflow(
+    `export const meta = { name: "cause", description: "d" };\n` +
+      `await agent("first"); await agent("second");`,
+    {
+      runAgent: async ({ prompt }) => {
+        calls++;
+        if (prompt === "second") throw original;
+        return richOk(prompt);
+      },
+    },
+  );
+  await expect(rejected).rejects.toMatchObject({
+    cause: original,
+    usage: { totalTokens: 26 },
+  });
+  expect(calls).toBe(2);
+});
+
+it("preserves caller abort reason alongside accumulated usage", async () => {
+  const controller = new AbortController();
+  const reason = new Error("caller cancelled");
+  let secondStarted!: () => void;
+  const secondStartedPromise = new Promise<void>(
+    (resolve) => (secondStarted = resolve),
+  );
+  const never = new Promise<SubagentResult>(() => {});
+  const running = runWorkflow(
+    `export const meta = { name: "abort-cause", description: "d" };\n` +
+      `await agent("first"); await agent("second");`,
+    {
+      signal: controller.signal,
+      runAgent: async ({ prompt }) => {
+        if (prompt === "first") return richOk(prompt);
+        secondStarted();
+        return never;
+      },
+    },
+  );
+  await secondStartedPromise;
+  controller.abort(reason);
+  await expect(running).rejects.toMatchObject({
+    cause: reason,
+    usage: { totalTokens: 26 },
+  });
+});
+
+describe("workflow usage accounting", () => {
+  it("keeps legacy result objects structurally compatible", () => {
+    const legacyResult: WorkflowRunResult = {
+      meta: { name: "legacy", description: "legacy" },
+      result: null,
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      phases: [],
+    };
+    expect(legacyResult.usage).toBeUndefined();
+  });
+
+  const meta = `export const meta = { name: "usage", description: "d" };\n`;
+  const usage = {
+    input: 11,
+    output: 7,
+    cacheRead: 5,
+    cacheWrite: 3,
+    costUsd: 0.125,
+    totalTokens: 26,
+    turns: 2,
+  };
+
+  it("does not add usage when a runner throws without a result", async () => {
+    const result = await runWorkflow(
+      meta + `return await parallel([() => agent("boom")]);`,
+      {
+        runAgent: async () => {
+          throw new Error("boom");
+        },
+      },
+    );
+
+    expect(result.errorCount).toBe(1);
+    expect(result.tokensSpent).toBe(0);
+    expect(result.usage).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      turns: 0,
+    });
+  });
+
+  it("aggregates every usage field in a direct run result", async () => {
+    const result: WorkflowRunResultWithUsage = await runWorkflow(
+      meta + `return await agent("hello");`,
+      {
+        runAgent: async ({ prompt }) => richOk(prompt),
+      },
+    );
+
+    expect(result.tokensSpent).toBe(7);
+    expect(result.usage).toEqual(usage);
+  });
+
+  it("includes canonical usage in progress and async job snapshots", async () => {
+    const progress: WorkflowProgress[] = [];
+    const runner: WorkflowAgentRunner = async ({ prompt }) => richOk(prompt);
+    const script = meta + `return await agent("hello");`;
+    const result = await runWorkflow(script, {
+      runAgent: runner,
+      onProgress: (event) => progress.push(event),
+    });
+    const lastProgress = progress.at(-1);
+    expect(lastProgress?.usage).toEqual(usage);
+    expect(result.usage).toEqual(usage);
+
+    const job = startWorkflowJob("usage", script, { runAgent: runner });
+    try {
+      await job.promise;
+      expect(job.snapshot.tokensSpent).toBe(7);
+      expect(job.snapshot.usage).toEqual(usage);
+      expect(job.result?.usage).toEqual(usage);
+    } finally {
+      workflowJobRegistry.delete(job.id);
     }
   });
 });

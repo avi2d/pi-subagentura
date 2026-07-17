@@ -5,6 +5,8 @@ import {
   type RunWorkflowOptions,
   type WorkflowProgress,
   type WorkflowRunResult,
+  type WorkflowUsage,
+  zeroWorkflowUsage,
 } from "./workflow-core";
 
 // ── Background workflow-job registry ─────────────────────────────────
@@ -21,7 +23,9 @@ export interface WorkflowJobState {
   snapshot: {
     agentsSpawned: number;
     errorCount: number;
+    /** @deprecated Output-token count; use usage.totalTokens. */
     tokensSpent: number;
+    usage?: WorkflowUsage;
     phases: string[];
     lastMessage?: string;
     currentPhase?: string;
@@ -99,6 +103,7 @@ export function startWorkflowJob(
       agentsSpawned: 0,
       errorCount: 0,
       tokensSpent: 0,
+      usage: zeroWorkflowUsage(),
       phases: [],
       runningCount: 0,
     },
@@ -112,6 +117,7 @@ export function startWorkflowJob(
       state.snapshot.agentsSpawned = p.agentsSpawned;
       state.snapshot.errorCount = p.errorCount;
       state.snapshot.tokensSpent = p.tokensSpent;
+      state.snapshot.usage = p.usage ? { ...p.usage } : state.snapshot.usage;
       state.snapshot.runningCount = p.runningCount;
       if (p.kind === "phase" && p.phase) {
         state.snapshot.currentPhase = p.phase;
