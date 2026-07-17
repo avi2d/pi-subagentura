@@ -388,6 +388,27 @@ describe("multiplexer-tmux", () => {
     expect(new TmuxMultiplexer().isPaneAlive("%99")).toBe(false);
   });
 
+  it("isPaneAliveAsync uses execFile rather than execFileSync", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        throw new Error("sync liveness probe must not run");
+      },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(null, "#{pane_id}\n"),
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    await expect(new TmuxMultiplexer().isPaneAliveAsync("%42")).resolves.toBe(
+      true,
+    );
+  });
+
   it("isPaneAlive uses correct tmux args: display-message -p -t paneId #{pane_id}", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     const calls: string[][] = [];

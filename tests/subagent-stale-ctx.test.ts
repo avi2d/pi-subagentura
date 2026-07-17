@@ -113,7 +113,9 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     });
 
     // The call must NOT throw — that's the entire point of the fix.
-    expect(() => mod.pollArtifactChanges(brokenPi as any)).not.toThrow();
+    await expect(
+      mod.pollArtifactChanges(brokenPi as any),
+    ).resolves.toBeUndefined();
 
     expect(brokenPi.sendMessage).toHaveBeenCalledTimes(1);
     expect(state.pendingDeliveries?.[0].state).toBe("queued");
@@ -147,7 +149,9 @@ describe("pollArtifactChanges stale-ctx defenses", () => {
     });
 
     // The call must NOT throw.
-    expect(() => mod.pollArtifactChanges(brokenPi as any)).not.toThrow();
+    await expect(
+      mod.pollArtifactChanges(brokenPi as any),
+    ).resolves.toBeUndefined();
 
     // sendMessage was attempted (we know it threw).
     expect(brokenPi.sendMessage).toHaveBeenCalled();

@@ -22,7 +22,7 @@
  * runs on every backend.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import type { Multiplexer } from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
 
@@ -325,6 +325,24 @@ export class TmuxMultiplexer implements Multiplexer {
     } catch {
       return false;
     }
+  }
+
+  isPaneAliveAsync(paneId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "tmux",
+          withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
+          { timeout: 5000 },
+          (error) => {
+            resolve(!error);
+          },
+        );
+      } catch {
+        // A synchronous child-process setup failure is also a dead pane.
+        resolve(false);
+      }
+    });
   }
 
   sendKeys(paneId: string, text: string): void {
