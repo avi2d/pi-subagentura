@@ -96,6 +96,23 @@ The guidance gives the parent agent reasonable default behavior when the user as
 
 The defaults prefer async `subagent_isolated` for fresh scouts/reviewers, `subagent_with_context` for oracle checks, injected completions instead of polling, and one writer at a time for implementation. For cheap fanout, they suggest validating model availability before using optional model overrides.
 
+## Cancellation context snapshots (opt-in)
+
+Cancellation snapshots are **disabled by default**. To enable bounded snapshots before parent-initiated cancellation, set:
+
+```bash
+SUBAGENT_CANCEL_SNAPSHOT=full pi
+```
+
+In-process sub-agents write a private atomic JSON snapshot of the canonical active branch plus bounded partial streaming state. Interactive/process sub-agents write a private manifest that points to their already-persisted Pi session JSONL and artifact files; the transcript is not duplicated. Cancellation results expose receipt paths and errors, never snapshot contents.
+
+Optional configuration:
+
+- `SUBAGENT_CANCEL_SNAPSHOT_DIR` — override the private snapshot root. The directory and files are created with `0700`/`0600` permissions.
+- `SUBAGENT_CANCEL_SNAPSHOT_MAX_BYTES` — maximum raw in-process snapshot size. The default is `1048576` bytes (1 MiB); accepted values range from `4096` bytes to `16777216` bytes (16 MiB). Invalid values use the default. Oversized snapshots preserve as much context as fits and record explicit truncation/error metadata.
+
+Snapshots use schema version 1, temp-file + rename writes, deterministic per-session/job paths, and idempotent receipts so overlapping cancellation and shutdown paths do not duplicate files. They may contain sensitive prompts, tool arguments, and model output; keep the snapshot directory private and do not commit it.
+
 ## Tools
 
 ### `subagent_with_context`

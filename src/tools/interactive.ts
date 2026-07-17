@@ -313,9 +313,14 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      const snapshotText = state.cancellationSnapshot?.path
+        ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
+        : state.cancellationSnapshot?.error
+          ? ` Snapshot error: ${state.cancellationSnapshot.error}`
+          : "";
       userNotification =
         `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
-        `Artifacts retained at ${state.artifactDir}.`;
+        `Artifacts retained at ${state.artifactDir}.${snapshotText}`;
       try {
         ctx.ui.notify(userNotification, "warning");
       } catch {
@@ -328,7 +333,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
             text:
               `Interactive sub-agent ${params.jobId} cancelled. ` +
               `No separate cancellation completion will be injected into the parent LLM. ` +
-              `Artifacts retained at ${state.artifactDir}.`,
+              `Artifacts retained at ${state.artifactDir}.` +
+              (state.cancellationSnapshot?.path
+                ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}.`
+                : state.cancellationSnapshot?.error
+                  ? ` Snapshot error: ${state.cancellationSnapshot.error}.`
+                  : ""),
           },
         ],
         details: { ...state },

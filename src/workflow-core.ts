@@ -72,6 +72,9 @@ export type WorkflowAgentRunner = (req: {
     phase?: string;
     label?: string;
   }) => void;
+  onCancellationSnapshot?: (
+    receipt: import("./cancellation-snapshots").CancellationSnapshotReceipt,
+  ) => void;
 }) => Promise<SubagentResult>;
 
 export interface WorkflowMeta {
@@ -111,6 +114,9 @@ export interface RunWorkflowOptions {
   runAgent: WorkflowAgentRunner;
   signal?: AbortSignal;
   onProgress?: (p: WorkflowProgress) => void;
+  onCancellationSnapshot?: (
+    receipt: import("./cancellation-snapshots").CancellationSnapshotReceipt,
+  ) => void;
   concurrency?: number;
   processConcurrency?: number;
   /** Resolve a saved workflow script by name, for `workflow(name, args)` composition. */
