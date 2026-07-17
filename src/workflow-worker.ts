@@ -246,6 +246,7 @@ async function executeScript(
               signal: engine.signal,
               isolation,
               label: agentOpts.label,
+              thinkingLevel: agentOpts.thinkingLevel,
               onCancellationSnapshot: engine.onCancellationSnapshot,
               onProgress: (ev) => {
                 if (ev.kind === "phase") {

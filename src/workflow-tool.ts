@@ -94,6 +94,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       signal,
       isolation,
       label,
+      thinkingLevel,
       onProgress,
       onCancellationSnapshot,
     }) => {
@@ -121,6 +122,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             cwd: ctx.cwd,
             contextText: null,
             background: true,
+            thinkingLevel,
           });
           const result = await awaitInteractiveResult(
             state,
@@ -165,6 +167,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         parentModelRegistry: ctx.modelRegistry,
         onCancellationSnapshot,
         cancellationSource: "workflow",
+        thinkingLevel,
       });
       return jobPromise;
     };
@@ -241,7 +244,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "",
       "Injected helpers/globals:",
       "  agent(prompt, opts?)   -> spawn one isolated sub-agent. opts: { schema?, label?, phase?,",
-      "                            model?, persona?, isolation? }. Without schema returns the final text;",
+      "                            model?, persona?, isolation?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
       "                            with schema returns a value validated against the supported JSON Schema",
       "                            subset (type, enum, required/properties, additionalProperties, items,",
       "                            minItems, maxItems), or null after retries. Returns null on error",

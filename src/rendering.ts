@@ -1,4 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { formatUsage } from "./helpers";
@@ -6,6 +7,10 @@ import type { SubagentDetails } from "./subagent";
 import type { SubagentResult } from "./helpers";
 import { sanitizeOutput } from "./notifications";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+
+function thinkingSuffix(level?: ThinkingLevel): string {
+  return level ? ` · thinking: ${level}` : "";
+}
 
 // ── Rendering ────────────────────────────────────────────────────────
 
@@ -20,6 +25,12 @@ export function renderSubagentCall(
   text += theme.fg("accent", taskPreview);
   if (args.model) {
     text += theme.fg("dim", ` @${args.model}`);
+  }
+  if (args.thinkingLevel) {
+    text += theme.fg(
+      "dim",
+      thinkingSuffix(String(args.thinkingLevel) as ThinkingLevel),
+    );
   }
   if (args.async) {
     text += theme.fg("accent", " [async]");
@@ -43,6 +54,8 @@ export function renderSubagentResult(
       result.details?.status === "running" ? result.details : undefined;
     const status = runningDetails?.subagentStatus;
     const model = runningDetails?.model;
+    const thinkingLevel =
+      runningDetails?.thinkingLevel ?? status?.thinkingLevel;
 
     let text =
       theme.fg("accent", "● ") + theme.fg("toolTitle", "Sub-agent working");
@@ -67,7 +80,7 @@ export function renderSubagentResult(
       const usageStr = formatUsage(status.usage, model);
       if (usageStr) {
         text += `
-  ${theme.fg("muted", usageStr)}`;
+  ${theme.fg("muted", usageStr)}${theme.fg("dim", thinkingSuffix(thinkingLevel))}`;
       }
 
       if (status.output) {
@@ -87,20 +100,39 @@ export function renderSubagentResult(
     result.content.find(
       (c): c is { type: "text"; text: string } => c.type === "text",
     )?.text ?? "";
+  const resultDetails = result.details as
+    | { usageSummary?: string; thinkingLevel?: ThinkingLevel }
+    | undefined;
 
   if (result.isError) {
+    const thinking = thinkingSuffix(resultDetails?.thinkingLevel);
     if (!expanded) {
       const preview = truncateToWidth(text.replace(/\s+/g, " "), 120);
-      return new Text(theme.fg("error", preview), 0, 0);
+      return new Text(
+        thinking
+          ? `${theme.fg("dim", thinking)}\n${theme.fg("error", preview)}`
+          : theme.fg("error", preview),
+        0,
+        0,
+      );
     }
-    return new Text(theme.fg("error", text), 0, 0);
+    return new Text(
+      thinking
+        ? `${theme.fg("dim", thinking)}\n${theme.fg("error", text)}`
+        : theme.fg("error", text),
+      0,
+      0,
+    );
   }
 
-  const usageStr = (result.details as { usageSummary?: string } | undefined)
-    ?.usageSummary;
+  const usageStr = resultDetails?.usageSummary;
+  const thinking = thinkingSuffix(resultDetails?.thinkingLevel);
 
   if (usageStr) {
-    const header = theme.fg("success", "✓ ") + theme.fg("muted", usageStr);
+    const header =
+      theme.fg("success", "✓ ") +
+      theme.fg("muted", usageStr) +
+      theme.fg("dim", thinking);
     if (!expanded) {
       return new Text(header, 0, 0);
     }
@@ -109,9 +141,19 @@ export function renderSubagentResult(
 
   if (!expanded) {
     const preview = truncateToWidth(text.replace(/\s+/g, " "), 120);
-    return new Text(theme.fg("dim", preview), 0, 0);
+    return new Text(
+      thinking
+        ? `${theme.fg("dim", thinking)}\n${theme.fg("dim", preview)}`
+        : theme.fg("dim", preview),
+      0,
+      0,
+    );
   }
-  return new Text(text, 0, 0);
+  return new Text(
+    thinking ? `${theme.fg("dim", thinking)}\n${text}` : text,
+    0,
+    0,
+  );
 }
 
 /**
@@ -125,7 +167,10 @@ export function renderAsyncSpawn(
   const jobId = details.jobId;
   const text =
     theme.fg("accent", "⚡ ") +
-    theme.fg("toolTitle", `Sub-agent started — job ${jobId}`) +
+    theme.fg(
+      "toolTitle",
+      `Sub-agent started — job ${jobId}${thinkingSuffix(details.thinkingLevel)}`,
+    ) +
     "\n" +
     theme.fg("dim", "  Use get_subagent_status to check progress.");
   return new Text(text, 0, 0);
@@ -159,7 +204,7 @@ export function renderSubagentNotify(
     typeof message.content === "string"
       ? message.content
       : (message.content ?? [])
-          .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+          .map((part) => (part.type === "text" ? part.text ?? "" : ""))
           .join("");
 
   let line: string;

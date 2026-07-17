@@ -23,6 +23,7 @@
  * of the codebase compiles unchanged.
  */
 
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -342,6 +343,7 @@ export function buildPiInteractiveCommand(params: {
   systemPromptFile?: string;
   model?: string;
   cwd: string;
+  thinkingLevel?: ThinkingLevel;
 }): string {
   const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const parts = [
@@ -353,6 +355,9 @@ export function buildPiInteractiveCommand(params: {
   ];
   if (params.model) {
     parts.push("--model", escape(params.model));
+  }
+  if (params.thinkingLevel) {
+    parts.push("--thinking", escape(params.thinkingLevel));
   }
   if (params.systemPromptFile) {
     parts.push("--append-system-prompt", escape(params.systemPromptFile));
@@ -438,6 +443,8 @@ export function launchInteractiveSubagent(params: {
    * If omitted, falls back to `cwd` (backward-compatible for tests).
    */
   parentCwd?: string;
+  /** Thinking/reasoning level for the child Pi process. */
+  thinkingLevel?: ThinkingLevel;
 }): InteractiveSubagentState {
   const id = randomBytes(4).toString("hex");
   const cwd = resolve(params.cwd);
@@ -550,6 +557,7 @@ export function launchInteractiveSubagent(params: {
       systemPromptFile,
       model: params.model,
       cwd,
+      thinkingLevel: params.thinkingLevel,
     });
     writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;

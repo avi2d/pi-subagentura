@@ -8,6 +8,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { SubagentResult, Usage } from "./helpers";
 
 // ── Limits ───────────────────────────────────────────────────────────
@@ -106,6 +107,8 @@ export interface WorkflowAgentOpts {
   isolation?: string;
   /** Accepted for fidelity but a no-op in v2. */
   agentType?: string;
+  /** Thinking/reasoning level for the sub-agent. Clamped to model capabilities. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 export type WorkflowAgentProgress =
@@ -130,6 +133,8 @@ export type WorkflowAgentRunner = (req: {
   signal?: AbortSignal;
   isolation?: string;
   label?: string;
+  /** Thinking/reasoning level for the sub-agent. */
+  thinkingLevel?: ThinkingLevel;
   /**
    * Optional callback for emitting progress events from inside the runner.
    * Used to surface fallback warnings and forward mid-agent live status.

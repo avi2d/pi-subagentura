@@ -4,7 +4,10 @@ import {
   type ExtensionAPI,
   type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type {
+  AgentToolResult,
+  ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -51,12 +54,18 @@ interface RunningFooterContext {
 
 type InProcessSubagentDetails =
   | { status: "started"; jobId: string; contextMessages: number }
-  | { status: "running"; subagentStatus: SubagentLiveStatus; model?: string }
+  | {
+      status: "running";
+      subagentStatus: SubagentLiveStatus;
+      model?: string;
+      thinkingLevel?: ThinkingLevel;
+    }
   | {
       status: "done" | "error";
       usage: Usage;
       model?: string;
       usageSummary?: string;
+      thinkingLevel?: ThinkingLevel;
       contextMessages?: number;
     }
   | { status: "cancelled" | "not_found"; jobId?: string };
@@ -142,6 +151,7 @@ async function runSubagent(
   onUpdate: ((partial: AgentToolResult<any>) => void) | undefined,
   defaultModel: Model<any> | undefined,
   parentModelRegistry: ModelRegistry | undefined,
+  thinkingLevel?: ThinkingLevel,
 ): Promise<SubagentResult> {
   try {
     const { jobPromise, modelWarning } = await startSubagentJob({
@@ -154,6 +164,7 @@ async function runSubagent(
       onUpdate,
       defaultModel,
       parentModelRegistry,
+      thinkingLevel,
     });
     const result = await jobPromise;
     if (modelWarning && !result.isError) {
@@ -196,6 +207,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "The sub-agent sees everything discussed so far plus the new task.",
       "Model is inherited by default. Use the model param to override (e.g. 'minimax/MiniMax-M2.7').",
       "Use list_available_models to see which models have configured auth before setting model.",
+      "Use thinkingLevel to control reasoning depth (off|minimal|low|medium|high|xhigh|max). Higher levels use more tokens.",
       "Streams output in real-time when sync.",
       "",
       "Examples:",
@@ -254,6 +266,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           liveStatus,
           modelLabel,
           modelWarning,
+          thinkingLevel,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
@@ -265,6 +278,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           defaultModel: ctx.model,
           maxAge: params.maxAge,
           parentModelRegistry: ctx.modelRegistry,
+          thinkingLevel: params.thinkingLevel,
         });
         const jobState: JobState = {
           id: jobId,
@@ -275,6 +289,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           cwd: targetCwd,
           promise: jobPromise,
           modelLabel,
+          thinkingLevel,
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
@@ -338,6 +353,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         onUpdate,
         ctx.model,
         ctx.modelRegistry,
+        params.thinkingLevel,
       );
 
       const usageStr = formatUsage(result.usage, result.model);
@@ -346,6 +362,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         contextMessages: messages.length,
         usage: result.usage,
         model: result.model,
+        thinkingLevel: result.thinkingLevel,
         usageSummary: usageStr,
       };
 
@@ -382,6 +399,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       "Only receives the task and optional persona. No conversation history.",
       "Model is inherited by default. Use the model param to override (e.g. 'minimax/MiniMax-M2.7').",
       "Use list_available_models to see which models have configured auth before setting model.",
+      "Use thinkingLevel to control reasoning depth (off|minimal|low|medium|high|xhigh|max). Higher levels use more tokens.",
       "Streams output in real-time when sync.",
       "",
       "Examples:",
@@ -419,6 +437,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           liveStatus,
           modelLabel,
           modelWarning,
+          thinkingLevel,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
@@ -430,6 +449,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           defaultModel: ctx.model,
           maxAge: params.maxAge,
           parentModelRegistry: ctx.modelRegistry,
+          thinkingLevel: params.thinkingLevel,
         });
         const jobState: JobState = {
           id: jobId,
@@ -440,6 +460,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           cwd: targetCwd,
           promise: jobPromise,
           modelLabel,
+          thinkingLevel,
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
@@ -491,6 +512,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         onUpdate,
         ctx.model,
         ctx.modelRegistry,
+        params.thinkingLevel,
       );
 
       const usageStr = formatUsage(result.usage, result.model);
@@ -499,6 +521,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         contextMessages: 0,
         usage: result.usage,
         model: result.model,
+        thinkingLevel: result.thinkingLevel,
         usageSummary: usageStr,
       };
 
@@ -566,6 +589,7 @@ function registerGetSubagentStatusTool(pi: ExtensionAPI): void {
             usage: result.usage,
             model: result.model,
             usageSummary: usageStr,
+            thinkingLevel: result.thinkingLevel,
           },
           isError: result.isError,
         };
@@ -701,6 +725,7 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         usage: result.usage,
         model: result.model,
         usageSummary: usageStr,
+        thinkingLevel: result.thinkingLevel,
       };
 
       return {
@@ -818,7 +843,8 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
 
     renderResult(result, _options, theme, _context) {
       const details = result.details as
-        (InProcessSubagentDetails & { jobId?: string }) | undefined;
+        | (InProcessSubagentDetails & { jobId?: string })
+        | undefined;
       const jobId = String(details?.jobId ?? "unknown");
       const cancelled = details?.status === "cancelled";
       const firstContent = result.content?.[0];
