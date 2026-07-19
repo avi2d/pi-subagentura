@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-07-19
+
 ### Added
 
 - A first-class reusable-workflow guide, user-command reference, and agent-facing tool reference.
@@ -66,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workflow `runningCount` decremented on agent failure; timeout propagates abort to in-flight work.
 - Shared workflow script parsing (`workflow-script.mjs`) used by main thread and worker thread.
 
-[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.0.2...HEAD
+[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.0.3...HEAD
+[3.0.3]: https://github.com/lmn451/pi-subagentura/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/lmn451/pi-subagentura/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/lmn451/pi-subagentura/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/lmn451/pi-subagentura/compare/v2.3.3...v3.0.0
