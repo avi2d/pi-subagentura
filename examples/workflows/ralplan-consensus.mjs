@@ -289,7 +289,24 @@ Compare actual findings against pre-commitment predictions. Issue structured ver
 
 // === ARGS ===
 
-const idea = args && typeof args.idea === "string" ? args.idea : null;
+function parseWorkflowArgs(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+const workflowArgs = parseWorkflowArgs(args);
+const idea =
+  workflowArgs && typeof workflowArgs.idea === "string"
+    ? workflowArgs.idea
+    : null;
 if (!idea) {
   return {
     consensus: false,
@@ -298,12 +315,16 @@ if (!idea) {
   };
 }
 const maxIterations =
-  args && typeof args.maxIterations === "number" && args.maxIterations > 0
-    ? Math.floor(args.maxIterations)
+  workflowArgs &&
+  typeof workflowArgs.maxIterations === "number" &&
+  workflowArgs.maxIterations > 0
+    ? Math.floor(workflowArgs.maxIterations)
     : 5;
 const artifactsDir =
-  args && typeof args.artifactsDir === "string" && args.artifactsDir
-    ? args.artifactsDir
+  workflowArgs &&
+  typeof workflowArgs.artifactsDir === "string" &&
+  workflowArgs.artifactsDir
+    ? workflowArgs.artifactsDir
     : "plans";
 
 // === SCHEMAS (kept within the runtime's minimal JSON-Schema subset) ===

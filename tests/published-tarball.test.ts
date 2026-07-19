@@ -117,6 +117,22 @@ function resolvesInTarball(mod: string, entries: string[]): boolean {
   );
 }
 
+function packageFileDeclarationMatches(
+  declaration: string,
+  entries: string[],
+): boolean {
+  if (entries.includes(declaration)) return true;
+  if (declaration.includes("*")) {
+    const pattern = declaration
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      .replaceAll("*", "[^/]*");
+    const regex = new RegExp(`^${pattern}$`);
+    return entries.some((entry) => regex.test(entry));
+  }
+  const directory = declaration.replace(/\/$/, "");
+  return entries.some((entry) => entry.startsWith(`${directory}/`));
+}
+
 describe("published tarball", () => {
   const work = mkdtempSync(join(tmpdir(), "pi-subagentura-pubtest-"));
   let entries: string[] = [];
@@ -146,7 +162,9 @@ describe("published tarball", () => {
   });
 
   it("package.json `files` array matches the tarball contents", () => {
-    const missing = PKG.files.filter((f) => !entries.includes(f));
+    const missing = PKG.files.filter(
+      (file) => !packageFileDeclarationMatches(file, entries),
+    );
     expect(
       missing,
       `tarball is missing files declared in package.json: ${missing.join(", ")}`,
@@ -159,6 +177,21 @@ describe("published tarball", () => {
       "src/helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
         "Re-add it to package.json `files`.",
     ).toContain("src/helpers.ts");
+  });
+
+  it("contains the workflow guide, examples, and bundled RALPLAN skill", () => {
+    expect(entries).toEqual(
+      expect.arrayContaining([
+        "docs/workflows.md",
+        "examples/workflows/README.md",
+        "examples/workflows/package-to-skill.mjs",
+        "examples/workflows/ralplan-consensus.mjs",
+        "examples/workflows/ralplan-from-skill.mjs",
+        "examples/workflows/ralplan-occ.mjs",
+        "examples/workflows/skill-to-workflow.mjs",
+        "skills/ralplan/SKILL.md",
+      ]),
+    );
   });
 
   it("every local import in shipped .ts files resolves to a file in the tarball", () => {

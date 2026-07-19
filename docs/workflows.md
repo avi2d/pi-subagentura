@@ -5,19 +5,25 @@ keywords: [workflow, subagent, ralplan, planner, architect, critic, consensus]
 
 # Workflows
 
-This project ships several `.mjs` workflow scripts that orchestrate isolated sub-agents via the `workflow` tool. Two are **generic converters**; the rest are **concrete instantiations** of consensus planning pipelines.
+This project ships several `.mjs` workflow scripts under
+`examples/workflows/`. They orchestrate isolated sub-agents via the `workflow`
+tool. Two are **generic converters**; the rest are **concrete instantiations**
+of consensus planning pipelines.
 
-Workflow scripts are trusted agent-authored JavaScript. The worker VM hides accidental Node globals and disables string code generation, but it is not a security boundary; do not feed arbitrary user-supplied JavaScript to the workflow tool.
+Workflow scripts are trusted agent-authored JavaScript. The worker VM hides
+accidental Node globals and disables string code generation, but it is not a
+security boundary; do not feed arbitrary user-supplied JavaScript to the
+workflow tool.
 
 ## Inventory
 
 | File                     | Size    | Purpose                                                  |
 | ------------------------ | ------- | -------------------------------------------------------- |
-| `skill-to-workflow.mjs`  | 12.3 KB | Generic: convert any Pi skill → workflow script          |
+| `skill-to-workflow.mjs`  | 12.8 KB | Generic: convert any Pi skill → workflow script          |
 | `package-to-skill.mjs`   | 11.5 KB | Generic: convert any Pi package source → pure skill      |
-| `ralplan-consensus.mjs`  | 23.4 KB | Workflow re-implementation of `pi-ralplan`               |
-| `ralplan-occ.mjs`        | 56.4 KB | Workflow re-implementation of oh-my-claudecode's RALPLAN |
-| `ralplan-from-skill.mjs` | 27.9 KB | Demo: `skill-to-workflow` output for pi-ralplan          |
+| `ralplan-consensus.mjs`  | 24.4 KB | Workflow re-implementation of `pi-ralplan`               |
+| `ralplan-occ.mjs`        | 59.6 KB | Workflow re-implementation of oh-my-claudecode's RALPLAN |
+| `ralplan-from-skill.mjs` | 28.8 KB | Demo: `skill-to-workflow` output for pi-ralplan          |
 
 The demo output of `package-to-skill` is in `skills/ralplan/` — a complete installable skill.
 
@@ -33,7 +39,7 @@ Both converters are reusable building blocks. Pass them through the `workflow` t
 
 ```js
 workflow({
-  script: readFileSync("skill-to-workflow.mjs", "utf8"),
+  script: readFileSync("examples/workflows/skill-to-workflow.mjs", "utf8"),
   args: {
     skillPath: "/path/to/skill-dir",
     outputPath: "/path/to/output.mjs",
@@ -49,7 +55,7 @@ workflow({
 
 ```js
 workflow({
-  script: readFileSync("package-to-skill.mjs", "utf8"),
+  script: readFileSync("examples/workflows/package-to-skill.mjs", "utf8"),
   args: {
     sourcePath: "/path/to/pi-package",
     skillDir: "/path/to/output-skill",
@@ -69,7 +75,7 @@ Re-implements the pi-ralplan consensus pipeline as a workflow. Three isolated ro
 
 ```js
 workflow({
-  script: readFileSync("ralplan-consensus.mjs", "utf8"),
+  script: readFileSync("examples/workflows/ralplan-consensus.mjs", "utf8"),
   args: { idea: "build a CLI that diffs two directories", maxIterations: 5 },
 });
 ```
@@ -86,7 +92,7 @@ Faithful port of oh-my-claudecode's RALPLAN skill with gate detection, deliberat
 
 ```js
 workflow({
-  script: readFileSync("ralplan-occ.mjs", "utf8"),
+  script: readFileSync("examples/workflows/ralplan-occ.mjs", "utf8"),
   args: {
     idea: "migrate auth module to JWT",
     deliberate: "auto", // auto-detect high-risk substrings
@@ -99,7 +105,7 @@ workflow({
 **Fidelity limitations** (also documented in the script header):
 
 - Interactive AskUserQuestion checkpoints are not supported by the workflow runtime. Substituted with `[pending approval]` log markers.
-- `--architect codex` / `--critic codex` model overrides are accepted as args but not applied — workflow `agent()` doesn't route per-role models.
+- Architect and Critic model overrides are routed through their respective `agent()` calls, but each model id must be configured in Pi.
 - The workflow never executes; it always returns `pending_approval: true` and `execution_halted: true`, per OCC's planning/execution boundary.
 
 ## Workflow tool pitfalls
@@ -108,7 +114,7 @@ These are the failure modes we hit while building the converters above. Document
 
 ### 1. Defensive args parsing
 
-When the `workflow` tool is invoked from an LLM agent (rather than from test code or a direct script call), `params.args` arrives as a JSON-encoded **string**, not a parsed object. The TypeBox `Type.Unknown` schema doesn't auto-parse. Add a defensive helper:
+Tool callers may pass `args` as an object or as a JSON-encoded string. The TypeBox `Type.Unknown` schema does not normalize the value, so reusable scripts should accept both forms:
 
 ```js
 function _parseArgs(raw) {
@@ -126,7 +132,7 @@ function _parseArgs(raw) {
 const _a = _parseArgs(args);
 ```
 
-This is in `skill-to-workflow.mjs` and `package-to-skill.mjs`. The two hand-crafted workflows (`ralplan-consensus.mjs`, `ralplan-occ.mjs`) do not have it — they were generated by workflows invoked with `args: {}` so the bug never surfaced. **Should be retrofitted.**
+All bundled examples normalize both forms, and the behavior tests exercise each script with object and JSON-string arguments.
 
 ### 2. JSON-stringified payloads for large content
 
@@ -212,16 +218,15 @@ Pi package source
 
 ## Adding a new workflow
 
-1. Copy `skill-to-workflow.mjs` or `package-to-skill.mjs` as a starting template.
+1. Copy `examples/workflows/skill-to-workflow.mjs` or `examples/workflows/package-to-skill.mjs` as a starting template.
 2. Apply pitfalls 1-6 above — they are not optional.
 3. Run via `workflow({ script: readFileSync("your-script.mjs", "utf8"), args: {...}, budget: 100000 })`.
 4. Budget: 50k-100k for 4-agent flows, 200k+ for 5+ agent flows or flows with large content.
 
 ## Future work
 
-- Add unit tests for the two converters (currently zero coverage).
-- Retrofit `_parseArgs()` into the two hand-crafted workflows.
-- Ship the converters as a `pi-package` extension (`pi install npm:pi-subagentura-workflows`).
+- Expand converter tests to cover malformed agent output and partial writes.
+- Consider whether the examples should also be installable as named presets.
 - Investigate whether `validateSchema` should support `additionalProperties` natively.
 
 ## Workflow visibility and scaling

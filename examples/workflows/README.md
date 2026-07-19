@@ -1,0 +1,134 @@
+# Bundled workflow examples
+
+These trusted `.mjs` scripts are included in the `pi-subagentura` npm package.
+They demonstrate reusable workflow structure and provide practical planning and
+conversion flows.
+
+## Running an example
+
+From a repository checkout, start Pi with the extension and ask the parent to
+read an example and pass its complete source to the `workflow` tool:
+
+```text
+pi -e . --orchestrator
+Run examples/workflows/ralplan-consensus.mjs with idea="review src/auth.ts" and maxIterations=2.
+```
+
+The equivalent agent-tool payload is:
+
+```js
+workflow({
+  script: "<contents of examples/workflows/ralplan-consensus.mjs>",
+  args: {
+    idea: "Review src/auth.ts and produce an implementation plan",
+    maxIterations: 2,
+    artifactsDir: "plans",
+  },
+});
+```
+
+To reuse a script by name, pass the same source to `save_workflow` once, then
+run it with `workflow({ name, args })` or select it with `/workflows`.
+
+All bundled examples accept either an args object or its JSON-string form. JSON
+strings are useful when another tool boundary serializes the payload:
+
+```js
+workflow({
+  name: "ralplan-consensus",
+  args: '{"idea":"Review src/auth.ts","maxIterations":2}',
+});
+```
+
+## Planning workflows
+
+### `ralplan-consensus.mjs`
+
+A Planner → Architect → Critic loop that asks agents to write review artifacts
+and a final plan.
+
+| Argument        | Required | Meaning                               |
+| --------------- | -------- | ------------------------------------- |
+| `idea`          | yes      | Planning problem                      |
+| `maxIterations` | no       | Positive iteration cap; defaults to 3 |
+| `artifactsDir`  | no       | Output directory; defaults to `plans` |
+
+### `ralplan-occ.mjs`
+
+An OCC-style RALPLAN flow with a short-prompt gate, deliberate-mode checks,
+per-reviewer model routing, and explicit approval markers. It never executes
+the resulting plan.
+
+| Argument             | Required | Meaning                                                   |
+| -------------------- | -------- | --------------------------------------------------------- |
+| `idea`               | yes      | Planning problem                                          |
+| `deliberate`         | no       | `true`, `false`, or `"auto"` risk-triggered mode          |
+| `maxIterations`      | no       | Iteration cap from 1 to 5; defaults to 5                  |
+| `artifactsDir`       | no       | Final-plan directory; defaults to `.omc/plans`            |
+| `draftsDir`          | no       | Draft directory; defaults to `.omc/drafts`                |
+| `planName`           | no       | Final plan basename; defaults to `ralplan`                |
+| `architectModel`     | no       | Model id passed to the Architect `agent()` call           |
+| `criticModel`        | no       | Model id passed to the Critic `agent()` call              |
+| `executeOnConsensus` | no       | Changes the reported approval status; never executes code |
+
+### `ralplan-from-skill.mjs`
+
+A generated, self-contained RALPLAN example derived from the bundled skill.
+
+| Argument        | Required | Meaning                                        |
+| --------------- | -------- | ---------------------------------------------- |
+| `idea`          | yes      | Planning problem                               |
+| `workingDir`    | yes      | Absolute project directory                     |
+| `specPath`      | no       | Optional spec file                             |
+| `planName`      | no       | Plan filename without extension                |
+| `deliberate`    | no       | Boolean override; otherwise inferred from idea |
+| `maxIterations` | no       | Positive iteration cap; defaults to 5          |
+
+## Converter workflows
+
+### `skill-to-workflow.mjs`
+
+Converts a small Pi skill into a self-contained workflow:
+
+```js
+workflow({
+  script: "<contents of examples/workflows/skill-to-workflow.mjs>",
+  args: {
+    skillPath: "/absolute/path/to/my-skill",
+    outputPath: "/absolute/path/to/generated-flow.mjs",
+  },
+});
+```
+
+### `package-to-skill.mjs`
+
+Distills a Pi extension package into an installable skill:
+
+```js
+workflow({
+  script: "<contents of examples/workflows/package-to-skill.mjs>",
+  args: {
+    sourcePath: "/absolute/path/to/package",
+    skillDir: "/absolute/path/to/generated-skill",
+    packageName: "my-generated-skill",
+    packageVersion: "1.0.0",
+  },
+});
+```
+
+Both converters delegate filesystem inspection and writes to agents because
+the workflow VM does not expose Node filesystem APIs. Their generated workflow
+source is parsed in the test suite before it is accepted.
+
+## Limitations
+
+- Scripts are trusted JavaScript, not untrusted-input sandboxes.
+- Workflow jobs are async by default and live only for the current parent
+  session. Reload, resume, quit, and new-session transitions cancel them.
+- Process-isolated agents require tmux or Zellij; otherwise the runtime falls
+  back to in-process execution.
+- Interactive user-question pauses are represented by pending-approval output;
+  a workflow cannot suspend and later resume at an `AskUserQuestion` checkpoint.
+- File-writing examples depend on the delegated agents having appropriate read
+  and write tools and permissions.
+- Model overrides must name models configured in the active Pi installation.

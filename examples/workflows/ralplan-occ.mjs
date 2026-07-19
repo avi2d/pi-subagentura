@@ -2,7 +2,6 @@
 // Planner / Architect / Critic re-review loop with deliberate-mode pre-mortem + expanded test plan.
 // Never executes. Always returns pending_approval:true and execution_halted:true.
 // Workflow runs to completion in one pass; interactive checkpoints (steps 2, 6, 7) emit [pending approval] markers.
-// Fidelity gap: args.architectModel / args.criticModel are accepted but not routed per-role.
 // Fidelity gap: deliberate-mode triggers are substring-based on the idea string only.
 // Fidelity gap: company-context advisory (OCC step 0) skipped — no MCP in workflow sandbox.
 // Fidelity gap: workflow does NOT write .omc/plans/{name}.md itself; sub-agents own their writes.
@@ -20,6 +19,21 @@ export const meta = {
     { title: "Consolidate" },
   ],
 };
+
+function parseWorkflowArgs(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+const workflowArgs = parseWorkflowArgs(args);
 
 const PLANNER_PERSONA = `---
 name: planner
@@ -829,8 +843,8 @@ const CRITIC_SCHEMA = {
 
 // Main execution
 phase("Gate");
-const gateResult = checkGate(args);
-const idea0 = String((args && args.idea) || "");
+const gateResult = checkGate(workflowArgs);
+const idea0 = String((workflowArgs && workflowArgs.idea) || "");
 const promptWords = idea0.trim().split(/\s+/).filter(Boolean).length;
 const lowerIdea = idea0.toLowerCase();
 const hadEscapePrefix =
@@ -884,16 +898,17 @@ if (!idea.trim()) {
   };
 }
 
-const mode = isDeliberate(idea, args) ? "DELIBERATE" : "SHORT";
+const mode = isDeliberate(idea, workflowArgs) ? "DELIBERATE" : "SHORT";
 const maxIter = Math.min(
-  Math.max(Number((args && args.maxIterations) || 5), 1),
+  Math.max(Number((workflowArgs && workflowArgs.maxIterations) || 5), 1),
   5,
 );
 log("mode=" + mode + "; maxIterations=" + maxIter);
 
-const artifactsDir = (args && args.artifactsDir) || ".omc/plans";
-const draftsDir = (args && args.draftsDir) || ".omc/drafts";
-const planName = (args && args.planName) || "ralplan";
+const artifactsDir =
+  (workflowArgs && workflowArgs.artifactsDir) || ".omc/plans";
+const draftsDir = (workflowArgs && workflowArgs.draftsDir) || ".omc/drafts";
+const planName = (workflowArgs && workflowArgs.planName) || "ralplan";
 const planPath = artifactsDir + "/" + planName + ".md";
 
 log(
@@ -918,7 +933,7 @@ for (let iteration = 1; iteration <= maxIter; iteration++) {
   lastRoundReached = iteration;
 
   phase("Round " + iteration + " - Planner");
-  const plannerOut = agent(
+  const plannerOut = await agent(
     buildPlannerPrompt(idea, mode, feedback, iteration),
     {
       schema: PLANNER_SCHEMA,
@@ -933,11 +948,21 @@ for (let iteration = 1; iteration <= maxIter; iteration++) {
   lastDraft = plannerOut;
 
   phase("Round " + iteration + " - Architect");
-  const archOut = agent(buildArchitectPrompt(lastDraft, mode), {
+  const architectOptions = {
     schema: ARCHITECT_SCHEMA,
     phase: "Round " + iteration + " - Architect",
     label: "architect",
-  });
+  };
+  if (
+    typeof workflowArgs.architectModel === "string" &&
+    workflowArgs.architectModel
+  ) {
+    architectOptions.model = workflowArgs.architectModel;
+  }
+  const archOut = await agent(
+    buildArchitectPrompt(lastDraft, mode),
+    architectOptions,
+  );
   if (!archOut) {
     log(
       "architect returned null on round " +
@@ -985,11 +1010,21 @@ for (let iteration = 1; iteration <= maxIter; iteration++) {
   }
 
   phase("Round " + iteration + " - Critic");
-  const critOut = agent(buildCriticPrompt(lastDraft, lastArchitect, mode), {
+  const criticOptions = {
     schema: CRITIC_SCHEMA,
     phase: "Round " + iteration + " - Critic",
     label: "critic",
-  });
+  };
+  if (
+    typeof workflowArgs.criticModel === "string" &&
+    workflowArgs.criticModel
+  ) {
+    criticOptions.model = workflowArgs.criticModel;
+  }
+  const critOut = await agent(
+    buildCriticPrompt(lastDraft, lastArchitect, mode),
+    criticOptions,
+  );
   if (!critOut) {
     log(
       "critic returned null on round " +
@@ -1040,7 +1075,10 @@ let status;
 if (!lastDraft) {
   status = "no_planner_output";
 } else if (consensusReached) {
-  status = args && args.executeOnConsensus ? "consensus_approved" : "consensus";
+  status =
+    workflowArgs && workflowArgs.executeOnConsensus
+      ? "consensus_approved"
+      : "consensus";
 } else {
   status = "no_consensus";
 }
@@ -1125,7 +1163,7 @@ const result = {
   statusLine: "Status: pending approval -- workflow halted before execution",
   fidelityGaps: {
     interactiveCheckpointsUnsupported: true,
-    perRoleModelRouting: false,
+    perRoleModelRouting: true,
     note: "Workflow runs to completion; emits [pending approval] markers; never invokes Skill(team|ralph); does not write .omc/plans/{name}.md directly.",
   },
 };

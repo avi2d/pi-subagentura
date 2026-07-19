@@ -1,7 +1,7 @@
 {
   "name": "pi-subagentura",
-  "version": "3.0.2",
-  "description": "Public Pi package that adds in-process sub-agents via the SDK",
+  "version": "3.0.3",
+  "description": "Reusable agent workflows and observable, attachable sub-agents for the Pi coding agent",
   "author": "lmn451",
   "license": "MIT",
   "main": "src/subagent.ts",
@@ -9,9 +9,17 @@
   "keywords": [
     "pi-package",
     "pi",
+    "pi-coding-agent",
     "subagent",
+    "interactive-subagents",
     "agent",
     "multi-agent",
+    "orchestrator",
+    "orchestration",
+    "agent-workflows",
+    "agent-observability",
+    "tmux",
+    "zellij",
     "swarm",
     "crew"
   ],
@@ -26,6 +34,10 @@
   "files": [
     "LICENSE",
     "ORCHESTRATOR_SYSTEM_PROMPT.md",
+    "docs/workflows.md",
+    "examples/workflows/README.md",
+    "examples/workflows/*.mjs",
+    "skills/ralplan",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
