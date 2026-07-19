@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A first-class reusable-workflow guide, user-command reference, and agent-facing tool reference.
+- Workflow examples and the bundled RALPLAN skill in the published npm tarball, guarded by parser, behavior, README-surface, and tarball regression tests.
+
+### Changed
+
+- README positioning now leads with parent-orchestrated workflows, bring-your-own agents and prompts, interactive child sessions, and reusable workflows.
+- Package description and discovery keywords now cover interactive subagents, orchestration, workflows, tmux, and Zellij.
+- Bundled workflow scripts now live under `examples/workflows/` with an index and usage guide.
+
 ## [3.0.2] - 2026-07-17
 
 ### Added

@@ -49,6 +49,21 @@ export const meta = {
   ],
 };
 
+function parseWorkflowArgs(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+const workflowArgs = parseWorkflowArgs(args);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Role personas — inlined verbatim from pi-ralplan/pi/skills/ralplan/prompts/*.md
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,25 +581,25 @@ function criticPromptBuilder(
 // unreviewed draft. Loop terminates on dual-APPROVE or after maxIterations.
 // ─────────────────────────────────────────────────────────────────────────────
 
-validateArgs(args);
+validateArgs(workflowArgs);
 
-const safeIdeaStr = safeIdea(args);
+const safeIdeaStr = safeIdea(workflowArgs);
 
-const PLAN_DIR = args.workingDir + "/plans";
+const PLAN_DIR = workflowArgs.workingDir + "/plans";
 const DRAFT_DIR = PLAN_DIR + "/drafts";
-const SPEC_PATH = args.specPath || null;
+const SPEC_PATH = workflowArgs.specPath || null;
 const DRAFT_PATH = DRAFT_DIR + "/plan_draft.md";
 const ARCH_REVIEW_PATH = DRAFT_DIR + "/architect_review.md";
 const CRIT_REVIEW_PATH = DRAFT_DIR + "/critic_review.md";
-const FINAL_PATH = PLAN_DIR + "/" + (args.planName || "plan") + ".md";
+const FINAL_PATH = PLAN_DIR + "/" + (workflowArgs.planName || "plan") + ".md";
 
-const mode = resolveMode(args);
+const mode = resolveMode(workflowArgs);
 
 const maxIterations =
-  typeof args.maxIterations === "number" &&
-  args.maxIterations > 0 &&
-  args.maxIterations <= 100
-    ? Math.floor(args.maxIterations)
+  typeof workflowArgs.maxIterations === "number" &&
+  workflowArgs.maxIterations > 0 &&
+  workflowArgs.maxIterations <= 100
+    ? Math.floor(workflowArgs.maxIterations)
     : 5;
 
 const feedback = [];

@@ -2,40 +2,61 @@
 
 [![npm](https://img.shields.io/npm/v/pi-subagentura?label=npm)](https://npmjs.com/package/pi-subagentura) [![GitHub](https://img.shields.io/github/v/tag/lmn451/pi-subagentura?label=github)](https://github.com/lmn451/pi-subagentura)
 
-> **Note:** The `docs/` folder is managed by the [`pi-docs`](https://github.com/lmn451/pi-docs) package.
+> **Docs ownership:** this repository is the source of truth for `docs/`.
+> [`pi-docs`](https://github.com/lmn451/pi-docs) is the separately published doc
+> injector that can index these files; it does not manage or sync them.
 
-A public [Pi](https://pi.dev) package that combines lightweight in-process
-delegation with observable, attachable interactive sub-agents.
+Give the parent Pi agent one task and let it build the team. pi-subagentura adds
+reusable multi-agent workflows, lightweight background delegation, and real
+child Pi sessions you can watch, attach to, and continue in tmux or Zellij.
 
-**Interactive sub-agents are the standout feature.** `subagent_interactive`
-launches a real, separate Pi session in a tmux or zellij pane. Watch its Pi TUI
-and tool activity in real time, focus the pane from your current multiplexer,
-attach from another terminal, and send follow-up prompts into the same child
-context. Every turn also writes durable lifecycle and output artifacts, so the
-work remains inspectable after detach, reload, or parent restart.
+Start Pi with the bundled orchestrator guidance and describe the outcome you
+want. The parent can turn that request into a saved workflow, run its agents in
+the background, and keep their intermediate results out of the parent context.
 
-Available tools:
+## Quick start
 
-- `subagent_with_context` — spawn a sub-agent that inherits the full conversation history
-- `subagent_isolated` — spawn a sub-agent with a fresh, empty context window
-- `get_subagent_status` — poll an async subagent job for live progress
-- `get_subagent_result` — block until an async job completes and return the final output
-- `cancel_subagent` — abort a running async job
-- `prune_subagent_jobs` — remove all completed and failed jobs from the registry
-- `subagent_interactive` — spawn an attachable Pi session in a tmux/zellij pane
-- `get_interactive_subagent_status` — list attachable sessions with pane/session/artifact metadata
-- `cancel_interactive_subagent` — kill an attachable interactive sub-agent pane
-- `send_interactive_subagent_message` — send a follow-up into a live child REPL without losing context
-- `read_subagent_artifact` — read an interactive sub-agent's lifecycle events and output
-- `list_subagent_artifacts` — list all known interactive sub-agents and artifact locations
+```text
+pi --orchestrator
+/workflow review the authentication layer
+/workflows
+/workflow-tree
+```
 
-For quick delegated work, in-process sub-agents stream progress in the current
-Pi process. With `async: true`, they run in the background while the main agent
-continues, and can be polled, collected, or cancelled by job id.
+`/workflow` asks the parent to create, save, and immediately run a reusable
+workflow. `/workflows` runs saved workflows, and `/workflow-tree` shows live
+phases, agents, and cancellation controls.
 
-Interactive children remain `idle` between turns instead of exiting. Follow-ups
-preserve model context, and each completion maps its Pi `turnId` to an immutable
-`outputs/<eventId>.md` snapshot recoverable through `read_subagent_artifact`.
+## Reusable workflows
+
+Workflow files are ordinary `.mjs` scripts with static metadata and a small set
+of injected orchestration primitives:
+
+- `agent()` runs an isolated role with optional schema validation, persona,
+  model, thinking level, phase label, and process/in-process isolation.
+- `parallel()` starts independent agent thunks concurrently and waits at a
+  barrier before continuing.
+- `pipeline()` streams each item through a sequence of stages without waiting
+  for every item to finish a stage first.
+- `phase()` names progress in the TUI. Saved workflows may call another saved
+  workflow with `workflow(name, args)`, with one level of nesting.
+
+Execution is async by default: the tool returns a workflow id while Pi remains
+usable, with status and results available through the UI, slash commands, and
+agent tools. Workflow agents default to separate Pi processes in tmux or
+Zellij, so they are observable and attachable; when no multiplexer is
+available, the runtime falls back to in-process execution. Intermediate agent
+results stay in workflow variables outside the parent model context, and only
+the workflow's final result returns to the parent.
+
+Workflow scripts are trusted agent-authored JavaScript. The VM improves
+determinism but is not a security boundary, so never run untrusted JavaScript.
+Background workflow jobs are scoped to the current parent session and are
+cancelled by reload, resume, quit, or a new session. Attachable interactive
+sub-agents use durable artifacts and can survive those boundaries.
+
+See the [workflow guide](./docs/workflows.md) and
+[bundled examples](./examples/workflows/README.md).
 
 ## Why use it?
 
@@ -46,7 +67,83 @@ preserve model context, and each completion maps its Pi `turnId` to an immutable
 - Run lightweight sub-agents in-process or in the background
 - Compare context-aware and isolated reasoning
 - Poll, collect, or cancel background jobs on demand
+- Build reusable review, research, migration, and conversion workflows
 - Use bundled orchestration defaults for scout/plan, oracle checks, parallel review, and review loops
+
+## User commands
+
+These commands are intended for people at the Pi prompt.
+
+| Command             | Purpose                                                           |
+| ------------------- | ----------------------------------------------------------------- |
+| `/workflow`         | Create, save, and run a reusable workflow from a task             |
+| `/workflows`        | Select and run a saved workflow                                   |
+| `/list-workflows`   | Alias for `/workflows`                                            |
+| `/workflow-status`  | List workflow jobs and their live or terminal status              |
+| `/workflow-tree`    | Open the interactive workflow progress tree                       |
+| `/delete-workflow`  | Delete a saved workflow by name or picker                         |
+| `/cancel-all-flows` | Cancel active jobs, workflows, and running interactive sub-agents |
+
+## Agent-facing tools
+
+The extension registers 21 public tools for parent agents.
+
+| Tool                                | Purpose                                                        |
+| ----------------------------------- | -------------------------------------------------------------- |
+| `workflow`                          | Run a trusted workflow script or saved workflow                |
+| `save_workflow`                     | Validate and save a reusable workflow                          |
+| `list_workflows`                    | List saved workflows                                           |
+| `delete_workflow`                   | Delete a saved workflow                                        |
+| `get_workflow_status`               | Inspect a background workflow                                  |
+| `get_workflow_result`               | Wait for and return a workflow result                          |
+| `cancel_workflow`                   | Cancel a background workflow                                   |
+| `subagent_with_context`             | Delegate with the parent conversation                          |
+| `subagent_isolated`                 | Delegate with a fresh context                                  |
+| `get_subagent_status`               | Inspect an async in-process job                                |
+| `get_subagent_result`               | Wait for and return an async job result                        |
+| `cancel_subagent`                   | Cancel an async job                                            |
+| `prune_subagent_jobs`               | Remove completed and failed jobs                               |
+| `list_available_models`             | List configured model identifiers                              |
+| `subagent_interactive`              | Launch an attachable Pi session in tmux/Zellij                 |
+| `get_interactive_subagent_status`   | Inspect attachable child sessions                              |
+| `cancel_interactive_subagent`       | Kill an attachable child pane                                  |
+| `send_interactive_subagent_message` | Send a follow-up while preserving child context                |
+| `list_subagent_artifacts`           | List durable interactive-agent artifacts                       |
+| `read_subagent_artifact`            | Read lifecycle events and output snapshots                     |
+| `cleanup_subagent_artifacts`        | Remove expired artifact directories and stale registry entries |
+
+## How it compares with other Pi sub-agent extensions
+
+There is no single best extension; the useful distinction is what kind of
+control you want after delegation. This table compares the most widely used Pi
+sub-agent extensions as of July 2026, based on their published documentation.
+
+| Extension                                                                                | Strongest fit                                                        | Pros                                                                                                                                                                                                                    | Cons / tradeoffs                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **pi-subagentura**                                                                       | Work you may want to watch, attach to, or continue interactively     | Combines lightweight in-process jobs with real child Pi sessions; tmux/Zellij attach and focus commands; mid-session follow-ups; durable per-turn artifacts; parent restart/reload rehydration; bounded workflow runner | Interactive mode requires tmux or Zellij and starts another process; in-process jobs and workflows do not survive parent-session replacement; workflow JavaScript is trusted code, not a security sandbox; smaller community than the alternatives below |
+| [`@adamjen/pi-interactive-subagents`](https://github.com/HazAT/pi-interactive-subagents) | Fully asynchronous, multiplexer-native agent workflows               | Dedicated panes in cmux, tmux, Zellij, or WezTerm; live status widget; interruption and session resume; custom agents; child-to-parent help requests; bundled `/plan` and `/iterate` workflows                          | Child-process/multiplexer-only design with no lightweight in-process path; its help-request flow exits and later resumes the child; no documented immutable per-turn output and durable delivery-receipt protocol comparable to pi-subagentura's         |
+| [`pi-subagents`](https://github.com/nicobailon/pi-subagents)                             | Feature-rich orchestration and automated multi-step coding workflows | Large built-in agent/workflow set; foreground and background runs; chains, parallel groups, worktrees, lifecycle artifacts, fleet UI, watchdog review, supervisor messaging, and nested delegation                      | Much larger configuration and tool surface; more concepts to learn; does not provide an attachable terminal session—the fleet view is an inspector inside Pi                                                                                             |
+| [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents)                   | Claude Code-style sub-agents inside Pi                               | Polished live widget and FleetView; foreground/background execution; steering and resume; custom agent definitions; worktree isolation; scheduling; model/tool/extension controls                                       | Broad feature/configuration surface; UI and control stay inside the parent Pi experience rather than exposing a normal attachable child terminal; persistent sessions/artifacts are optional rather than the default source of truth                     |
+| [`@mjakl/pi-subagent`](https://github.com/mjakl/pi-subagent)                             | A small, predictable delegation primitive                            | Simple tool shape; fresh or parent-seeded context; parallel calls; named persistent sessions; depth/cycle guards; rich streaming TUI                                                                                    | Fewer orchestration features; no background job manager or durable event protocol; no live attachable pane; a stale persistent-session lock can require manual cleanup after a killed process                                                            |
+
+If you want multiplexer-native async agents with broader terminal support, try
+`@adamjen/pi-interactive-subagents`. If you want the broadest orchestration
+toolbox, start with `pi-subagents`. If you want a Claude Code-like UI, try
+`@tintinweb/pi-subagents`. If you want the smallest conventional child-process
+implementation, try `@mjakl/pi-subagent`. pi-subagentura is for the narrower
+case where a delegated agent should remain a real session you can observe and
+re-enter, while still offering cheap in-process delegation for short tasks.
+
+### Adjacent coding-agent implementations
+
+These are not Pi extensions, so the comparison is secondary. They are useful
+reference points for the interaction model.
+
+| Tool                                                                | Pros                                                                                                                                                                     | Cons / difference from pi-subagentura                                                                                                                                                                                  |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Claude Code subagents](https://code.claude.com/docs/en/sub-agents) | Mature built-in delegation; foreground/background execution; custom prompts, models, tools, permissions, and skills; context forking; automatic or explicit routing      | Subagents are normally task workers that return results to the parent; they cannot spawn subagents; direct multi-session collaboration is a separate agent-teams feature; no tmux/Zellij attach-and-rehydrate protocol |
+| [Codex subagents](https://developers.openai.com/codex/)             | First-class agent threads in the app, CLI, and IDE; inspect, steer, interrupt, and switch threads; custom agent configurations; bounded nesting and concurrency controls | Part of the Codex product rather than a portable Pi extension; delegation can consume substantially more tokens; no artifact contract designed for attaching to a normal child terminal process                        |
+| [OpenCode agents](https://opencode.ai/docs/agents/)                 | Simple primary/subagent model; automatic or explicit `@` invocation; custom prompts, models, tools, and permissions; built-in parent/child session navigation            | Navigation stays inside OpenCode's session UI; no separate attachable mux pane or pi-subagentura-compatible durable artifact/delivery protocol                                                                         |
 
 ![Sub-agent demo](working.png)
 
