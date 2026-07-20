@@ -245,6 +245,7 @@ export interface EventRecord {
 }
 
 export const MAX_EVENT_BATCH_BYTES = 256 * 1024;
+export const MAX_EVENT_RECORD_BYTES = 4 * MAX_EVENT_BATCH_BYTES;
 export const MAX_EVENT_ID_LENGTH = 128;
 export const MAX_TURN_ID_LENGTH = 256;
 export const MAX_EVENT_TEXT_LENGTH = 2_000;
@@ -821,10 +822,25 @@ export function readEventBatch(
     return { records: [], endOffset: fromOffset };
   }
   const offset = Math.max(0, Math.min(fromOffset, size));
-  const content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
+  let content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
   try {
-    if (content.byteLength > 0)
+    if (content.byteLength > 0) {
       readSync(fd, content, 0, content.length, offset);
+      while (
+        content.indexOf(0x0a) < 0 &&
+        offset + content.byteLength < size &&
+        content.byteLength < MAX_EVENT_RECORD_BYTES
+      ) {
+        const remaining = Math.min(
+          MAX_EVENT_BATCH_BYTES,
+          size - offset - content.byteLength,
+          MAX_EVENT_RECORD_BYTES - content.byteLength,
+        );
+        const next = Buffer.alloc(remaining);
+        readSync(fd, next, 0, next.length, offset + content.byteLength);
+        content = Buffer.concat([content, next]);
+      }
+    }
   } finally {
     closeSync(fd);
   }
@@ -1572,20 +1588,65 @@ export function saveInteractiveStates(
   if (!current || current.schemaVersion !== CURRENT_STATE_SCHEMA_VERSION) {
     throw new Error(`unsupported schemaVersion: ${payload.schemaVersion}`);
   }
+  withInteractiveStateLock(cwd, () => {
+    const existing = loadInteractiveStates(cwd);
+    writeInteractiveStatesUnlocked(cwd, {
+      ...current,
+      states: { ...(existing?.states ?? {}), ...current.states },
+    });
+  });
+}
+
+const STATE_LOCK_TIMEOUT_MS = 2_000;
+const STATE_LOCK_STALE_MS = 30_000;
+
+function withInteractiveStateLock<T>(cwd: string, action: () => T): T {
+  const piDir = join(cwd, ".pi");
+  const lock = join(piDir, "subagentura-state.lock");
+  mkdirSync(piDir, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + STATE_LOCK_TIMEOUT_MS;
+  let fd: number | undefined;
+  while (fd === undefined) {
+    try {
+      fd = openSync(lock, "wx", 0o600);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > STATE_LOCK_STALE_MS) {
+          unlinkSync(lock);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring interactive state lock: ${lock}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try {
+    return action();
+  } finally {
+    closeSync(fd);
+    try {
+      unlinkSync(lock);
+    } catch {
+      /* another recovery path may already have removed a stale lock */
+    }
+  }
+}
+
+function writeInteractiveStatesUnlocked(
+  cwd: string,
+  payload: InteractiveSubagentStateFile,
+): void {
   const file = stateFilePath(cwd);
-
-  mkdirSync(join(cwd, ".pi"), { recursive: true, mode: 0o700 });
-
-  const tmp = file + ".tmp";
-
-  writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 });
-
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
   renameSync(tmp, file);
 }
-// SAFETY: load-modify-write is not atomic across concurrent callers.
-// Safe today only because a pi session is single-event-loop and never
-// calls this re-entrantly. Do NOT call from parallel async paths without
-// adding a write lock.
+
 /**
  * Convenience: load (or create fresh) + add/overwrite entry by id + save.
  * Called from hot paths (spawn) where a write failure must not break the parent.
@@ -1595,33 +1656,32 @@ export function appendInteractiveState(
   entry:
     InteractiveSubagentPersistedStateV1 | InteractiveSubagentPersistedStateV2,
 ): void {
-  const current = loadInteractiveStates(cwd) ?? {
-    schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
-
-    parent: "pi",
-
-    states: {},
-  };
-
-  const art = artifactPath(
-    dirname(entry.artifactDir),
-    basename(entry.artifactDir),
-  );
-  current.states[entry.id] = {
-    ...entry,
-    eventByteCursor: "eventByteCursor" in entry ? entry.eventByteCursor : 0,
-    sessionByteCursor:
-      "sessionByteCursor" in entry ? entry.sessionByteCursor : 0,
-    pendingDeliveries:
-      "pendingDeliveries" in entry ? entry.pendingDeliveries : [],
-    deliveryReceipts: "deliveryReceipts" in entry ? entry.deliveryReceipts : [],
-    legacyCutoverOffset:
-      "legacyCutoverOffset" in entry
-        ? entry.legacyCutoverOffset
-        : eventLogEndOffset(art),
-  };
-
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd) ?? {
+      schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
+      parent: "pi",
+      states: {},
+    };
+    const art = artifactPath(
+      dirname(entry.artifactDir),
+      basename(entry.artifactDir),
+    );
+    current.states[entry.id] = {
+      ...entry,
+      eventByteCursor: "eventByteCursor" in entry ? entry.eventByteCursor : 0,
+      sessionByteCursor:
+        "sessionByteCursor" in entry ? entry.sessionByteCursor : 0,
+      pendingDeliveries:
+        "pendingDeliveries" in entry ? entry.pendingDeliveries : [],
+      deliveryReceipts:
+        "deliveryReceipts" in entry ? entry.deliveryReceipts : [],
+      legacyCutoverOffset:
+        "legacyCutoverOffset" in entry
+          ? entry.legacyCutoverOffset
+          : eventLogEndOffset(art),
+    };
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
 
 export function updateInteractiveState(
@@ -1629,39 +1689,35 @@ export function updateInteractiveState(
   id: string,
   update: (entry: InteractiveSubagentPersistedStateV2) => void,
 ): void {
-  const current = loadInteractiveStates(cwd);
-  const entry = current?.states[id];
-  if (!current || !entry) return;
-  update(entry);
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd);
+    const entry = current?.states[id];
+    if (!current || !entry) return;
+    update(entry);
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
-
-// SAFETY: load-modify-write is not atomic across concurrent callers.
-// Safe today only because a pi session is single-event-loop and never
-// calls this re-entrantly. Do NOT call from parallel async paths without
-// adding a write lock.
 /**
  * Convenience: load + drop entry by id + save. No-op if absent or file missing.
  */
 export function removeInteractiveState(cwd: string, id: string): void {
-  const current = loadInteractiveStates(cwd);
-
-  if (!current) return;
-
-  if (!(id in current.states)) return;
-
-  delete current.states[id];
-
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd);
+    if (!current || !(id in current.states)) return;
+    delete current.states[id];
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
 /**
  * Delete the state file outright. Used on session_shutdown(reason="new") to
  * give the next session a clean slate. No-op if the file doesn't exist.
  */
 export function deleteInteractiveStatesFile(cwd: string): void {
-  try {
-    unlinkSync(stateFilePath(cwd));
-  } catch {
-    /* best effort — file may not exist */
-  }
+  withInteractiveStateLock(cwd, () => {
+    try {
+      unlinkSync(stateFilePath(cwd));
+    } catch {
+      /* best effort — file may not exist */
+    }
+  });
 }

@@ -51,6 +51,7 @@ function cleanGlobals() {
   const globalState = globalThis as any;
   globalState.__piSubagenturaPiRef = undefined;
   globalState.__piSubagenturaUi = undefined;
+  globalState.__piSubagenturaSessionManager = undefined;
   globalState.__piSubagenturaParentStreaming = false;
   globalState.__piSubagenturaPendingJobDeliveries = [];
   globalState.__piSubagenturaInProcessFlushScheduled = false;
@@ -172,6 +173,9 @@ describe("in-process completion delivery queue", () => {
     (globalThis as any).__piSubagenturaPiRef = {
       sendMessage: firstSessionSend,
     };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-a",
+    };
     (globalThis as any).__piSubagenturaParentStreaming = true;
     const job = makeJobState({ notifyOnComplete: "notify" });
 
@@ -181,6 +185,9 @@ describe("in-process completion delivery queue", () => {
 
     (globalThis as any).__piSubagenturaPiRef = {
       sendMessage: secondSessionSend,
+    };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-b",
     };
     (globalThis as any).__piSubagenturaParentStreaming = false;
     flushInProcessDeliveries();
