@@ -136,7 +136,7 @@ All bundled examples normalize both forms, and the behavior tests exercise each 
 
 ### 2. JSON-stringified payloads for large content
 
-Schema validation breaks on multi-KB string fields. The workflow runtime's `validateSchema` (in `src/workflow-core.ts`) only handles a small subset: `type`, `enum`, `properties`, `required`, `items`, `minItems`, `maxItems`. Anything >10KB inline is risky. Wrap large structured data in a single string field:
+Schema validation breaks on multi-KB string fields. The workflow runtime's `validateSchema` (in `src/workflow-core.ts`) handles a small subset: `type`, `enum`, `properties`, `required`, `additionalProperties: false`, `items`, `minItems`, and `maxItems`. Anything >10KB inline is risky. Wrap large structured data in a single string field:
 
 ```js
 // BAD — critic.md at 22KB breaks validation
@@ -194,9 +194,9 @@ This avoided the "JSON-encoding of large file map fails" failure mode in `packag
 
 The sandbox exposes only: `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `args`, `budget`, `console`. No `fs`, no `path`, no `process`. Calling `mkdirSync` or `readFileSync` in the script body throws `ReferenceError`. String code generation is disabled, but this VM is still a determinism aid rather than a security boundary. All file I/O must happen in sub-agents via tools.
 
-### 6. `additionalProperties` is silently ignored
+### 6. `additionalProperties: false` rejects unknown keys
 
-The `validateSchema` function in `src/workflow-core.ts` does not check `additionalProperties`. If you write a schema like `{ type: "object", required: ["SKILL.md"], additionalProperties: { type: "string" } }`, the agent may produce objects with extra keys, and they won't be validated. Either enumerate all properties explicitly, or use a single string field (see point 2).
+The `validateSchema` function in `src/workflow-core.ts` enforces `additionalProperties: false` for object schemas. Any output key not listed in `properties` produces a validation error. Use it when an agent result must not contain undeclared keys; otherwise, extra keys are allowed.
 
 ## Round-trip: package ↔ skill ↔ workflow
 
@@ -227,7 +227,6 @@ Pi package source
 
 - Expand converter tests to cover malformed agent output and partial writes.
 - Consider whether the examples should also be installable as named presets.
-- Investigate whether `validateSchema` should support `additionalProperties` natively.
 
 ## Workflow visibility and scaling
 
