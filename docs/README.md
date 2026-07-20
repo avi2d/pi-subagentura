@@ -14,9 +14,9 @@ Reference docs for the pi-subagentura project.
 | [workflows.md](./workflows.md)                             | Workflow scripts shipped in the repo (consensus pipelines + converters) |
 | [interactive-tmux-review.md](./interactive-tmux-review.md) | Code review of `src/interactive-tmux.ts` via GLM-5.2                    |
 
-## Workflow scripts at the repo root
+## Workflow scripts in `examples/workflows/`
 
-These are `.mjs` workflow files invoked via the `workflow` tool:
+These are `.mjs` workflow files under `examples/workflows/` invoked via the `workflow` tool:
 
 ```
 skill-to-workflow.mjs       (12 KB)  Generic: Pi skill → workflow script
