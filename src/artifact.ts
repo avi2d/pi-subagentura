@@ -887,7 +887,7 @@ export function readEventBatch(
   }
   if (
     endOffset === offset &&
-    content.byteLength === MAX_EVENT_BATCH_BYTES &&
+    content.byteLength > 0 &&
     offset + content.byteLength < size
   ) {
     endOffset = offset + content.byteLength;
