@@ -165,6 +165,29 @@ describe("in-process completion delivery queue", () => {
     });
     expect(job.notificationDelivered).toBe(true);
   });
+
+  it("does not deliver a queued completion into a replacement parent session", async () => {
+    const firstSessionSend = vi.fn();
+    const secondSessionSend = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: firstSessionSend,
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const job = makeJobState({ notifyOnComplete: "notify" });
+
+    deliverNotification(job, SUCCESS_RESULT);
+    await Promise.resolve();
+    expect(firstSessionSend).not.toHaveBeenCalled();
+
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: secondSessionSend,
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    flushInProcessDeliveries();
+
+    expect(secondSessionSend).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBeFalsy();
+  });
 });
 
 describe("artifact notification compatibility", () => {
