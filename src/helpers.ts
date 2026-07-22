@@ -35,6 +35,7 @@ import {
   type CancellationSnapshotReceipt,
   type CancellationSnapshotSource,
 } from "./cancellation-snapshots";
+import { withOrchestrationContext } from "./orchestration-context";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -123,6 +124,8 @@ export type SubagentResult =
       usage: Usage;
       model?: string;
       thinkingLevel?: ThinkingLevel;
+      /** Set when the sub-agent was aborted before producing a final answer. */
+      cancelled?: boolean;
     }
   | {
       isError: true;
@@ -130,6 +133,8 @@ export type SubagentResult =
       usage: Usage;
       model?: undefined;
       thinkingLevel?: ThinkingLevel;
+      /** Never set on the error branch; present so the union can be probed. */
+      cancelled?: undefined;
       errorMessage: string;
     };
 
@@ -175,6 +180,26 @@ export interface JobState {
   maxAge?: number;
   /** Most recent cancellation snapshot receipt, when snapshots are enabled. */
   cancellationSnapshot?: CancellationSnapshotReceipt;
+  /**
+   * Controller wired to this job's session (async jobs only). Aborting it
+   * cancels the session AND cascades to any descendants this job owns.
+   */
+  abort?: AbortController;
+  /** Job id of the owning parent sub-agent (undefined for root-parent spawns). */
+  parentJobId?: string;
+  /** Orchestration depth of this job. Root parent's direct children are 1. */
+  depth?: number;
+  /** Recorded when a cancel path fires, for observability and result shaping. */
+  cancellation?: CancellationInfo & { at: number };
+}
+
+/** Who/why a cancellation happened — threaded to logs and snapshots. */
+export interface CancellationInfo {
+  source: CancellationSnapshotSource;
+  /** Session id, tool-call id, or symbolic origin (e.g. "user_escape"). */
+  initiator?: string;
+  /** Human-readable reason preserved in logs and the snapshot. */
+  reason?: string;
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -244,6 +269,94 @@ export function pruneCompletedJobs(): number {
     }
   }
   return removed;
+}
+
+/**
+ * Recover a structured {@link CancellationInfo} from an AbortSignal.
+ *
+ * Our own cancel paths call `controller.abort(info)`, so `signal.reason` is the
+ * CancellationInfo object. When Pi core aborts a parent turn (e.g. the user
+ * pressed Escape) the reason is a DOMException/Error/string — we surface its
+ * message and fall back to the given source.
+ */
+export function readCancellationInfo(
+  signal: AbortSignal | undefined,
+  fallbackSource: CancellationSnapshotSource,
+): CancellationInfo {
+  const reason = signal?.reason;
+  if (
+    reason &&
+    typeof reason === "object" &&
+    "source" in (reason as Record<string, unknown>)
+  ) {
+    return reason as CancellationInfo;
+  }
+  const message =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : undefined;
+  return { source: fallbackSource, reason: message };
+}
+
+/**
+ * Abort every running async job the given owner spawned, recursively.
+ *
+ * Each async job's controller fires its own abort handler (snapshot →
+ * session.abort → cascade), so aborting a controller propagates the cancel
+ * through the whole ownership subtree. Sync jobs are not registered here; their
+ * descendants are reached from the sync job's own abort handler via {@link cascadeChildAborts}.
+ * Returns the ids that were signalled.
+ */
+export function cascadeChildAborts(
+  ownerJobId: string,
+  info: CancellationInfo,
+): string[] {
+  const signalled: string[] = [];
+  for (const [childId, child] of jobRegistry) {
+    if (child.parentJobId !== ownerJobId) continue;
+    if (child.status !== "running") continue;
+    child.cancellation = { ...info, at: Date.now() };
+    // Mark cancelled up front so late settlement cannot flip it to done/error
+    // and no completion notification fires for an aborted child.
+    child.status = "cancelled";
+    scheduleJobCleanup(childId, true);
+    signalled.push(childId);
+    if (child.abort) {
+      try {
+        child.abort.abort(info);
+      } catch {
+        /* controller may already be aborted */
+      }
+    } else {
+      child.session.abort().catch(() => {});
+      signalled.push(...cascadeChildAborts(childId, info));
+    }
+  }
+  return signalled;
+}
+
+/**
+ * Cancel a specific async job and its owned descendants. Records the
+ * cancellation metadata, then aborts the job's controller (which snapshots and
+ * tears down the session) and cascades to children.
+ */
+export function abortJobTree(jobId: string, info: CancellationInfo): string[] {
+  const job = jobRegistry.get(jobId);
+  if (!job || job.status !== "running") return [];
+  job.cancellation = { ...info, at: Date.now() };
+  const cascaded = cascadeChildAborts(jobId, info);
+  if (job.abort) {
+    try {
+      job.abort.abort(info);
+    } catch {
+      /* already aborted */
+    }
+  } else {
+    job.session.abort().catch(() => {});
+  }
+  return [jobId, ...cascaded];
 }
 
 export function scheduleJobCleanup(
@@ -371,6 +484,13 @@ export interface StartSubagentJobParams {
   cancellationSource?: CancellationSnapshotSource;
   /** Thinking/reasoning level. Pass through to createAgentSession. */
   thinkingLevel?: ThinkingLevel;
+  /**
+   * Orchestration depth of THIS job (root parent's direct child = 1). Bound
+   * into the async context so nested spawns can see their own depth.
+   */
+  depth?: number;
+  /** Top-level parent session id, propagated for observability. */
+  rootSessionId?: string;
 }
 
 export interface StartSubagentJobResult {
@@ -410,6 +530,8 @@ export async function startSubagentJob(
     onCancellationSnapshot,
     cancellationSource,
     thinkingLevel,
+    depth,
+    rootSessionId,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -528,19 +650,37 @@ export async function startSubagentJob(
   // Wire abort signal
   if (signal) {
     handleAbort = () => {
-      debugLog("warn", "job_abort", { jobId });
-      const receipt = snapshotInProcessSession({
-        kind: "in-process",
+      const info = readCancellationInfo(signal, cancellationSource ?? "signal");
+      debugLog("warn", "job_abort", {
         jobId,
-        session,
-        cwd,
-        model: modelLabel,
-        activeTool: liveStatus.activeTool,
-        partialOutput: liveStatus.output,
-        source: cancellationSource ?? "signal",
+        source: info.source,
+        initiator: info.initiator ?? null,
+        reason: info.reason ?? null,
+        depth: depth ?? null,
+        rootSessionId: rootSessionId ?? null,
       });
-      onCancellationSnapshot?.(receipt);
+      // Only take a snapshot when a receiver was wired (workflow path). The
+      // in-process cancel sites snapshot before aborting to capture pre-abort
+      // state, so snapshotting again here would be redundant.
+      if (onCancellationSnapshot) {
+        onCancellationSnapshot(
+          snapshotInProcessSession({
+            kind: "in-process",
+            jobId,
+            session,
+            cwd,
+            model: modelLabel,
+            activeTool: liveStatus.activeTool,
+            partialOutput: liveStatus.output,
+            source: info.source,
+            initiator: info.initiator,
+            reason: info.reason,
+          }),
+        );
+      }
       session.abort().catch(() => {});
+      // Cancellation is transitive: tear down every descendant this job owns.
+      cascadeChildAborts(jobId, info);
     };
     if (signal.aborted) {
       handleAbort();
@@ -642,8 +782,41 @@ export async function startSubagentJob(
     let result!: SubagentResult;
     try {
       debugLog("info", "prompt_start", { jobId });
-      await session.prompt(finalPrompt);
+      // Bind ownership + depth so any nested sub-agent spawned during this
+      // prompt can discover its owner (for cascade) and its depth (for the cap).
+      await withOrchestrationContext(
+        { ownerJobId: jobId, depth: depth ?? 0, rootSessionId },
+        () => session.prompt(finalPrompt),
+      );
       debugLog("info", "prompt_complete", { jobId });
+
+      // Aborted before completion → return an explicit cancelled result rather
+      // than a false empty success. Pi resolves prompt() on abort (it does not
+      // throw), so without this check an aborted job looks like `done` output.
+      if (signal?.aborted) {
+        const info = readCancellationInfo(
+          signal,
+          cancellationSource ?? "signal",
+        );
+        result = {
+          isError: false,
+          cancelled: true,
+          output: `Sub-agent cancelled before completion${info.reason ? `: ${info.reason}` : ""}.`,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+          },
+          model: session.model
+            ? `${session.model.provider}/${session.model.id}`
+            : undefined,
+          thinkingLevel: effectiveThinkingLevel,
+        };
+        return result;
+      }
 
       // Extract final assistant output
       const messages = session.agent.state.messages;

@@ -92,6 +92,10 @@ import {
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
 } from "../src/tools/in-process";
+import {
+  DEFAULT_MAX_ORCHESTRATION_DEPTH,
+  withOrchestrationContext,
+} from "../src/orchestration-context";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -283,10 +287,11 @@ describe("subagent_isolated tool", () => {
 
   it("passes null context to startSubagentJob (sync path)", async () => {
     const ctx = mockCtx();
-    // isolated tool doesn't consult getBranch at all, so no messages needed
+    // isolated tool doesn't consult getBranch at all, so no messages needed.
+    // async now defaults to true, so pass async: false to exercise the sync path.
     const result = await toolDef.execute(
       "call-1",
-      { task: "analyze code" },
+      { task: "analyze code", async: false },
       undefined,
       undefined,
       ctx,
@@ -299,6 +304,45 @@ describe("subagent_isolated tool", () => {
     // Result should come from the mocked runSubagent path
     expect(result.content[0].text).toBe("task completed");
     expect(result.details.status).toBe("done");
+  });
+
+  it("defaults to async (background) when the flag is omitted", async () => {
+    const ctx = mockCtx();
+    const result = await toolDef.execute(
+      "call-async-default",
+      { task: "analyze code" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    // Async path returns immediately with a started job, not inline output.
+    expect(result.details.status).toBe("started");
+    expect(result.content[0].text).toMatch(/^Job .* started/);
+    // The owning controller must be wired so ancestor aborts can cascade.
+    expect(mockStartSubagentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: expect.any(AbortSignal), depth: 1 }),
+    );
+  });
+
+  it("refuses to spawn once the orchestration depth cap is reached", async () => {
+    const ctx = mockCtx();
+    const result = await withOrchestrationContext(
+      { ownerJobId: "deep-parent", depth: DEFAULT_MAX_ORCHESTRATION_DEPTH },
+      () =>
+        toolDef.execute(
+          "call-too-deep",
+          { task: "spawn yet another reviewer" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/depth limit reached/i);
+    // No job should have been spawned.
+    expect(mockStartSubagentJob).not.toHaveBeenCalled();
   });
 
   it("registers with BaseParams schema", () => {

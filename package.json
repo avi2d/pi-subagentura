@@ -47,6 +47,7 @@
     "src/child-protocol.ts",
     "src/delivery.ts",
     "src/helpers.ts",
+    "src/orchestration-context.ts",
     "src/pi-sdk-compat.ts",
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
