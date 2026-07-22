@@ -15,6 +15,28 @@ accidental Node globals and disables string code generation, but it is not a
 security boundary; do not feed arbitrary user-supplied JavaScript to the
 workflow tool.
 
+## Authoring contract
+
+Submit raw JavaScript without markdown fences. The first statement should be a
+pure-literal `export const meta = { name, description, phases? }`; do not use
+TypeScript, imports, `require`, filesystem APIs, `Date.now()`, `Math.random()`,
+or argless `new Date()`. For editor support, reference the published ambient
+declarations at `pi-subagentura/workflow`.
+
+Use workflows only when work decomposes into independent agents or streaming
+stages. The VM globals are `agent`, `parallel`, `pipeline`, `workflow`, `phase`,
+`log`, `args`, immutable `cwd` (the parent execution directory), `budget`,
+`console`, and guarded `Date`/`Math`. `parallel()` takes thunks; `pipeline()`
+moves each item through all stages independently without a between-stage
+barrier. Use unique short labels, include enough context and relevant paths in
+every agent prompt, handle `null` failures, and add a final synthesis agent when
+one coherent result is required.
+
+Call `phase()` at real work-group transitions. Calls to `agent()` inherit the
+current phase unless `phase` is set explicitly. With `schema`, use the plain
+supported JSON Schema subset. In-process agents use native structured output;
+process agents use textual JSON extraction and validation as a fallback.
+
 ## Inventory
 
 | File                     | Size    | Purpose                                                  |
@@ -192,7 +214,11 @@ This avoided the "JSON-encoding of large file map fails" failure mode in `packag
 
 ### 5. The runtime does not inject Node APIs
 
-The sandbox exposes only: `agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, `args`, `budget`, `console`. No `fs`, no `path`, no `process`. Calling `mkdirSync` or `readFileSync` in the script body throws `ReferenceError`. String code generation is disabled, but this VM is still a determinism aid rather than a security boundary. All file I/O must happen in sub-agents via tools.
+The sandbox exposes only the documented workflow helpers plus immutable `cwd`,
+`console`, and guarded `Date`/`Math`. No `fs`, no `path`, no `process`. Calling
+`mkdirSync` or `readFileSync` in the script body throws `ReferenceError`. String
+code generation is disabled, but this VM is still a determinism aid rather than
+a security boundary. All file I/O must happen in sub-agents via tools.
 
 ### 6. `additionalProperties: false` rejects unknown keys
 
@@ -283,18 +309,23 @@ updates as workflow log events when the underlying runner exposes them.
 Run `/workflow-tree` to open an overlay over the current session. It supports:
 
 - `↑↓` / `j` / `k` to select a workflow
-- `enter` / `→` to expand or collapse phase/latest-event details
+- `enter` / `→` to expand or collapse phase, latest-event, and per-agent rows
 - `←` to collapse
 - `c` to cancel the selected running workflow
 - `q` / `esc` to close
 
-The overlay is keyboard-driven. Mouse-clickable controls directly on widget rows are still deferred because widgets are intentionally passive status surfaces.
+Each workflow snapshot retains the latest 50 agent-attempt records; the overlay
+displays the latest 20 and reports how many older records were omitted. These
+records show phase, label, model, and status, not full tool-call history.
+
+The overlay is keyboard-driven. Mouse-clickable controls directly on widget rows
+are still deferred because widgets are intentionally passive status surfaces.
 
 #### 4. Remaining gaps
 
 - Workflow widget rows are summaries, not mouse-clickable controls.
 - Progress event coalescing/rate limiting is still basic.
-- The overlay shows workflow-level phase/latest-event details, not full per-agent tool-call history.
+- Per-agent rows do not include full tool-call history.
 
 ### Process isolation
 

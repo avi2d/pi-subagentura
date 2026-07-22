@@ -1,58 +1,30 @@
-import { runInNewContext } from "node:vm";
+import { parse } from "acorn";
+
+const META_EXPORT_NAME = "meta";
+const RESERVE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 /** Split a workflow script into its static `meta` literal and executable body. */
-const META_EVAL_TIMEOUT_MS = 100;
-
 export function parseWorkflow(script) {
-  const tokens = scanTopLevelTokens(script);
-  let metaTokenIndex = -1;
-  let braceStart = -1;
-
-  for (let i = 0; i < tokens.length - 4; i++) {
-    if (
-      tokens[i].value === "export" &&
-      tokens[i + 1].value === "const" &&
-      tokens[i + 2].value === "meta" &&
-      tokens[i + 3].value === "="
-    ) {
-      metaTokenIndex = i;
-      braceStart = tokens[i + 4].value === "{" ? tokens[i + 4].start : -1;
-      break;
-    }
-  }
-  if (metaTokenIndex === -1) {
+  const ast = parseWorkflowAst(script);
+  const metaExport = findMetaExport(ast.body);
+  if (metaExport === null) {
     throw new Error(
       "Workflow script must declare `export const meta = { name, description }` as a pure literal.",
     );
   }
-  if (braceStart === -1) {
-    throw new Error(
-      "`export const meta` must be assigned an object literal `{ ... }`.",
-    );
-  }
 
-  const braceEnd = matchBrace(script, braceStart);
-  const metaText = script.slice(braceStart, braceEnd + 1);
   let meta;
   try {
-    const sandbox = Object.assign(Object.create(null), {
-      Date: makeGuardedDate(),
-      Math: makeGuardedMath(),
-    });
-    meta = runInNewContext(`(${metaText})`, sandbox, {
-      timeout: META_EVAL_TIMEOUT_MS,
-      microtaskMode: "afterEvaluate",
-      contextCodeGeneration: { strings: false, wasm: false },
-    });
+    meta = parseMetaLiteral(metaExport.init, "meta");
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `Workflow \`meta\` must be a pure literal (no variables/calls). Eval failed: ${msg}`,
-    );
+    const message = err instanceof Error ? `: ${err.message}` : "";
+    throw new Error(`Workflow \`meta\` must be a pure literal${message}`);
   }
-  if (!meta || typeof meta !== "object") {
-    throw new Error("Workflow `meta` did not evaluate to an object.");
+
+  if (meta == null || typeof meta !== "object" || Array.isArray(meta)) {
+    throw new Error("Workflow `meta` did not evaluate to an object literal.");
   }
+
   if (typeof meta.name !== "string" || !meta.name) {
     throw new Error("Workflow `meta.name` must be a non-empty string.");
   }
@@ -60,319 +32,243 @@ export function parseWorkflow(script) {
     throw new Error("Workflow `meta.description` must be a non-empty string.");
   }
 
-  let metaEnd = braceEnd + 1;
-  if (script[metaEnd] === ";") metaEnd++;
-  const body = stripWorkflowExports(script, tokens, metaTokenIndex, metaEnd);
+  const body = stripWorkflowExports(script, ast.body, metaExport.node);
   return { meta, body };
 }
 
-const CONTROL_HEADER_KEYWORDS = new Set([
-  "if",
-  "while",
-  "for",
-  "with",
-  "switch",
-  "catch",
-]);
-
-function scanTopLevelTokens(src) {
-  const tokens = [];
-  let braceDepth = 0;
-  let parenDepth = 0;
-  let bracketDepth = 0;
-  let previousToken = "";
-  const parenContexts = [];
-  let i = 0;
-
-  while (i < src.length) {
-    const c = src[i];
-    if (/\s/.test(c)) {
-      i++;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      i = skipString(src, i);
-      previousToken = "string";
-      continue;
-    }
-    if (c === "`") {
-      i = skipTemplate(src, i);
-      previousToken = "template";
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "/") {
-      i = skipLineComment(src, i);
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      i = skipBlockComment(src, i);
-      continue;
-    }
-    if (c === "/" && isRegexStart(previousToken)) {
-      i = skipRegex(src, i);
-      previousToken = "regex";
-      continue;
-    }
-
-    const identifier = readIdentifier(src, i);
-    if (identifier) {
-      if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
-        tokens.push(identifier);
-      }
-      previousToken = identifier.value;
-      i = identifier.end;
-      continue;
-    }
-
-    const token = { value: c, start: i, end: i + 1 };
-    if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) {
-      tokens.push(token);
-    }
-    const nextPreviousToken = punctuatorToken(c, previousToken, parenContexts);
-    if (c === "{") braceDepth++;
-    else if (c === "}") braceDepth--;
-    else if (c === "(") parenDepth++;
-    else if (c === ")") parenDepth--;
-    else if (c === "[") bracketDepth++;
-    else if (c === "]") bracketDepth--;
-    previousToken = nextPreviousToken;
-    i++;
-  }
-  return tokens;
+function parseWorkflowAst(script) {
+  return parse(script, {
+    sourceType: "module",
+    ecmaVersion: "latest",
+    allowHashBang: true,
+    allowReturnOutsideFunction: true,
+    ranges: true,
+  });
 }
 
-function stripWorkflowExports(src, tokens, metaTokenIndex, metaEnd) {
-  const ranges = [{ start: tokens[metaTokenIndex].start, end: metaEnd }];
-  for (let i = 0; i < tokens.length; i++) {
-    if (i === metaTokenIndex || tokens[i].value !== "export") continue;
-    let end = tokens[i].end;
-    if (tokens[i + 1]?.value === "default") end = tokens[i + 1].end;
-    ranges.push({ start: tokens[i].start, end });
+function findMetaExport(body) {
+  for (const node of body) {
+    if (!isMetaExport(node)) continue;
+    const decl = node.declaration.declarations[0];
+    return { node, init: decl.init };
   }
-  ranges.sort((a, b) => a.start - b.start);
-  let body = "";
-  let cursor = 0;
-  for (const range of ranges) {
-    body += src.slice(cursor, range.start);
-    cursor = range.end;
-  }
-  return body + src.slice(cursor);
+  return null;
 }
 
-function readIdentifier(src, start) {
-  if (!/[A-Za-z_$]/.test(src[start])) return null;
-  let end = start + 1;
-  while (end < src.length && /[A-Za-z0-9_$]/.test(src[end])) end++;
-  return { value: src.slice(start, end), start, end };
-}
-
-function punctuatorToken(token, previousToken, parenContexts) {
-  if (token === "(") {
-    parenContexts.push(CONTROL_HEADER_KEYWORDS.has(previousToken));
-  } else if (token === ")") {
-    return parenContexts.pop() ? "control-close" : token;
+function isMetaExport(node) {
+  if (
+    node.type !== "ExportNamedDeclaration" ||
+    !node.declaration ||
+    node.declaration.type !== "VariableDeclaration" ||
+    node.declaration.kind !== "const"
+  ) {
+    return false;
   }
-  return token;
-}
 
-function isRegexStart(previousToken) {
+  if (node.declaration.declarations.length !== 1) return false;
+
+  const decl = node.declaration.declarations[0];
   return (
-    !previousToken ||
-    new Set([
-      "(",
-      "control-close",
-      "=",
-      "[",
-      "{",
-      ",",
-      ":",
-      ";",
-      "!",
-      "?",
-      "+",
-      "-",
-      "*",
-      "%",
-      "&",
-      "|",
-      "~",
-      ">",
-      "return",
-      "throw",
-      "case",
-      "delete",
-      "void",
-      "typeof",
-      "new",
-      "in",
-      "instanceof",
-      "else",
-      "do",
-    ]).has(previousToken)
+    decl.id?.type === "Identifier" &&
+    decl.id.name === META_EXPORT_NAME &&
+    !!decl.init
   );
 }
 
-function matchBrace(src, openIdx) {
-  let depth = 0;
-  let i = openIdx;
-  let previousToken = "";
-  const parenContexts = [];
-  while (i < src.length) {
-    const c = src[i];
-    if (c === '"' || c === "'") {
-      i = skipString(src, i);
-      previousToken = "string";
-      continue;
+function parseMetaLiteral(node, path) {
+  if (node.type === "Literal") {
+    if (node.value instanceof RegExp) {
+      throw new Error(`${path}: regex values are not allowed`);
     }
-    if (c === "`") {
-      i = skipTemplate(src, i);
-      previousToken = "template";
-      continue;
+    if (typeof node.value === "bigint") {
+      throw new Error(`${path}: bigint values are not allowed`);
     }
-    if (c === "/" && src[i + 1] === "/") {
-      i = skipLineComment(src, i);
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      i = skipBlockComment(src, i);
-      continue;
-    }
-    if (c === "/" && isRegexStart(previousToken)) {
-      i = skipRegex(src, i);
-      previousToken = "regex";
-      continue;
-    }
-    const identifier = readIdentifier(src, i);
-    if (identifier) {
-      previousToken = identifier.value;
-      i = identifier.end;
-      continue;
-    }
-    const nextPreviousToken = punctuatorToken(c, previousToken, parenContexts);
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return i;
-    }
-    previousToken = nextPreviousToken;
-    i++;
+    return node.value;
   }
-  throw new Error("Unbalanced braces in `export const meta` literal.");
-}
 
-function skipTemplate(src, start) {
-  let i = start + 1;
-  while (i < src.length) {
-    if (src[i] === "\\") {
-      i += 2;
-      continue;
-    }
-    if (src[i] === "`") return i + 1;
-    if (src[i] === "$" && src[i + 1] === "{") {
-      i = skipTemplateExpression(src, i + 2);
-      continue;
-    }
-    i++;
+  if (node.type === "ObjectExpression") {
+    return parseObjectLiteral(node, path);
   }
-  return src.length;
-}
 
-function skipTemplateExpression(src, start) {
-  let depth = 1;
-  let i = start;
-  let previousToken = "";
-  const parenContexts = [];
-  while (i < src.length) {
-    const c = src[i];
-    if (/\s/.test(c)) {
-      i++;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      i = skipString(src, i);
-      previousToken = "string";
-      continue;
-    }
-    if (c === "`") {
-      i = skipTemplate(src, i);
-      previousToken = "template";
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "/") {
-      i = skipLineComment(src, i);
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      i = skipBlockComment(src, i);
-      continue;
-    }
-    if (c === "/" && isRegexStart(previousToken)) {
-      i = skipRegex(src, i);
-      previousToken = "regex";
-      continue;
-    }
-    const identifier = readIdentifier(src, i);
-    if (identifier) {
-      previousToken = identifier.value;
-      i = identifier.end;
-      continue;
-    }
-    const nextPreviousToken = punctuatorToken(c, previousToken, parenContexts);
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return i + 1;
-    }
-    previousToken = nextPreviousToken;
-    i++;
+  if (node.type === "ArrayExpression") {
+    return parseArrayLiteral(node, path);
   }
-  return src.length;
+
+  if (node.type === "UnaryExpression") {
+    if (node.operator !== "-" && node.operator !== "+") {
+      throw new Error(`${path}: unsupported unary operator ${node.operator}`);
+    }
+    if (
+      node.argument.type !== "Literal" ||
+      typeof node.argument.value !== "number"
+    ) {
+      throw new Error(
+        `${path}: unary expressions are only allowed for numbers`,
+      );
+    }
+    const value = node.argument.value;
+    return node.operator === "-" ? -value : value;
+  }
+
+  if (node.type === "TemplateLiteral") {
+    if (node.expressions.length > 0) {
+      throw new Error(`${path}: template literals must be static`);
+    }
+    if (node.quasis.length !== 1) {
+      throw new Error(`${path}: invalid template literal`);
+    }
+    const template = node.quasis[0];
+    return template.value.cooked ?? template.value.raw;
+  }
+
+  if (node.type === "BinaryExpression") {
+    if (node.operator !== "+") {
+      throw new Error(`${path}: unsupported operator ${node.operator}`);
+    }
+    const left = parseMetaLiteral(node.left, `${path}.left`);
+    const right = parseMetaLiteral(node.right, `${path}.right`);
+    if (!isMetadataPrimitive(left) || !isMetadataPrimitive(right)) {
+      throw new Error(
+        `${path}: binary expressions can only combine primitive literals`,
+      );
+    }
+    return left + right;
+  }
+
+  throw new Error(`${path}: unsupported expression (${node.type})`);
 }
 
-function skipLineComment(src, start) {
-  const newline = src.indexOf("\n", start + 2);
-  return newline === -1 ? src.length : newline;
+function isMetadataPrimitive(value) {
+  const type = typeof value;
+  return (
+    value === null ||
+    type === "string" ||
+    type === "number" ||
+    type === "boolean"
+  );
 }
 
-function skipBlockComment(src, start) {
-  const end = src.indexOf("*/", start + 2);
-  return end === -1 ? src.length : end + 2;
+function parseObjectLiteral(node, path) {
+  const out = {};
+  for (const property of node.properties) {
+    if (property.type !== "Property") {
+      throw new Error(`${path}: spread properties are not allowed`);
+    }
+
+    if (property.kind !== "init") {
+      throw new Error(
+        `${path}: only literal object properties are allowed, not method/getter/setter`,
+      );
+    }
+
+    if (property.shorthand) {
+      throw new Error(`${path}: shorthand properties are not allowed`);
+    }
+
+    if (property.computed) {
+      throw new Error(`${path}: computed keys are not allowed`);
+    }
+
+    if (property.method) {
+      throw new Error(`${path}: method properties are not allowed`);
+    }
+
+    if (property.key == null) {
+      throw new Error(`${path}: missing property key`);
+    }
+
+    const key = parseMetaObjectKey(property.key, path);
+    if (RESERVE_KEYS.has(key)) {
+      throw new Error(
+        `${path}: reserved key ${JSON.stringify(key)} is not allowed`,
+      );
+    }
+
+    if (!property.value) {
+      throw new Error(`${path}.${key}: object property value is missing`);
+    }
+
+    out[key] = parseMetaLiteral(property.value, `${path}.${key}`);
+  }
+
+  return out;
 }
 
-function skipRegex(src, start) {
-  let i = start + 1;
-  let inClass = false;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "\\") {
-      i += 2;
+function parseMetaObjectKey(key, path) {
+  if (key.type === "Identifier") return key.name;
+  if (key.type === "Literal") {
+    if (key.value === null) {
+      throw new Error(`${path}: null keys are not allowed`);
+    }
+    if (typeof key.value === "string" || typeof key.value === "number") {
+      return String(key.value);
+    }
+    throw new Error(`${path}: unsupported key type ${key.type}`);
+  }
+
+  throw new Error(`${path}: unsupported key type ${key.type}`);
+}
+
+function parseArrayLiteral(node, path) {
+  const out = [];
+  for (let i = 0; i < node.elements.length; i++) {
+    const item = node.elements[i];
+    if (item == null) {
+      throw new Error(`${path}[${i}]: sparse array entries are not allowed`);
+    }
+    out.push(parseMetaLiteral(item, `${path}[${i}]`));
+  }
+  return out;
+}
+
+/** Strip workflow export wrappers into executable statements and remove meta declaration. */
+function stripWorkflowExports(script, body, metaNode) {
+  const removals = [];
+
+  for (const node of body) {
+    if (node === metaNode) {
+      removals.push({
+        start: node.start,
+        end: node.end,
+        replacement: "",
+      });
       continue;
     }
-    if (c === "[") inClass = true;
-    else if (c === "]") inClass = false;
-    else if (c === "/" && !inClass) {
-      i++;
-      while (/[A-Za-z]/.test(src[i])) i++;
-      return i;
-    }
-    i++;
-  }
-  return src.length;
-}
 
-function skipString(src, start) {
-  const quote = src[start];
-  let i = start + 1;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "\\") {
-      i += 2;
+    if (
+      node.type !== "ExportNamedDeclaration" &&
+      node.type !== "ExportDefaultDeclaration" &&
+      node.type !== "ExportAllDeclaration"
+    ) {
       continue;
     }
-    if (c === quote) return i + 1;
-    i++;
+
+    if (node.declaration) {
+      removals.push({
+        start: node.start,
+        end: node.end,
+        replacement: script.slice(node.declaration.start, node.end),
+      });
+      continue;
+    }
+
+    removals.push({
+      start: node.start,
+      end: node.end,
+      replacement: "",
+    });
   }
-  return src.length;
+
+  if (!removals.length) return script;
+
+  removals.sort((a, b) => b.start - a.start);
+  let out = script;
+  for (const removal of removals) {
+    out = `${out.slice(0, removal.start)}${removal.replacement}${out.slice(
+      removal.end,
+    )}`;
+  }
+  return out;
 }
 
 export function makeGuardedDate() {

@@ -60,6 +60,7 @@ interface Engine {
   sem: Semaphore;
   processSem: Semaphore;
   loadWorkflow?: (name: string) => string | null;
+  cwd: string;
   budgetTotal: number | null;
   workflowTimeoutMs: number;
   counters: {
@@ -69,6 +70,8 @@ interface Engine {
     tokensSpent: number;
     runningCount: number;
   };
+  nextAgentAttemptId: number;
+
   usage: WorkflowUsage;
   failureCause?: unknown;
   phases: string[];
@@ -136,6 +139,7 @@ export async function runWorkflow(
       opts.processConcurrency ?? defaultProcessConcurrency(),
     ),
     loadWorkflow: opts.loadWorkflow,
+    cwd: opts.cwd ?? process.cwd(),
     budgetTotal: opts.budgetTotal ?? null,
     counters: {
       agentsSpawned: 0,
@@ -143,6 +147,8 @@ export async function runWorkflow(
       tokensSpent: 0,
       runningCount: 0,
     },
+    nextAgentAttemptId: 0,
+
     usage: zeroWorkflowUsage(),
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
@@ -187,31 +193,27 @@ async function executeScript(
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
   const emit = (p: WorkflowProgressUpdate) => {
     if (engine.closed) return;
-    if (p.kind === "phase" && p.phase) engine.phases.push(p.phase);
+    if (p.kind === "phase" && p.phase) {
+      engine.phases.push(p.phase);
+    }
     engine.onProgress?.(withProgressCounters(p, engine.counters, engine.usage));
   };
-
   const runAgentCall = async (payload: {
     prompt: unknown;
     opts?: WorkflowAgentOpts;
   }): Promise<{ value: unknown; tokensDelta: number }> => {
-    const prompt = payload.prompt;
-    const agentOpts = payload.opts ?? {};
-    if (engine.signal?.aborted) throw new Error("Workflow aborted.");
-    if (typeof prompt !== "string" || prompt.trim() === "") {
+    if (typeof payload.prompt !== "string" || payload.prompt.trim() === "") {
       throw new Error("agent(prompt): prompt must be a non-empty string.");
     }
-    if (
-      engine.budgetTotal != null &&
-      engine.budgetTotal - engine.counters.tokensSpent <= 0
-    ) {
-      throw new Error("Workflow token budget exhausted.");
-    }
 
+    const prompt = payload.prompt;
+    const agentOpts = payload.opts ?? {};
     const hasSchema = agentOpts.schema != null;
     const isolation = agentOpts.isolation ?? "process";
     const isProcess = isolation !== "in-process";
     const sem = isProcess ? engine.processSem : engine.sem;
+    const resolvedPhase =
+      agentOpts.phase != null ? String(agentOpts.phase) : undefined;
     await sem.acquire();
     let tokensDelta = 0;
     try {
@@ -225,17 +227,26 @@ async function executeScript(
           );
         }
         engine.counters.agentsSpawned++;
+        const agentId = ++engine.nextAgentAttemptId;
         engine.counters.runningCount++;
+        let status: "done" | "error" = "done";
         try {
-          // Emit *before* awaiting runAgent so status polling sees in-flight process agents.
           emit({
             kind: "agent_start",
             label: agentOpts.label,
-            phase: agentOpts.phase,
+            phase: resolvedPhase,
             model: agentOpts.model,
+            agentId,
           });
           const finalPrompt = hasSchema
-            ? buildSchemaPrompt(prompt, agentOpts.schema, attempt, lastErr)
+            ? isProcess
+              ? buildProcessSchemaPrompt(
+                  prompt,
+                  agentOpts.schema,
+                  attempt,
+                  lastErr,
+                )
+              : buildInProcessSchemaPrompt(prompt, attempt, lastErr)
             : prompt;
           let res: SubagentResult;
           try {
@@ -246,22 +257,25 @@ async function executeScript(
               signal: engine.signal,
               isolation,
               label: agentOpts.label,
+              ...(hasSchema && !isProcess ? { schema: agentOpts.schema } : {}),
               onCancellationSnapshot: engine.onCancellationSnapshot,
               thinkingLevel: agentOpts.thinkingLevel,
               onProgress: (ev) => {
                 if (ev.kind === "phase") {
                   if (ev.phase) {
-                    emit({
-                      ...ev,
-                      phase: agentOpts.phase ?? ev.phase,
-                    });
+                    emit({ ...ev, phase: ev.phase, agentId });
                   }
                   return;
                 }
-                emit({ ...ev, phase: agentOpts.phase });
+                emit({
+                  ...ev,
+                  phase: ev.phase ?? resolvedPhase,
+                  agentId,
+                });
               },
             });
           } catch (error) {
+            status = "error";
             engine.failureCause = error;
             if (!engine.signal.aborted) engine.counters.errorCount++;
             throw error;
@@ -270,24 +284,42 @@ async function executeScript(
           tokensDelta += outTokens;
           engine.usage = addWorkflowUsage(engine.usage, res.usage);
           engine.counters.tokensSpent += outTokens;
-
           if (res.isError) {
+            status = "error";
             engine.counters.errorCount++;
             return { value: null, tokensDelta };
           }
           if (!hasSchema) return { value: res.output, tokensDelta };
-
+          if (!isProcess && res.workflowStructuredOutput != null) {
+            const schemaCapture = res.workflowStructuredOutput;
+            if (!schemaCapture?.called) {
+              status = "error";
+              lastErr = "No structured_output call found.";
+              continue;
+            }
+            const verrs = validateSchema(schemaCapture.value, agentOpts.schema);
+            if (verrs.length === 0)
+              return { value: schemaCapture.value, tokensDelta };
+            status = "error";
+            lastErr = verrs.slice(0, 5).join("; ");
+            continue;
+          }
           const raw = extractJson(res.output);
           if (raw != null) {
             try {
               const parsed = JSON.parse(raw);
               const verrs = validateSchema(parsed, agentOpts.schema);
               if (verrs.length === 0) return { value: parsed, tokensDelta };
+              status = "error";
               lastErr = verrs.slice(0, 5).join("; ");
             } catch (e) {
-              lastErr = `JSON parse error: ${e instanceof Error ? e.message : String(e)}`;
+              status = "error";
+              lastErr = `JSON parse error: ${
+                e instanceof Error ? e.message : String(e)
+              }`;
             }
           } else {
+            status = "error";
             lastErr = "no JSON object/array found in output";
           }
         } finally {
@@ -295,12 +327,13 @@ async function executeScript(
           emit({
             kind: "agent_done",
             label: agentOpts.label,
-            phase: agentOpts.phase,
+            phase: resolvedPhase,
             model: agentOpts.model,
+            status,
+            agentId,
           });
         }
       }
-
       engine.counters.errorCount++;
       emit({
         kind: "log",
@@ -417,6 +450,7 @@ function runWorkflowWorker(
       type: "init",
       script,
       args,
+      cwd: engine.cwd,
       budgetTotal: engine.budgetTotal,
       syncTimeoutMs: WORKFLOW_SYNC_TIMEOUT_MS,
       maxItemsPerCall: MAX_ITEMS_PER_CALL,
@@ -462,7 +496,7 @@ export function stringify(x: unknown): string {
   return workflowStringify(x);
 }
 
-function buildSchemaPrompt(
+function buildProcessSchemaPrompt(
   prompt: string,
   schema: unknown,
   attempt: number,
@@ -477,6 +511,20 @@ function buildSchemaPrompt(
     `${prompt}\n\n` +
     `Respond with ONLY a single JSON value that conforms to this JSON Schema. ` +
     `No prose, no markdown fences, no commentary.\n\nJSON Schema:\n${schemaText}${retry}`
+  );
+}
+function buildInProcessSchemaPrompt(
+  prompt: string,
+  attempt: number,
+  lastErr: string,
+): string {
+  const retry =
+    attempt > 0
+      ? `\n\nYour previous response did not include a valid structured_output call (${lastErr}). Retry using a single tool call.`
+      : "";
+  return (
+    `${prompt}${retry}` +
+    `\n\nUse the structured_output tool as your ONLY final action.`
   );
 }
 

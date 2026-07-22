@@ -6,6 +6,8 @@ import {
 } from "./workflow-jobs";
 import { formatWorkflowUsage } from "./workflow-core";
 
+const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
+
 export type WorkflowTreeAction =
   { kind: "cancel"; workflowId: string } | { kind: "close" };
 
@@ -219,6 +221,32 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
       depth: 1,
       selectable: false,
       text: `◆ phase: ${phase}`,
+    });
+  }
+  const records = job.snapshot.agentRecords ?? [];
+  const agentRows = records.slice(-MAX_WORKFLOW_TREE_AGENT_ROWS);
+  const omittedForUi =
+    (job.snapshot.agentRecordsOmitted ?? 0) +
+    Math.max(0, records.length - agentRows.length);
+  if (omittedForUi > 0) {
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: `… ${omittedForUi} older agent records omitted`,
+    });
+  }
+  for (const record of agentRows) {
+    const marker =
+      record.status === "running" ? "→" : record.status === "error" ? "✗" : "✓";
+    const label = `${record.label ?? "agent"} #${record.agentId}`;
+    const model = record.model ? ` @${record.model}` : "";
+    const phase = record.phase ? ` (${record.phase})` : "";
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: `${marker} ${record.status} ${label}${model}${phase}`,
     });
   }
   if (job.snapshot.lastMessage) {

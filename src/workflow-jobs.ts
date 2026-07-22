@@ -4,9 +4,11 @@ import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
   type RunWorkflowOptions,
+  type WorkflowAgentRecord,
   type WorkflowProgress,
   type WorkflowRunResult,
   type WorkflowUsage,
+  MAX_WORKFLOW_AGENT_RECORDS,
   zeroWorkflowUsage,
 } from "./workflow-core";
 
@@ -30,6 +32,8 @@ export interface WorkflowJobState {
     phases: string[];
     lastMessage?: string;
     currentPhase?: string;
+    agentRecords?: WorkflowAgentRecord[];
+    agentRecordsOmitted?: number;
     runningCount?: number;
   };
   result?: WorkflowRunResult;
@@ -111,6 +115,8 @@ export function startWorkflowJob(
       tokensSpent: 0,
       usage: zeroWorkflowUsage(),
       phases: [],
+      agentRecords: [],
+      agentRecordsOmitted: 0,
       runningCount: 0,
     },
     completionNotification: onComplete,
@@ -136,6 +142,9 @@ export function startWorkflowJob(
         state.snapshot.lastMessage = `→ started${formatWorkflowAgentTag(p)}`;
       } else if (p.kind === "agent_done") {
         state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
+      }
+      if (p.kind === "agent_start" || p.kind === "agent_done") {
+        recordWorkflowAgentProgress(state.snapshot, p);
       }
     },
     onCancellationSnapshot: (receipt) => {
@@ -229,6 +238,42 @@ export function getRunningWorkflowCount(): number {
     if (st.status === "running") count++;
   }
   return count;
+}
+
+function recordWorkflowAgentProgress(
+  snapshot: WorkflowJobState["snapshot"],
+  progress: Extract<WorkflowProgress, { kind: "agent_start" | "agent_done" }>,
+): void {
+  if (typeof progress.agentId !== "number") return;
+  const records = (snapshot.agentRecords ??= []);
+  if (progress.kind === "agent_start") {
+    records.push({
+      agentId: progress.agentId,
+      phase: progress.phase,
+      label: progress.label,
+      model: progress.model,
+      status: "running",
+    });
+  } else {
+    const record = records.find(
+      (candidate) => candidate.agentId === progress.agentId,
+    );
+    if (record) {
+      record.status = progress.status ?? "done";
+    } else {
+      records.push({
+        agentId: progress.agentId,
+        phase: progress.phase,
+        label: progress.label,
+        model: progress.model,
+        status: progress.status ?? "done",
+      });
+    }
+  }
+  while (records.length > MAX_WORKFLOW_AGENT_RECORDS) {
+    records.shift();
+    snapshot.agentRecordsOmitted = (snapshot.agentRecordsOmitted ?? 0) + 1;
+  }
 }
 
 function formatWorkflowAgentTag(p: WorkflowProgress): string {

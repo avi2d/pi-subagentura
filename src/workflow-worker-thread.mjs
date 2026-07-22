@@ -20,6 +20,7 @@ let workerConfig = {
   maxItemsPerCall: 4096,
   maxWorkflowDepth: 1,
   budgetTotal: null,
+  cwd: "",
 };
 let tokensSpent = 0;
 
@@ -50,6 +51,7 @@ parentPort.on("message", (msg) => {
       maxItemsPerCall: msg.maxItemsPerCall,
       maxWorkflowDepth: msg.maxWorkflowDepth,
       budgetTotal: msg.budgetTotal,
+      cwd: msg.cwd,
     };
     executeScript(msg.script, msg.args, 0)
       .then((value) => parentPort.postMessage({ type: "result", value }))
@@ -80,6 +82,8 @@ async function executeScript(script, args, depth) {
 }
 
 async function executeBody(meta, body, args, depth) {
+  let currentPhase;
+
   function checkAbort() {
     if (aborted) throw new Error("Workflow aborted.");
   }
@@ -93,7 +97,19 @@ async function executeBody(meta, body, args, depth) {
       if (workerConfig.budgetTotal != null && budgetRemaining() <= 0) {
         throw new Error("Workflow token budget exhausted.");
       }
-      const res = await rpc("agent", { prompt, opts });
+      const hasExplicitPhase = Object.prototype.hasOwnProperty.call(
+        opts,
+        "phase",
+      );
+      const resolvedPhase =
+        hasExplicitPhase && opts.phase != null
+          ? String(opts.phase)
+          : currentPhase;
+      const callOpts = { ...opts, phase: resolvedPhase };
+      const res = await rpc("agent", {
+        prompt,
+        opts: callOpts,
+      });
       tokensSpent +=
         res && typeof res.tokensDelta === "number" ? res.tokensDelta : 0;
       return res ? res.value : null;
@@ -169,6 +185,7 @@ async function executeBody(meta, body, args, depth) {
 
   function phase(title) {
     const t = String(title ?? "");
+    currentPhase = t;
     parentPort.postMessage({
       type: "progress",
       payload: { kind: "phase", phase: t },
@@ -214,6 +231,12 @@ async function executeBody(meta, body, args, depth) {
     },
     Date: makeGuardedDate(),
     Math: makeGuardedMath(),
+  });
+  Object.defineProperty(sandbox, "cwd", {
+    value: workerConfig.cwd,
+    enumerable: true,
+    writable: false,
+    configurable: false,
   });
 
   try {

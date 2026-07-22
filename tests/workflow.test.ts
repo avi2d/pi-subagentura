@@ -1,30 +1,32 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  parseWorkflow,
-  runWorkflow,
-  extractJson,
-  validateSchema,
   MAX_ITEMS_PER_CALL,
-  saveWorkflowScript,
-  loadWorkflowScript,
-  listSavedWorkflows,
-  sanitizeWorkflowName,
+  MAX_WORKFLOW_AGENT_RECORDS,
+  SCHEMA_RETRIES,
   MAX_WORKFLOW_JOBS,
-  startWorkflowJob,
-  deleteWorkflowScript,
-  workflowJobRegistry,
-  awaitInteractiveResult,
-  renderProgress,
-  formatWorkflowUsage,
-  registerWorkflowTool,
-  retryPendingWorkflowNotifications,
-  getWorkflowCompletionPresentation,
   MAX_WORKFLOW_NOTIFICATION_ATTEMPTS,
+  awaitInteractiveResult,
+  deleteWorkflowScript,
+  extractJson,
+  formatWorkflowUsage,
+  getWorkflowCompletionPresentation,
+  listSavedWorkflows,
+  loadWorkflowScript,
+  parseWorkflow,
+  registerWorkflowTool,
+  renderProgress,
+  retryPendingWorkflowNotifications,
+  runWorkflow,
+  saveWorkflowScript,
+  sanitizeWorkflowName,
+  startWorkflowJob,
   type WorkflowAgentRunner,
-  type WorkflowUsage,
+  type WorkflowProgress,
   type WorkflowRunResult,
   type WorkflowRunResultWithUsage,
-  type WorkflowProgress,
+  type WorkflowUsage,
+  validateSchema,
+  workflowJobRegistry,
 } from "../src/workflow";
 import type { SubagentResult } from "../src/helpers";
 import {
@@ -33,7 +35,6 @@ import {
   artifactPath,
   writeOutput,
 } from "../src/artifact";
-import { spawnSync } from "node:child_process";
 import { formatWorkflowNotificationSummary } from "../src/workflow-tool";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -128,34 +129,119 @@ describe("parseWorkflow", () => {
 
   it("handles braces and semicolons inside meta string values", () => {
     const { meta, body } = parseWorkflow(
-      `export const meta = { name: "f", description: "uses { and } and ; chars" };\nlog("hi");`,
+      `export const meta = { name: "f", description: "uses { and } and ; chars" };\nlog(\"hi\");`,
     );
     expect(meta.description).toBe("uses { and } and ; chars");
     expect(body).toContain('log("hi");');
   });
 
-  it("worker parser handles escaped quotes before braces in meta string values", async () => {
-    const script = String.raw`export const meta = { name: "f", description: "escaped quote: \" } still inside string" };
-return 42;`;
+  it("preserves nested literals, static templates, and negative numbers", () => {
+    const { meta } = parseWorkflow(
+      "export const meta = {\n" +
+        '  name: "flow",\n' +
+        "  description: `literal template`,\n" +
+        "  phases: [{ title: `phase-template` }],\n" +
+        "  retries: [1, -2, { values: [3, 4] }],\n" +
+        "};\nreturn 0;",
+    );
+    expect(meta).toEqual({
+      name: "flow",
+      description: "literal template",
+      phases: [{ title: "phase-template" }],
+      retries: [1, -2, { values: [3, 4] }],
+    });
+  });
 
-    const r = await runWorkflow(script, { runAgent: echoRunner() });
+  it("finds metadata after helper declarations", () => {
+    const script = [
+      "const helper = 2;",
+      "function helperFn() { return helper + 1; }",
+      'export const meta = { name: "helpers", description: "after" };',
+      "return helperFn();",
+    ].join("\n");
+    const { meta, body } = parseWorkflow(script);
+    expect(meta).toEqual({ name: "helpers", description: "after" });
+    expect(body).toContain("function helperFn()");
+  });
 
-    expect(r.meta.description).toBe('escaped quote: " } still inside string');
-    expect(r.result).toBe(42);
+  it("rejects member expressions in metadata values", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: base.name, description: \"d\" };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects call expressions in metadata", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: String(\"flow\"), description: \"d\" };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects interpolated template literals in metadata", () => {
+    expect(() =>
+      parseWorkflow(
+        'export const meta = { name: `interpolated ${"x"}`, description: "d" };',
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects spread properties in metadata", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: \"x\", description: \"d\", ...{ whenToUse: \"x\" } };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects computed keys in metadata objects", () => {
+    expect(() =>
+      parseWorkflow(
+        `const key = \"name\";\nexport const meta = { [key]: \"x\", description: \"d\" };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects shorthand keys in metadata objects", () => {
+    expect(() =>
+      parseWorkflow(
+        `const n = \"x\";\nexport const meta = { n, description: \"d\" };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects methods and accessors in metadata objects", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { get name() { return \"x\"; }, description: \"d\" };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects sparse arrays in metadata", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: \"x\", description: \"d\", phases: [{ title: \"ok\" }, , { title: \"more\" }] };`,
+      ),
+    ).toThrow(/pure literal/i);
+  });
+
+  it("rejects reserved keys in metadata", () => {
+    expect(() =>
+      parseWorkflow(
+        `export const meta = { name: \"x\", description: \"d\", __proto__: {} };`,
+      ),
+    ).toThrow(/pure literal/i);
   });
 
   it("rejects a meta literal that references a helper (not pure)", () => {
     expect(() =>
-      parseWorkflow(`export const meta = { name: agent, description: "x" };\n`),
-    ).toThrow(/pure literal/i);
-  });
-
-  it("rejects constructor-chain code generation in meta", () => {
-    expect(() =>
       parseWorkflow(
-        `export const meta = { name: "f", description: "d", leak: this.constructor.constructor("return process.version")() };\nreturn 1;`,
+        `export const meta = { name: agent, description: \"x\" };\n`,
       ),
-    ).toThrow(/pure literal|Code generation from strings disallowed/i);
+    ).toThrow(/pure literal/i);
   });
 
   it("throws when meta is missing", () => {
@@ -163,10 +249,11 @@ return 42;`;
   });
 
   it("throws when name/description are absent", () => {
-    expect(() => parseWorkflow(`export const meta = { name: "x" };\n`)).toThrow(
-      /description/,
-    );
+    expect(() =>
+      parseWorkflow(`export const meta = { name: \"x\" };\n`),
+    ).toThrow(/description/);
   });
+
   it("ignores fake metadata in comments, templates, and regex literals", () => {
     const script = [
       '// export const meta = { name: "fake", description: "fake" };',
@@ -188,7 +275,6 @@ return 42;`;
 export const meta = { name: "real", description: "real" };
 return fake;`;
     const { meta, body } = parseWorkflow(script);
-
     expect(meta).toEqual({ name: "real", description: "real" });
     expect(body).toContain("export const meta");
   });
@@ -211,30 +297,7 @@ return increment(helper);`;
 export const meta = { name: "regex-control", description: "d" };
 return helper();`;
     const result = await runWorkflow(script, { runAgent: echoRunner() });
-
     expect(result.result).toBe(1);
-  });
-
-  it("times out metadata evaluation in a child process", () => {
-    const script =
-      'export const meta = { name: "loop", description: "d", loop: (() => { while (true) {} })() };';
-    const child = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { parseWorkflow } from ${JSON.stringify(
-          "./src/workflow-script.mjs",
-        )}; parseWorkflow(${JSON.stringify(script)});`,
-      ],
-      { encoding: "utf8", timeout: 2_000 },
-    );
-
-    expect((child.error as NodeJS.ErrnoException | undefined)?.code).not.toBe(
-      "ETIMEDOUT",
-    );
-    expect(child.status).not.toBe(0);
-    expect(`${child.stderr}${child.stdout}`).toMatch(/timed out|pure literal/i);
   });
 });
 
@@ -271,6 +334,49 @@ describe("determinism guards", () => {
     await expect(
       run(`return this.constructor.constructor("return Date.now()")();`),
     ).rejects.toThrow(/Code generation from strings disallowed|Date\.now/i);
+  });
+});
+
+describe("workflow cwd global", () => {
+  const meta = `export const meta = { name: "cwd", description: "d" };\n`;
+
+  it("exposes the parent cwd as an immutable enumerable global", async () => {
+    const parentCwd = "/tmp/workflow-parent";
+    const result = await runWorkflow(
+      meta +
+        `const before = cwd; cwd = "changed"; ` +
+        `const descriptor = Object.getOwnPropertyDescriptor(globalThis, "cwd"); ` +
+        `return { before, after: cwd, descriptor };`,
+      { runAgent: echoRunner(), cwd: parentCwd },
+    );
+
+    expect(result.result).toEqual({
+      before: parentCwd,
+      after: parentCwd,
+      descriptor: {
+        value: parentCwd,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+    });
+  });
+
+  it("keeps cwd consistent in nested workflows", async () => {
+    const parentCwd = "/tmp/workflow-nested";
+    const child =
+      `export const meta = { name: "child-cwd", description: "d" };\n` +
+      `return cwd;`;
+    const result = await runWorkflow(
+      meta + `return [cwd, await workflow("child")];`,
+      {
+        runAgent: echoRunner(),
+        cwd: parentCwd,
+        loadWorkflow: () => child,
+      },
+    );
+
+    expect(result.result).toEqual([parentCwd, parentCwd]);
   });
 });
 
@@ -356,6 +462,29 @@ describe("agent() + budget", () => {
     );
 
     expect(seenIsolation).toBe("in-process");
+  });
+
+  it("inherits phases per workflow body without leaking nested phases", async () => {
+    const phases: Array<string | undefined> = [];
+    const child =
+      `export const meta = { name: "child", description: "d" };\n` +
+      `phase("Child"); return await agent("child");`;
+    const script =
+      meta +
+      `phase("Parent"); await agent("before"); ` +
+      `await workflow("child"); ` +
+      `await agent("override", { phase: "Manual" }); ` +
+      `return await agent("after");`;
+
+    await runWorkflow(script, {
+      runAgent: echoRunner(),
+      loadWorkflow: () => child,
+      onProgress: (progress) => {
+        if (progress.kind === "agent_start") phases.push(progress.phase);
+      },
+    });
+
+    expect(phases).toEqual(["Parent", "Child", "Manual", "Parent"]);
   });
 
   it("returns null and counts errors when the sub-agent errors", async () => {
@@ -519,6 +648,43 @@ describe("schema enforcement", () => {
     expect(call).toBe(2);
   });
 
+  it("uses in-process structured output capture instead of parsing text", async () => {
+    let schemaArg: unknown = undefined;
+    const runAgent: WorkflowAgentRunner = async ({ schema }) => {
+      schemaArg = schema;
+      return {
+        ...ok("noise"),
+        workflowStructuredOutput: { called: true, value: { n: 7 } },
+      };
+    };
+    const body = `return await agent("give n", { isolation: "in-process", schema: ${JSON.stringify(schema)} });`;
+    const r = await runWorkflow(meta + body, { runAgent });
+    expect(schemaArg).toEqual(schema);
+    expect(r.result).toEqual({ n: 7 });
+  });
+
+  it("retries when structured_output is not called and fails after retries", async () => {
+    let calls = 0;
+    const expectedSchema = schema;
+    let schemaArg: unknown = undefined;
+    const runAgent: WorkflowAgentRunner = async ({ schema }) => {
+      calls++;
+      expect(schema).toEqual(expectedSchema);
+      schemaArg = schema;
+      return {
+        ...ok("not json", 3),
+        workflowStructuredOutput: { called: false, value: undefined },
+      };
+    };
+    const body = `return await agent("give n", { isolation: "in-process", schema: ${JSON.stringify(schema)} });`;
+    const r = await runWorkflow(meta + body, { runAgent });
+    expect(schemaArg).toEqual(expectedSchema);
+    expect(calls).toBe(SCHEMA_RETRIES);
+    expect(r.result).toBeNull();
+    expect(r.errorCount).toBe(1);
+    expect(r.usage?.output).toBe(3 * SCHEMA_RETRIES);
+  });
+
   it("returns null and counts an error after exhausting retries", async () => {
     const runAgent: WorkflowAgentRunner = async () => ok("no json here");
     const body = `return await agent("give n", { schema: ${JSON.stringify(schema)} });`;
@@ -526,6 +692,37 @@ describe("schema enforcement", () => {
     expect(r.result).toBeNull();
     expect(r.errorCount).toBe(1);
     expect(r.agentsSpawned).toBe(3);
+  });
+
+  it("keeps process-mode schema behavior: no runner schema field, text fallback prompt", async () => {
+    let runAgentCalls = 0;
+    let schemaArg: unknown = undefined;
+    let promptPreview = "";
+    const runAgent: WorkflowAgentRunner = async ({ schema, prompt }) => {
+      schemaArg = schema;
+      if (!promptPreview) promptPreview = prompt as string;
+      const out = runAgentCalls === 0 ? ok("oops", 1) : ok('{"n": 5}', 2);
+      runAgentCalls++;
+      return out;
+    };
+    const body = `return await agent("give n", { schema: ${JSON.stringify(schema)} });`;
+    const r = await runWorkflow(meta + body, { runAgent });
+    expect(schemaArg).toBeUndefined();
+    expect(promptPreview).toContain("Respond with ONLY a single JSON value");
+    expect(r.result).toEqual({ n: 5 });
+    expect(runAgentCalls).toBe(2);
+  });
+
+  it("does not pass schema to non-schema sub-agent runs", async () => {
+    let schemaArg: unknown = undefined;
+    const runAgent: WorkflowAgentRunner = async ({ schema }) => {
+      schemaArg = schema;
+      return ok("done");
+    };
+    const body = `return await agent("just do work");`;
+    const r = await runWorkflow(meta + body, { runAgent });
+    expect(schemaArg).toBeUndefined();
+    expect(r.result).toBe("done");
   });
 });
 
@@ -709,6 +906,25 @@ describe("background workflow jobs", () => {
     expect(run.result).toBe("done");
     expect(job.status).toBe("done");
     expect(job.snapshot.agentsSpawned).toBe(1);
+  });
+
+  it("stores one bounded record per agent attempt", async () => {
+    const count = MAX_WORKFLOW_AGENT_RECORDS + 1;
+    const script =
+      `export const meta = { name: "records", description: "d" };\n` +
+      `return await parallel(Array.from({ length: ${count} }, (_, index) => ` +
+      `() => agent(String(index), { label: "worker" })));`;
+    const job = startWorkflowJob("records", script, { runAgent: echoRunner() });
+
+    await job.promise;
+
+    expect(job.snapshot.agentRecords).toHaveLength(MAX_WORKFLOW_AGENT_RECORDS);
+    expect(job.snapshot.agentRecordsOmitted).toBe(1);
+    expect(job.snapshot.agentRecords?.[0]?.agentId).toBe(2);
+    expect(job.snapshot.agentRecords?.at(-1)?.agentId).toBe(count);
+    expect(
+      job.snapshot.agentRecords?.every((record) => record.status === "done"),
+    ).toBe(true);
   });
 
   it("calls the completion hook after all agents finish", async () => {
@@ -1594,8 +1810,7 @@ describe("registerWorkflowTool", () => {
   });
 
   it("workflow tool has the expected description and parameters", () => {
-    const tools: Array<{ name: string; description: string; parameters: any }> =
-      [];
+    const tools: any[] = [];
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
       registerFlag: vi.fn(),
@@ -1606,11 +1821,48 @@ describe("registerWorkflowTool", () => {
     const wf = tools.find((t) => t.name === "workflow")!;
     expect(wf.description).toContain("agent(prompt, opts?)");
     expect(wf.description).toContain("workflow(name, args?)");
+    expect(wf.description).toContain("immutable parent working directory");
+    expect(wf.promptSnippet).toContain("decomposable multi-agent work");
+    const guidance = wf.promptGuidelines.join("\n");
+    expect(guidance).toContain("raw JavaScript");
+    expect(guidance).toContain("first statement");
+    expect(guidance).toContain("immutable cwd");
+    expect(guidance).toContain("parallel() takes thunks");
+    expect(guidance).toContain("pipeline() streams");
+    expect(guidance).toContain("unique short labels");
+    expect(guidance).toContain("plain JSON Schema");
+    expect(guidance).toContain("null results");
+    expect(guidance).toContain("final synthesis");
     expect(wf.parameters).toBeDefined();
     expect(wf.parameters.properties).toBeDefined();
     expect(Object.keys(wf.parameters.properties)).toContain("script");
     expect(Object.keys(wf.parameters.properties)).toContain("name");
     expect(Object.keys(wf.parameters.properties)).toContain("async");
+  });
+
+  it("threads the tool execution cwd into the workflow global", async () => {
+    const tools: any[] = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerCommand: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const workflowTool = tools.find((tool) => tool.name === "workflow")!;
+    const result = await workflowTool.execute(
+      "",
+      {
+        script:
+          `export const meta = { name: "tool-cwd", description: "d" };\n` +
+          `return cwd;`,
+        async: false,
+      },
+      undefined,
+      undefined,
+      { cwd: "/tmp/tool-context", modelRegistry: {} },
+    );
+
+    expect(result.details.status).toBe("done");
+    expect(result.content[0].text).toContain("/tmp/tool-context");
   });
 
   it("does not report a completed workflow as cancelled", async () => {

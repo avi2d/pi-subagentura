@@ -5,6 +5,12 @@
   "author": "lmn451",
   "license": "MIT",
   "main": "src/subagent.ts",
+  "exports": {
+    ".": "./src/subagent.ts",
+    "./workflow": {
+      "types": "./types/workflow.d.ts"
+    }
+  },
   "type": "module",
   "keywords": [
     "pi-package",
@@ -38,6 +44,7 @@
     "examples/workflows/README.md",
     "examples/workflows/*.mjs",
     "skills/ralplan",
+    "types/workflow.d.ts",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
@@ -64,6 +71,7 @@
     "src/workflow-script.mjs",
     "src/workflow-script.d.mts",
     "src/workflow-worker.ts",
+    "src/workflow-structured-output.ts",
     "src/workflow-worker-thread.mjs",
     "src/workflow-jobs.ts",
     "src/workflow-ui.ts",
@@ -126,6 +134,7 @@
     "vitest": "^4.1.0"
   },
   "dependencies": {
+    "acorn": "^8.14.0",
     "is-path-inside": "^4.0.0",
     "ndjson": "^2.0.0"
   }

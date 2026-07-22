@@ -31,6 +31,10 @@ import {
   createCompatibleSessionRuntime,
 } from "./pi-sdk-compat";
 import {
+  createWorkflowStructuredOutputTool,
+  type WorkflowStructuredOutputCapture,
+} from "./workflow-structured-output";
+import {
   snapshotInProcessSession,
   type CancellationSnapshotReceipt,
   type CancellationSnapshotSource,
@@ -123,6 +127,7 @@ export type SubagentResult =
       usage: Usage;
       model?: string;
       thinkingLevel?: ThinkingLevel;
+      workflowStructuredOutput?: WorkflowStructuredOutputCapture;
     }
   | {
       isError: true;
@@ -131,6 +136,7 @@ export type SubagentResult =
       model?: undefined;
       thinkingLevel?: ThinkingLevel;
       errorMessage: string;
+      workflowStructuredOutput?: WorkflowStructuredOutputCapture;
     };
 
 export interface SubagentLiveStatus {
@@ -367,6 +373,8 @@ export interface StartSubagentJobParams {
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
+  /** Optional JSON Schema delivered via a workflow structured-output tool in in-process mode. */
+  workflowStructuredOutputSchema?: unknown;
   onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void;
   cancellationSource?: CancellationSnapshotSource;
   /** Thinking/reasoning level. Pass through to createAgentSession. */
@@ -407,6 +415,7 @@ export async function startSubagentJob(
     onUpdate,
     defaultModel,
     parentModelRegistry,
+    workflowStructuredOutputSchema,
     onCancellationSnapshot,
     cancellationSource,
     thinkingLevel,
@@ -504,11 +513,22 @@ export async function startSubagentJob(
     model: modelLabel ?? "default",
     cwd,
   });
+  const {
+    tool: workflowStructuredOutputTool,
+    capture: workflowStructuredOutput,
+  } =
+    workflowStructuredOutputSchema === undefined
+      ? { tool: undefined, capture: undefined }
+      : createWorkflowStructuredOutputTool(workflowStructuredOutputSchema);
+
   const sessionOptions = buildSessionOptions(sessionRuntime, {
     sessionManager: SessionManager.inMemory(),
     model: targetModel,
     cwd,
     ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(workflowStructuredOutputTool
+      ? { customTools: [workflowStructuredOutputTool] }
+      : {}),
   });
   const session = (
     await createAgentSession(
@@ -636,10 +656,31 @@ export async function startSubagentJob(
     promptPreview: finalPrompt.slice(0, 500),
   });
 
+  const attachWorkflowStructuredOutput = <T extends SubagentResult>(
+    result: T,
+  ): T =>
+    workflowStructuredOutput === undefined
+      ? result
+      : ({ ...result, workflowStructuredOutput } as T);
+
   // Launch the prompt in a promise chain (NOT awaited — returns immediately).
   // The jobPromise represents the full lifecycle: prompt → extraction → cleanup.
+  let result: SubagentResult = {
+    isError: true,
+    output: "(no output)",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 0,
+    },
+    model: undefined,
+    thinkingLevel: effectiveThinkingLevel,
+    errorMessage: "No subagent result captured.",
+  };
   const jobPromise = (async (): Promise<SubagentResult> => {
-    let result!: SubagentResult;
     try {
       debugLog("info", "prompt_start", { jobId });
       await session.prompt(finalPrompt);
@@ -697,16 +738,16 @@ export async function startSubagentJob(
       }
 
       if (session.agent.state.errorMessage) {
-        result = {
+        result = attachWorkflowStructuredOutput({
           isError: true,
           output: finalOutput || "(no output)",
           usage,
           model: undefined,
           thinkingLevel: effectiveThinkingLevel,
           errorMessage: session.agent.state.errorMessage,
-        };
+        });
       } else {
-        result = {
+        result = attachWorkflowStructuredOutput({
           isError: false,
           output: finalOutput || "(no output)",
           usage,
@@ -714,7 +755,7 @@ export async function startSubagentJob(
             ? `${session.model.provider}/${session.model.id}`
             : undefined,
           thinkingLevel: effectiveThinkingLevel,
-        };
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -725,7 +766,7 @@ export async function startSubagentJob(
         stack: stack ?? null,
         errorName: err instanceof Error ? err.name : typeof err,
       });
-      result = {
+      result = attachWorkflowStructuredOutput({
         output: `Sub-agent crashed: ${msg}`,
         usage: {
           input: 0,
@@ -739,7 +780,7 @@ export async function startSubagentJob(
         thinkingLevel: effectiveThinkingLevel,
         isError: true,
         errorMessage: msg,
-      };
+      });
     } finally {
       debugLog("info", "job_complete", {
         jobId,

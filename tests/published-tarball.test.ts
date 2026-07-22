@@ -39,6 +39,7 @@ const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
   name: string;
   version: string;
   files: string[];
+  exports: Record<string, unknown>;
 };
 const NM_SMOKE_DIR = join(
   REPO,
@@ -177,6 +178,17 @@ describe("published tarball", () => {
       "src/helpers.ts is missing from the tarball — this is the exact pi-subagentura@2.0.0 regression. " +
         "Re-add it to package.json `files`.",
     ).toContain("src/helpers.ts");
+  });
+
+  it("publishes workflow declarations through the workflow subpath", () => {
+    expect(entries).toContain("types/workflow.d.ts");
+    const packedPackage = JSON.parse(
+      readFileSync(join(pkgDir, "package.json"), "utf8"),
+    );
+    expect(packedPackage.exports).toEqual({
+      ".": "./src/subagent.ts",
+      "./workflow": { types: "./types/workflow.d.ts" },
+    });
   });
 
   it("contains the workflow guide, examples, and bundled RALPLAN skill", () => {
