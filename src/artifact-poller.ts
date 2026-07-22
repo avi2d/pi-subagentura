@@ -36,7 +36,7 @@ import {
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
-import { debugLog } from "./helpers";
+import { debugLog, jobRegistry } from "./helpers";
 import { formatActivityRow } from "./rendering";
 import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
@@ -54,6 +54,32 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+
+function getRunningSubagentCount(): number {
+  const inProcessCount = [...jobRegistry.values()].filter(
+    (job) => job.status === "running",
+  ).length;
+  const interactiveCount = [...interactiveSubagentRegistry.values()].filter(
+    (state) => state.status === "running" || state.status === "idle",
+  ).length;
+  return inProcessCount + interactiveCount;
+}
+
+export function updateRunningSubagentFooter(
+  ui: Pick<ExtensionUIContext, "setStatus">,
+): void {
+  const runningCount = getRunningSubagentCount();
+  try {
+    ui.setStatus(
+      FOOTER_KEY,
+      runningCount > 0
+        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
+        : undefined,
+    );
+  } catch {
+    /* ui stale */
+  }
+}
 
 /** Derive delivery status from an already narrowed completion event. */
 function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
@@ -121,7 +147,6 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
     ) {
       return;
     }
-    let runningCount = 0;
     const widgetRows: string[] = [];
     const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
     for (const [state, paneAlive] of liveness) {
@@ -212,21 +237,9 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
         });
       }
 
-      // Only count sub-agents that are actively processing a turn as "running".
-
-      // "exited" is terminal (pane dead) — the sub-agent is done; hide it from the
-
-      // running count and widget even though the for-loop keeps tail-reading its
-
-      // session log (for the user-role revival case in processSessionLogEntry).
-
-      // "idle" is between turns (REPL open, pane alive) — still a live sub-agent
-
-      // awaiting follow-up, so it stays in the count.
-
+      // Keep live interactive sub-agents in the activity widget. Exited panes are
+      // still tail-read above so a later user-role entry can revive them.
       if (state.status === "running" || state.status === "idle") {
-        runningCount++;
-
         widgetRows.push(formatActivityRow(state));
       }
     }
@@ -258,16 +271,7 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
 
     // Paint footer + widget. Both are TUI-only — never reach the LLM.
     if (ui) {
-      try {
-        ui.setStatus(
-          FOOTER_KEY,
-          runningCount > 0
-            ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
-            : undefined,
-        );
-      } catch {
-        /* ui stale */
-      }
+      updateRunningSubagentFooter(ui);
       try {
         ui.setWidget(
           WIDGET_KEY,

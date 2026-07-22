@@ -68,6 +68,7 @@ describe("pollArtifactChanges", () => {
   beforeEach(() => {
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    g.__piSubagenturaRegistry?.clear?.();
     g.__piSubagenturaWorkflowJobs?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaUi = undefined;
@@ -76,6 +77,7 @@ describe("pollArtifactChanges", () => {
 
   afterEach(() => {
     (globalThis as any).__piSubagenturaParentStreaming = false;
+    (globalThis as any).__piSubagenturaRegistry?.clear?.();
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
     vi.doUnmock("node:child_process");
   });
@@ -86,6 +88,24 @@ describe("pollArtifactChanges", () => {
     const sendMessage = installDeliverySpies();
     await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps running in-process jobs in the shared footer", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    mod.jobRegistry.set("async-1", { status: "running" } as any);
+    const setStatus = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      setStatus,
+      setWidget: vi.fn(),
+    };
+
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+
+    expect(setStatus).toHaveBeenCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent running",
+    );
   });
 
   it("keeps the event loop responsive while async liveness is pending", async () => {
@@ -1152,7 +1172,7 @@ describe("pollArtifactChanges", () => {
       delete (globalThis as any).__piSubagenturaUi;
     });
 
-    it("AC-B3: all-running registry shows correct count (regression guard)", async () => {
+    it("AC-B3: combines interactive and in-process footer counts", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
         execFileSync: (_file: string, args: string[]) => {
@@ -1168,6 +1188,7 @@ describe("pollArtifactChanges", () => {
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      mod.jobRegistry.set("async-1", { status: "running" } as any);
 
       const a = makeState().state;
       a.id = "a";
@@ -1187,7 +1208,7 @@ describe("pollArtifactChanges", () => {
 
       expect(setStatus).toHaveBeenCalledWith(
         "subagentura-running",
-        "⚡ 2 sub-agents running",
+        "⚡ 3 sub-agents running",
       );
       const widgetArgs = setWidget.mock.calls[0];
       expect(widgetArgs[1].length).toBe(2);

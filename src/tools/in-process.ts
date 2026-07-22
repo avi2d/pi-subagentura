@@ -13,7 +13,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { FOOTER_KEY } from "../artifact-poller";
+import { updateRunningSubagentFooter } from "../artifact-poller";
 import { cleanupOldArtifacts, type CleanupResult } from "../artifact";
 import {
   buildLiveUpdate,
@@ -70,23 +70,8 @@ type InProcessSubagentDetails =
     }
   | { status: "cancelled" | "not_found"; jobId?: string };
 
-function getRunningJobCount(): number {
-  return [...jobRegistry.values()].filter((job) => job.status === "running")
-    .length;
-}
-
 function updateRunningFooter(ctx: RunningFooterContext): void {
-  const runningCount = getRunningJobCount();
-  try {
-    ctx.ui.setStatus(
-      FOOTER_KEY,
-      runningCount > 0
-        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
-        : undefined,
-    );
-  } catch {
-    /* ctx stale */
-  }
+  updateRunningSubagentFooter(ctx.ui);
 }
 
 function createAsyncJobErrorResult(error: unknown): SubagentResult {
