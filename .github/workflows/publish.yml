@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: write
 
 jobs:
   publish:
@@ -49,3 +50,18 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --provenance --access public
+
+      - name: Setup GitHub Packages registry
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@lmn451"
+
+      - name: Set GitHub Packages name
+        run: npm pkg set name="@lmn451/pi-subagentura"
+
+      - name: Publish to GitHub Packages
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}

@@ -8,14 +8,14 @@
  *
  * What is verified:
  *   - Trigger: only v* tags trigger publish
- *   - Permissions: id-token: write is present (trusted publishing / OIDC)
- *   - Pre-publish validation runs before npm publish:
- *       typecheck → tests → tarball smoke → pack:check → publish
+ *   - Permissions: OIDC for npmjs and package writes for GitHub Packages
+ *   - Pre-publish validation runs before either registry publish:
+ *       typecheck → tests → tarball smoke → pack:check → npmjs → GitHub
  *   - Tag-version mismatch is checked before typecheck (early-exit)
- *   - npm publish uses --provenance and --access public
+ *   - npmjs publish uses --provenance and --access public
+ *   - GitHub Packages publish uses the scoped package name and GITHUB_TOKEN
  *   - npm ci (not npm install) is used
  *   - Node version is 24 with npm cache
- *   - Every pre-publish validation step exists (typecheck, test, tarball, pack)
  */
 
 import { describe, it, expect } from "vitest";
@@ -213,6 +213,7 @@ interface WorkflowStep {
   run?: string;
   uses?: string;
   with?: Record<string, unknown>;
+  env?: Record<string, unknown>;
 }
 
 /** Extract the ordered steps array from the parsed workflow. */
@@ -246,7 +247,11 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
   const parsed = parseSimpleYaml(raw);
   const root = parsed as Record<string, unknown>;
   const steps = extractSteps(parsed);
-  const publishStepIdx = findStepIndex(steps, "npm publish");
+  const npmPublishStepIdx = findStepIndex(steps, "npm publish --provenance");
+  const githubPublishStepIdx = findStepIndex(
+    steps,
+    "npm publish --access public",
+  );
 
   // ---- Trigger ----
 
@@ -264,11 +269,12 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
   // ---- Permissions ----
 
   describe("permissions", () => {
-    it("grants id-token: write for OIDC / trusted publishing", () => {
+    it("grants registry publishing permissions", () => {
       const perms = root.permissions as Record<string, unknown>;
       expect(perms).toBeDefined();
       expect(perms.contents).toBe("read");
       expect(perms["id-token"]).toBe("write");
+      expect(perms.packages).toBe("write");
     });
   });
 
@@ -278,43 +284,43 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
     it("has a typecheck step before npm publish", () => {
       const idx = findStepIndex(steps, "typecheck");
       expect(idx).not.toBe(-1);
-      expect(idx).toBeLessThan(publishStepIdx);
+      expect(idx).toBeLessThan(npmPublishStepIdx);
     });
 
     it("has a test step (npm test) before npm publish", () => {
       const idx = findStepIndex(steps, "npm test");
       expect(idx).not.toBe(-1);
-      expect(idx).toBeLessThan(publishStepIdx);
+      expect(idx).toBeLessThan(npmPublishStepIdx);
     });
 
     it("has a tarball smoke-test step before npm publish", () => {
       const idx = findStepIndex(steps, "published-tarball.test");
       expect(idx).not.toBe(-1);
-      expect(idx).toBeLessThan(publishStepIdx);
+      expect(idx).toBeLessThan(npmPublishStepIdx);
     });
 
     it("has a pack:check step before npm publish", () => {
       const idx = findStepIndex(steps, "pack:check");
       expect(idx).not.toBe(-1);
-      expect(idx).toBeLessThan(publishStepIdx);
+      expect(idx).toBeLessThan(npmPublishStepIdx);
     });
 
-    it("the publish step is after all validation steps", () => {
-      const packIdx = findStepIndex(steps, "pack:check");
-      const tarballIdx = findStepIndex(steps, "published-tarball.test");
-      const testIdx = findStepIndex(steps, "npm test");
-      const typecheckIdx = findStepIndex(steps, "typecheck");
-      const lastValidation = Math.max(
-        packIdx,
-        tarballIdx,
-        testIdx,
-        typecheckIdx,
-      );
-      expect(publishStepIdx).toBeGreaterThan(lastValidation);
+    it("publishes to npmjs after all validation steps", () => {
+      const validationIndexes = [
+        findStepIndex(steps, "pack:check"),
+        findStepIndex(steps, "published-tarball.test"),
+        findStepIndex(steps, "npm test"),
+        findStepIndex(steps, "typecheck"),
+      ];
+      expect(npmPublishStepIdx).toBeGreaterThan(Math.max(...validationIndexes));
     });
 
-    it("publish is the final step in the job", () => {
-      expect(publishStepIdx).toBe(steps.length - 1);
+    it("publishes to GitHub Packages after npmjs", () => {
+      expect(githubPublishStepIdx).toBeGreaterThan(npmPublishStepIdx);
+    });
+
+    it("GitHub Packages publish is the final step", () => {
+      expect(githubPublishStepIdx).toBe(steps.length - 1);
     });
   });
 
@@ -337,16 +343,45 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
     });
   });
 
-  // ---- npm publish flags ----
+  // ---- Registry publishing ----
 
-  describe("npm publish flags", () => {
+  describe("npmjs publish flags", () => {
     it("uses --provenance for OIDC attestation", () => {
-      const step = steps[publishStepIdx];
+      const step = steps[npmPublishStepIdx];
       expect(step?.run).toContain("--provenance");
     });
 
-    it("uses --access public for public packages", () => {
-      const step = steps[publishStepIdx];
+    it("uses --access public for the public package", () => {
+      const step = steps[npmPublishStepIdx];
+      expect(step?.run).toContain("--access public");
+    });
+  });
+
+  describe("GitHub Packages publish", () => {
+    it("uses the scoped GitHub package name", () => {
+      const nameStepIdx = findStepIndex(
+        steps,
+        'npm pkg set name="@lmn451/pi-subagentura"',
+      );
+      expect(nameStepIdx).not.toBe(-1);
+      expect(nameStepIdx).toBeLessThan(githubPublishStepIdx);
+    });
+
+    it("configures the GitHub npm registry and scope", () => {
+      const setupStep = steps.find(
+        (step) => step.with?.["registry-url"] === "https://npm.pkg.github.com",
+      );
+      expect(setupStep).toBeDefined();
+      expect(setupStep?.with?.scope).toBe("@lmn451");
+    });
+
+    it("authenticates with the workflow token", () => {
+      const step = steps[githubPublishStepIdx];
+      expect(step?.env?.NODE_AUTH_TOKEN).toBe("${{ github.token }}");
+    });
+
+    it("publishes the GitHub package publicly", () => {
+      const step = steps[githubPublishStepIdx];
       expect(step?.run).toContain("--access public");
     });
   });
@@ -390,16 +425,18 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
 
     it("uses actions/checkout@v6 and actions/setup-node@v6", () => {
       expect(findUseStepIndex(steps, "actions/checkout@")).not.toBe(-1);
-      expect(findUseStepIndex(steps, "actions/setup-node@")).not.toBe(-1);
-      // Pin major versions are v6
-      const checkoutStep = steps.find((s) =>
-        (s.uses ?? "").startsWith("actions/checkout@"),
+      const checkoutStep = steps.find((step) =>
+        (step.uses ?? "").startsWith("actions/checkout@"),
       );
-      expect(checkoutStep!.uses).toBe("actions/checkout@v6");
-      const setupStep = steps.find((s) =>
-        (s.uses ?? "").startsWith("actions/setup-node@"),
+      expect(checkoutStep?.uses).toBe("actions/checkout@v6");
+
+      const setupSteps = steps.filter((step) =>
+        (step.uses ?? "").startsWith("actions/setup-node@"),
       );
-      expect(setupStep!.uses).toBe("actions/setup-node@v6");
+      expect(setupSteps).toHaveLength(2);
+      for (const setupStep of setupSteps) {
+        expect(setupStep.uses).toBe("actions/setup-node@v6");
+      }
     });
   });
 
