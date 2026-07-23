@@ -85,6 +85,41 @@ function setupExtension() {
   return { api, shutdownHandler };
 }
 
+type ShutdownHandler = (event?: { reason?: string }, ctx?: any) => void;
+type SessionStartHandler = (event?: { reason?: string }, ctx?: any) => void;
+
+function setupExtensionWithSessionHandlers() {
+  const api = {
+    registerTool: vi.fn(),
+    registerMessageRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn().mockReturnValue(false),
+    sendMessage: vi.fn(),
+    sendUserMessage: vi.fn(),
+    on: vi.fn(),
+  };
+
+  registerExtension(api as any);
+
+  const handlers: {
+    start?: SessionStartHandler;
+    shutdown: ShutdownHandler[];
+  } = {
+    shutdown: [],
+  };
+
+  for (const [event, handler] of (api.on as any).mock.calls) {
+    if (event === "session_start") {
+      handlers.start = handler as SessionStartHandler;
+    }
+    if (event === "session_shutdown") {
+      handlers.shutdown.push(handler as ShutdownHandler);
+    }
+  }
+
+  return { api, handlers };
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 describe("session_shutdown handler", () => {
@@ -102,6 +137,7 @@ describe("session_shutdown handler", () => {
     g.__piSubagenturaInteractivePollerHandle = undefined;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
     g.__piSubagenturaPiRef = undefined;
+    g.__piSubagenturaSessionContexts = [];
     jobRegistry.clear();
     workflowJobRegistry.clear();
     __setTmuxMultiplexer({
@@ -229,6 +265,322 @@ describe("session_shutdown handler", () => {
       expect(cancelSpy).not.toHaveBeenCalled();
     },
   );
+
+  it("only tears down child-session-scoped interactive/jobs on child shutdown", () => {
+    const root = setupExtensionWithSessionHandlers();
+    const child = setupExtensionWithSessionHandlers();
+
+    const rootSessionId = "sess-root";
+    const childSessionId = "sess-child";
+
+    const rootCtx = {
+      sessionManager: { getSessionId: () => rootSessionId },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      cwd: "/tmp/root",
+    };
+    const childCtx = {
+      sessionManager: { getSessionId: () => childSessionId },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      cwd: "/tmp/child",
+    };
+
+    root.handlers.start?.({ reason: "startup" }, rootCtx as any);
+    child.handlers.start?.({ reason: "startup" }, childCtx as any);
+
+    const rootState = {
+      ...makeState("root-run", "running"),
+      parentSessionId: rootSessionId,
+    };
+    const childState = {
+      ...makeState("child-run", "running"),
+      parentSessionId: childSessionId,
+    };
+    interactiveTmux.interactiveSubagentRegistry.set(rootState.id, rootState);
+    interactiveTmux.interactiveSubagentRegistry.set(childState.id, childState);
+
+    const rootAbort = new AbortController();
+    const childAbort = new AbortController();
+    jobRegistry.set("job-root", {
+      id: "job-root",
+      status: "running",
+      liveStatus: {
+        turn: 1,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn().mockResolvedValue(undefined) } as any,
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+        isError: false,
+        output: "done",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      }),
+      abort: rootAbort,
+      ownerSessionId: rootSessionId,
+    });
+    jobRegistry.set("job-child", {
+      id: "job-child",
+      status: "running",
+      liveStatus: {
+        turn: 1,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn().mockResolvedValue(undefined) } as any,
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+        isError: false,
+        output: "done",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      }),
+      abort: childAbort,
+      ownerSessionId: childSessionId,
+    });
+
+    workflowJobRegistry.set("wf-root", {
+      id: "wf-root",
+      name: "root",
+      status: "running",
+      startedAt: Date.now(),
+      promise: new Promise(() => {}),
+      abort: new AbortController(),
+      snapshot: {
+        agentsSpawned: 0,
+        errorCount: 0,
+        tokensSpent: 0,
+        phases: [],
+      },
+      ownerSessionId: rootSessionId,
+    });
+    workflowJobRegistry.set("wf-child", {
+      id: "wf-child",
+      name: "child",
+      status: "running",
+      startedAt: Date.now(),
+      promise: new Promise(() => {}),
+      abort: new AbortController(),
+      snapshot: {
+        agentsSpawned: 0,
+        errorCount: 0,
+        tokensSpent: 0,
+        phases: [],
+      },
+      ownerSessionId: childSessionId,
+    });
+
+    const childShutdown =
+      child.handlers.shutdown[child.handlers.shutdown.length - 1];
+    expect(typeof childShutdown).toBe("function");
+    childShutdown!({ reason: "new" }, childCtx as any);
+
+    expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(1);
+    expect(interactiveTmux.interactiveSubagentRegistry.has(rootState.id)).toBe(
+      true,
+    );
+    expect(interactiveTmux.interactiveSubagentRegistry.has(childState.id)).toBe(
+      false,
+    );
+
+    expect(cancelByStateSpy).toHaveBeenCalledTimes(1);
+    expect(cancelByStateSpy).toHaveBeenCalledWith(childState);
+
+    expect(jobRegistry.has("job-child")).toBe(false);
+    expect(jobRegistry.has("job-root")).toBe(true);
+    expect(rootAbort.signal.aborted).toBe(false);
+    expect(childAbort.signal.aborted).toBe(true);
+
+    expect(workflowJobRegistry.has("wf-child")).toBe(false);
+    expect(workflowJobRegistry.has("wf-root")).toBe(true);
+    expect((globalThis as any).__piSubagenturaInteractivePollerHandle).toBe(
+      fakeHandle,
+    );
+
+    expect(globalThis.__piSubagenturaPiRef).toBe(root.api);
+
+    const rootShutdown =
+      root.handlers.shutdown[root.handlers.shutdown.length - 1];
+    rootShutdown?.({ reason: "new" }, rootCtx as any);
+
+    expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
+    expect(jobRegistry.size).toBe(0);
+    expect(workflowJobRegistry.size).toBe(0);
+  });
+
+  it("supports out-of-order child shutdown while preserving non-closed sessions", () => {
+    const root = setupExtensionWithSessionHandlers();
+    const childA = setupExtensionWithSessionHandlers();
+    const childB = setupExtensionWithSessionHandlers();
+
+    const rootSessionId = "parent-2";
+    const childAId = "child-2a";
+    const childBId = "child-2b";
+
+    const rootCtx = {
+      sessionManager: { getSessionId: () => rootSessionId },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      cwd: "/tmp/root-2",
+    };
+    const childACtx = {
+      sessionManager: { getSessionId: () => childAId },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      cwd: "/tmp/child-a",
+    };
+    const childBCtx = {
+      sessionManager: { getSessionId: () => childBId },
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
+      cwd: "/tmp/child-b",
+    };
+
+    root.handlers.start?.({ reason: "startup" }, rootCtx as any);
+    childA.handlers.start?.({ reason: "startup" }, childACtx as any);
+    childB.handlers.start?.({ reason: "startup" }, childBCtx as any);
+
+    const childAState = {
+      ...makeState("child-a", "running"),
+      parentSessionId: childAId,
+    };
+    const childBState = {
+      ...makeState("child-b", "running"),
+      parentSessionId: childBId,
+    };
+    interactiveTmux.interactiveSubagentRegistry.set(
+      childAState.id,
+      childAState,
+    );
+    interactiveTmux.interactiveSubagentRegistry.set(
+      childBState.id,
+      childBState,
+    );
+
+    const childAAbort = new AbortController();
+    const childBAbort = new AbortController();
+    jobRegistry.set("job-child-a", {
+      id: "job-child-a",
+      status: "running",
+      liveStatus: {
+        turn: 1,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn().mockResolvedValue(undefined) } as any,
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+        isError: false,
+        output: "done",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      }),
+      abort: childAAbort,
+      ownerSessionId: childAId,
+    });
+    jobRegistry.set("job-child-b", {
+      id: "job-child-b",
+      status: "running",
+      liveStatus: {
+        turn: 1,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn().mockResolvedValue(undefined) } as any,
+      startedAt: Date.now(),
+      promise: Promise.resolve({
+        isError: false,
+        output: "done",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      }),
+      abort: childBAbort,
+      ownerSessionId: childBId,
+    });
+
+    const shutdownA =
+      childA.handlers.shutdown[childA.handlers.shutdown.length - 1];
+    const shutdownB =
+      childB.handlers.shutdown[childB.handlers.shutdown.length - 1];
+    shutdownA?.({ reason: "new" }, childACtx as any);
+
+    // After closing child-a, child-b remains active as the top session.
+    expect(cancelByStateSpy).toHaveBeenCalledTimes(1);
+    expect(cancelByStateSpy).toHaveBeenCalledWith(childAState);
+    expect((globalThis as any).__piSubagenturaInteractivePollerHandle).toBe(
+      fakeHandle,
+    );
+    expect(childBAbort.signal.aborted).toBe(false);
+    expect(globalThis.__piSubagenturaPiRef).toBe(childB.api);
+
+    // Parent is still running and unaffected.
+    expect(
+      (globalThis as any).__piSubagenturaSessionManager?.getSessionId?.(),
+    ).toBe(childBId);
+
+    expect(
+      interactiveTmux.interactiveSubagentRegistry.has(childAState.id),
+    ).toBe(false);
+    expect(
+      interactiveTmux.interactiveSubagentRegistry.has(childBState.id),
+    ).toBe(true);
+    expect(jobRegistry.has("job-child-a")).toBe(false);
+    expect(jobRegistry.has("job-child-b")).toBe(true);
+
+    shutdownB?.({ reason: "new" }, childBCtx as any);
+
+    expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
+    expect(childBAbort.signal.aborted).toBe(true);
+  });
 
   it("clears interactiveSubagentRegistry in session_shutdown", () => {
     // Pre-populate with both running and non-running states. The cancel

@@ -19,6 +19,8 @@ export type WorkflowJobStatus = "running" | "done" | "error" | "cancelled";
 export interface WorkflowJobState {
   id: string;
   name: string;
+  /** Owning Pi session id for nested-session shutdown scoping. */
+  ownerSessionId?: string;
   status: WorkflowJobStatus;
   startedAt: number;
   promise: Promise<WorkflowRunResult>;
@@ -81,6 +83,7 @@ export function startWorkflowJob(
   >,
   startedAt?: number,
   onComplete?: (job: WorkflowJobState) => boolean | void,
+  ownerSessionId?: string,
 ): WorkflowJobState {
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
     // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
@@ -105,6 +108,7 @@ export function startWorkflowJob(
   const state: WorkflowJobState = {
     id,
     name,
+    ownerSessionId,
     status: "running",
     startedAt: startedAt ?? Date.now(),
     promise: undefined as unknown as Promise<WorkflowRunResult>,

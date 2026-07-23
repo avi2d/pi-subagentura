@@ -170,6 +170,8 @@ export interface JobState {
   cwd?: string;
   promise: Promise<SubagentResult>;
   modelLabel?: string;
+  /** Owning Pi session id for nested-session shutdown scoping. */
+  ownerSessionId?: string;
   /** Effective level after Pi's model-capability clamping. */
   thinkingLevel?: ThinkingLevel;
   /** Notification mode requested by spawner's notifyOnComplete param */

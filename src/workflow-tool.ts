@@ -386,6 +386,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             baseOpts,
             jobStartedAt,
             notifyWorkflowCompletion,
+            ctx.sessionManager?.getSessionId?.(),
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -864,6 +865,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         },
         Date.now(),
         notifyWorkflowCompletion,
+        ctx.sessionManager?.getSessionId?.(),
       );
       return { job, meta };
     };
