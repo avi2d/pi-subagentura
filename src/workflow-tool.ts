@@ -20,6 +20,7 @@ import {
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
+  normalizeCancelledWorkflowState,
   startWorkflowJob,
   workflowJobRegistry,
   type WorkflowJobState,
@@ -674,6 +675,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         };
       }
       if (st.status === "cancelled") {
+        normalizeCancelledWorkflowState(st);
         return {
           content: [
             { type: "text", text: `Workflow ${st.id} is already cancelled.` },
@@ -702,8 +704,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }
       st.abort.abort();
       st.status = "cancelled";
+      normalizeCancelledWorkflowState(st);
       if (cancellationSnapshotsEnabled()) {
         await waitForCancellationReceipts(st);
+        normalizeCancelledWorkflowState(st);
       }
       return {
         content: [{ type: "text", text: `Workflow ${st.id} cancelled.` }],

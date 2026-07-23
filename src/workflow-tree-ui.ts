@@ -1,6 +1,7 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
   getWorkflowCompletionPresentation,
+  normalizeCancelledWorkflowState,
   workflowJobRegistry,
   type WorkflowJobState,
 } from "./workflow-jobs";
@@ -145,6 +146,7 @@ export class WorkflowTreeComponent {
     }
     job.abort.abort();
     job.status = "cancelled";
+    normalizeCancelledWorkflowState(job);
     this.opts.notify?.(`Cancelled workflow ${job.id}.`);
     this.changed();
     this.opts.done({ kind: "cancel", workflowId: job.id });
@@ -238,7 +240,13 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
   }
   for (const record of agentRows) {
     const marker =
-      record.status === "running" ? "→" : record.status === "error" ? "✗" : "✓";
+      record.status === "running"
+        ? "→"
+        : record.status === "error"
+          ? "✗"
+          : record.status === "cancelled"
+            ? "⊘"
+            : "✓";
     const label = `${record.label ?? "agent"} #${record.agentId}`;
     const model = record.model ? ` @${record.model}` : "";
     const phase = record.phase ? ` (${record.phase})` : "";

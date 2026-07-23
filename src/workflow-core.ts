@@ -219,7 +219,7 @@ export interface WorkflowAgentRecord {
   phase?: string;
   label?: string;
   model?: string;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
 }
 
 export const MAX_WORKFLOW_AGENT_RECORDS = 50;

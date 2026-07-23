@@ -1,0 +1,135 @@
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  startWorkflowJob,
+  workflowJobRegistry,
+  type WorkflowJobState,
+} from "../src/workflow-jobs";
+import { registerWorkflowTool } from "../src/workflow-tool";
+import { cancelAllFlows } from "../src/cancel-all-flows";
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+const SCRIPT =
+  'export const meta = { name: "cancel-race", description: "d" };\n' +
+  'return await agent("in flight");';
+
+let jobs: WorkflowJobState[] = [];
+
+afterEach(async () => {
+  for (const job of jobs) {
+    if (job.status === "running") job.abort.abort();
+    try {
+      await job.promise;
+    } catch {
+      /* expected for cancelled jobs */
+    }
+    workflowJobRegistry.delete(job.id);
+  }
+  jobs = [];
+});
+
+async function startInFlightWorkflow(): Promise<WorkflowJobState> {
+  let entered!: () => void;
+  const agentEntered = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const job = startWorkflowJob("cancel-race", SCRIPT, {
+    runAgent: async ({ signal }) => {
+      entered();
+      await new Promise<never>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(signal.reason ?? new Error("aborted"));
+          return;
+        }
+        signal?.addEventListener(
+          "abort",
+          () => reject(signal.reason ?? new Error("aborted")),
+          { once: true },
+        );
+      });
+      return {
+        isError: false,
+        output: "ok",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 1,
+        },
+        model: "test/model",
+      } as any;
+    },
+  });
+  jobs.push(job);
+  await agentEntered;
+  await tick();
+  expect(job.snapshot.runningCount).toBe(1);
+  expect(job.snapshot.agentRecords?.[0]?.status).toBe("running");
+  return job;
+}
+
+function workflowTools(): Record<string, any> {
+  const tools: Record<string, any> = {};
+  registerWorkflowTool({
+    registerTool: (tool: any) => {
+      tools[tool.name] = tool;
+    },
+    registerCommand: () => {},
+  } as any);
+  return tools;
+}
+
+describe("cancelled workflow snapshot normalization", () => {
+  it("normalizes cancel_workflow immediately and after settlement", async () => {
+    const job = await startInFlightWorkflow();
+    const tools = workflowTools();
+    const cancel = tools.cancel_workflow;
+    const getStatus = tools.get_workflow_status;
+
+    const immediate = await cancel.execute("cancel", { workflowId: job.id });
+    expect(immediate.details.status).toBe("cancelled");
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
+    const immediateStatus = await getStatus.execute("status", {
+      workflowId: job.id,
+    });
+    expect(immediateStatus.details.runningCount).toBe(0);
+
+    await expect(job.promise).rejects.toThrow(/aborted/i);
+    const afterSettlement = await cancel.execute("cancel", {
+      workflowId: job.id,
+    });
+    expect(afterSettlement.details.status).toBe("cancelled");
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
+    const afterSettlementStatus = await getStatus.execute("status", {
+      workflowId: job.id,
+    });
+    expect(afterSettlementStatus.details.runningCount).toBe(0);
+  });
+
+  it("normalizes cancelAllFlows immediately and after settlement", async () => {
+    const job = await startInFlightWorkflow();
+    const getStatus = workflowTools().get_workflow_status;
+
+    const immediate = await cancelAllFlows();
+    expect(immediate.workflowsAborted).toBe(1);
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
+    const immediateStatus = await getStatus.execute("status", {
+      workflowId: job.id,
+    });
+    expect(immediateStatus.details.runningCount).toBe(0);
+
+    await expect(job.promise).rejects.toThrow(/aborted/i);
+    const afterSettlement = await cancelAllFlows();
+    expect(afterSettlement.workflowsAborted).toBe(0);
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
+    const afterSettlementStatus = await getStatus.execute("status", {
+      workflowId: job.id,
+    });
+    expect(afterSettlementStatus.details.runningCount).toBe(0);
+  });
+});

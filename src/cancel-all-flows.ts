@@ -13,7 +13,10 @@ import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
 } from "./interactive-tmux";
-import { workflowJobRegistry } from "./workflow-jobs";
+import {
+  normalizeCancelledWorkflowState,
+  workflowJobRegistry,
+} from "./workflow-jobs";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -105,10 +108,13 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
       workflow.suppressCompletionNotification = true;
       workflow.abort.abort();
       workflow.status = "cancelled";
+      result.workflowsAborted++;
+    }
+    if (workflow.status === "cancelled") {
+      normalizeCancelledWorkflowState(workflow);
       for (const receipt of workflow.cancellationSnapshots ?? []) {
         addSnapshot(receipt);
       }
-      result.workflowsAborted++;
     }
   }
 

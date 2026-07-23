@@ -154,6 +154,7 @@ export function startWorkflowJob(
     .then((r) => {
       if (state.status === "running") state.status = "done";
       state.result = r;
+      if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       return r;
     })
@@ -161,6 +162,7 @@ export function startWorkflowJob(
       const msg = err instanceof Error ? err.message : String(err);
       state.status = abort.signal.aborted ? "cancelled" : "error";
       state.error = msg;
+      if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       throw err;
     });
@@ -228,6 +230,14 @@ export function retryPendingWorkflowNotifications(): void {
   for (const job of workflowJobRegistry.values()) {
     if (job.status === "running") continue;
     invokeCompletionHook(job);
+  }
+}
+
+export function normalizeCancelledWorkflowState(state: WorkflowJobState): void {
+  if (!state.snapshot) return;
+  state.snapshot.runningCount = 0;
+  for (const record of state.snapshot.agentRecords ?? []) {
+    if (record.status === "running") record.status = "cancelled";
   }
 }
 

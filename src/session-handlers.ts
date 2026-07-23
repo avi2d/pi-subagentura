@@ -17,7 +17,10 @@ import {
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
-import { workflowJobRegistry } from "./workflow-jobs";
+import {
+  normalizeCancelledWorkflowState,
+  workflowJobRegistry,
+} from "./workflow-jobs";
 import {
   advanceSessionContextGeneration,
   createSessionContextRef,
@@ -221,7 +224,13 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       // before aborting so late settlement cannot notify a replacement session.
       for (const workflow of workflowJobRegistry.values()) {
         workflow.suppressCompletionNotification = true;
-        if (workflow.status === "running") workflow.abort.abort();
+        if (workflow.status === "running") {
+          workflow.abort.abort();
+          workflow.status = "cancelled";
+        }
+        if (workflow.status === "cancelled") {
+          normalizeCancelledWorkflowState(workflow);
+        }
       }
 
       jobRegistry.clear();

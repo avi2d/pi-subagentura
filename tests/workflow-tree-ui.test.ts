@@ -163,7 +163,12 @@ describe("WorkflowTreeComponent", () => {
   });
 
   it("cancels the selected running workflow with c", () => {
-    const job = makeJob();
+    const job = makeJob({
+      snapshot: {
+        ...makeJob().snapshot,
+        agentRecords: [{ agentId: 1, status: "running" }],
+      },
+    });
     const abortSpy = vi.spyOn(job.abort, "abort");
     workflowJobRegistry.set(job.id, job);
     const done = vi.fn();
@@ -174,6 +179,8 @@ describe("WorkflowTreeComponent", () => {
 
     expect(abortSpy).toHaveBeenCalledTimes(1);
     expect(job.status).toBe("cancelled");
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
     expect(notify).toHaveBeenCalledWith("Cancelled workflow wf_test.");
     expect(done).toHaveBeenCalledWith({
       kind: "cancel",
