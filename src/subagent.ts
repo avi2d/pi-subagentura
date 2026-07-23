@@ -107,6 +107,12 @@ export default function (pi: ExtensionAPI) {
     type: "boolean",
     default: false,
   });
+  pi.registerFlag("only-interactive", {
+    description: "Enable only interactive sub-agent tools",
+    type: "boolean",
+    default: false,
+  });
+  const onlyInteractive = pi.getFlag("only-interactive") === true;
   pi.on("before_agent_start", (event) => {
     if (pi.getFlag("orchestrator") !== true) return;
     return {
@@ -114,12 +120,17 @@ export default function (pi: ExtensionAPI) {
     };
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  const sessionScope = registerSessionHandlers(pi);
+const sessionScope = registerSessionHandlers(pi);
   registerInteractiveSubagentTools(pi, sessionScope);
+  if (onlyInteractive) {
+    registerSubagentArtifactsCleanupTool(pi, sessionScope);
+    registerSubagentModelListTool(pi);
+  } else {
+    registerWorkflowTool(pi, sessionScope);
+    registerInProcessSubagentTools(pi, sessionScope);
+    registerInProcessMaintenanceTools(pi, sessionScope);
+  }
   registerInteractiveSupervisor(pi, sessionScope);
-  registerWorkflowTool(pi, sessionScope);
-  registerInProcessSubagentTools(pi, sessionScope);
-  registerInProcessMaintenanceTools(pi, sessionScope);
   // ── Cancel-all-flows shortcut and command ──────────────────────
   registerCancelAllFlows(pi, sessionScope);
 }

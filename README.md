@@ -55,6 +55,16 @@ pi --orchestrator
 workflow. `/workflows` runs saved workflows, and `/workflow-tree` shows live
 phases, agents, and cancellation controls.
 
+Attach-only mode keeps the full interactive session toolchain but skips in-process
+and workflow sub-agents. Start Pi with:
+
+```text
+pi --only-interactive
+```
+
+Use this when you want only attachable child-session tools while preserving
+poller/rehydration and interactive artifact controls.
+
 ## Reusable workflows
 
 Workflow files are ordinary `.mjs` scripts with static metadata and a small set

@@ -1563,3 +1563,7 @@ export function registerSubagentArtifactsCleanupTool(
 ): void {
   registerCleanupArtifactsTool(pi, scope);
 }
+
+export function registerSubagentArtifactsCleanupTool(pi: ExtensionAPI): void {
+  registerCleanupArtifactsTool(pi);
+}
