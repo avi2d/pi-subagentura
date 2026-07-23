@@ -31,6 +31,7 @@ import {
   type Usage,
 } from "../helpers";
 import { resolveSpawnDepth } from "../orchestration-context";
+import { getActiveSessionContextToken } from "../session-context";
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
@@ -101,6 +102,53 @@ function resolveSpawn(ctx: SpawnContext) {
     }
   }
   return { ...spawn, rootSessionId };
+}
+
+function isSpawnContextStale(
+  token: ReturnType<typeof getActiveSessionContextToken>,
+): boolean {
+  if (!token) return false;
+  const current = getActiveSessionContextToken();
+  return (
+    !current ||
+    current.id !== token.id ||
+    current.generation !== token.generation
+  );
+}
+
+function discardAsyncSpawn(
+  abort: AbortController,
+  session: { abort: () => Promise<unknown> },
+): void {
+  const reason = {
+    source: "session_shutdown" as const,
+    reason: "parent session shut down before async spawn registration",
+  };
+  try {
+    abort.abort(reason);
+  } catch {
+    /* controller may already be aborted */
+  }
+  try {
+    void Promise.resolve(session.abort()).catch(() => {
+      /* child session may already be disposed */
+    });
+  } catch {
+    /* child session may already be disposed */
+  }
+}
+
+function cancelledAsyncSpawnResult(): AgentToolResult<InProcessSubagentDetails> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: "Async sub-agent spawn cancelled during session shutdown.",
+      },
+    ],
+    details: { status: "cancelled" },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
 }
 
 /** Tool result returned when a spawn would exceed the orchestration depth cap. */
@@ -295,6 +343,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         )
         .map((e) => e.message);
 
+      const spawnContextToken = getActiveSessionContextToken();
       if (runAsync) {
         if (messages.length === 0) {
           return {
@@ -334,6 +383,10 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
         });
+        if (isSpawnContextStale(spawnContextToken)) {
+          discardAsyncSpawn(abort, session);
+          return cancelledAsyncSpawnResult();
+        }
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -501,6 +554,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       const spawn = resolveSpawn(ctx);
       if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
 
+      const spawnContextToken = getActiveSessionContextToken();
       if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
         // Own the child's session so any ancestor abort cascades to it.
@@ -528,6 +582,10 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
         });
+        if (isSpawnContextStale(spawnContextToken)) {
+          discardAsyncSpawn(abort, session);
+          return cancelledAsyncSpawnResult();
+        }
         const jobState: JobState = {
           id: jobId,
           status: "running",

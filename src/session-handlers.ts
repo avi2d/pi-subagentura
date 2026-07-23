@@ -19,6 +19,7 @@ import {
 } from "./interactive-tmux";
 import { workflowJobRegistry } from "./workflow-jobs";
 import {
+  advanceSessionContextGeneration,
   createSessionContextRef,
   getSessionContextStack,
   registerSessionContext,
@@ -52,6 +53,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
   pi.on("session_start", (event, ctx) => {
+    advanceSessionContextGeneration(sessionContext.id);
     removeSessionContext(sessionContext.id);
     sessionContext.ui = ctx.ui;
     sessionContext.sessionManager = ctx.sessionManager;
@@ -118,6 +120,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       if (contextIndex < 0) return;
 
       const wasTop = contextIndex === contextStack.length - 1;
+      advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
       setActiveSessionRefs(contextStack[contextStack.length - 1]);
       g2.__piSubagenturaParentStreaming = false;

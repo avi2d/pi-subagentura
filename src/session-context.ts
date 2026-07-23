@@ -10,6 +10,7 @@ export const ACTIVE_SESSION_CONTEXT_ID_KEY =
 
 export interface SessionContextRef {
   id: number;
+  generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
   sessionManager?: {
@@ -21,6 +22,8 @@ export interface SessionContextRef {
 declare global {
   // eslint-disable-next-line no-var
   var __piSubagenturaActiveSessionContextId: number | undefined;
+  // eslint-disable-next-line no-var
+  var __piSubagenturaActiveSessionContextGeneration: number | undefined;
 }
 
 function getGlobalState() {
@@ -48,6 +51,7 @@ export function nextSessionContextId(): number {
 export function createSessionContextRef(pi: ExtensionAPI): SessionContextRef {
   return {
     id: nextSessionContextId(),
+    generation: 0,
     pi,
   };
 }
@@ -74,6 +78,20 @@ export function removeSessionContext(
   return removed;
 }
 
+/** Advance a context generation so pending work cannot cross its lifecycle. */
+export function advanceSessionContextGeneration(contextId: number): number {
+  const context = getSessionContextStack().find(
+    (entry) => entry.id === contextId,
+  );
+  if (!context) return 0;
+  context.generation++;
+  const g = getGlobalState() as any;
+  if (g[ACTIVE_SESSION_CONTEXT_ID_KEY] === context.id) {
+    g.__piSubagenturaActiveSessionContextGeneration = context.generation;
+  }
+  return context.generation;
+}
+
 export function setActiveSessionRefs(context?: SessionContextRef): void {
   const g = getGlobalState() as any;
   if (!context) {
@@ -81,6 +99,7 @@ export function setActiveSessionRefs(context?: SessionContextRef): void {
     g.__piSubagenturaUi = undefined;
     g.__piSubagenturaSessionManager = undefined;
     g[ACTIVE_SESSION_CONTEXT_ID_KEY] = undefined;
+    g.__piSubagenturaActiveSessionContextGeneration = undefined;
     return;
   }
 
@@ -88,9 +107,25 @@ export function setActiveSessionRefs(context?: SessionContextRef): void {
   g.__piSubagenturaUi = context.ui;
   g.__piSubagenturaSessionManager = context.sessionManager;
   g[ACTIVE_SESSION_CONTEXT_ID_KEY] = context.id;
+  g.__piSubagenturaActiveSessionContextGeneration = context.generation;
+}
+
+export interface ActiveSessionContextToken {
+  id: number;
+  generation: number;
 }
 
 export function getActiveSessionContextId(): number | undefined {
   const g = getGlobalState() as any;
   return g[ACTIVE_SESSION_CONTEXT_ID_KEY];
+}
+
+export function getActiveSessionContextToken():
+  ActiveSessionContextToken | undefined {
+  const g = getGlobalState() as any;
+  const id = g[ACTIVE_SESSION_CONTEXT_ID_KEY];
+  const generation = g.__piSubagenturaActiveSessionContextGeneration;
+  if (typeof id !== "number" || typeof generation !== "number")
+    return undefined;
+  return { id, generation };
 }
