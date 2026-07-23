@@ -1,5 +1,41 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/subagent";
+
+const INTERACTIVE_TOOL_NAMES = [
+  "cancel_interactive_subagent",
+  "get_interactive_subagent_status",
+  "read_subagent_artifact",
+  "send_interactive_subagent_message",
+  "subagent_interactive",
+  "list_subagent_artifacts",
+  "cleanup_subagent_artifacts",
+].sort();
+
+const IN_PROCESS_TOOL_NAMES = [
+  "cancel_subagent",
+  "get_subagent_result",
+  "get_subagent_status",
+  "list_available_models",
+  "prune_subagent_jobs",
+  "subagent_isolated",
+  "subagent_with_context",
+].sort();
+
+const WORKFLOW_TOOL_NAMES = [
+  "cancel_workflow",
+  "delete_workflow",
+  "get_workflow_result",
+  "get_workflow_status",
+  "list_workflows",
+  "save_workflow",
+  "workflow",
+].sort();
+
+function getRegisteredToolNames(api: {
+  registerTool: ReturnType<typeof vi.fn>;
+}) {
+  return api.registerTool.mock.calls.map(([tool]: any[]) => tool.name).sort();
+}
 
 function mockApi(overrides: Record<string, any> = {}) {
   return {
@@ -15,9 +51,21 @@ function mockApi(overrides: Record<string, any> = {}) {
 }
 
 describe("extension registration", () => {
+  let previousChild: string | undefined;
+  beforeEach(() => {
+    previousChild = process.env.PI_SUBAGENTURA_CHILD;
+    delete process.env.PI_SUBAGENTURA_CHILD;
+  });
+  afterEach(() => {
+    if (previousChild === undefined) {
+      delete process.env.PI_SUBAGENTURA_CHILD;
+    } else {
+      process.env.PI_SUBAGENTURA_CHILD = previousChild;
+    }
+  });
+
   it("registers the expected tools without throwing", () => {
     const api = mockApi();
-
     expect(() => registerExtension(api as any)).not.toThrow();
     expect(api.registerMessageRenderer).toHaveBeenCalledOnce();
     expect(api.registerMessageRenderer).toHaveBeenCalledWith(
@@ -25,32 +73,11 @@ describe("extension registration", () => {
       expect.any(Function),
     );
 
-    const names = api.registerTool.mock.calls
-      .map(([tool]: any[]) => tool.name)
-      .sort();
-    expect(names).toEqual(
+    expect(getRegisteredToolNames(api)).toEqual(
       [
-        "cancel_interactive_subagent",
-        "cancel_subagent",
-        "cancel_workflow",
-        "delete_workflow",
-        "cleanup_subagent_artifacts",
-        "get_interactive_subagent_status",
-        "get_subagent_result",
-        "get_subagent_status",
-        "get_workflow_result",
-        "get_workflow_status",
-        "list_available_models",
-        "list_subagent_artifacts",
-        "list_workflows",
-        "prune_subagent_jobs",
-        "read_subagent_artifact",
-        "save_workflow",
-        "send_interactive_subagent_message",
-        "subagent_interactive",
-        "subagent_isolated",
-        "subagent_with_context",
-        "workflow",
+        ...INTERACTIVE_TOOL_NAMES,
+        ...IN_PROCESS_TOOL_NAMES,
+        ...WORKFLOW_TOOL_NAMES,
       ].sort(),
     );
     expect(api.registerCommand).toHaveBeenCalledWith(
@@ -75,8 +102,55 @@ describe("extension registration", () => {
     });
   });
 
+  it("registers the --only-interactive flag", () => {
+    const api = mockApi();
+
+    registerExtension(api as any);
+
+    expect(api.registerFlag).toHaveBeenCalledWith("only-interactive", {
+      description: "Enable only interactive sub-agent tools",
+      type: "boolean",
+      default: false,
+    });
+  });
+
+  it("omits in-process and workflow tools when --only-interactive is enabled", () => {
+    const api = mockApi({
+      getFlag: vi.fn((name: string) => name === "only-interactive"),
+    });
+
+    registerExtension(api as any);
+
+    const names = getRegisteredToolNames(api);
+    expect(names).toEqual(INTERACTIVE_TOOL_NAMES);
+
+    for (const name of IN_PROCESS_TOOL_NAMES) {
+      expect(names).not.toContain(name);
+    }
+    for (const name of WORKFLOW_TOOL_NAMES) {
+      expect(names).not.toContain(name);
+    }
+  });
+
+  it("keeps interactive tools and session handlers with --only-interactive", () => {
+    const api = mockApi({
+      getFlag: vi.fn((name: string) => name === "only-interactive"),
+    });
+
+    registerExtension(api as any);
+
+    expect(getRegisteredToolNames(api)).toEqual(INTERACTIVE_TOOL_NAMES);
+
+    const events = api.on.mock.calls.map(([event]: any[]) => event as string);
+    expect(events).toContain("session_start");
+    expect(events).toContain("session_shutdown");
+    expect(events).toContain("agent_settled");
+  });
+
   it("appends the bundled prompt when --orchestrator is enabled", async () => {
-    const api = mockApi({ getFlag: vi.fn().mockReturnValue(true) });
+    const api = mockApi({
+      getFlag: vi.fn((name: string) => name === "orchestrator"),
+    });
 
     registerExtension(api as any);
 
@@ -100,6 +174,8 @@ describe("extension registration", () => {
       registerCommand: vi.fn(),
       registerShortcut: vi.fn(),
       on: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn(),
     };
 
     try {
