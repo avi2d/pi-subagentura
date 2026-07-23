@@ -730,16 +730,17 @@ describe("extractJson", () => {
   it("strips code fences", () => {
     expect(extractJson('```json\n{"a":1}\n```')).toBe('{"a":1}');
   });
-  it("extracts the first balanced object from surrounding prose", () => {
-    expect(extractJson('Sure! Here you go: {"a": {"b": 2}} done')).toBe(
-      '{"a": {"b": 2}}',
-    );
+  it("requires object output to be JSON-only (no surrounding prose)", () => {
+    expect(extractJson('Sure! Here you go: {"a": {"b": 2}} done')).toBeNull();
   });
-  it("extracts arrays", () => {
-    expect(extractJson("result: [1, 2, 3]")).toBe("[1, 2, 3]");
+  it("requires array output to be JSON-only (no surrounding prose)", () => {
+    expect(extractJson("result: [1, 2, 3]")).toBeNull();
   });
   it("returns null when there is no JSON", () => {
     expect(extractJson("just words")).toBeNull();
+  });
+  it("accepts strict string scalars", () => {
+    expect(extractJson('"done"')).toBe('"done"');
   });
 });
 
