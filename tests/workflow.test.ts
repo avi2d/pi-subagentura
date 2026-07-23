@@ -724,6 +724,65 @@ describe("schema enforcement", () => {
     expect(schemaArg).toBeUndefined();
     expect(r.result).toBe("done");
   });
+
+  it("accepts strict JSON scalar outputs in process mode", async () => {
+    const cases = [
+      { schema: { type: "string" }, output: '"done"', expected: "done" },
+      { schema: { type: "number" }, output: "3.5", expected: 3.5 },
+      { schema: { type: "integer" }, output: "7", expected: 7 },
+      { schema: { type: "boolean" }, output: "true", expected: true },
+      { schema: { type: "null" }, output: "null", expected: null },
+    ];
+
+    for (const testCase of cases) {
+      const isolations: string[] = [];
+      const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
+        isolations.push(isolation ?? "undefined");
+        return ok(testCase.output);
+      };
+      const body = `return await agent("scalar", { schema: ${JSON.stringify(testCase.schema)} });`;
+      const r = await runWorkflow(meta + body, { runAgent });
+      expect(r.result).toEqual(testCase.expected);
+      expect(r.errorCount).toBe(0);
+      expect(isolations).toEqual(["process"]);
+    }
+  });
+
+  it("rejects prose around scalar JSON and retries in process mode", async () => {
+    const cases = [
+      { schema: { type: "string" }, output: 'Answer: "done"' },
+      { schema: { type: "number" }, output: "The answer is 3.5." },
+      { schema: { type: "integer" }, output: "Result: 7" },
+      { schema: { type: "boolean" }, output: "The answer is true." },
+      { schema: { type: "null" }, output: "Result: null" },
+    ];
+
+    for (const testCase of cases) {
+      const isolations: string[] = [];
+      const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
+        isolations.push(isolation ?? "undefined");
+        return ok(testCase.output);
+      };
+      const body = `return await agent("scalar", { schema: ${JSON.stringify(testCase.schema)} });`;
+      const r = await runWorkflow(meta + body, { runAgent });
+      expect(r.result).toBeNull();
+      expect(r.errorCount).toBe(1);
+      expect(isolations).toEqual(Array(SCHEMA_RETRIES).fill("process"));
+    }
+  });
+
+  it("accepts fenced JSON scalars in process mode", async () => {
+    const isolations: string[] = [];
+    const runAgent: WorkflowAgentRunner = async ({ isolation }) => {
+      isolations.push(isolation ?? "undefined");
+      return ok("Here is the answer:\n```json\n42\n```\nThanks.");
+    };
+    const body = `return await agent("scalar", { schema: ${JSON.stringify({ type: "number" })} });`;
+    const r = await runWorkflow(meta + body, { runAgent });
+    expect(r.result).toBe(42);
+    expect(r.errorCount).toBe(0);
+    expect(isolations).toEqual(["process"]);
+  });
 });
 
 describe("extractJson", () => {
