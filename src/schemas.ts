@@ -42,7 +42,7 @@ export const BaseParams = Type.Object({
   async: Type.Optional(
     Type.Boolean({
       description:
-        "Run subagent in background. Returns a jobId immediately instead of blocking. Async jobs inject their result by default when complete. Poll with get_subagent_status or collect with get_subagent_result only when requested or when manual follow-up is needed. The main agent continues execution immediately — it does NOT wait for async sub-agents to complete. Use only if users asks to",
+        "Run subagent in background. DEFAULT: true — fan-out and long-running work must not block the parent turn. Returns a jobId immediately instead of blocking; the main agent continues and the result is injected when complete (poll with get_subagent_status or collect with get_subagent_result for manual follow-up). Pass async: false ONLY for a single short sub-agent whose answer you need inline before continuing. Async keeps the parent responsive but does NOT by itself prevent nested fan-out — depth is capped separately.",
     }),
   ),
   notifyOnComplete: Type.Optional(

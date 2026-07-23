@@ -64,7 +64,13 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   const jobs = [...jobRegistry.values()].filter(
     (job) => job.status === "running",
   );
+  const jobCancellation = {
+    source: "cancel_all" as const,
+    initiator: "cancel_all_flows",
+    reason: "cancel-all-flows aborted every running flow",
+  };
   for (const job of jobs) {
+    job.cancellation = { ...jobCancellation, at: Date.now() };
     job.cancellationSnapshot = snapshotInProcessSession({
       kind: "in-process",
       jobId: job.id,
@@ -74,12 +80,17 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
       activeTool: job.liveStatus?.activeTool,
       partialOutput: job.liveStatus?.output,
       source: "cancel_all",
+      initiator: jobCancellation.initiator,
+      reason: jobCancellation.reason,
     });
     addSnapshot(job.cancellationSnapshot);
   }
   for (const job of jobs) {
     try {
-      await job.session.abort();
+      // Prefer the controller so the abort handler cascades to descendants;
+      // fall back to a direct session abort for jobs spawned without one.
+      if (job.abort) job.abort.abort(jobCancellation);
+      else await job.session.abort();
     } catch {
       /* session may already be disposed */
     }

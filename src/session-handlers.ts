@@ -141,9 +141,21 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
+      let shutdownInitiator: string | undefined;
+      try {
+        shutdownInitiator = ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        shutdownInitiator = undefined;
+      }
+      const shutdownCancellation = {
+        source: "session_shutdown" as const,
+        initiator: shutdownInitiator,
+        reason: `session_shutdown (${event?.reason ?? "unknown"})`,
+      };
       // Snapshot all in-process jobs before any abort can wait for idle.
       for (const job of jobRegistry.values()) {
         if (job.status !== "running") continue;
+        job.cancellation = { ...shutdownCancellation, at: Date.now() };
         job.cancellationSnapshot = snapshotInProcessSession({
           kind: "in-process",
           jobId: job.id,
@@ -153,13 +165,17 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
           activeTool: job.liveStatus?.activeTool,
           partialOutput: job.liveStatus?.output,
           source: "session_shutdown",
+          initiator: shutdownCancellation.initiator,
+          reason: shutdownCancellation.reason,
         });
       }
-      // Abort all running subagent sessions before clearing
+      // Abort all running subagent sessions before clearing. Prefer the
+      // controller so descendants are torn down too.
       for (const job of jobRegistry.values()) {
         if (job.status === "running") {
           try {
-            job.session.abort().catch(() => {});
+            if (job.abort) job.abort.abort(shutdownCancellation);
+            else job.session.abort().catch(() => {});
           } catch {
             /* session may already be disposed */
           }
