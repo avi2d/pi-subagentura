@@ -1410,6 +1410,9 @@ export function registerInteractiveChildMaintenanceTools(
   registerCleanupArtifactsTool(pi);
 }
 
+export function registerSubagentModelListTool(pi: ExtensionAPI): void {
+  registerListAvailableModelsTool(pi);
+}
 export function registerSubagentArtifactsCleanupTool(pi: ExtensionAPI): void {
   registerCleanupArtifactsTool(pi);
 }

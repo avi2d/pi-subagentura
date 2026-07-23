@@ -35,6 +35,7 @@ import {
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
   registerSubagentArtifactsCleanupTool,
+  registerSubagentModelListTool,
 } from "./tools/in-process";
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
@@ -124,6 +125,7 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveSupervisor(pi);
   if (onlyInteractive) {
     registerSubagentArtifactsCleanupTool(pi);
+    registerSubagentModelListTool(pi);
   } else {
     registerWorkflowTool(pi, sessionContext);
     registerInProcessSubagentTools(pi);

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/subagent";
 
-const INTERACTIVE_TOOL_NAMES = [
+const BASE_INTERACTIVE_TOOL_NAMES = [
   "cancel_interactive_subagent",
   "get_interactive_subagent_status",
   "read_subagent_artifact",
@@ -11,11 +11,15 @@ const INTERACTIVE_TOOL_NAMES = [
   "cleanup_subagent_artifacts",
 ].sort();
 
+const INTERACTIVE_TOOL_NAMES = [
+  ...BASE_INTERACTIVE_TOOL_NAMES,
+  "list_available_models",
+].sort();
+
 const IN_PROCESS_TOOL_NAMES = [
   "cancel_subagent",
   "get_subagent_result",
   "get_subagent_status",
-  "list_available_models",
   "prune_subagent_jobs",
   "subagent_isolated",
   "subagent_with_context",
