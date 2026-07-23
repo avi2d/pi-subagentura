@@ -15,6 +15,7 @@ const INTERACTIVE_TOOL_NAMES = [
   ...BASE_INTERACTIVE_TOOL_NAMES,
   "list_available_models",
 ].sort();
+
 const IN_PROCESS_TOOL_NAMES = [
   "cancel_subagent",
   "get_subagent_result",
