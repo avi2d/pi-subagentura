@@ -40,6 +40,28 @@ workflow({
 });
 ```
 
+## Authoring guidance
+
+Write raw JavaScript without fences. Start with a pure-literal
+`export const meta = { name, description, phases? }` statement; do not use
+TypeScript, imports, `require`, filesystem APIs, `Date.now()`, `Math.random()`,
+or argless `new Date()`. Ambient authoring types are published at
+`pi-subagentura/workflow`. The runtime exposes `agent`, `parallel`, `pipeline`,
+`workflow`, `phase`, `log`, `args`, immutable parent `cwd`, `budget`, `console`,
+and guarded `Date`/`Math`.
+
+Use a workflow only for decomposable multi-agent work. Pass thunks to
+`parallel()`; `pipeline()` streams each item through every stage independently.
+Call `phase()` at real group transitions: later agents inherit that phase unless
+their options explicitly override it. Give agents unique short labels and enough
+context and paths to work independently, handle `null` failures, and use a final
+synthesis agent when the result must be coherent.
+
+Schemas must use the runtime's plain JSON Schema subset. In-process agents use
+native structured output; process-isolated agents fall back to textual JSON
+extraction and validation. Workflow snapshots retain the latest 50 per-agent
+records, while `/workflow-tree` displays the latest 20 and reports omissions.
+
 ## Planning workflows
 
 ### `ralplan-consensus.mjs`

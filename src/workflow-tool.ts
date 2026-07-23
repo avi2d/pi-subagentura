@@ -116,6 +116,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       signal,
       isolation,
       label,
+      schema,
       thinkingLevel,
       onProgress,
       onCancellationSnapshot,
@@ -190,6 +191,9 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         onCancellationSnapshot,
         cancellationSource: "workflow",
         thinkingLevel,
+        ...(isolation === "in-process" && schema !== undefined
+          ? { workflowStructuredOutputSchema: schema }
+          : {}),
       });
       return jobPromise;
     };
@@ -266,7 +270,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "",
       "Injected helpers/globals:",
       "  agent(prompt, opts?)   -> spawn one isolated sub-agent. opts: { schema?, label?, phase?,",
-      "                            model?, persona?, isolation?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
+      "                            model?, persona?, isolation?, agentType?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
       "                            with schema returns a value validated against the supported JSON Schema",
       "                            subset (type, enum, required/properties, additionalProperties, items,",
       "                            minItems, maxItems), or null after retries. Returns null on error",
@@ -276,13 +280,26 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  parallel(thunks)       -> run `() => Promise` thunks concurrently (barrier); failures -> null.",
       "  pipeline(items, ...st) -> stream each item through stages, no barrier between stages.",
       "  workflow(name, args?)  -> run a saved workflow inline (one level deep).",
-      "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> soft completed-output-token target; parallel in-flight calls may overshoot.",
+      "  phase(title) / log(msg)-> progress UI only. args -> your `args`; cwd -> immutable parent working directory; budget -> soft completed-output-token target; parallel in-flight calls may overshoot.",
       "",
       "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
       "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
+    promptSnippet:
+      "Orchestrate decomposable multi-agent work with trusted raw JavaScript workflows.",
+    promptGuidelines: [
+      "Use workflows only for decomposable multi-agent work; handle simple or sequential tasks directly.",
+      "Pass raw JavaScript with no markdown fences. The first statement must be a pure-literal `export const meta = { name, description, phases? }`.",
+      "Do not use TypeScript, imports, require, fs, or other Node APIs. Date.now(), Math.random(), and argless new Date() are unavailable.",
+      "Available globals are agent, parallel, pipeline, workflow, phase, log, args, immutable cwd, budget, console, guarded Date, and guarded Math.",
+      "Call phase(title) at real work-group transitions. Agent phase defaults to the current phase; an explicit agent phase overrides it.",
+      "parallel() takes thunks such as `() => agent(...)`; pipeline() streams each item through every stage independently, with no barrier between stages.",
+      "Give agent calls unique short labels, include enough task context and relevant paths, and treat failed agents or stages as null.",
+      "Use only the documented plain JSON Schema subset for schema outputs; in-process agents use native structured output while process agents use validated textual JSON fallback.",
+      "Filter or handle null results, then use a final synthesis agent when the workflow needs one coherent answer.",
+    ],
     parameters: Type.Object({
       script: Type.Optional(
         Type.String({
@@ -341,6 +358,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       const runAgent = makeRunAgent(ctx);
       const baseOpts = {
         args: params.args,
+        cwd: ctx.cwd,
         budgetTotal: params.budget ?? null,
         runAgent,
         loadWorkflow: (n: string) => loadWorkflowScript(n),
@@ -839,6 +857,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         script,
         {
           args: argsValue,
+          cwd: ctx.cwd,
           budgetTotal: null,
           runAgent: makeRunAgent(ctx),
           loadWorkflow: (n: string) => loadWorkflowScript(n),

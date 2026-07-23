@@ -110,22 +110,23 @@ export interface WorkflowAgentOpts {
   /** Thinking/reasoning level for the sub-agent. Clamped to model capabilities. */
   thinkingLevel?: ThinkingLevel;
 }
-
 export type WorkflowAgentProgress =
   | {
       kind: "phase";
       phase: string;
       message?: string;
       label?: string;
+      agentId?: number;
     }
   | {
       kind: "log";
       message: string;
       phase?: string;
       label?: string;
+      agentId?: number;
     };
 
-/** Injectable spawn function — the real one wraps startSubagentJob / launchInteractiveSubagent. */
+/** Injectable spawn function — wraps in-process or process-backed agents. */
 export type WorkflowAgentRunner = (req: {
   prompt: string;
   persona?: string;
@@ -133,7 +134,8 @@ export type WorkflowAgentRunner = (req: {
   signal?: AbortSignal;
   isolation?: string;
   label?: string;
-  /** Thinking/reasoning level for the sub-agent. */
+  schema?: unknown;
+  /** Thinking/reasoning for the sub-agent. */
   thinkingLevel?: ThinkingLevel;
   /**
    * Optional callback for emitting progress events from inside the runner.
@@ -159,6 +161,7 @@ export type WorkflowProgress =
       phase: string;
       message?: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -172,6 +175,7 @@ export type WorkflowProgress =
       phase?: string;
       message: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -185,6 +189,7 @@ export type WorkflowProgress =
       phase?: string;
       message?: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -198,6 +203,8 @@ export type WorkflowProgress =
       phase?: string;
       message?: string;
       label?: string;
+      status?: "done" | "error";
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -206,6 +213,16 @@ export type WorkflowProgress =
       runningCount: number;
       model?: string;
     };
+
+export interface WorkflowAgentRecord {
+  agentId: number;
+  phase?: string;
+  label?: string;
+  model?: string;
+  status: "running" | "done" | "error";
+}
+
+export const MAX_WORKFLOW_AGENT_RECORDS = 50;
 
 export type WorkflowProgressUpdate = {
   [K in WorkflowProgress["kind"]]: Omit<
@@ -243,6 +260,8 @@ export class WorkflowExecutionError extends Error {
 
 export interface RunWorkflowOptions {
   args?: unknown;
+  /** Parent execution directory exposed to workflow scripts as immutable `cwd`. */
+  cwd?: string;
   /** Soft completed-output-token target; in-flight parallel calls may overshoot. */
   budgetTotal?: number | null;
   runAgent: WorkflowAgentRunner;
