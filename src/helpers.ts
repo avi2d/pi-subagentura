@@ -206,7 +206,7 @@ declare global {
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
   var __piSubagenturaSessionManager:
-    { getEntries?: () => unknown[] } | undefined;
+    { getEntries?: () => unknown[]; getSessionId?: () => string } | undefined;
   var __piSubagenturaInjectCount: number | undefined;
   var __piSubagenturaInteractivePollerHandle:
     ReturnType<typeof setInterval> | undefined;

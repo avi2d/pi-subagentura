@@ -51,6 +51,7 @@ function cleanGlobals() {
   const globalState = globalThis as any;
   globalState.__piSubagenturaPiRef = undefined;
   globalState.__piSubagenturaUi = undefined;
+  globalState.__piSubagenturaSessionManager = undefined;
   globalState.__piSubagenturaParentStreaming = false;
   globalState.__piSubagenturaPendingJobDeliveries = [];
   globalState.__piSubagenturaInProcessFlushScheduled = false;
@@ -164,6 +165,35 @@ describe("in-process completion delivery queue", () => {
       triggerTurn: false,
     });
     expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("does not deliver a queued completion into a replacement parent session", async () => {
+    const firstSessionSend = vi.fn();
+    const secondSessionSend = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: firstSessionSend,
+    };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-a",
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const job = makeJobState({ notifyOnComplete: "notify" });
+
+    deliverNotification(job, SUCCESS_RESULT);
+    await Promise.resolve();
+    expect(firstSessionSend).not.toHaveBeenCalled();
+
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: secondSessionSend,
+    };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-b",
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    flushInProcessDeliveries();
+
+    expect(secondSessionSend).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBeFalsy();
   });
 });
 

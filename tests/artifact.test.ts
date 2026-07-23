@@ -26,6 +26,7 @@ import {
   isTurnTerminal,
   lastEvent,
   listArtifacts,
+  MAX_EVENT_RECORD_BYTES,
   listOutputTurns,
   loadInteractiveStates,
   MAX_EVENT_TEXT_LENGTH,
@@ -265,6 +266,53 @@ describe("artifact", () => {
     }
     expect(batches).toBeGreaterThan(1);
     expect(records).toBe(count);
+  });
+
+  it("does not skip a valid event larger than the physical batch size", () => {
+    const art = artifactPath(root, "oversized-event");
+    ensureArtifactDir(art);
+    const event = {
+      version: 2,
+      eventId: "oversized-completion",
+      turnId: "oversized-turn",
+      ts: 1,
+      type: "completion",
+      outcome: "error",
+      source: "agent_settled",
+      errorMessage: "x".repeat(MAX_EVENT_BATCH_BYTES + 1024),
+    };
+    writeFileSync(art.statusFile, JSON.stringify(event) + "\n");
+
+    const events = readEvents(art);
+
+    expect(events).toHaveLength(1);
+    expect((events[0] as any).eventId).toBe("oversized-completion");
+  });
+
+  it("advances cursor for records larger than MAX_EVENT_RECORD_BYTES", () => {
+    const art = artifactPath(root, "ultra-oversized-event");
+    ensureArtifactDir(art);
+    const event = {
+      version: 2,
+      eventId: "ultra-oversized-completion",
+      turnId: "ultra-oversized-turn",
+      ts: 1,
+      type: "completion",
+      outcome: "done",
+      source: "agent_settled",
+      errorMessage: "x".repeat(MAX_EVENT_RECORD_BYTES + 1024),
+    };
+    writeFileSync(art.statusFile, JSON.stringify(event) + "\n");
+
+    const first = readEventBatch(art, 0);
+
+    expect(first.endOffset).toBeGreaterThan(0);
+
+    const second = readEventBatch(art, first.endOffset);
+
+    expect(second.endOffset).toBeGreaterThan(first.endOffset);
+
+    expect(readEvents(art)).toEqual([]);
   });
 
   describe("readOutput", () => {
@@ -994,6 +1042,36 @@ describe("persisted interactive state helpers", () => {
     appendInteractiveState(root, updated);
 
     expect(loadInteractiveStates(root)?.states["abc12345"]?.paneId).toBe("%99");
+  });
+
+  it("preserves updates from concurrent parents using the same cwd", () => {
+    saveInteractiveStates(root, {
+      schemaVersion: 2,
+      parent: "pi",
+      states: {},
+    });
+    const firstParent = loadInteractiveStates(root)!;
+    const secondParent = loadInteractiveStates(root)!;
+    firstParent.states.aaaaaaaa = {
+      ...SAMPLE,
+      id: "aaaaaaaa",
+      artifactDir: "/tmp/artifacts/aaaaaaaa",
+      parentSessionId: "parent-a",
+    };
+    secondParent.states.bbbbbbbb = {
+      ...SAMPLE,
+      id: "bbbbbbbb",
+      artifactDir: "/tmp/artifacts/bbbbbbbb",
+      parentSessionId: "parent-b",
+    };
+
+    saveInteractiveStates(root, firstParent);
+    saveInteractiveStates(root, secondParent);
+
+    expect(Object.keys(loadInteractiveStates(root)!.states).sort()).toEqual([
+      "aaaaaaaa",
+      "bbbbbbbb",
+    ]);
   });
 
   it("removeInteractiveState drops the entry by id", () => {

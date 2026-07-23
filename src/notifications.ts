@@ -32,6 +32,8 @@ const MAX_IN_PROCESS_FLUSH_BYTES = 64 * 1024;
 interface PendingJobCompletion {
   kind: "completion";
   deliveryId: string;
+  ownerPi: ExtensionAPI;
+  ownerSessionId?: string;
   jobState: JobState;
   result: SubagentResult;
 }
@@ -39,6 +41,8 @@ interface PendingJobCompletion {
 interface PendingJobOverflow {
   kind: "overflow";
   deliveryId: string;
+  ownerPi: ExtensionAPI;
+  ownerSessionId?: string;
   overflowPath: string;
   mode: NotifyOnComplete;
   triggerTurn: boolean;
@@ -139,6 +143,8 @@ function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
       .update(`in-process-overflow\0${oldest.deliveryId}`)
       .digest("hex")
       .slice(0, 32),
+    ownerPi: oldest.ownerPi,
+    ownerSessionId: oldest.ownerSessionId,
     overflowPath,
     mode: "notify",
     triggerTurn: false,
@@ -271,6 +277,7 @@ export function deliverNotification(
   if (!pi) return; // extension not loaded yet
 
   const mode = jobState.notifyOnComplete ?? "inject";
+  const ownerSessionId = g2.__piSubagenturaSessionManager?.getSessionId?.();
   const deliveryId = createHash("sha256")
     .update(`${jobState.id}\0${mode}`)
     .digest("hex")
@@ -290,6 +297,8 @@ export function deliverNotification(
     queue.push({
       kind: "completion",
       deliveryId,
+      ownerPi: pi,
+      ownerSessionId,
       jobState,
       result: boundedResult,
     });
@@ -321,6 +330,7 @@ export function flushInProcessDeliveries(): void {
   const g = globalThis as any;
   const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return;
+  const currentSessionId = g.__piSubagenturaSessionManager?.getSessionId?.();
   const queue = pendingJobDeliveries();
   const llm: Array<{
     pending: PendingJobDelivery;
@@ -332,6 +342,14 @@ export function flushInProcessDeliveries(): void {
   let bytes = 0;
   for (let index = 0; index < queue.length;) {
     const pending = queue[index];
+    const crossedSession =
+      pending.ownerSessionId !== undefined &&
+      currentSessionId !== undefined &&
+      pending.ownerSessionId !== currentSessionId;
+    if (crossedSession) {
+      queue.splice(index, 1);
+      continue;
+    }
     if (pending.kind === "overflow") {
       const content =
         "⚠️ In-process completion delivery overflowed its bounded queue." +
