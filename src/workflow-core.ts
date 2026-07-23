@@ -290,28 +290,128 @@ export function extractJson(text: string): string | null {
   let s = text.trim();
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
   if (fence) s = fence[1].trim();
-  const start = s.search(/[[{]/);
-  if (start === -1) return null;
-  const open = s[start];
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  let i = start;
-  let inStr: string | null = null;
-  for (; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (c === "\\") i++;
-      else if (c === inStr) inStr = null;
-      continue;
-    }
-    if (c === '"' || c === "'") inStr = c;
-    else if (c === open) depth++;
-    else if (c === close) {
-      depth--;
-      if (depth === 0) return s.slice(start, i + 1);
+  const balanced = extractBalancedJsonToken(s);
+  if (balanced) return balanced;
+
+  const scalar = extractScalarJsonToken(s);
+  return scalar;
+}
+
+function extractBalancedJsonToken(s: string): string | undefined {
+  for (let i = 0; i < s.length; i++) {
+    const open = s[i];
+    if (open !== "{" && open !== "[") continue;
+    const close = open === "{" ? "}" : "]";
+    let depth = 0;
+    let inStr: string | null = null;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (inStr) {
+        if (c === "\\") {
+          j++;
+          continue;
+        }
+        if (c === inStr) inStr = null;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        inStr = c;
+      } else if (c === open) {
+        depth++;
+      } else if (c === close) {
+        depth--;
+        if (depth === 0) return s.slice(i, j + 1);
+      }
     }
   }
+  return undefined;
+}
+
+function extractScalarJsonToken(s: string): string | null {
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === " " || c === "\n" || c === "\t" || c === "\r") {
+      continue;
+    }
+
+    if (c === '"' || c === "'") {
+      if (!canStartScalarToken(s, i)) continue;
+      const quoted = parseQuotedStringToken(s, i);
+      if (!quoted) continue;
+      return quoted;
+    }
+
+    if (c === "t" && isJsonKeyword(s, i, "true")) {
+      return "true";
+    }
+    if (c === "f" && isJsonKeyword(s, i, "false")) {
+      return "false";
+    }
+    if (c === "n" && isJsonKeyword(s, i, "null")) {
+      return "null";
+    }
+
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      if (!canStartScalarToken(s, i)) continue;
+      const raw = parseNumberToken(s, i);
+      if (raw) return raw;
+      continue;
+    }
+
+    if (!isBoundaryChar(c)) {
+      return null;
+    }
+  }
+
   return null;
+}
+
+function isBoundaryChar(ch: string | undefined): boolean {
+  return /^[a-z0-9]$/i.test(ch ?? "");
+}
+
+function canStartScalarToken(text: string, index: number): boolean {
+  if (index <= 0) return true;
+  return !isBoundaryChar(text[index - 1]);
+}
+
+function isJsonKeyword(text: string, index: number, keyword: string): boolean {
+  if (!canStartScalarToken(text, index)) return false;
+  if (text.slice(index, index + keyword.length) !== keyword) return false;
+  const next = text[index + keyword.length];
+  return !isBoundaryChar(next);
+}
+
+function parseNumberToken(text: string, start: number): string | undefined {
+  const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(
+    text.slice(start),
+  );
+  if (!match) return undefined;
+  const raw = match[0];
+  const end = text[start + raw.length];
+  if (end !== undefined && isBoundaryChar(end)) return undefined;
+  return raw;
+}
+
+function parseQuotedStringToken(text: string, start: number): string | null {
+  const quote = text[start];
+  let i = start + 1;
+  let escaped = false;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (c === quote) break;
+  }
+  if (i >= text.length) return null;
+  const value = text.slice(start + 1, i);
+  return quote === '"' ? `"${value}"` : JSON.stringify(value);
 }
 
 /** Validate `value` against a small JSON-Schema subset. Returns a list of human-readable errors. */
@@ -320,6 +420,9 @@ export function validateSchema(
   schema: any,
   path = "$",
 ): string[] {
+  const schemaErrors = validateSchemaDefinition(schema, path);
+  if (schemaErrors.length > 0) return schemaErrors;
+
   if (!schema || typeof schema !== "object") return [];
   const errs: string[] = [];
   const t = schema.type as string | string[] | undefined;
@@ -386,6 +489,128 @@ export function validateSchema(
   return errs;
 }
 
+export function validateSchemaDefinition(schema: any, path = "$"): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return [`${path}: schema must be an object`];
+  }
+
+  const errs: string[] = [];
+  const allowed = new Set([
+    "type",
+    "enum",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "minItems",
+    "maxItems",
+  ]);
+
+  for (const key of Object.keys(schema)) {
+    if (allowed.has(key)) continue;
+    errs.push(`${path}: unsupported schema key "${key}"`);
+  }
+
+  const validTypes = new Set([
+    "object",
+    "array",
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "null",
+  ]);
+  if (schema.type !== undefined) {
+    if (Array.isArray(schema.type)) {
+      for (const t of schema.type) {
+        if (typeof t !== "string") {
+          errs.push(
+            `${path}.type: expected string type name, got ${jsType(t)}`,
+          );
+          continue;
+        }
+        if (!validTypes.has(t)) {
+          errs.push(`${path}.type: unsupported type "${t}"`);
+        }
+      }
+    } else if (typeof schema.type === "string") {
+      if (!validTypes.has(schema.type)) {
+        errs.push(`${path}.type: unsupported type "${schema.type}"`);
+      }
+    } else {
+      errs.push(`${path}.type: expected string or array`);
+    }
+  }
+
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) {
+    errs.push(`${path}.enum: expected array`);
+  }
+
+  if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required)) {
+      errs.push(`${path}.required: expected string array`);
+    } else if (!schema.required.every((k: unknown) => typeof k === "string")) {
+      errs.push(`${path}.required: expected string array`);
+    }
+  }
+
+  if (schema.additionalProperties !== undefined) {
+    const ap = schema.additionalProperties;
+    if (typeof ap !== "boolean") {
+      errs.push(
+        ...validateSchemaDefinition(ap, `${path}.additionalProperties`),
+      );
+    }
+  }
+
+  if (
+    schema.properties !== undefined &&
+    (schema.properties === null ||
+      typeof schema.properties !== "object" ||
+      Array.isArray(schema.properties))
+  ) {
+    errs.push(`${path}.properties: expected object`);
+  }
+
+  if (typeof schema.minItems !== "undefined") {
+    if (!Number.isInteger(schema.minItems) || schema.minItems < 0) {
+      errs.push(`${path}.minItems: expected non-negative integer`);
+    }
+  }
+  if (typeof schema.maxItems !== "undefined") {
+    if (!Number.isInteger(schema.maxItems) || schema.maxItems < 0) {
+      errs.push(`${path}.maxItems: expected non-negative integer`);
+    } else if (
+      schema.minItems !== undefined &&
+      Number.isInteger(schema.minItems) &&
+      schema.maxItems < schema.minItems
+    ) {
+      errs.push(`${path}.maxItems: must be >= minItems`);
+    }
+  }
+
+  if (
+    schema.items !== undefined &&
+    (schema.items === null || typeof schema.items !== "object")
+  ) {
+    errs.push(`${path}.items: expected object`);
+  } else if (schema.items !== undefined && !Array.isArray(schema.items)) {
+    errs.push(...validateSchemaDefinition(schema.items, `${path}.items`));
+  }
+
+  if (
+    schema.properties &&
+    typeof schema.properties === "object" &&
+    !Array.isArray(schema.properties)
+  ) {
+    for (const [k, sub] of Object.entries(schema.properties)) {
+      errs.push(...validateSchemaDefinition(sub, `${path}.${k}`));
+    }
+  }
+
+  return errs;
+}
+
 function matchesType(v: unknown, ty: string): boolean {
   switch (ty) {
     case "object":
@@ -403,7 +628,7 @@ function matchesType(v: unknown, ty: string): boolean {
     case "null":
       return v === null;
     default:
-      return true;
+      return false;
   }
 }
 

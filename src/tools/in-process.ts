@@ -725,8 +725,11 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "get_subagent_result",
     label: "Get Subagent Result",
-    description:
+    description: [
       "Block until an async subagent job completes, then return the final output and usage summary.",
+      "ONLY call this tool when the user explicitly asks you to wait for or collect a specific async result.",
+      "Do not call it immediately after spawning async sub-agents; completion injection handles normal background fan-out.",
+    ].join("\n"),
     parameters: ResultParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -777,29 +780,98 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         };
       }
 
-      // Active waits suppress settlement notifications without treating an
-      // aborted wait as a retrieved result.
-      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
-      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
-      try {
-        waitResult = await abortableWait(job.promise, signal);
-      } finally {
-        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
-      }
-      if (waitResult.aborted) {
+      if (job.status === "running" && params.wait !== true) {
+        const live = buildLiveUpdate(job.liveStatus, job.modelLabel);
+        const currentText =
+          (live.content?.[0] as { type: "text"; text: string } | undefined)
+            ?.text || "";
         return {
+          ...live,
           content: [
             {
               type: "text",
-              text: `Wait for job ${params.jobId} cancelled.`,
+              text: currentText
+                ? `${currentText}\n\nJob ${params.jobId} continues in the background.`
+                : `Job ${params.jobId} continues in the background.`,
             },
+          ],
+          details: {
+            ...(live.details as Record<string, unknown>),
+            jobId: params.jobId,
+          },
+        };
+      }
+
+      // Active waits suppress settlement notifications while they are running,
+      // without treating an aborted wait as a retrieved result.
+      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
+      let timedOut = false;
+      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      let parentAbortHandler: (() => void) | undefined;
+      const waitTimeoutMs = Math.min(
+        Math.max(params.timeoutMs ?? 30_000, 1),
+        300_000,
+      );
+      let waitActive = true;
+      const releaseActiveResultWait = (): void => {
+        if (!waitActive) return;
+        waitActive = false;
+        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
+      };
+      const waitController = new AbortController();
+      const cleanup = (): void => {
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        if (signal && parentAbortHandler) {
+          signal.removeEventListener("abort", parentAbortHandler);
+        }
+        releaseActiveResultWait();
+      };
+      parentAbortHandler = () => {
+        releaseActiveResultWait();
+        waitController.abort(signal?.reason);
+      };
+      if (signal) {
+        signal.addEventListener("abort", parentAbortHandler);
+      }
+      if (job.status === "running") {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          releaseActiveResultWait();
+          waitController.abort("timeout");
+        }, waitTimeoutMs);
+      }
+      try {
+        waitResult = await abortableWait(job.promise, waitController.signal);
+      } finally {
+        cleanup();
+      }
+      if (waitResult.aborted) {
+        if (timedOut) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Timed out while waiting for job ${params.jobId} after ${waitTimeoutMs}ms.`,
+              },
+            ],
+            details: {
+              jobId: params.jobId,
+              status: "wait_timeout",
+              timeoutMs: waitTimeoutMs,
+            },
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            { type: "text", text: `Wait for job ${params.jobId} cancelled.` },
           ],
           details: { jobId: params.jobId, status: "wait_cancelled" },
           isError: true,
         };
       }
       const result = waitResult.value!;
-
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
 
@@ -815,7 +887,6 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-
       const usageStr = formatUsage(result.usage, result.model);
       const details: InProcessSubagentDetails = {
         status: result.isError ? "error" : "done",
@@ -824,7 +895,6 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         usageSummary: usageStr,
         thinkingLevel: result.thinkingLevel,
       };
-
       return {
         content: [
           {

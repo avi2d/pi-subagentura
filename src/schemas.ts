@@ -89,6 +89,20 @@ export const ResultParams = Type.Object({
     description:
       "Job ID returned by async subagent_with_context or subagent_isolated spawn",
   }),
+  wait: Type.Optional(
+    Type.Boolean({
+      description:
+        "Explicitly wait for a running job. Set true ONLY when the user asks to wait. Otherwise running jobs return immediately and continue in the background.",
+    }),
+  ),
+  timeoutMs: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 300_000,
+      description:
+        "Maximum explicit wait in milliseconds. Defaults to 30000. A timeout does not cancel the job.",
+    }),
+  ),
 });
 
 export const CancelParams = Type.Object({

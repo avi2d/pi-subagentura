@@ -12,6 +12,7 @@ import type {
 import { formatUsage, jobRegistry } from "./helpers";
 import { isCompletionEvent, type SubagentEvent } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+import { getActiveSessionContextId } from "./session-context";
 
 /**
  * @deprecated Delivery is queue-bounded rather than concurrency-capped.
@@ -34,6 +35,7 @@ interface PendingJobCompletion {
   deliveryId: string;
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
+  ownerSessionContextId?: number;
   jobState: JobState;
   result: SubagentResult;
 }
@@ -43,6 +45,7 @@ interface PendingJobOverflow {
   deliveryId: string;
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
+  ownerSessionContextId?: number;
   overflowPath: string;
   mode: NotifyOnComplete;
   triggerTurn: boolean;
@@ -145,6 +148,7 @@ function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
       .slice(0, 32),
     ownerPi: oldest.ownerPi,
     ownerSessionId: oldest.ownerSessionId,
+    ownerSessionContextId: oldest.ownerSessionContextId,
     overflowPath,
     mode: "notify",
     triggerTurn: false,
@@ -253,6 +257,23 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
   }
   return summary;
 }
+function runningInProcessJobCount(): number {
+  return [...jobRegistry.values()].filter((job) => job.status === "running")
+    .length;
+}
+
+function runningInProcessJobsNote(): string {
+  const remaining = runningInProcessJobCount();
+  if (remaining <= 0) return "";
+  const noun = remaining === 1 ? "job" : "jobs";
+  const verb = remaining === 1 ? "is" : "are";
+  return `${remaining} in-process sub-agent ${noun} ${verb} still running\nDo not claim all review work is complete yet`;
+}
+
+function appendRunningJobsNote(content: string): string {
+  const note = runningInProcessJobsNote();
+  return note ? `${content}\n${note}` : content;
+}
 
 function completionMessageOptions(triggerTurnOnComplete?: boolean): {
   deliverAs: "followUp";
@@ -278,6 +299,7 @@ export function deliverNotification(
 
   const mode = jobState.notifyOnComplete ?? "inject";
   const ownerSessionId = g2.__piSubagenturaSessionManager?.getSessionId?.();
+  const ownerSessionContextId = getActiveSessionContextId();
   const deliveryId = createHash("sha256")
     .update(`${jobState.id}\0${mode}`)
     .digest("hex")
@@ -299,6 +321,7 @@ export function deliverNotification(
       deliveryId,
       ownerPi: pi,
       ownerSessionId,
+      ownerSessionContextId,
       jobState,
       result: boundedResult,
     });
@@ -331,6 +354,7 @@ export function flushInProcessDeliveries(): void {
   const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return;
   const currentSessionId = g.__piSubagenturaSessionManager?.getSessionId?.();
+  const currentContextId = getActiveSessionContextId();
   const queue = pendingJobDeliveries();
   const llm: Array<{
     pending: PendingJobDelivery;
@@ -340,20 +364,26 @@ export function flushInProcessDeliveries(): void {
     status: "done" | "error";
   }> = [];
   let bytes = 0;
+  const runningJobsCount = runningInProcessJobCount();
   for (let index = 0; index < queue.length;) {
     const pending = queue[index];
+    const crossedContext =
+      pending.ownerSessionContextId !== undefined &&
+      pending.ownerSessionContextId !== currentContextId;
     const crossedSession =
       pending.ownerSessionId !== undefined &&
       currentSessionId !== undefined &&
       pending.ownerSessionId !== currentSessionId;
-    if (crossedSession) {
+    const shouldDrop = crossedContext || crossedSession;
+    if (shouldDrop) {
       queue.splice(index, 1);
       continue;
     }
     if (pending.kind === "overflow") {
-      const content =
+      let content =
         "⚠️ In-process completion delivery overflowed its bounded queue." +
         `\nCompletion identity ledger: ${pending.overflowPath}`;
+      content = appendRunningJobsNote(content);
       const itemBytes = Buffer.byteLength(content, "utf8");
       if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES)
         break;
@@ -368,19 +398,18 @@ export function flushInProcessDeliveries(): void {
       index++;
       continue;
     }
-    const { jobState, result, deliveryId } = pending;
+    const { jobState, result } = pending;
     const mode = jobState.notifyOnComplete ?? "inject";
     const trigger = completionTriggersTurn(
       mode,
       jobState.triggerTurnOnComplete,
     );
     const summary = buildNotifySummary(jobState.id, result);
-    const content =
+    let content =
       mode === "inject"
-        ? `${summary}\n[Untrusted sub-agent output]\n${
-            sanitizeOutput(result.output) || "(sub-agent produced no output)"
-          }`
+        ? `${summary}\n[Untrusted sub-agent output]\n${sanitizeOutput(result.output) || "(sub-agent produced no output)"}`
         : `${summary}\nResult retained in job ${jobState.id}; use get_subagent_result for details.`;
+    content = appendRunningJobsNote(content);
     const itemBytes = Buffer.byteLength(content, "utf8");
     if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES) break;
     llm.push({
@@ -393,6 +422,7 @@ export function flushInProcessDeliveries(): void {
     bytes += itemBytes;
     index++;
   }
+
   if (llm.length === 0) return;
   const triggersTurn = llm.some(({ trigger }) => trigger);
   if (g.__piSubagenturaParentStreaming && !triggersTurn) return;
@@ -414,6 +444,7 @@ export function flushInProcessDeliveries(): void {
             ? "error"
             : "done",
           error: llm.some(({ status }) => status === "error"),
+          remainingRunningJobs: runningJobsCount,
         },
       },
       {

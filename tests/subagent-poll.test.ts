@@ -400,6 +400,7 @@ describe("pollArtifactChanges", () => {
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
+    mod.jobRegistry.set("still-running", { status: "running" } as any);
     const art = artifactPath(join(artifactDir, ".."), state.id);
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
@@ -416,6 +417,10 @@ describe("pollArtifactChanges", () => {
     expect(call.content).toContain("Output:");
     expect(call.content).toContain("Activity log:");
     expect(call.content).not.toContain("read_subagent_artifact");
+    expect(call.content).toContain(
+      "1 in-process sub-agent job is still running",
+    );
+    expect(call.details.remainingRunningJobs).toBe(1);
     expect(state.eventByteCursor).toBe(eventLogEndOffset(art));
   });
 

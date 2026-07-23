@@ -222,7 +222,7 @@ describe("get_subagent_result abort-aware wait", () => {
 
     const result = await toolDef.execute(
       "call-1",
-      { jobId },
+      { jobId, wait: true },
       ac.signal,
       undefined,
       mockCtx(),
@@ -249,7 +249,7 @@ describe("get_subagent_result abort-aware wait", () => {
     // Start the tool call
     const toolPromise = toolDef.execute(
       "call-1",
-      { jobId },
+      { jobId, wait: true },
       ac.signal,
       undefined,
       mockCtx(),
@@ -292,7 +292,13 @@ describe("get_subagent_result abort-aware wait", () => {
     const ac = new AbortController();
     ac.abort();
 
-    await toolDef.execute("call-1", { jobId }, ac.signal, undefined, mockCtx());
+    await toolDef.execute(
+      "call-1",
+      { jobId, wait: true },
+      ac.signal,
+      undefined,
+      mockCtx(),
+    );
 
     // Key invariant: resultRetrieved must be false when wait is aborted
     expect(job.resultRetrieved).toBeFalsy();
@@ -320,7 +326,13 @@ describe("get_subagent_result abort-aware wait", () => {
     const ac = new AbortController();
     const removeSpy = vi.spyOn(ac.signal, "removeEventListener");
 
-    await toolDef.execute("call-1", { jobId }, ac.signal, undefined, mockCtx());
+    await toolDef.execute(
+      "call-1",
+      { jobId, wait: true },
+      ac.signal,
+      undefined,
+      mockCtx(),
+    );
 
     // After normal completion, the abort listener should be removed
     expect(removeSpy).toHaveBeenCalledWith("abort", expect.any(Function));
@@ -350,7 +362,7 @@ describe("get_subagent_result abort-aware wait", () => {
     );
     const wait = toolDef.execute(
       "result-call",
-      { jobId },
+      { jobId, wait: true },
       new AbortController().signal,
       undefined,
       mockCtx(),

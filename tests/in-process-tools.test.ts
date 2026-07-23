@@ -528,6 +528,91 @@ describe("get_subagent_result tool", () => {
     toolDef = getToolDef(api, "get_subagent_result");
   });
 
+  it("warns agents to wait only when explicitly requested", () => {
+    expect(toolDef.description).toContain(
+      "ONLY call this tool when the user explicitly asks you to wait",
+    );
+    expect(toolDef.description).toContain(
+      "Do not call it immediately after spawning async sub-agents",
+    );
+  });
+
+  it("returns immediately for a running job unless waiting is explicit", async () => {
+    const jobId = "running-without-wait";
+    let resolveJob!: (value: SubagentResult) => void;
+    const jobPromise = new Promise<SubagentResult>((resolve) => {
+      resolveJob = resolve;
+    });
+    const job = createJobState({ id: jobId, promise: jobPromise });
+    jobRegistry.set(jobId, job);
+
+    const executePromise = toolDef.execute(
+      "call-1",
+      { jobId },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    const raced = await Promise.race([
+      executePromise.then((result: any) => ({
+        kind: "result" as const,
+        result,
+      })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 20),
+      ),
+    ]);
+
+    resolveJob(defaultSuccessResult);
+    await executePromise;
+    expect(raced.kind).toBe("result");
+    if (raced.kind !== "result") return;
+    expect(raced.result.details.status).toBe("running");
+    expect(raced.result.content[0].text).toContain(
+      "continues in the background",
+    );
+    expect(job.resultRetrieved).toBeFalsy();
+  });
+
+  it("bounds an explicit wait and leaves the job running after timeout", async () => {
+    const jobId = "bounded-explicit-wait";
+    let resolveJob!: (value: SubagentResult) => void;
+    const jobPromise = new Promise<SubagentResult>((resolve) => {
+      resolveJob = resolve;
+    });
+    const job = createJobState({ id: jobId, promise: jobPromise });
+    jobRegistry.set(jobId, job);
+
+    const executePromise = toolDef.execute(
+      "call-1",
+      { jobId, wait: true, timeoutMs: 10 },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    const raced = await Promise.race([
+      executePromise.then((result: any) => ({
+        kind: "result" as const,
+        result,
+      })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 30),
+      ),
+    ]);
+
+    resolveJob(defaultSuccessResult);
+    await executePromise;
+    expect(raced.kind).toBe("result");
+    if (raced.kind !== "result") return;
+    expect(raced.result.details).toMatchObject({
+      jobId,
+      status: "wait_timeout",
+      timeoutMs: 10,
+    });
+    expect(job.status).toBe("running");
+    expect(job.resultRetrieved).toBeFalsy();
+  });
+
   it("returns not_found for unknown jobId", async () => {
     const result = await toolDef.execute(
       "call-1",
@@ -618,10 +703,10 @@ describe("get_subagent_result tool", () => {
     });
     jobRegistry.set(jobId, job);
 
-    // Start execute – it will set resultRetrieved=true then await the promise
+    // Start execute and wait for completion so cancellation race can be observed.
     const executePromise = toolDef.execute(
       "call-1",
-      { jobId },
+      { jobId, wait: true },
       undefined,
       undefined,
       mockCtx(),

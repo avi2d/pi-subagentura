@@ -31,6 +31,29 @@ export const MAX_FLUSH_BYTES = 64 * 1024;
 export const MAX_ARTIFACT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_FORMATTED_IDENTIFIER = 96;
 
+function runningInProcessJobCount(): number {
+  const g = globalThis as any;
+  const registry = g.__piSubagenturaRegistry;
+  if (!(registry instanceof Map)) return 0;
+  return [...registry.values()].filter((job) => {
+    const status = (job as { status?: unknown })?.status;
+    return status === "running";
+  }).length;
+}
+
+function runningInProcessJobsNote(): string {
+  const remaining = runningInProcessJobCount();
+  if (remaining <= 0) return "";
+  const noun = remaining === 1 ? "job" : "jobs";
+  const verb = remaining === 1 ? "is" : "are";
+  return `${remaining} in-process sub-agent ${noun} ${verb} still running\nDo not claim all review work is complete yet`;
+}
+
+function appendRunningJobsNote(content: string): string {
+  const note = runningInProcessJobsNote();
+  return note ? `${content}\n${note}` : content;
+}
+
 function boundedIdentifier(value: unknown, fallback: string): string {
   if (typeof value !== "string" || value.length === 0) return fallback;
   const sanitized = sanitizeOutput(value.slice(0, MAX_FORMATTED_IDENTIFIER));
@@ -267,6 +290,7 @@ function formatIntent(intent: PersistedDeliveryIntent): string {
   const output = intent.mode === "inject" ? readBoundedOutput(intent) : null;
   const message =
     typeof intent.message === "string" ? sanitizeOutput(intent.message) : "";
+
   const body =
     intent.mode === "notify"
       ? message
@@ -277,7 +301,9 @@ function formatIntent(intent: PersistedDeliveryIntent): string {
           ? `\n${message}`
           : "\n(no immutable output available)"
         : `\n<untrusted-subagent-output>\n${output || "(empty output)"}\n</untrusted-subagent-output>`;
-  return truncateUtf8(`${header}${body}\n${pointer(intent)}`, MAX_FLUSH_BYTES);
+  return appendRunningJobsNote(
+    truncateUtf8(`${header}${body}\n${pointer(intent)}`, MAX_FLUSH_BYTES),
+  );
 }
 
 export function flushDeliveries(
@@ -297,6 +323,7 @@ export function flushDeliveries(
       llm.push({ state, intent, content: formatIntent(intent) });
     }
   }
+  const runningJobsCount = runningInProcessJobCount();
   if (llm.length === 0) return;
   const selected: typeof llm = [];
   let bytes = 0;
@@ -327,6 +354,7 @@ export function flushDeliveries(
             : selected.some(({ intent }) => intent.status === "cancelled")
               ? "cancelled"
               : "done",
+          remainingRunningJobs: runningJobsCount,
           error: selected.some(({ intent }) => intent.status === "error"),
         },
       },

@@ -1,11 +1,10 @@
-/**
- * Session lifecycle handlers and interactive poller setup.
- *
+/** Session lifecycle handlers and interactive poller setup.
+
  * Extracted from src/subagent.ts so the extension entrypoint can stay focused
  * on registration and public exports.
  */
 
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deleteInteractiveStatesFile } from "./artifact";
 import { pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
@@ -19,13 +18,23 @@ import {
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { workflowJobRegistry } from "./workflow-jobs";
+import {
+  createSessionContextRef,
+  getSessionContextStack,
+  registerSessionContext,
+  removeSessionContext,
+  setActiveSessionRefs,
+} from "./session-context";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
 export function registerSessionHandlers(pi: ExtensionAPI): void {
+  const sessionContext = createSessionContextRef(pi);
   const g2 = getGlobalState() as any;
+  registerSessionContext(sessionContext);
+  setActiveSessionRefs(sessionContext);
 
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaParentStreaming = false;
@@ -43,8 +52,16 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
   pi.on("session_start", (event, ctx) => {
+    removeSessionContext(sessionContext.id);
+    sessionContext.ui = ctx.ui;
+    sessionContext.sessionManager = ctx.sessionManager;
+    registerSessionContext(sessionContext);
+    setActiveSessionRefs(sessionContext);
     g2.__piSubagenturaUi = ctx.ui;
     g2.__piSubagenturaSessionManager = ctx.sessionManager;
+    g2.__piSubagenturaPiRef = pi;
+    g2.__piSubagenturaParentStreaming = false;
+
     // Rehydrate on startup (resumed session after quit), reload, and resume.
     // The session ID filter ensures only subagents created in this specific session
     // are rehydrated. On 'new' and 'fork' we skip — those are explicit fresh starts.
@@ -94,6 +111,21 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       ctx: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
     ) => {
       const g2 = getGlobalState() as any;
+      const contextStack = getSessionContextStack();
+      const contextIndex = contextStack.findIndex(
+        (entry) => entry.id === sessionContext.id,
+      );
+      if (contextIndex < 0) return;
+
+      const wasTop = contextIndex === contextStack.length - 1;
+      removeSessionContext(sessionContext.id);
+      setActiveSessionRefs(contextStack[contextStack.length - 1]);
+      g2.__piSubagenturaParentStreaming = false;
+
+      if (!wasTop || contextStack.length > 0) {
+        // Non-top handlers belong to nested sessions; restore parent refs only.
+        return;
+      }
 
       // Stop the global poller so it doesn't fire after we're gone. Without
       // clearInterval the handle would keep the event loop alive across restarts.

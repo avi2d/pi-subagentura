@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { jobRegistry } from "../src/helpers";
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
+import { updateRunningSubagentFooter } from "../src/artifact-poller";
 import { workflowJobRegistry } from "../src/workflow-jobs";
 
 function registerHandlers() {
@@ -36,6 +37,11 @@ describe("session handler lifecycle callbacks", () => {
     globalState.__piSubagenturaUi = undefined;
     globalState.__piSubagenturaSessionManager = undefined;
     globalState.__piSubagenturaParentStreaming = false;
+    const contextStack = globalState.__piSubagenturaSessionContextStack;
+    if (Array.isArray(contextStack)) {
+      contextStack.length = 0;
+    }
+    globalState.__piSubagenturaSessionContextIdCounter = 0;
   });
 
   afterEach(() => {
@@ -93,5 +99,81 @@ describe("session handler lifecycle callbacks", () => {
     expect(workflowJobRegistry.size).toBe(0);
     expect((globalThis as any).__piSubagenturaPiRef).toBeUndefined();
     expect(pi.on).toHaveBeenCalled();
+  });
+
+  it("keeps parent async jobs and footer visible after nested session shutdown", () => {
+    const parent = registerHandlers();
+    const child = registerHandlers();
+    const parentUi = { setStatus: vi.fn() };
+    const parentSessionManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    const childSessionManager = {
+      getSessionId: () => "child-session",
+      getEntries: () => [],
+    };
+    const parentCtx = {
+      cwd: root,
+      ui: parentUi,
+      sessionManager: parentSessionManager,
+    };
+    const childCtx = {
+      cwd: root,
+      ui: parentUi,
+      sessionManager: childSessionManager,
+    };
+
+    parent.handlers.get("session_start")![0](
+      { reason: "startup" },
+      parentCtx as any,
+    );
+    child.handlers.get("session_start")![0](
+      { reason: "startup" },
+      childCtx as any,
+    );
+
+    jobRegistry.set("running-parent-job", {
+      id: "running-parent-job",
+      status: "running",
+      liveStatus: {
+        turn: 0,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn() },
+      startedAt: Date.now(),
+      promise: new Promise<never>(() => {}),
+    } as any);
+
+    updateRunningSubagentFooter(parentUi as any);
+    expect(parentUi.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent running",
+    );
+    parentUi.setStatus.mockClear();
+
+    child.handlers.get("session_shutdown")![1](
+      { reason: "agent_settled" },
+      childCtx as any,
+    );
+    expect(jobRegistry.size).toBe(1);
+    expect((globalThis as any).__piSubagenturaPiRef).toBe(parent.pi);
+    expect((globalThis as any).__piSubagenturaSessionManager).toBe(
+      parentSessionManager,
+    );
+
+    updateRunningSubagentFooter(parentUi as any);
+    expect(parentUi.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent running",
+    );
   });
 });

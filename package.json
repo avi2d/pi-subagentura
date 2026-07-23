@@ -64,6 +64,7 @@
     "src/multiplexer-zellij.ts",
     "src/rehydrate.ts",
     "src/session-handlers.ts",
+    "src/session-context.ts",
     "src/subagent.ts",
     "src/subagent-artifact-cli.ts",
     "src/workflow.ts",

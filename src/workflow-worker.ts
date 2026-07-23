@@ -25,6 +25,7 @@ import {
   defaultConcurrency,
   defaultProcessConcurrency,
   extractJson,
+  validateSchemaDefinition,
   validateSchema,
   type RunWorkflowOptions,
   type Semaphore,
@@ -209,6 +210,14 @@ async function executeScript(
     const prompt = payload.prompt;
     const agentOpts = payload.opts ?? {};
     const hasSchema = agentOpts.schema != null;
+    if (hasSchema) {
+      const schemaValidation = validateSchemaDefinition(agentOpts.schema);
+      if (schemaValidation.length > 0) {
+        throw new Error(
+          `Invalid workflow schema: ${schemaValidation.join("; ")}`,
+        );
+      }
+    }
     const isolation = agentOpts.isolation ?? "process";
     const isProcess = isolation !== "in-process";
     const sem = isProcess ? engine.processSem : engine.sem;

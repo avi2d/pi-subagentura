@@ -101,7 +101,13 @@ describe("session_shutdown handler", () => {
     const g = globalThis as any;
     g.__piSubagenturaInteractivePollerHandle = undefined;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    const contextStack = g.__piSubagenturaSessionContextStack;
+    if (Array.isArray(contextStack)) contextStack.length = 0;
+    g.__piSubagenturaSessionContextIdCounter = 0;
     g.__piSubagenturaPiRef = undefined;
+    g.__piSubagenturaUi = undefined;
+    g.__piSubagenturaSessionManager = undefined;
+    g.__piSubagenturaParentStreaming = false;
     jobRegistry.clear();
     workflowJobRegistry.clear();
     __setTmuxMultiplexer({
