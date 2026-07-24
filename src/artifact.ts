@@ -1599,41 +1599,184 @@ export function saveInteractiveStates(
 
 const STATE_LOCK_TIMEOUT_MS = 2_000;
 const STATE_LOCK_STALE_MS = 30_000;
+const stateLockWaiter = new Int32Array(new SharedArrayBuffer(4));
+type StateLockOwner = { pid: number; token: string };
 
-function withInteractiveStateLock<T>(cwd: string, action: () => T): T {
+function readStateLockOwner(lock: string): StateLockOwner | undefined {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(lock, "utf8"),
+    ) as Partial<StateLockOwner>;
+    const pid = parsed.pid;
+    const token = parsed.token;
+    if (
+      typeof pid === "number" &&
+      Number.isSafeInteger(pid) &&
+      pid > 0 &&
+      typeof token === "string" &&
+      token.length > 0
+    ) {
+      return { pid, token };
+    }
+  } catch {
+    /* A partial or legacy lock is recoverable after its lease ages out. */
+  }
+  return undefined;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function releaseStateLock(
+  lock: string,
+  fd: number,
+  ownerMetadata: string,
+  acquiredDevice: number,
+  acquiredInode: number,
+): void {
+  closeSync(fd);
+  try {
+    const currentFd = openSync(lock, constants.O_RDONLY);
+    const current = fstatSync(currentFd);
+    closeSync(currentFd);
+    if (current.dev !== acquiredDevice || current.ino !== acquiredInode) return;
+    if (readFileSync(lock, "utf8") !== ownerMetadata) return;
+    unlinkSync(lock);
+  } catch {
+    /* A recovery path may have already removed or replaced this lock. */
+  }
+}
+
+function releaseStateRecoveryLock(
+  lock: string,
+  fd: number,
+  ownerMetadata: string,
+): void {
+  closeSync(fd);
+  try {
+    if (readFileSync(lock, "utf8") === ownerMetadata) unlinkSync(lock);
+  } catch {
+    /* A recovery path may have already removed or replaced this claim. */
+  }
+}
+
+export function withInteractiveStateLock<T>(cwd: string, action: () => T): T {
   const piDir = join(cwd, ".pi");
   const lock = join(piDir, "subagentura-state.lock");
+  const recoveryLock = `${lock}.recovery`;
   mkdirSync(piDir, { recursive: true, mode: 0o700 });
   const deadline = Date.now() + STATE_LOCK_TIMEOUT_MS;
+  const ownerMetadata = JSON.stringify({
+    pid: process.pid,
+    token: randomUUID(),
+  });
+  const recoveryMetadata = JSON.stringify({
+    pid: process.pid,
+    token: randomUUID(),
+  });
   let fd: number | undefined;
+  let recoveryFd: number | undefined;
+  let acquiredDevice = 0;
+  let acquiredInode = 0;
   while (fd === undefined) {
     try {
       fd = openSync(lock, "wx", 0o600);
+      writeFileSync(fd, ownerMetadata);
+      const acquired = fstatSync(fd);
+      acquiredDevice = acquired.dev;
+      acquiredInode = acquired.ino;
+      if (recoveryFd !== undefined) {
+        releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        recoveryFd = undefined;
+      }
     } catch (error: any) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > STATE_LOCK_STALE_MS) {
+      if (fd !== undefined) {
+        closeSync(fd);
+        fd = undefined;
+        try {
           unlinkSync(lock);
-          continue;
+        } catch {
+          /* Another process may have recovered an incomplete lock. */
         }
-      } catch {
-        continue;
+      }
+      if (error?.code !== "EEXIST") {
+        if (recoveryFd !== undefined) {
+          releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        }
+        throw error;
+      }
+      if (recoveryFd === undefined) {
+        try {
+          recoveryFd = openSync(recoveryLock, "wx", 0o600);
+          writeFileSync(recoveryFd, recoveryMetadata);
+        } catch (recoveryError: any) {
+          if (recoveryFd !== undefined) {
+            closeSync(recoveryFd);
+            recoveryFd = undefined;
+            try {
+              unlinkSync(recoveryLock);
+            } catch {
+              /* Another contender may own the recovery claim. */
+            }
+          }
+          if (recoveryError?.code !== "EEXIST") throw recoveryError;
+          // Existing recovery claims are never reclaimed automatically.
+        }
+      }
+      if (recoveryFd !== undefined) {
+        try {
+          if (!existsSync(lock)) continue;
+          const owner = readStateLockOwner(lock);
+          const lockAge = Date.now() - statSync(lock).mtimeMs;
+          const stale = !owner && lockAge > STATE_LOCK_STALE_MS;
+          if (owner && isProcessAlive(owner.pid)) {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          } else if (stale || (owner && !isProcessAlive(owner.pid))) {
+            unlinkSync(lock);
+            continue;
+          } else {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          }
+        } catch {
+          if (recoveryFd !== undefined) {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          }
+        }
       }
       if (Date.now() >= deadline) {
+        if (recoveryFd !== undefined) {
+          releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        }
         throw new Error(`timed out acquiring interactive state lock: ${lock}`);
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      Atomics.wait(stateLockWaiter, 0, 0, 10);
     }
   }
   try {
     return action();
   } finally {
-    closeSync(fd);
-    try {
-      unlinkSync(lock);
-    } catch {
-      /* another recovery path may already have removed a stale lock */
-    }
+    releaseStateLock(lock, fd, ownerMetadata, acquiredDevice, acquiredInode);
   }
 }
 

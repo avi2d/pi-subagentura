@@ -113,7 +113,10 @@ describe("in-process completion delivery queue", () => {
     const staleSend = vi.fn(() => {
       throw new Error("stale context");
     });
-    (globalThis as any).__piSubagenturaPiRef = { sendMessage: staleSend };
+    const pi: { sendMessage: (...args: any[]) => any } = {
+      sendMessage: staleSend,
+    };
+    (globalThis as any).__piSubagenturaPiRef = pi;
     const job = makeJobState();
 
     deliverNotification(job, SUCCESS_RESULT);
@@ -121,7 +124,8 @@ describe("in-process completion delivery queue", () => {
     expect(job.notificationDelivered).toBeFalsy();
 
     const freshSend = vi.fn();
-    (globalThis as any).__piSubagenturaPiRef = { sendMessage: freshSend };
+    pi.sendMessage = freshSend;
+    (globalThis as any).__piSubagenturaPiRef = pi;
     flushInProcessDeliveries();
 
     expect(freshSend).toHaveBeenCalledOnce();

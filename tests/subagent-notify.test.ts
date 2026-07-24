@@ -764,6 +764,164 @@ describe("notifyOnComplete", () => {
       expect(queue).toEqual([]);
     });
 
+    it("uses the async spawn owner after a generation rollover", async () => {
+      const jobId = "spawn-owner-generation";
+      const control = createJobControl();
+      mockStartSubagentJob.mockImplementationOnce(() =>
+        mockJobResult(jobId, control.jobPromise),
+      );
+      (globalThis as any).__piSubagenturaActiveSessionContextId = 701;
+      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 1;
+      await isolatedToolDef.execute(
+        "spawn-owner-call",
+        { async: true, task: "test", notifyOnComplete: "inject" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 2;
+      control.resolve(SUCCESS_RESULT);
+      await vi.waitFor(() => {
+        expect(jobRegistry.get(jobId)?.status).toBe("done");
+      });
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
+        [],
+      );
+    });
+
+    it("drops a queued completion when the same context rolls generation", () => {
+      const state: any = {
+        id: "generation-rollover",
+        status: "completed",
+        liveStatus: {},
+        session: { abort: vi.fn() },
+        startedAt: 0,
+        promise: Promise.resolve(SUCCESS_RESULT),
+        notifyOnComplete: "inject",
+      };
+      jobRegistry.set(state.id, state);
+      (globalThis as any).__piSubagenturaParentStreaming = true;
+      (globalThis as any).__piSubagenturaActiveSessionContextId = 77;
+      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 1;
+      deliverNotification(state, SUCCESS_RESULT);
+      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 2;
+      (globalThis as any).__piSubagenturaParentStreaming = false;
+      flushInProcessDeliveries();
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
+        [],
+      );
+    });
+
+    it("does not deliver a tokenless completion to a different Pi identity", () => {
+      const oldPi = api;
+      const state: any = {
+        id: "pi-identity-fallback",
+        status: "completed",
+        liveStatus: {},
+        session: { abort: vi.fn() },
+        startedAt: 0,
+        promise: Promise.resolve(SUCCESS_RESULT),
+        notifyOnComplete: "inject",
+      };
+      jobRegistry.set(state.id, state);
+      (globalThis as any).__piSubagenturaParentStreaming = true;
+      (globalThis as any).__piSubagenturaActiveSessionContextId = undefined;
+      (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
+        undefined;
+      deliverNotification(state, SUCCESS_RESULT);
+      const newPi = { ...oldPi, sendMessage: vi.fn() };
+      (globalThis as any).__piSubagenturaPiRef = newPi;
+      (globalThis as any).__piSubagenturaParentStreaming = false;
+      flushInProcessDeliveries();
+      expect(newPi.sendMessage).not.toHaveBeenCalled();
+      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
+        [],
+      );
+    });
+
+    it("does not merge overflow ledgers across context generations", () => {
+      (globalThis as any).__piSubagenturaParentStreaming = true;
+      for (let index = 0; index < 40; index++) {
+        const generation = index < 20 ? 1 : 2;
+        (globalThis as any).__piSubagenturaActiveSessionContextId = 88;
+        (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
+          generation;
+        const state: any = {
+          id: `generation-overflow-${index}`,
+          status: "completed",
+          liveStatus: {},
+          session: { abort: vi.fn() },
+          startedAt: 0,
+          promise: Promise.resolve(SUCCESS_RESULT),
+          notifyOnComplete: "notify",
+        };
+        jobRegistry.set(state.id, state);
+        deliverNotification(state, {
+          ...SUCCESS_RESULT,
+          output: `${index}:${"x".repeat(20_000)}`,
+        });
+      }
+      const queue = (globalThis as any)
+        .__piSubagenturaPendingJobDeliveries as any[];
+      const overflows = queue.filter((pending) => pending.kind === "overflow");
+      expect(overflows).toHaveLength(2);
+      for (const overflow of overflows) {
+        const rows = readFileSync(overflow.overflowPath, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const generations = rows.map((row) =>
+          Number(row.jobId.split("-").pop()) < 20 ? 1 : 2,
+        );
+        expect(new Set(generations)).toHaveLength(1);
+      }
+      (globalThis as any).__piSubagenturaParentStreaming = false;
+      flushInProcessDeliveries();
+    });
+
+    it("keeps overflow queue bounded for distinct owners", () => {
+      (globalThis as any).__piSubagenturaParentStreaming = true;
+      for (
+        let index = 0;
+        index < MAX_IN_PROCESS_DELIVERY_RECORDS + 8;
+        index++
+      ) {
+        (globalThis as any).__piSubagenturaActiveSessionContextId = 1000;
+        (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
+          index + 1;
+        const state: any = {
+          id: `distinct-owner-${index}`,
+          status: "completed",
+          liveStatus: {},
+          session: { abort: vi.fn() },
+          startedAt: 0,
+          promise: Promise.resolve(SUCCESS_RESULT),
+          notifyOnComplete: "notify",
+        };
+        jobRegistry.set(state.id, state);
+        deliverNotification(state, {
+          ...SUCCESS_RESULT,
+          output: `${index}:${"x".repeat(20_000)}`,
+        });
+      }
+      const queue = (globalThis as any)
+        .__piSubagenturaPendingJobDeliveries as any[];
+      expect(queue.length).toBeLessThanOrEqual(MAX_IN_PROCESS_DELIVERY_RECORDS);
+      expect(queue.every((pending) => pending.kind === "overflow")).toBe(true);
+      const owners = queue.map(
+        (pending) =>
+          `${pending.ownerSessionContextId}:${pending.ownerSessionContextGeneration}`,
+      );
+      expect(new Set(owners).size).toBe(queue.length);
+      (globalThis as any).__piSubagenturaParentStreaming = false;
+      flushInProcessDeliveries();
+      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
+        [],
+      );
+    });
+
     it("keeps collapsed inject and trigger semantics in one overflow envelope", () => {
       (globalThis as any).__piSubagenturaParentStreaming = true;
       for (let index = 0; index < 40; index++) {

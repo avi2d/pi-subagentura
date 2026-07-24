@@ -12,7 +12,10 @@ import type {
 import { formatUsage, jobRegistry } from "./helpers";
 import { isCompletionEvent, type SubagentEvent } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
-import { getActiveSessionContextId } from "./session-context";
+import {
+  getActiveSessionContextToken,
+  type ActiveSessionContextToken,
+} from "./session-context";
 
 /**
  * @deprecated Delivery is queue-bounded rather than concurrency-capped.
@@ -36,6 +39,7 @@ interface PendingJobCompletion {
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
   ownerSessionContextId?: number;
+  ownerSessionContextGeneration?: number;
   jobState: JobState;
   result: SubagentResult;
 }
@@ -46,6 +50,7 @@ interface PendingJobOverflow {
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
   ownerSessionContextId?: number;
+  ownerSessionContextGeneration?: number;
   overflowPath: string;
   mode: NotifyOnComplete;
   triggerTurn: boolean;
@@ -112,29 +117,82 @@ function mergeJobOverflowSemantics(
   if (collapsed.result.isError) summary.status = "error";
 }
 
-function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
-  const summary = queue.find(
-    (pending): pending is PendingJobOverflow => pending.kind === "overflow",
-  );
+function ownerSessionContextOf(
+  pending: PendingJobDelivery,
+): ActiveSessionContextToken | undefined {
+  if (
+    pending.ownerSessionContextId === undefined ||
+    pending.ownerSessionContextGeneration === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    id: pending.ownerSessionContextId,
+    generation: pending.ownerSessionContextGeneration,
+  };
+}
+
+function sameDeliveryOwner(
+  left: PendingJobDelivery,
+  right: PendingJobDelivery,
+): boolean {
+  const leftContext = ownerSessionContextOf(left);
+  const rightContext = ownerSessionContextOf(right);
+  if (
+    leftContext?.id !== rightContext?.id ||
+    leftContext?.generation !== rightContext?.generation
+  ) {
+    return false;
+  }
+  if (left.ownerSessionId !== undefined || right.ownerSessionId !== undefined) {
+    if (left.ownerSessionId !== right.ownerSessionId) return false;
+  }
+  return left.ownerPi === right.ownerPi;
+}
+
+function discardOldestOverflow(queue: PendingJobDelivery[]): boolean {
+  let oldestIndex = -1;
+  for (let index = queue.length - 1; index >= 0; index--) {
+    if (queue[index].kind === "overflow") {
+      oldestIndex = index;
+      break;
+    }
+  }
+  if (oldestIndex < 0) return false;
+  const [discarded] = queue.splice(oldestIndex, 1) as [PendingJobOverflow];
+  try {
+    unlinkSync(discarded.overflowPath);
+  } catch {
+    /* The ledger may already have been removed during stale-owner cleanup. */
+  }
+  return true;
+}
+
+function collapseOldestJobDelivery(queue: PendingJobDelivery[]): boolean {
   const oldestIndex = queue.findIndex(
     (pending) => pending.kind === "completion",
   );
-  if (oldestIndex < 0) return;
-  const [oldest] = queue.splice(oldestIndex, 1) as [PendingJobCompletion];
+  if (oldestIndex < 0) return false;
+  const [collapsed] = queue.splice(oldestIndex, 1) as [PendingJobCompletion];
+  const summary = queue.find(
+    (pending): pending is PendingJobOverflow =>
+      pending.kind === "overflow" && sameDeliveryOwner(pending, collapsed),
+  );
   const overflowPath =
     summary?.overflowPath ??
     join(
       tmpdir(),
       `pi-subagentura-delivery-overflow-${process.pid}-${randomUUID()}.ndjson`,
     );
-  appendOverflowIdentity(overflowPath, oldest);
+  appendOverflowIdentity(overflowPath, collapsed);
   if (summary) {
-    mergeJobOverflowSemantics(summary, oldest);
-    return;
+    mergeJobOverflowSemantics(summary, collapsed);
+    return true;
   }
   let second: PendingJobCompletion | undefined;
   const secondIndex = queue.findIndex(
-    (pending) => pending.kind === "completion",
+    (pending) =>
+      pending.kind === "completion" && sameDeliveryOwner(pending, collapsed),
   );
   if (secondIndex >= 0) {
     [second] = queue.splice(secondIndex, 1) as [PendingJobCompletion];
@@ -143,20 +201,22 @@ function collapseOldestJobDelivery(queue: PendingJobDelivery[]): void {
   const overflow: PendingJobOverflow = {
     kind: "overflow",
     deliveryId: createHash("sha256")
-      .update(`in-process-overflow\0${oldest.deliveryId}`)
+      .update(`in-process-overflow\0${collapsed.deliveryId}`)
       .digest("hex")
       .slice(0, 32),
-    ownerPi: oldest.ownerPi,
-    ownerSessionId: oldest.ownerSessionId,
-    ownerSessionContextId: oldest.ownerSessionContextId,
+    ownerPi: collapsed.ownerPi,
+    ownerSessionId: collapsed.ownerSessionId,
+    ownerSessionContextId: collapsed.ownerSessionContextId,
+    ownerSessionContextGeneration: collapsed.ownerSessionContextGeneration,
     overflowPath,
     mode: "notify",
     triggerTurn: false,
     status: "done",
   };
-  mergeJobOverflowSemantics(overflow, oldest);
+  mergeJobOverflowSemantics(overflow, collapsed);
   if (second) mergeJobOverflowSemantics(overflow, second);
   queue.unshift(overflow);
+  return true;
 }
 
 // ── Notification Delivery ───────────────────────────────────────
@@ -294,12 +354,23 @@ export function deliverNotification(
   result: SubagentResult,
 ): void {
   const g2 = typeof global !== "undefined" ? global : globalThis;
-  const pi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
+  const deliveryOwner = jobState.deliveryOwner;
+  const pi =
+    deliveryOwner?.pi ?? (g2.__piSubagenturaPiRef as ExtensionAPI | undefined);
   if (!pi) return; // extension not loaded yet
-
   const mode = jobState.notifyOnComplete ?? "inject";
-  const ownerSessionId = g2.__piSubagenturaSessionManager?.getSessionId?.();
-  const ownerSessionContextId = getActiveSessionContextId();
+  const ownerSessionId = deliveryOwner
+    ? deliveryOwner.sessionId
+    : g2.__piSubagenturaSessionManager?.getSessionId?.();
+  const ownerSessionContext = deliveryOwner
+    ? deliveryOwner.sessionContextId !== undefined &&
+      deliveryOwner.sessionContextGeneration !== undefined
+      ? {
+          id: deliveryOwner.sessionContextId,
+          generation: deliveryOwner.sessionContextGeneration,
+        }
+      : undefined
+    : getActiveSessionContextToken();
   const deliveryId = createHash("sha256")
     .update(`${jobState.id}\0${mode}`)
     .digest("hex")
@@ -321,7 +392,8 @@ export function deliverNotification(
       deliveryId,
       ownerPi: pi,
       ownerSessionId,
-      ownerSessionContextId,
+      ownerSessionContextId: ownerSessionContext?.id,
+      ownerSessionContextGeneration: ownerSessionContext?.generation,
       jobState,
       result: boundedResult,
     });
@@ -329,7 +401,8 @@ export function deliverNotification(
       queue.length > MAX_IN_PROCESS_DELIVERY_RECORDS ||
       pendingDeliveryBytes(queue) > MAX_IN_PROCESS_DELIVERY_BYTES
     ) {
-      collapseOldestJobDelivery(queue);
+      if (collapseOldestJobDelivery(queue)) continue;
+      if (!discardOldestOverflow(queue)) break;
     }
   }
   requestInProcessDeliveryFlush();
@@ -354,7 +427,7 @@ export function flushInProcessDeliveries(): void {
   const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi) return;
   const currentSessionId = g.__piSubagenturaSessionManager?.getSessionId?.();
-  const currentContextId = getActiveSessionContextId();
+  const currentSessionContext = getActiveSessionContextToken();
   const queue = pendingJobDeliveries();
   const llm: Array<{
     pending: PendingJobDelivery;
@@ -367,14 +440,17 @@ export function flushInProcessDeliveries(): void {
   const runningJobsCount = runningInProcessJobCount();
   for (let index = 0; index < queue.length;) {
     const pending = queue[index];
-    const crossedContext =
-      pending.ownerSessionContextId !== undefined &&
-      pending.ownerSessionContextId !== currentContextId;
+    const ownerSessionContext = ownerSessionContextOf(pending);
+    const crossedContext = ownerSessionContext
+      ? !currentSessionContext ||
+        ownerSessionContext.id !== currentSessionContext.id ||
+        ownerSessionContext.generation !== currentSessionContext.generation
+      : false;
     const crossedSession =
       pending.ownerSessionId !== undefined &&
-      currentSessionId !== undefined &&
       pending.ownerSessionId !== currentSessionId;
-    const shouldDrop = crossedContext || crossedSession;
+    const crossedPi = !ownerSessionContext && pending.ownerPi !== pi;
+    const shouldDrop = crossedContext || crossedSession || crossedPi;
     if (shouldDrop) {
       queue.splice(index, 1);
       continue;

@@ -160,6 +160,14 @@ export type JobStatus = "running" | "done" | "error" | "cancelled";
 /** Notification delivery mode for async subagent completion */
 export type NotifyOnComplete = "notify" | "inject";
 
+export interface JobDeliveryOwner {
+  /** Pi API identity captured when the async job was spawned. */
+  pi: ExtensionAPI;
+  sessionId?: string;
+  sessionContextId?: number;
+  sessionContextGeneration?: number;
+}
+
 export interface JobState {
   id: string;
   status: JobStatus;
@@ -174,6 +182,8 @@ export interface JobState {
   thinkingLevel?: ThinkingLevel;
   /** Notification mode requested by spawner's notifyOnComplete param */
   notifyOnComplete?: NotifyOnComplete;
+  /** Delivery owner captured at async spawn time. */
+  deliveryOwner?: JobDeliveryOwner;
   /** Whether completion notifications should trigger a parent LLM turn. */
   triggerTurnOnComplete?: boolean;
   /** At-most-once delivery guard */

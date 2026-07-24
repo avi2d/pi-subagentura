@@ -43,6 +43,7 @@ import {
   snapshotOutput,
   stateFilePath,
   writeOutput,
+  withInteractiveStateLock,
   type InteractiveSubagentPersistedStateV2,
   type SubagentEvent,
 } from "../src/artifact";
@@ -735,6 +736,53 @@ describe("persisted interactive state helpers", () => {
     deliveryReceipts: [],
     legacyCutoverOffset: 0,
   };
+
+  it("does not steal a stale-looking lock owned by a live process", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    mkdirSync(piDir, { recursive: true, mode: 0o700 });
+    const metadata = JSON.stringify({ pid: process.pid, token: "live-owner" });
+    writeFileSync(lock, metadata, { mode: 0o600 });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    expect(() => withInteractiveStateLock(root, () => undefined)).toThrow(
+      /timed out acquiring interactive state lock/,
+    );
+    expect(readFileSync(lock, "utf8")).toBe(metadata);
+  });
+
+  it("does not unlink a replacement lock during owner cleanup", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    const replacement = JSON.stringify({
+      pid: process.pid,
+      token: "replacement",
+    });
+    withInteractiveStateLock(root, () => {
+      rmSync(lock);
+      writeFileSync(lock, replacement, { mode: 0o600 });
+    });
+    expect(readFileSync(lock, "utf8")).toBe(replacement);
+  });
+
+  it("fails closed when a recovery claim already exists", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    const recoveryLock = `${lock}.recovery`;
+    mkdirSync(piDir, { recursive: true, mode: 0o700 });
+    const deadOwner = JSON.stringify({ pid: 999_999_999, token: "dead" });
+    const existingRecovery = JSON.stringify({
+      pid: 999_999_999,
+      token: "recovery-owner",
+    });
+    writeFileSync(lock, deadOwner, { mode: 0o600 });
+    writeFileSync(recoveryLock, existingRecovery, { mode: 0o600 });
+    expect(() => withInteractiveStateLock(root, () => undefined)).toThrow(
+      /timed out acquiring interactive state lock/,
+    );
+    expect(readFileSync(lock, "utf8")).toBe(deadOwner);
+    expect(readFileSync(recoveryLock, "utf8")).toBe(existingRecovery);
+  });
 
   it("stateFilePath returns <cwd>/.pi/subagentura-state.json", () => {
     expect(stateFilePath(root)).toBe(

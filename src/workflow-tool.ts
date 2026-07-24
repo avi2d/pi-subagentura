@@ -43,6 +43,7 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
+import { getOrchestrationContext } from "./orchestration-context";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -262,6 +263,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "Workflow scripts are trusted agent-authored code, not arbitrary user input;",
       "the VM sandbox limits accidental Node globals but is not a security boundary.",
       "Do not run untrusted/user-supplied JavaScript as a workflow.",
+      "In-process sub-agents cannot invoke this tool; this topology is unsupported",
+      "until cross-registry cancellation is implemented (GitHub issue #62).",
       "",
       "Script shape:",
       "  export const meta = { name: 'my-flow', description: '...', phases: [{ title: 'Scan' }] };",
@@ -339,6 +342,18 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       onUpdate: any,
       ctx: any,
     ): Promise<any> {
+      const orchestrationContext = getOrchestrationContext();
+      if (orchestrationContext) {
+        const error =
+          "Workflow tool unavailable inside an in-process sub-agent orchestration context; " +
+          "this topology is unsupported until cross-registry cancellation is implemented " +
+          "(GitHub issue #62).";
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${error}` }],
+          details: { status: "error", error },
+          isError: true,
+        };
+      }
       const script: string | null =
         typeof params.script === "string" && params.script.trim()
           ? params.script

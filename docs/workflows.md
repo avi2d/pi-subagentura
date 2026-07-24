@@ -15,6 +15,10 @@ accidental Node globals and disables string code generation, but it is not a
 security boundary; do not feed arbitrary user-supplied JavaScript to the
 workflow tool.
 
+An in-process sub-agent orchestration context cannot invoke the `workflow` tool.
+This topology is unsupported until cross-registry cancellation is implemented; see
+GitHub issue [#62](https://github.com/lmn451/pi-subagentura/issues/62).
+
 ## Authoring contract
 
 Submit raw JavaScript without markdown fences. The first statement should be a

@@ -28,6 +28,7 @@ import {
   validateSchema,
   workflowJobRegistry,
 } from "../src/workflow";
+import { withOrchestrationContext } from "../src/orchestration-context";
 import type { SubagentResult } from "../src/helpers";
 import {
   appendCompletionEvent,
@@ -1923,6 +1924,37 @@ describe("registerWorkflowTool", () => {
 
     expect(result.details.status).toBe("done");
     expect(result.content[0].text).toContain("/tmp/tool-context");
+  });
+
+  it("rejects workflow execution from in-process orchestration contexts", async () => {
+    const tools: any[] = [];
+    const pi = {
+      registerTool: vi.fn((def: any) => tools.push(def)),
+      registerCommand: vi.fn(),
+    };
+    registerWorkflowTool(pi as any);
+    const workflowTool = tools.find((tool) => tool.name === "workflow")!;
+    const result = await withOrchestrationContext(
+      { ownerJobId: "parent-job", depth: 1 },
+      () =>
+        workflowTool.execute(
+          "",
+          {
+            script:
+              `export const meta = { name: "unsupported", description: "d" };\n` +
+              `return "should not run";`,
+            async: false,
+          },
+          undefined,
+          undefined,
+          { cwd: "/tmp", modelRegistry: {} },
+        ),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.details.error).toContain("issue #62");
+    expect(result.content[0].text).toContain(
+      "in-process sub-agent orchestration",
+    );
   });
 
   it("does not report a completed workflow as cancelled", async () => {

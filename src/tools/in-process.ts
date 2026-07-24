@@ -24,6 +24,7 @@ import {
   pruneCompletedJobs,
   scheduleJobCleanup,
   startSubagentJob,
+  type JobDeliveryOwner,
   type JobState,
   type JobStatus,
   type SubagentLiveStatus,
@@ -102,6 +103,25 @@ function resolveSpawn(ctx: SpawnContext) {
     }
   }
   return { ...spawn, rootSessionId };
+}
+
+function captureDeliveryOwner(
+  pi: ExtensionAPI,
+  ctx: SpawnContext,
+  token: ReturnType<typeof getActiveSessionContextToken>,
+): JobDeliveryOwner {
+  let sessionId: string | undefined;
+  try {
+    sessionId = ctx.sessionManager?.getSessionId?.();
+  } catch {
+    /* A stale parent context has no reliable session identity. */
+  }
+  return {
+    pi,
+    sessionId,
+    sessionContextId: token?.id,
+    sessionContextGeneration: token?.generation,
+  };
 }
 
 function isSpawnContextStale(
@@ -344,6 +364,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         .map((e) => e.message);
 
       const spawnContextToken = getActiveSessionContextToken();
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
       if (runAsync) {
         if (messages.length === 0) {
           return {
@@ -407,6 +428,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
                 ? "notify"
                 : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -555,6 +577,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
 
       const spawnContextToken = getActiveSessionContextToken();
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
       if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
         // Own the child's session so any ancestor abort cascades to it.
@@ -606,6 +629,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
                 ? "notify"
                 : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
