@@ -1,10 +1,9 @@
 /**
  * Tests for the subagent_interactive tool's `notifyOnComplete` defaulting.
  *
- * The tool's `execute` defaults `notifyOnComplete` to "inject" (not "notify")
- * so the parent LLM is woken up by default when an interactive sub-agent
- * finishes. These tests assert the default by mocking the tmux-backed
- * `launchInteractiveSubagent` helper and capturing the call args.
+ * The tool's `execute` defaults `notifyOnComplete` to "notify" and enables
+ * automatic parent-turn triggering. These tests assert the default by mocking the
+ * tmux-backed `launchInteractiveSubagent` helper and capturing the call args.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -102,7 +101,7 @@ describe("subagent_interactive notifyOnComplete default", () => {
     vi.clearAllMocks();
   });
 
-  it("defaults to 'inject' when notifyOnComplete is omitted (parent LLM is woken up by default)", async () => {
+  it("defaults to notify + automatic triggering when both params are omitted", async () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
 
@@ -114,20 +113,19 @@ describe("subagent_interactive notifyOnComplete default", () => {
       mockCtx(),
     );
 
-    // The helper was called exactly once.
     expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    // And the default was 'inject' — not 'notify'.
     const callArgs = mockLaunchInteractiveSubagent.mock.calls[0][0];
-    expect(callArgs.notifyOnComplete).toBe("inject");
+    expect(callArgs.notifyOnComplete).toBe("notify");
+    expect(callArgs.triggerTurnOnComplete).toBe(true);
     expect(result.content[0].text).toContain(
-      "Completion output will be injected into the parent LLM",
+      "Completion output will not be injected into the parent LLM",
     );
     expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the injection",
+      "A new parent turn will start automatically after the pointer delivery",
     );
   });
 
-  it("forwards 'notify' when explicitly passed (opt out of LLM wake-up)", async () => {
+  it("defaults explicit notify mode to automatic triggering", async () => {
     const toolDef = getInteractiveToolDef(api);
 
     const result = await toolDef.execute(
@@ -142,11 +140,14 @@ describe("subagent_interactive notifyOnComplete default", () => {
     expect(
       mockLaunchInteractiveSubagent.mock.calls[0][0].notifyOnComplete,
     ).toBe("notify");
+    expect(
+      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
+    ).toBe(true);
     expect(result.content[0].text).toContain(
       "Completion output will not be injected into the parent LLM",
     );
     expect(result.content[0].text).toContain(
-      "No new parent turn will start automatically",
+      "A new parent turn will start automatically after the pointer delivery",
     );
   });
 
@@ -207,6 +208,29 @@ describe("subagent_interactive notifyOnComplete default", () => {
     );
   });
 
+  it("preserves explicit false triggering for notify mode", async () => {
+    const toolDef = getInteractiveToolDef(api);
+
+    const result = await toolDef.execute(
+      "call-notify-no-trigger",
+      {
+        task: "research X",
+        notifyOnComplete: "notify",
+        triggerTurnOnComplete: false,
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(
+      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
+    ).toBe(false);
+    expect(result.content[0].text).toContain(
+      "No new parent turn will start automatically",
+    );
+  });
+
   it("notifies the user without scheduling another LLM completion when cancelled", async () => {
     const toolDef = getCancelToolDef(api);
     const ctx = mockCtx();
@@ -238,13 +262,10 @@ describe("subagent_interactive notifyOnComplete default", () => {
     expect(properties).toBeDefined();
     expect(properties.notifyOnComplete).toBeDefined();
     expect(properties.triggerTurnOnComplete).toBeDefined();
-    // Description must document 'inject' as the default and 'notify' as a valid
-    // alternative. We don't assert literal phrasing — just that 'inject' is the
-    // documented default — so wording tweaks don't break the test.
+    // Description must document 'notify' as the default and 'inject' as a valid
+    // alternative.
     const desc = properties.notifyOnComplete.description ?? "";
-    // 'inject' is documented as the default.
-    expect(desc).toMatch(/inject.*default|default.*inject/i);
-    // 'notify' is documented as a valid choice (just not the default).
-    expect(desc).toContain('"notify"');
+    expect(desc).toMatch(/notify.*default|default.*notify/i);
+    expect(desc).toContain('"inject"');
   });
 });

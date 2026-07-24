@@ -77,6 +77,26 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated?.triggerTurnOnComplete).toBe(true);
   });
 
+  it("preserves an explicit false trigger override across rehydrate", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "explicit-false");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+      triggerTurnOnComplete: false,
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd);
+
+    expect(
+      interactiveSubagentRegistry.get(state.id)?.triggerTurnOnComplete,
+    ).toBe(false);
+  });
+
   it("rebuilds attach and focus commands on rehydrate", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");

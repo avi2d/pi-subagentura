@@ -330,8 +330,8 @@ Parameters:
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `notifyOnComplete` — `"inject"` (default) persists full output; `"notify"` persists only an artifact pointer. Both modes show a user-facing completion notification.
-- `triggerTurnOnComplete` — optional override. Notify defaults to `false`; inject defaults to `true`.
+- `notifyOnComplete` — `"notify"` (default) persists only an artifact pointer; `"inject"` persists full output. Both modes show a user-facing completion notification.
+- `triggerTurnOnComplete` — optional override. Defaults to `true` for both modes; `false` disables automatic parent-turn triggering.
 
 The spawn result states whether completion output will be injected into the parent
 LLM and whether delivery will automatically start a new parent turn.
@@ -418,19 +418,15 @@ the payload saved for parent LLM context (full output versus artifact pointer);
 LLM turn. Both payload modes display the same user-facing notification;
 `notifyOnComplete` does not control toast behavior.
 
-- `"inject"` (**default**, including async in-process tools) persists one attributed custom
-  completion message and triggers a turn by default. Explicit
-  `triggerTurnOnComplete: false` disables triggering.
-- `"notify"` persists an attributed pointer-only custom message in parent
-  context without triggering a provider call. Explicit
-  `triggerTurnOnComplete: true` wakes the parent immediately.
+- `"inject"` persists one attributed custom completion message and triggers a turn by default for async in-process tools. Explicit `triggerTurnOnComplete: false` disables triggering.
+- `"notify"` persists an attributed pointer-only custom message in parent context. The public `subagent_interactive` tool enables triggering by default; explicit `triggerTurnOnComplete: false` disables it.
 
 | Configuration                             | Persisted in parent context | Starts an immediate parent turn |
 | ----------------------------------------- | --------------------------- | ------------------------------- |
-| `inject` (default)                        | Full completion output      | Yes                             |
+| `inject` (in-process default)             | Full completion output      | Yes (unless overridden)         |
 | `inject` + `triggerTurnOnComplete: false` | Full completion output      | No                              |
-| `notify` (default trigger behavior)       | Artifact pointer only       | No                              |
-| `notify` + `triggerTurnOnComplete: true`  | Artifact pointer only       | Yes                             |
+| `notify` (interactive default)            | Artifact pointer only       | Yes                             |
+| `notify` + `triggerTurnOnComplete: false` | Artifact pointer only       | No                              |
 
 Triggering completions are handed to Pi's native `followUp` queue even while the
 parent is busy, so they run after the active turn without relying on extension-owned

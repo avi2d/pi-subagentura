@@ -156,13 +156,13 @@ export const InteractiveParams = Type.Object({
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
-        'Controls the payload saved for parent LLM context, independently of triggerTurnOnComplete. Both modes show the same user-facing notification, and the spawn result explains what will happen. "inject" (default) sends full output; "notify" persists only an artifact pointer.',
+        'Controls the payload saved for parent LLM context. Defaults to "notify" (pointer-only, no injected output); "inject" sends full output. Both modes show a user-facing notification.',
     }),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
+        "Independently controls whether delivery starts a new parent LLM turn. Defaults true for both notify and inject; false disables triggering for either mode. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
     }),
   ),
   mux: Type.Optional(

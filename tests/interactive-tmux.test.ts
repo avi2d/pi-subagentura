@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importFresh } from "./test-utils";
 
+import { loadInteractiveStates } from "../src/artifact";
 /** Standard tmux pane id returned by mocks when "new-window"/"split-window" is called. */
 const MOCK_PANE_ID = "%42";
 /** Tab-separated session/window/pane — matches real tmux #{...} format. */
@@ -819,17 +820,15 @@ describe("interactive-tmux", () => {
   });
 
   describe("InteractiveSubagentState.notifyOnComplete", () => {
-    // The state field and the launchInteractiveSubagent param are the two
-    // integration points for the inject-mode feature. Launching a real tmux
-    // pane in tests is impractical, so we only assert the param shape / default
-    // value: the helper must accept notifyOnComplete and propagate it to the
-    // returned state, defaulting to undefined when omitted.
+    // The public tool passes an effective mode before calling this low-level helper.
+    // Direct callers without parent-session context retain the legacy inject fallback,
+    // while the tool-level default is covered by subagent-interactive-default.test.ts.
 
     beforeEach(() => {
       vi.doUnmock("node:fs");
     });
 
-    it("defaults the state to inject when notifyOnComplete is omitted", async () => {
+    it("keeps the low-level inject fallback when mode is omitted", async () => {
       const tmp = makeTmp();
       process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
       process.env.TMUX = makeArgs().TMUX;
@@ -929,9 +928,14 @@ describe("interactive-tmux", () => {
         cwd: tmp,
         notifyOnComplete: "notify",
         triggerTurnOnComplete: true,
+        parentSessionId: "parent-session",
+        parentCwd: tmp,
       });
 
       expect(state.triggerTurnOnComplete).toBe(true);
+      expect(
+        loadInteractiveStates(tmp)?.states[state.id]?.triggerTurnOnComplete,
+      ).toBe(true);
     });
   });
 
