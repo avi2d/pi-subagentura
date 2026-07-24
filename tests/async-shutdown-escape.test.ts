@@ -106,10 +106,14 @@ describe("async spawn shutdown handoff", () => {
       expect(jobRegistry.size).toBe(0);
 
       const sessionAbort = vi.fn();
+      const start = vi.fn();
+      const disposeBeforeStart = vi.fn();
       gate.resolve({
         jobId: `${toolName}-late-job`,
         jobPromise: new Promise(() => {}),
         session: { abort: sessionAbort },
+        start,
+        disposeBeforeStart,
         liveStatus: {
           turn: 0,
           output: "",
@@ -129,7 +133,65 @@ describe("async spawn shutdown handoff", () => {
       expect(result.details.status).toBe("cancelled");
       expect(result.isError).toBe(true);
       expect(jobRegistry.size).toBe(0);
+      expect(start).not.toHaveBeenCalled();
+      expect(disposeBeforeStart).toHaveBeenCalledOnce();
       expect(sessionAbort).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    ["subagent_isolated", { task: "nested spawn", async: true }],
+    ["subagent_with_context", { task: "nested spawn", async: true }],
+  ])(
+    "starts a pending %s spawn when a nested context becomes active",
+    async (toolName, params) => {
+      const gate = createStartGate();
+      mockStartSubagentJob.mockReturnValue(gate.promise);
+      const tools = setupTools();
+      const parentPi = { on: vi.fn(), sendMessage: vi.fn() } as any;
+      registerSessionHandlers(parentPi);
+      const ctx = fakeCtx(toolName === "subagent_with_context");
+
+      const spawn = tools[toolName].execute(
+        "call",
+        params,
+        undefined,
+        undefined,
+        ctx,
+      );
+      await Promise.resolve();
+
+      const childPi = { on: vi.fn(), sendMessage: vi.fn() } as any;
+      registerSessionHandlers(childPi);
+
+      const start = vi.fn();
+      const disposeBeforeStart = vi.fn();
+      gate.resolve({
+        jobId: `${toolName}-nested-job`,
+        jobPromise: new Promise(() => {}),
+        session: { abort: vi.fn() },
+        start,
+        disposeBeforeStart,
+        liveStatus: {
+          turn: 0,
+          output: "",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+          },
+        },
+        modelLabel: "test/model",
+      });
+
+      const result = await spawn;
+      expect(result.details.status).toBe("started");
+      expect(jobRegistry.has(`${toolName}-nested-job`)).toBe(true);
+      expect(disposeBeforeStart).not.toHaveBeenCalled();
+      expect(start).toHaveBeenCalledOnce();
     },
   );
 });

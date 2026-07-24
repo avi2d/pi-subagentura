@@ -516,6 +516,10 @@ export interface StartSubagentJobResult {
   jobPromise: Promise<SubagentResult>;
   session: AgentSession;
   liveStatus: SubagentLiveStatus;
+  /** Begin prompt execution after the caller validates and registers the job. */
+  start: () => void;
+  /** Settle and dispose a prepared session without ever starting its prompt. */
+  disposeBeforeStart: () => void;
   modelLabel?: string;
   /** Effective session level after model-capability clamping. */
   thinkingLevel?: ThinkingLevel;
@@ -524,10 +528,10 @@ export interface StartSubagentJobResult {
 }
 
 /**
- * Create a subagent session and start its prompt execution.
+ * Prepare a subagent session for prompt execution.
  *
- * Returns immediately with { jobId, jobPromise, session, liveStatus }.
- * The jobPromise resolves to a SubagentResult when the subagent completes.
+ * The caller must invoke `start()` after validating and registering the job.
+ * `disposeBeforeStart()` settles and cleans up without invoking the prompt.
  * The liveStatus object is mutated in real-time by the event subscriber.
  *
  * This is the shared core used by both sync (runSubagent) and async paths.
@@ -813,8 +817,24 @@ export async function startSubagentJob(
       ? result
       : ({ ...result, workflowStructuredOutput } as T);
 
-  // Launch the prompt in a promise chain (NOT awaited — returns immediately).
-  // The jobPromise represents the full lifecycle: prompt → extraction → cleanup.
+  // Prompt execution is gated so async callers can validate ownership and
+  // register the job before any model or tool side effects are possible.
+  let startGateResolve!: () => void;
+  let started = false;
+  let disposedBeforeStart = false;
+  const startGate = new Promise<void>((resolve) => {
+    startGateResolve = resolve;
+  });
+  const start = (): void => {
+    if (started || disposedBeforeStart) return;
+    started = true;
+    startGateResolve();
+  };
+  const disposePreparedSession = (): void => {
+    if (started || disposedBeforeStart) return;
+    disposedBeforeStart = true;
+    startGateResolve();
+  };
   let result: SubagentResult = {
     isError: true,
     output: "(no output)",
@@ -832,6 +852,31 @@ export async function startSubagentJob(
   };
   const jobPromise = (async (): Promise<SubagentResult> => {
     try {
+      await startGate;
+      if (disposedBeforeStart || signal?.aborted) {
+        const info = readCancellationInfo(
+          signal,
+          cancellationSource ?? "signal",
+        );
+        result = {
+          isError: false,
+          cancelled: true,
+          output: `Sub-agent cancelled before start${info.reason ? `: ${info.reason}` : ""}.`,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+          },
+          model: session.model
+            ? `${session.model.provider}/${session.model.id}`
+            : undefined,
+          thinkingLevel: effectiveThinkingLevel,
+        };
+        return result;
+      }
       debugLog("info", "prompt_start", { jobId });
       // Bind ownership + depth so any nested sub-agent spawned during this
       // prompt can discover its owner (for cascade) and its depth (for the cap).
@@ -991,6 +1036,8 @@ export async function startSubagentJob(
     jobPromise,
     session,
     liveStatus,
+    start,
+    disposeBeforeStart: disposePreparedSession,
     modelLabel,
     thinkingLevel: effectiveThinkingLevel,
     modelWarning,

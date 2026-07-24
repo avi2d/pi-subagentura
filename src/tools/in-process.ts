@@ -32,7 +32,10 @@ import {
   type Usage,
 } from "../helpers";
 import { resolveSpawnDepth } from "../orchestration-context";
-import { getActiveSessionContextToken } from "../session-context";
+import {
+  getActiveSessionContextToken,
+  isSessionContextTokenLive,
+} from "../session-context";
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
@@ -124,22 +127,12 @@ function captureDeliveryOwner(
   };
 }
 
-function isSpawnContextStale(
-  token: ReturnType<typeof getActiveSessionContextToken>,
-): boolean {
-  if (!token) return false;
-  const current = getActiveSessionContextToken();
-  return (
-    !current ||
-    current.id !== token.id ||
-    current.generation !== token.generation
-  );
-}
-
 function discardAsyncSpawn(
   abort: AbortController,
   session: { abort: () => Promise<unknown> },
+  disposeBeforeStart?: () => void,
 ): void {
+  disposeBeforeStart?.();
   const reason = {
     source: "session_shutdown" as const,
     reason: "parent session shut down before async spawn registration",
@@ -265,7 +258,7 @@ async function runSubagent(
   rootSessionId?: string,
 ): Promise<SubagentResult> {
   try {
-    const { jobPromise, modelWarning } = await startSubagentJob({
+    const { jobPromise, modelWarning, start } = await startSubagentJob({
       task,
       persona,
       modelOverride,
@@ -279,6 +272,7 @@ async function runSubagent(
       depth,
       rootSessionId,
     });
+    start?.();
     const result = await jobPromise;
     if (modelWarning && !result.isError) {
       result.output = `${modelWarning}\n---\n${result.output}`;
@@ -389,6 +383,8 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           modelLabel,
           modelWarning,
           thinkingLevel,
+          start,
+          disposeBeforeStart,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
@@ -404,8 +400,8 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
         });
-        if (isSpawnContextStale(spawnContextToken)) {
-          discardAsyncSpawn(abort, session);
+        if (!isSessionContextTokenLive(spawnContextToken)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
         const jobState: JobState = {
@@ -437,6 +433,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         updateRunningFooter(ctx);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
+        start?.();
 
         return {
           content: [
@@ -590,6 +587,8 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           modelLabel,
           modelWarning,
           thinkingLevel,
+          start,
+          disposeBeforeStart,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
@@ -605,8 +604,8 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
         });
-        if (isSpawnContextStale(spawnContextToken)) {
-          discardAsyncSpawn(abort, session);
+        if (!isSessionContextTokenLive(spawnContextToken)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
         const jobState: JobState = {
@@ -638,6 +637,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         updateRunningFooter(ctx);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
+        start?.();
 
         return {
           content: [

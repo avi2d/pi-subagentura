@@ -770,6 +770,11 @@ describe("notifyOnComplete", () => {
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
+      const contextStack = (globalThis as any)
+        .__piSubagenturaSessionContextStack;
+      const activeContext = contextStack.at(-1);
+      activeContext.id = 701;
+      activeContext.generation = 1;
       (globalThis as any).__piSubagenturaActiveSessionContextId = 701;
       (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 1;
       await isolatedToolDef.execute(
@@ -779,6 +784,7 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
+      activeContext.generation = 2;
       (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 2;
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {

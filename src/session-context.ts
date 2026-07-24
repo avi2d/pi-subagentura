@@ -129,3 +129,14 @@ export function getActiveSessionContextToken():
     return undefined;
   return { id, generation };
 }
+
+/** Whether a captured context still belongs to the same live lifecycle. */
+export function isSessionContextTokenLive(
+  token: ActiveSessionContextToken | undefined,
+): boolean {
+  if (!token) return true;
+  const context = getSessionContextStack().find(
+    (entry) => entry.id === token.id,
+  );
+  return context?.generation === token.generation;
+}

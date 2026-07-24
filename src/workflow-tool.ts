@@ -169,7 +169,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         }
       }
       // In-process path: explicit isolation:"in-process" or fallback from failed process isolation
-      const { jobPromise } = await startSubagentJob({
+      const { jobPromise, start } = await startSubagentJob({
         task: prompt,
         persona,
         modelOverride: model,
@@ -197,6 +197,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
           ? { workflowStructuredOutputSchema: schema }
           : {}),
       });
+      start?.();
       return jobPromise;
     };
   }
