@@ -37,6 +37,7 @@ import {
   formatCompletionDeliveryBehavior,
 } from "../notifications";
 import { InteractiveParams } from "../schemas";
+import { updateRunningSubagentFooter } from "../artifact-poller";
 
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
@@ -173,6 +174,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           parentSessionId: ctx.sessionManager.getSessionId(),
           thinkingLevel: params.thinkingLevel,
         });
+        updateRunningSubagentFooter(ctx.ui);
 
         const displayMode = state.windowName
           ? "background (new window/tab)"
@@ -261,8 +263,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       pruneDeadInteractiveSubagents();
+      updateRunningSubagentFooter(ctx.ui);
       const states = params.jobId
         ? [interactiveSubagentRegistry.get(params.jobId)].filter(
             (s): s is InteractiveSubagentState => Boolean(s),
@@ -326,6 +329,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      updateRunningSubagentFooter(ctx.ui);
       const snapshotText = state.cancellationSnapshot?.path
         ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
         : state.cancellationSnapshot?.error
@@ -691,8 +695,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     ].join("\n"),
     parameters: Type.Object({}),
 
-    async execute(): Promise<any> {
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx): Promise<any> {
       pruneDeadInteractiveSubagents();
+      updateRunningSubagentFooter(ctx.ui);
       const states = [...interactiveSubagentRegistry.values()];
       const summary = states.map((s) => {
         const art = getArtifactForState(s);

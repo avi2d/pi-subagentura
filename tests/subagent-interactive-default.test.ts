@@ -1,17 +1,18 @@
 /**
- * Tests for the subagent_interactive tool's `notifyOnComplete` defaulting.
- *
- * The tool's `execute` defaults `notifyOnComplete` to "notify" and enables
- * automatic parent-turn triggering. These tests assert the default by mocking the
- * tmux-backed `launchInteractiveSubagent` helper and capturing the call args.
+ * Focused tool-lifecycle coverage for interactive notification defaults and
+ * prompt running-footer refreshes.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockCancelInteractiveSubagent, mockLaunchInteractiveSubagent } =
-  vi.hoisted(() => ({
-    mockCancelInteractiveSubagent: vi.fn(),
-    mockLaunchInteractiveSubagent: vi.fn(),
-  }));
+const {
+  mockCancelInteractiveSubagent,
+  mockLaunchInteractiveSubagent,
+  mockPruneDeadInteractiveSubagents,
+} = vi.hoisted(() => ({
+  mockCancelInteractiveSubagent: vi.fn(),
+  mockLaunchInteractiveSubagent: vi.fn(),
+  mockPruneDeadInteractiveSubagents: vi.fn(),
+}));
 
 vi.mock("../src/interactive-tmux", async (importOriginal) => {
   const actual =
@@ -20,10 +21,12 @@ vi.mock("../src/interactive-tmux", async (importOriginal) => {
     ...actual,
     launchInteractiveSubagent: mockLaunchInteractiveSubagent,
     cancelInteractiveSubagent: mockCancelInteractiveSubagent,
+    pruneDeadInteractiveSubagents: mockPruneDeadInteractiveSubagents,
   };
 });
 
 import registerExtension from "../src/subagent";
+import { interactiveSubagentRegistry } from "../src/interactive-tmux";
 
 /** Minimal ctx for the tool's execute signature. */
 function mockCtx() {
@@ -52,7 +55,31 @@ function getCancelToolDef(api: { registerTool: ReturnType<typeof vi.fn> }) {
   )?.[0];
 }
 
-describe("subagent_interactive notifyOnComplete default", () => {
+function getStatusToolDef(api: { registerTool: ReturnType<typeof vi.fn> }) {
+  return api.registerTool.mock.calls.find(
+    ([tool]: any[]) => tool.name === "get_interactive_subagent_status",
+  )?.[0];
+}
+
+function mockInteractiveState(status = "running") {
+  return {
+    id: "abc12345",
+    name: "Test",
+    task: "t",
+    paneId: "%99",
+    sessionFile: "/tmp/sess.jsonl",
+    cwd: "/tmp",
+    startedAt: Date.now(),
+    status,
+    mux: "tmux",
+    attachCommand: "tmux attach -t s",
+    selectPaneCommand: "tmux select-pane -t '%99'",
+    launchScriptFile: "/tmp/launch.sh",
+    artifactDir: "/tmp/artifacts/abc12345",
+  };
+}
+
+describe("subagent_interactive tool lifecycle", () => {
   let api: ReturnType<typeof setupExtension>;
 
   function setupExtension() {
@@ -71,33 +98,19 @@ describe("subagent_interactive notifyOnComplete default", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    interactiveSubagentRegistry.clear();
     api = setupExtension() as any;
     mockLaunchInteractiveSubagent.mockReset();
     mockCancelInteractiveSubagent.mockReset();
-    mockCancelInteractiveSubagent.mockReturnValue({
-      id: "abc12345",
-      status: "cancelled",
-      artifactDir: "/tmp/artifacts/abc12345",
-    });
-    // Return a minimal valid InteractiveSubagentState.
-    mockLaunchInteractiveSubagent.mockReturnValue({
-      id: "abc12345",
-      name: "Test",
-      task: "t",
-      paneId: "%99",
-      sessionFile: "/tmp/sess.jsonl",
-      cwd: "/tmp",
-      startedAt: Date.now(),
-      status: "running",
-      mux: "tmux",
-      attachCommand: "tmux attach -t s",
-      selectPaneCommand: "tmux select-pane -t '%99'",
-      launchScriptFile: "/tmp/launch.sh",
-      artifactDir: "/tmp/artifacts/abc12345",
-    });
+    mockPruneDeadInteractiveSubagents.mockReset();
+    mockCancelInteractiveSubagent.mockReturnValue(
+      mockInteractiveState("cancelled"),
+    );
+    mockLaunchInteractiveSubagent.mockReturnValue(mockInteractiveState());
   });
 
   afterEach(() => {
+    interactiveSubagentRegistry.clear();
     vi.clearAllMocks();
   });
 
@@ -208,6 +221,51 @@ describe("subagent_interactive notifyOnComplete default", () => {
     );
   });
 
+  it("updates the running footer immediately after launch", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const ctx = mockCtx();
+    const state = mockInteractiveState();
+    mockLaunchInteractiveSubagent.mockImplementationOnce(() => {
+      interactiveSubagentRegistry.set(state.id, state as any);
+      return state;
+    });
+
+    await toolDef.execute(
+      "call-footer-launch",
+      { task: "research X" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent active",
+    );
+  });
+
+  it("refreshes the footer when status pruning detects an exit", async () => {
+    const toolDef = getStatusToolDef(api);
+    const ctx = mockCtx();
+    const state = mockInteractiveState();
+    interactiveSubagentRegistry.set(state.id, state as any);
+    mockPruneDeadInteractiveSubagents.mockImplementationOnce(() => {
+      state.status = "exited";
+    });
+
+    await toolDef.execute(
+      "call-footer-exit",
+      { jobId: state.id },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "subagentura-running",
+      undefined,
+    );
+  });
   it("preserves explicit false triggering for notify mode", async () => {
     const toolDef = getInteractiveToolDef(api);
 
@@ -234,6 +292,12 @@ describe("subagent_interactive notifyOnComplete default", () => {
   it("notifies the user without scheduling another LLM completion when cancelled", async () => {
     const toolDef = getCancelToolDef(api);
     const ctx = mockCtx();
+    const state = mockInteractiveState();
+    interactiveSubagentRegistry.set(state.id, state as any);
+    mockCancelInteractiveSubagent.mockImplementationOnce(() => {
+      state.status = "cancelled";
+      return state;
+    });
 
     const result = await toolDef.execute(
       "call-cancel",
@@ -250,6 +314,10 @@ describe("subagent_interactive notifyOnComplete default", () => {
     );
     expect(result.content[0].text).toContain(
       "No separate cancellation completion will be injected",
+    );
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "subagentura-running",
+      undefined,
     );
   });
 

@@ -130,13 +130,20 @@ export function getActiveSessionContextToken():
   return { id, generation };
 }
 
+/** Resolve a captured context only while its original lifecycle is still live. */
+export function resolveLiveSessionContext(
+  token: ActiveSessionContextToken | undefined,
+): SessionContextRef | undefined {
+  if (!token) return undefined;
+  const context = getSessionContextStack().find(
+    (entry) => entry.id === token.id,
+  );
+  return context?.generation === token.generation ? context : undefined;
+}
+
 /** Whether a captured context still belongs to the same live lifecycle. */
 export function isSessionContextTokenLive(
   token: ActiveSessionContextToken | undefined,
 ): boolean {
-  if (!token) return true;
-  const context = getSessionContextStack().find(
-    (entry) => entry.id === token.id,
-  );
-  return context?.generation === token.generation;
+  return !token || resolveLiveSessionContext(token) !== undefined;
 }

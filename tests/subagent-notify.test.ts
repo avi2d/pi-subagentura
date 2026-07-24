@@ -764,6 +764,86 @@ describe("notifyOnComplete", () => {
       expect(queue).toEqual([]);
     });
 
+    it("delivers to the parent while a nested child context is active", async () => {
+      const jobId = "nested-context-parent-owner";
+      const control = createJobControl();
+      const parentSessionManager = {
+        getSessionId: () => "parent-session",
+        getEntries: () => [],
+      };
+      const parentSessionStart = api.on.mock.calls.find(
+        ([eventName]: any[]) => eventName === "session_start",
+      )?.[1];
+      parentSessionStart(
+        { reason: "new" },
+        {
+          cwd: "/tmp",
+          ui: { notify: api.notify },
+          sessionManager: parentSessionManager,
+        },
+      );
+      mockStartSubagentJob.mockImplementationOnce(() =>
+        mockJobResult(jobId, control.jobPromise),
+      );
+
+      await isolatedToolDef.execute(
+        "nested-context-spawn",
+        {
+          async: true,
+          task: "test",
+          notifyOnComplete: "inject",
+          triggerTurnOnComplete: true,
+        },
+        undefined,
+        undefined,
+        { ...mockCtx(), sessionManager: parentSessionManager },
+      );
+
+      const child = setupExtension();
+      const childSessionStart = child.api.on.mock.calls.find(
+        ([eventName]: any[]) => eventName === "session_start",
+      )?.[1];
+      childSessionStart(
+        { reason: "new" },
+        {
+          cwd: "/tmp",
+          ui: { notify: child.api.notify },
+          sessionManager: {
+            getSessionId: () => "child-session",
+            getEntries: () => [],
+          },
+        },
+      );
+      const contextStack = (globalThis as any)
+        .__piSubagenturaSessionContextStack;
+      expect(contextStack.at(-1).pi).toBe(child.api);
+
+      control.resolve(SUCCESS_RESULT);
+      await vi.waitFor(() => {
+        expect(jobRegistry.get(jobId)?.status).toBe("done");
+      });
+      const status = await statusToolDef.execute(
+        "nested-context-status",
+        { jobId },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      expect(status.details.status).toBe("done");
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(sentMessageAt(api, 0)).toMatchObject({
+        customType: "subagent-notify",
+        details: { jobId },
+      });
+      expect(sentMessageOptsAt(api, 0)).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      expect(api.notify).toHaveBeenCalledOnce();
+      expect(child.api.sendMessage).not.toHaveBeenCalled();
+    });
+
     it("uses the async spawn owner after a generation rollover", async () => {
       const jobId = "spawn-owner-generation";
       const control = createJobControl();
@@ -1073,7 +1153,7 @@ describe("notifyOnComplete", () => {
       );
     });
 
-    it("does NOT deliver notification when result was retrieved before completion", async () => {
+    it("keeps the UI notification when a retrieved result suppresses parent delivery", async () => {
       const jobId = "retrieve-suppress";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -1095,17 +1175,18 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      // The delivery guard checks !jobState.resultRetrieved and skips
-      await vi.waitFor(
-        () => {
-          expect(api.sendMessage).toHaveBeenCalledTimes(0);
-          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-        },
-        { timeout: 50 },
-      );
+      await vi.waitFor(() => {
+        expect(jobState.status).toBe("done");
+        expect(api.notify).toHaveBeenCalledWith(
+          expect.stringContaining(`Job ${jobId}`),
+          "info",
+        );
+      });
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(api.sendUserMessage).not.toHaveBeenCalled();
     });
 
-    it("suppresses inject notification when result was retrieved before completion", async () => {
+    it("keeps the inject UI notification when result delivery is suppressed", async () => {
       const jobId = "retrieve-inject-suppress";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -1125,13 +1206,15 @@ describe("notifyOnComplete", () => {
 
       control.resolve(SUCCESS_RESULT);
 
-      await vi.waitFor(
-        () => {
-          expect(api.sendMessage).toHaveBeenCalledTimes(0);
-          expect(api.sendUserMessage).toHaveBeenCalledTimes(0);
-        },
-        { timeout: 50 },
-      );
+      await vi.waitFor(() => {
+        expect(jobState.status).toBe("done");
+        expect(api.notify).toHaveBeenCalledWith(
+          expect.stringContaining(`Job ${jobId}`),
+          "info",
+        );
+      });
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(api.sendUserMessage).not.toHaveBeenCalled();
     });
   });
 

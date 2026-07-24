@@ -42,6 +42,7 @@ import {
   completionTriggersTurn,
   deliverNotification,
   formatCompletionDeliveryBehavior,
+  notifyInProcessCompletionWithoutDelivery,
 } from "../notifications";
 import { interactiveSubagentRegistry } from "../interactive-tmux";
 import { renderSubagentCall, renderSubagentResult } from "../rendering";
@@ -219,13 +220,15 @@ function settleAsyncJob(
   jobState.result = result;
   scheduleJobCleanup(jobId, false, jobState.maxAge);
 
-  if (
+  const shouldDeliver =
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
     !jobState.resultRetrieved &&
-    (jobState.activeResultWaits ?? 0) === 0
-  ) {
+    (jobState.activeResultWaits ?? 0) === 0;
+  if (shouldDeliver) {
     deliverNotification(jobState, result);
+  } else if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
+    notifyInProcessCompletionWithoutDelivery(jobState, result);
   }
 
   updateRunningFooter(ctx);
