@@ -226,8 +226,11 @@ export function renderSubagentNotify(
   return new Text(line, 0, 0);
 }
 
-/** Format a single TUI widget row for a running sub-agent. */
+/** Format a single TUI widget row for a live sub-agent. */
 export function formatActivityRow(state: InteractiveSubagentState): string {
+  if (state.status === "idle") {
+    return `○ ${state.name}: idle — ready for follow-up`;
+  }
   const ago = state.lastActivityAt
     ? ` (${agoStr(Date.now() - state.lastActivityAt)})`
     : "";

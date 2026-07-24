@@ -156,7 +156,7 @@ describe("session handler lifecycle callbacks", () => {
     updateRunningSubagentFooter(parentUi as any);
     expect(parentUi.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent running",
+      "⚡ 1 sub-agent active",
     );
     parentUi.setStatus.mockClear();
 
@@ -173,7 +173,7 @@ describe("session handler lifecycle callbacks", () => {
     updateRunningSubagentFooter(parentUi as any);
     expect(parentUi.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent running",
+      "⚡ 1 sub-agent active",
     );
   });
 });

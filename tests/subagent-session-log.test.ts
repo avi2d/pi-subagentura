@@ -525,7 +525,7 @@ describe("session-log tail-read", () => {
     // Footer status shows count.
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent running",
+      "⚡ 1 sub-agent active",
     );
     // Widget shows the activity row. Workflow widget is also cleared in the same poll.
     const activityWidgetCall = setWidget.mock.calls.find(
@@ -538,7 +538,7 @@ describe("session-log tail-read", () => {
     expect(lines[0]).toContain("rg TODO src/");
   });
 
-  it("clears the widget and footer when no sub-agents are running", async () => {
+  it("clears the widget and footer when no sub-agents are active", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     // Empty registry.

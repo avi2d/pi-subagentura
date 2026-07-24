@@ -73,7 +73,7 @@ export function updateRunningSubagentFooter(
     ui.setStatus(
       FOOTER_KEY,
       runningCount > 0
-        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
+        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
         : undefined,
     );
   } catch {

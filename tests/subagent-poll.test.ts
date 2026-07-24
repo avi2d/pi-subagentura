@@ -104,7 +104,7 @@ describe("pollArtifactChanges", () => {
 
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent running",
+      "⚡ 1 sub-agent active",
     );
   });
 
@@ -1023,11 +1023,11 @@ describe("pollArtifactChanges", () => {
   // ── Bug B regression tests (stale footer/widget for closed sub-agents) ──
   // When a sub-agent is "exited" (terminal, pane dead) the for-loop at line
   // ~518 of subagent.ts must still tail-read the session log (for user-role
-  // revival), but it must NOT contribute to the `runningCount` footer or
+  // revival, but it must NOT contribute to the active footer count or
   // the `widgetRows` list. `idle` sub-agents (between turns, REPL open) are
-  // still live and DO contribute to the running count.
+  // still live and DO contribute to the active count.
   describe("footer/widget (Bug B)", () => {
-    it("AC-B1: counts running + idle as 'running'; excludes exited from both footer and widget", async () => {
+    it("AC-B1: counts running + idle as 'active'; excludes exited from both footer and widget", async () => {
       // Mock display-message to branch on paneId:
       //   running-pane and idle-pane → alive (return success)
       //   exited-pane              → dead (throw)
@@ -1105,7 +1105,7 @@ describe("pollArtifactChanges", () => {
 
       expect(setStatus).toHaveBeenCalledWith(
         "subagentura-running",
-        "⚡ 2 sub-agents running",
+        "⚡ 2 sub-agents active",
       );
       expect(setWidget).toHaveBeenCalledWith(
         "subagentura-activity",
@@ -1119,6 +1119,75 @@ describe("pollArtifactChanges", () => {
       expect(idle.status).toBe("idle");
       expect(running.status).toBe("running");
 
+      delete (globalThis as any).__piSubagenturaUi;
+    });
+
+    it("AC-B1b: rehydrates a completed live pane as idle and ready", async () => {
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({
+        execFileSync: (_file: string, args: string[]) => {
+          if (args[0] === "display-message") return Buffer.from("#99");
+          return "";
+        },
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "#99"),
+      }));
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const cwd = makeTmp();
+      const id = "rehydrated-idle";
+      const artifactDir = join(cwd, id);
+      mkdirSync(artifactDir, { recursive: true });
+      const art = artifactPath(cwd, id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, {
+        ts: 2,
+        type: "done",
+        status: "done",
+        exitCode: 0,
+      });
+      appendInteractiveState(cwd, {
+        id,
+        paneId: "%idle-pane",
+        windowName: "demo",
+        mux: "tmux",
+        artifactDir,
+        sessionFile: "/tmp/sess.jsonl",
+        parentSessionId: "pi",
+        eventByteCursor: eventLogEndOffset(art),
+        lifecycle: {
+          completionTurnId: "turn-1",
+          completionOutcome: "done",
+          completionSource: "explicit",
+        },
+      });
+      mod.rehydrateInteractiveSubagents(cwd, "pi");
+      const state = mod.interactiveSubagentRegistry.get(id)!;
+      expect(state.status).toBe("idle");
+      const setStatus = vi.fn();
+      const setWidget = vi.fn();
+      (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+      await mod.pollArtifactChanges({
+        sendMessage: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any);
+
+      expect(state.status).toBe("idle");
+      expect(setStatus).toHaveBeenCalledWith(
+        "subagentura-running",
+        "⚡ 1 sub-agent active",
+      );
+      const widgetRows = setWidget.mock.calls[0][1] as string[];
+      expect(widgetRows).toContain(
+        "○ rehydrated-idle: idle — ready for follow-up",
+      );
+      expect(widgetRows.join("\n")).not.toContain("starting");
+      expect(widgetRows.join("\n")).not.toContain("stale");
       delete (globalThis as any).__piSubagenturaUi;
     });
 
@@ -1213,7 +1282,7 @@ describe("pollArtifactChanges", () => {
 
       expect(setStatus).toHaveBeenCalledWith(
         "subagentura-running",
-        "⚡ 3 sub-agents running",
+        "⚡ 3 sub-agents active",
       );
       const widgetArgs = setWidget.mock.calls[0];
       expect(widgetArgs[1].length).toBe(2);
