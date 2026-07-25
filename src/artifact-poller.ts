@@ -180,6 +180,7 @@ async function runPollArtifactChanges(
         }
       }),
     );
+    if (owner && !resolveLiveSessionContext(owner)) return;
     const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     if (
       !owner &&

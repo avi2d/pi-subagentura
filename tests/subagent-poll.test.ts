@@ -28,8 +28,10 @@ import {
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
 import {
+  advanceSessionContextGeneration,
   getSessionContextStack,
   registerSessionContext,
+  removeSessionContext,
 } from "../src/session-context";
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
@@ -88,6 +90,71 @@ describe("pollArtifactChanges", () => {
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
     vi.doUnmock("node:child_process");
   });
+
+  async function pollUntilOwnerInvalidation(
+    invalidate: (owner: { id: number; generation: number }) => void,
+  ) {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const item = makeState();
+    item.state.parentSessionId = "session-a";
+    item.state.cwd = join(item.artifactDir, "..");
+    const art = artifactPath(item.state.cwd, item.id);
+    appendCompletionEvent(art, {
+      turnId: `turn-${item.id}`,
+      outcome: "done",
+      source: "agent_settled",
+    });
+    appendInteractiveState(item.state.cwd, {
+      id: item.id,
+      paneId: item.state.paneId,
+      mux: item.state.mux,
+      artifactDir: item.state.artifactDir,
+      sessionFile: item.state.sessionFile,
+    });
+    const persistedBefore = loadInteractiveStates(item.state.cwd)?.states[
+      item.id
+    ];
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    const owner = { id: 701, generation: 1 };
+    const sendMessage = vi.fn();
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    registerSessionContext({
+      ...owner,
+      pi: { sendMessage } as any,
+      ui: { notify: vi.fn(), setStatus, setWidget } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    let releaseLiveness!: () => void;
+    let livenessStarted = false;
+    const blockedLiveness = new Promise<void>((resolve) => {
+      releaseLiveness = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => {
+        livenessStarted = true;
+        await blockedLiveness;
+        return true;
+      },
+    } as any);
+
+    const polling = mod.pollArtifactChanges({} as any, owner);
+    await Promise.resolve();
+    expect(livenessStarted).toBe(true);
+    invalidate(owner);
+    releaseLiveness();
+    await polling;
+
+    return {
+      state: item.state,
+      persistedBefore,
+      sendMessage,
+      setStatus,
+      setWidget,
+    };
+  }
 
   it("does nothing when registry is empty", async () => {
     const mod =
@@ -197,6 +264,38 @@ describe("pollArtifactChanges", () => {
     await Promise.all([pollA, pollB]);
 
     expect(bProcessedWhileAWasBlocked).toBe(true);
+  });
+
+  it("abandons mutation when its owner is removed during liveness", async () => {
+    const result = await pollUntilOwnerInvalidation((owner) => {
+      removeSessionContext(owner.id);
+    });
+
+    expect(result.state.eventByteCursor ?? 0).toBe(0);
+    expect(result.state.pendingDeliveries ?? []).toEqual([]);
+    expect(result.state.status).toBe("running");
+    expect(
+      loadInteractiveStates(result.state.cwd)?.states[result.state.id],
+    ).toEqual(result.persistedBefore);
+    expect(result.sendMessage).not.toHaveBeenCalled();
+    expect(result.setStatus).not.toHaveBeenCalled();
+    expect(result.setWidget).not.toHaveBeenCalled();
+  });
+
+  it("abandons mutation when its owner generation advances during liveness", async () => {
+    const result = await pollUntilOwnerInvalidation((owner) => {
+      advanceSessionContextGeneration(owner.id);
+    });
+
+    expect(result.state.eventByteCursor ?? 0).toBe(0);
+    expect(result.state.pendingDeliveries ?? []).toEqual([]);
+    expect(result.state.status).toBe("running");
+    expect(
+      loadInteractiveStates(result.state.cwd)?.states[result.state.id],
+    ).toEqual(result.persistedBefore);
+    expect(result.sendMessage).not.toHaveBeenCalled();
+    expect(result.setStatus).not.toHaveBeenCalled();
+    expect(result.setWidget).not.toHaveBeenCalled();
   });
 
   it("keeps running in-process jobs in the shared footer", async () => {
