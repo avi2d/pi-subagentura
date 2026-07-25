@@ -327,7 +327,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       "",
       "Runs async (background) BY DEFAULT so the parent turn stays responsive — pass async: false only for a single short sub-agent whose result you need inline.",
       "When fanning out multiple sub-agents (e.g. one per PR/file), leave async at its default so they run concurrently without blocking the parent.",
-      'The main agent continues immediately; async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
+      'The main agent continues immediately; async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" to persist a pointer-only completion in parent context without injecting the full output.',
       "Nested orchestration depth is capped (SUBAGENTURA_MAX_ORCHESTRATION_DEPTH, default 3); over-deep spawns are refused and the sub-agent should do the work itself.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
       "Both modes show the user a completion notification.",

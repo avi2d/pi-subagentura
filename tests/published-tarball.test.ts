@@ -21,7 +21,6 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -30,7 +29,7 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -40,12 +39,17 @@ const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
   version: string;
   files: string[];
   exports: Record<string, unknown>;
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
 };
-const NM_SMOKE_DIR = join(
-  REPO,
-  "node_modules",
-  ".pi-subagentura-smoke-" + PKG.version,
-);
+const SOURCE_EXTENSIONS = [".ts", ".mts", ".mjs", ".js"];
+const APPROVED_PI_PEERS = new Set([
+  "@earendil-works/pi-agent-core",
+  "@earendil-works/pi-ai",
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+  "typebox",
+]);
 
 interface PackResult {
   tgz: string;
@@ -99,23 +103,65 @@ function pack(work: string): PackResult {
   return { tgz, entries, pkgDir: join(pkgDir, "package") };
 }
 
-/** Returns the module specifier for every `from "./foo"` (or `./foo/bar`) in source. */
-function localImports(source: string): string[] {
-  const re = /from\s+["'](\.\/[^"']+)["']/g;
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(source)) !== null) out.push(m[1].slice(2)); // strip "./"
-  return out;
+interface SourceReference {
+  specifier: string;
+  runtime: boolean;
 }
 
-/** Local module `./foo` resolves to `./foo.ts`, `./foo.mjs`, or `./foo/index.ts`. */
-function resolvesInTarball(mod: string, entries: string[]): boolean {
-  if (entries.includes(`src/${mod}`)) return true;
-  return (
-    entries.includes(`src/${mod}.ts`) ||
-    entries.includes(`src/${mod}.mjs`) ||
-    entries.includes(`src/${mod}/index.ts`)
-  );
+function sourceReferences(source: string): SourceReference[] {
+  const references: SourceReference[] = [];
+  const patterns: Array<{
+    regex: RegExp;
+    runtime: (match: RegExpExecArray) => boolean;
+  }> = [
+    {
+      regex: /\bimport\s+(type\s+)?(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g,
+      runtime: (match) => match[1] === undefined,
+    },
+    {
+      regex: /\bexport\s+(type\s+)?[^"']*?\s+from\s+["']([^"']+)["']/g,
+      runtime: (match) => match[1] === undefined,
+    },
+    {
+      regex: /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+      runtime: () => true,
+    },
+    {
+      regex:
+        /\bnew\s+URL\s*\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g,
+      runtime: () => true,
+    },
+  ];
+  for (const { regex, runtime } of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(source)) !== null) {
+      const specifier = match[2] ?? match[1];
+      references.push({ specifier, runtime: runtime(match) });
+    }
+  }
+  return references;
+}
+
+function isSourceFile(path: string): boolean {
+  return SOURCE_EXTENSIONS.includes(extname(path));
+}
+
+function localCandidates(importer: string, specifier: string): string[] {
+  const base = resolve("/package", dirname(importer), specifier);
+  const packageRelative = relative("/package", base);
+  if (extname(packageRelative)) return [packageRelative];
+  return [
+    packageRelative,
+    ...SOURCE_EXTENSIONS.map((extension) => packageRelative + extension),
+    ...SOURCE_EXTENSIONS.map((extension) =>
+      join(packageRelative, "index" + extension),
+    ),
+  ];
+}
+
+function packageName(specifier: string): string {
+  if (!specifier.startsWith("@")) return specifier.split("/")[0];
+  return specifier.split("/").slice(0, 2).join("/");
 }
 
 function packageFileDeclarationMatches(
@@ -138,20 +184,16 @@ describe("published tarball", () => {
   const work = mkdtempSync(join(tmpdir(), "pi-subagentura-pubtest-"));
   let entries: string[] = [];
   let pkgDir = "";
+  let tgz = "";
 
   beforeAll(() => {
     const r = pack(work);
     entries = r.entries;
     pkgDir = r.pkgDir;
-    // Copy extracted tarball into node_modules so Vite resolves bare specifiers
-    if (existsSync(NM_SMOKE_DIR))
-      rmSync(NM_SMOKE_DIR, { recursive: true, force: true });
-    cpSync(pkgDir, NM_SMOKE_DIR, { recursive: true });
+    tgz = r.tgz;
   });
 
   afterAll(() => {
-    if (existsSync(NM_SMOKE_DIR))
-      rmSync(NM_SMOKE_DIR, { recursive: true, force: true });
     rmSync(work, { recursive: true, force: true });
   });
 
@@ -206,15 +248,18 @@ describe("published tarball", () => {
     );
   });
 
-  it("every local import in shipped .ts files resolves to a file in the tarball", () => {
+  it("resolves every package-relative source dependency inside the tarball", () => {
     const failures: string[] = [];
     for (const entry of entries) {
-      if (!entry.endsWith(".ts")) continue;
+      if (!isSourceFile(entry)) continue;
       const src = readFileSync(join(pkgDir, entry), "utf8");
-      for (const mod of localImports(src)) {
-        if (!resolvesInTarball(mod, entries)) {
+      for (const { specifier } of sourceReferences(src)) {
+        if (!specifier.startsWith("./") && !specifier.startsWith("../"))
+          continue;
+        const candidates = localCandidates(entry, specifier);
+        if (!candidates.some((candidate) => entries.includes(candidate))) {
           failures.push(
-            `${entry} imports './${mod}' but no candidate (${mod}.ts, ${mod}/index.ts) is in the tarball`,
+            `${entry} references '${specifier}' but none of ${candidates.join(", ")} is in the tarball`,
           );
         }
       }
@@ -225,57 +270,70 @@ describe("published tarball", () => {
     ).toEqual([]);
   });
 
-  it("extension entrypoint can be imported like Pi does", async () => {
-    // Pi reads package.json#pi.extensions → ["./src/subagent.ts"],
-    // resolves relative to the package root, and does a dynamic import
-    const pkgJson = JSON.parse(
-      readFileSync(join(NM_SMOKE_DIR, "package.json"), "utf-8"),
-    );
-    const extensions = pkgJson.pi?.extensions;
-    expect(extensions).toBeDefined();
-    expect(Array.isArray(extensions)).toBe(true);
-    expect(extensions!.length).toBeGreaterThan(0);
-    const entrypoint = extensions![0];
-    expect(entrypoint).toBe("./src/subagent.ts");
-
-    // Dynamic import like Pi does — resolves the relative path against the package root
-    const mod = await import(join(NM_SMOKE_DIR, entrypoint));
-
-    // Default export is the extension registration function
-    expect(typeof mod.default).toBe("function");
-
-    // Key named exports that Pi references
-    expect(typeof mod.formatUsage).toBe("function");
-    expect(mod.jobRegistry).toBeDefined();
+  it("ships the workflow worker thread referenced through import.meta.url", () => {
+    const source = readFileSync(join(pkgDir, "src/workflow-worker.ts"), "utf8");
+    expect(sourceReferences(source)).toContainEqual({
+      specifier: "./workflow-worker-thread.mjs",
+      runtime: true,
+    });
+    expect(entries).toContain("src/workflow-worker-thread.mjs");
   });
 
-  describe("package.json `files` array", () => {
-    it("includes every local import of every shipped .ts file (static check)", () => {
-      const tsFiles = PKG.files.filter((f) => f.endsWith(".ts"));
-      const failures: string[] = [];
-      for (const f of tsFiles) {
-        const source = readFileSync(join(REPO, f), "utf8");
-        for (const mod of localImports(source)) {
-          if (!resolvesInFiles(mod)) {
-            failures.push(
-              `${f} imports './${mod}' but 'src/${mod}.ts' (or 'src/${mod}/index.ts') is not in package.json 'files'`,
-            );
-          }
+  it("declares every bare runtime source import", () => {
+    const declared = new Set(Object.keys(PKG.dependencies ?? {}));
+    for (const peer of Object.keys(PKG.peerDependencies ?? {})) {
+      if (APPROVED_PI_PEERS.has(peer)) declared.add(peer);
+    }
+    const failures: string[] = [];
+    for (const entry of entries) {
+      if (!isSourceFile(entry)) continue;
+      const source = readFileSync(join(pkgDir, entry), "utf8");
+      for (const reference of sourceReferences(source)) {
+        const specifier = reference.specifier;
+        if (
+          !reference.runtime ||
+          specifier.startsWith("./") ||
+          specifier.startsWith("../") ||
+          specifier.startsWith("node:")
+        ) {
+          continue;
+        }
+        const dependency = packageName(specifier);
+        if (!declared.has(dependency)) {
+          failures.push(
+            `${entry} imports undeclared runtime dependency '${dependency}'`,
+          );
         }
       }
-      expect(
-        failures,
-        failures.length === 0 ? "" : `\n${failures.join("\n")}`,
-      ).toEqual([]);
-    });
+    }
+    expect(
+      failures,
+      failures.length === 0 ? "" : `\n${failures.join("\n")}`,
+    ).toEqual([]);
+  });
 
-    function resolvesInFiles(mod: string): boolean {
-      if (PKG.files.includes(`src/${mod}`)) return true;
-      return (
-        PKG.files.includes(`src/${mod}.ts`) ||
-        PKG.files.includes(`src/${mod}.mjs`) ||
-        PKG.files.includes(`src/${mod}/index.ts`)
+  it("loads the packed TypeScript extension in a clean production consumer", () => {
+    const consumer = join(work, "consumer");
+    mkdirSync(consumer);
+    const install = spawnSync(
+      "npm",
+      ["install", "--omit=dev", "--ignore-scripts", tgz, "jiti"],
+      { cwd: consumer, encoding: "utf8" },
+    );
+    if (install.status !== 0) {
+      throw new Error(
+        `clean consumer install failed (exit ${install.status}):\n${install.stderr || install.stdout}`,
       );
     }
-  });
+    const smoke = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        'import { createJiti } from "jiti"; const jiti = createJiti(import.meta.url); const mod = await jiti.import("pi-subagentura", { default: false }); if (typeof mod.default !== "function") process.exit(2);',
+      ],
+      { cwd: consumer, encoding: "utf8" },
+    );
+    expect(smoke.status, smoke.stderr || smoke.stdout).toBe(0);
+  }, 60_000);
 });

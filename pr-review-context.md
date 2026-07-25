@@ -151,10 +151,10 @@ events remained labeled `"Explicit"`.
 
 ## Additional API/documentation findings from late Luna review
 
-### P2 — `notifyOnComplete: "notify"` is incorrectly described as UI-only
+### P2 — `notifyOnComplete: "notify"` is incorrectly described as visual-only
 
-The LLM-facing in-process tool description calls notify mode a “UI-only hint”
-(`src/tools/in-process.ts:328-334`). The implementation instead persists a
+The LLM-facing in-process tool description previously called notify mode a
+“visual-only hint” (`src/tools/in-process.ts:328-334`). The implementation instead persists a
 pointer-only custom message into parent context, matching the schema contract
 (`src/schemas.ts:51-57`). This wording can make the parent poll unnecessarily or
 assume that no completion record will enter its context.

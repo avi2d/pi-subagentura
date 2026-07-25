@@ -323,7 +323,7 @@ async function runPollArtifactChanges(
       widgetRows.push(`… and ${extra} more`);
     }
 
-    // Paint footer + widget. Both are TUI-only — never reach the LLM.
+    // Paint footer + widget. Both are TUI surfaces that never reach the LLM.
     if (ui) {
       updateRunningSubagentFooter(ui);
       try {
