@@ -103,14 +103,14 @@ export default function (pi: ExtensionAPI) {
     };
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  registerSessionHandlers(pi);
-  registerWorkflowTool(pi);
+  const sessionContext = registerSessionHandlers(pi);
+  registerWorkflowTool(pi, sessionContext);
   registerInProcessSubagentTools(pi);
   registerInteractiveSubagentTools(pi);
   registerInProcessMaintenanceTools(pi);
 
   // ── Cancel-all-flows shortcut and command ──────────────────────
-  registerCancelAllFlows(pi);
+  registerCancelAllFlows(pi, sessionContext);
 }
 
 /**

@@ -17,10 +17,7 @@ import {
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
-import {
-  normalizeCancelledWorkflowState,
-  workflowJobRegistry,
-} from "./workflow-jobs";
+import { cleanupWorkflowJobsForOwner } from "./workflow-jobs";
 import {
   advanceSessionContextGeneration,
   createSessionContextRef,
@@ -28,13 +25,15 @@ import {
   registerSessionContext,
   removeSessionContext,
   setActiveSessionRefs,
+  type ActiveSessionContextToken,
+  type SessionContextRef,
 } from "./session-context";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
-export function registerSessionHandlers(pi: ExtensionAPI): void {
+export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
   const sessionContext = createSessionContextRef(pi);
   const g2 = getGlobalState() as any;
   registerSessionContext(sessionContext);
@@ -56,6 +55,11 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
   pi.on("session_start", (event, ctx) => {
+    const previousOwner: ActiveSessionContextToken = {
+      id: sessionContext.id,
+      generation: sessionContext.generation,
+    };
+    cleanupWorkflowJobsForOwner(previousOwner);
     advanceSessionContextGeneration(sessionContext.id);
     removeSessionContext(sessionContext.id);
     sessionContext.ui = ctx.ui;
@@ -98,7 +102,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
     const handle = setInterval(() => {
-      void pollArtifactChanges(pi).catch((err) => {
+      void pollArtifactChanges(pi, {
+        id: sessionContext.id,
+        generation: sessionContext.generation,
+      }).catch((err) => {
         console.error("[subagentura] artifact poll failed", err);
       });
     }, 5000);
@@ -123,6 +130,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       if (contextIndex < 0) return;
 
       const wasTop = contextIndex === contextStack.length - 1;
+      const shutdownOwner: ActiveSessionContextToken = {
+        id: sessionContext.id,
+        generation: sessionContext.generation,
+      };
       advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
       setActiveSessionRefs(contextStack[contextStack.length - 1]);
@@ -221,21 +232,11 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
-      // Workflow workers are bound to this parent context. Suppress completion
-      // before aborting so late settlement cannot notify a replacement session.
-      for (const workflow of workflowJobRegistry.values()) {
-        workflow.suppressCompletionNotification = true;
-        if (workflow.status === "running") {
-          workflow.abort.abort();
-          workflow.status = "cancelled";
-        }
-        if (workflow.status === "cancelled") {
-          normalizeCancelledWorkflowState(workflow);
-        }
-      }
+      // Workflow workers are bound to this exact parent lifecycle. Suppress
+      // completion before aborting so late settlement cannot notify a replacement.
+      cleanupWorkflowJobsForOwner(shutdownOwner);
 
       jobRegistry.clear();
-      workflowJobRegistry.clear();
       g2.__piSubagenturaPiRef = undefined;
       g2.__piSubagenturaSessionManager = undefined;
       g2.__piSubagenturaParentStreaming = false;
@@ -250,4 +251,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       }
     },
   );
+
+  return sessionContext;
 }

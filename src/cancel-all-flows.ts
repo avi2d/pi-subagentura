@@ -15,8 +15,9 @@ import {
 } from "./interactive-tmux";
 import {
   normalizeCancelledWorkflowState,
-  workflowJobRegistry,
+  workflowJobsForOwner,
 } from "./workflow-jobs";
+import type { ActiveSessionContextToken } from "./session-context";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -31,7 +32,9 @@ export interface CancelAllResult {
   snapshots?: CancellationSnapshotReceipt[];
 }
 
-export async function cancelAllFlows(): Promise<CancelAllResult> {
+export async function cancelAllFlows(
+  owner?: ActiveSessionContextToken,
+): Promise<CancelAllResult> {
   const result: CancelAllResult = {
     jobsAborted: 0,
     workflowsAborted: 0,
@@ -103,7 +106,7 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   }
 
   // 2. Abort all running workflows
-  for (const workflow of workflowJobRegistry.values()) {
+  for (const workflow of workflowJobsForOwner(owner)) {
     if (workflow.status === "running") {
       workflow.suppressCompletionNotification = true;
       workflow.abort.abort();

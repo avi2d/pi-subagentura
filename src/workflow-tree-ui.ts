@@ -2,10 +2,11 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
   getWorkflowCompletionPresentation,
   normalizeCancelledWorkflowState,
-  workflowJobRegistry,
+  workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { formatWorkflowUsage } from "./workflow-core";
+import type { ActiveSessionContextToken } from "./session-context";
 
 const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
 
@@ -16,6 +17,7 @@ type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 
 interface WorkflowTreeOptions {
   done: WorkflowTreeDone;
+  owner?: ActiveSessionContextToken;
   requestRender?: () => void;
   notify?: (message: string) => void;
 }
@@ -71,7 +73,7 @@ export class WorkflowTreeComponent {
   }
 
   handleInput(data: string): void {
-    const jobs = selectableJobs();
+    const jobs = selectableJobs(this.opts.owner);
     if (data === "q" || data === "\x1b") {
       this.opts.done({ kind: "close" });
       return;
@@ -116,7 +118,7 @@ export class WorkflowTreeComponent {
 
   private rows(): WorkflowRow[] {
     const rows: WorkflowRow[] = [];
-    for (const job of workflowJobRegistry.values()) {
+    for (const job of workflowJobsForOwner(this.opts.owner)) {
       const isExpanded = this.expanded.has(job.id);
       rows.push({
         job,
@@ -160,6 +162,7 @@ export class WorkflowTreeComponent {
 
 export async function showWorkflowTree(
   ui: ExtensionUIContext,
+  owner?: ActiveSessionContextToken,
 ): Promise<WorkflowTreeAction> {
   const custom = (ui as any).custom;
   if (typeof custom !== "function") {
@@ -176,6 +179,7 @@ export async function showWorkflowTree(
     ) =>
       new WorkflowTreeComponent({
         done,
+        owner,
         requestRender: () => tui.requestRender?.(),
         notify: (message) => ui.notify(message),
       }),
@@ -190,8 +194,8 @@ export async function showWorkflowTree(
   );
 }
 
-function selectableJobs(): WorkflowJobState[] {
-  return [...workflowJobRegistry.values()];
+function selectableJobs(owner?: ActiveSessionContextToken): WorkflowJobState[] {
+  return workflowJobsForOwner(owner);
 }
 
 function formatWorkflowSummary(job: WorkflowJobState): string {

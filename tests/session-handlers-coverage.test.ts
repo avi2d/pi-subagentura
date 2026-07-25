@@ -18,8 +18,8 @@ function registerHandlers() {
     }),
     sendMessage: vi.fn(),
   };
-  registerSessionHandlers(pi as any);
-  return { handlers, pi };
+  const sessionContext = registerSessionHandlers(pi as any);
+  return { handlers, pi, sessionContext };
 }
 
 describe("session handler lifecycle callbacks", () => {
@@ -55,7 +55,7 @@ describe("session handler lifecycle callbacks", () => {
   });
 
   it("tracks streaming state, captures session context, and shuts down jobs", async () => {
-    const { handlers, pi } = registerHandlers();
+    const { handlers, pi, sessionContext } = registerHandlers();
     const sessionManager = {
       getSessionId: () => "parent-session",
       getEntries: () => [],
@@ -88,6 +88,10 @@ describe("session handler lifecycle callbacks", () => {
       id: "workflow-1",
       status: "running",
       abort: workflowAbort,
+      parentSessionOwner: {
+        id: sessionContext.id,
+        generation: sessionContext.generation,
+      },
     } as any);
 
     await handlers.get("session_shutdown")![1]({ reason: "quit" }, ctx);

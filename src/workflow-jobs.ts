@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { debugLog } from "./helpers";
+import {
+  getActiveSessionContextToken,
+  isSessionContextTokenLive,
+  type ActiveSessionContextToken,
+} from "./session-context";
 import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
@@ -55,6 +60,8 @@ export interface WorkflowJobState {
   _notificationInFlight?: boolean;
   /** Number of successful delivery attempts. Only increments on success. */
   notificationAttempt?: number;
+  /** Parent session lifecycle that owns this workflow job. */
+  parentSessionOwner?: ActiveSessionContextToken;
 }
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
@@ -73,6 +80,65 @@ export const MAX_WORKFLOW_JOBS = 100;
 
 /** Maximum notification delivery attempts before giving up. */
 export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
+
+export function workflowJobBelongsToOwner(
+  job: WorkflowJobState,
+  owner: ActiveSessionContextToken | undefined,
+): boolean {
+  if (!owner) return !job.parentSessionOwner;
+  return (
+    job.parentSessionOwner?.id === owner.id &&
+    job.parentSessionOwner?.generation === owner.generation
+  );
+}
+
+export function workflowJobBelongsToActiveSession(
+  job: WorkflowJobState,
+): boolean {
+  return workflowJobBelongsToOwner(job, getActiveSessionContextToken());
+}
+
+export function getWorkflowJobForActiveSession(
+  workflowId: string,
+): WorkflowJobState | undefined {
+  return getWorkflowJobForOwner(workflowId, getActiveSessionContextToken());
+}
+
+export function getWorkflowJobForOwner(
+  workflowId: string,
+  owner: ActiveSessionContextToken | undefined,
+): WorkflowJobState | undefined {
+  const job = workflowJobRegistry.get(workflowId);
+  if (!job || !workflowJobBelongsToOwner(job, owner)) return undefined;
+  return job;
+}
+
+export function workflowJobsForActiveSession(): WorkflowJobState[] {
+  return workflowJobsForOwner(getActiveSessionContextToken());
+}
+
+export function workflowJobsForOwner(
+  owner: ActiveSessionContextToken | undefined,
+): WorkflowJobState[] {
+  return [...workflowJobRegistry.values()].filter((job) =>
+    workflowJobBelongsToOwner(job, owner),
+  );
+}
+
+export function cleanupWorkflowJobsForOwner(
+  owner: ActiveSessionContextToken | undefined,
+): void {
+  for (const [id, job] of workflowJobRegistry) {
+    if (!workflowJobBelongsToOwner(job, owner)) continue;
+    job.suppressCompletionNotification = true;
+    if (job.status === "running") {
+      job.abort.abort();
+      job.status = "cancelled";
+    }
+    if (job.status === "cancelled") normalizeCancelledWorkflowState(job);
+    workflowJobRegistry.delete(id);
+  }
+}
 
 async function runTrackedWorkflowAgent(
   state: WorkflowJobState,
@@ -103,12 +169,17 @@ export function startWorkflowJob(
   >,
   startedAt?: number,
   onComplete?: (job: WorkflowJobState) => boolean | void,
+  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
 ): WorkflowJobState {
+  const parentSessionOwner = owner;
   while (workflowJobRegistry.size >= MAX_WORKFLOW_JOBS) {
     // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
     let evicted = false;
     for (const [id, st] of workflowJobRegistry) {
-      if (st.status !== "running") {
+      if (
+        st.status !== "running" &&
+        workflowJobBelongsToOwner(st, parentSessionOwner)
+      ) {
         debugLog("info", "workflow_job_evicted", { evictedId: id });
         workflowJobRegistry.delete(id);
         evicted = true;
@@ -145,6 +216,7 @@ export function startWorkflowJob(
     completionNotificationDelivered: false,
     cancellationSnapshots: [],
     activeAgentRuns: new Set(),
+    parentSessionOwner,
   };
   state.promise = runWorkflow(script, {
     ...opts,
@@ -206,6 +278,12 @@ function invokeCompletionHook(job: WorkflowJobState): void {
   ) {
     return;
   }
+  if (
+    job.parentSessionOwner &&
+    !isSessionContextTokenLive(job.parentSessionOwner)
+  ) {
+    return;
+  }
   // Already exhausted — no-op, no increment, no log.
   if (job._notificationExhausted) return;
   // Synchronous reentrant guard: prevents recursive retry from
@@ -251,8 +329,10 @@ function invokeCompletionHook(job: WorkflowJobState): void {
 }
 
 /** Retry terminal workflow notifications that failed in this parent session. */
-export function retryPendingWorkflowNotifications(): void {
-  for (const job of workflowJobRegistry.values()) {
+export function retryPendingWorkflowNotifications(
+  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
+): void {
+  for (const job of workflowJobsForOwner(owner)) {
     if (job.status === "running") continue;
     invokeCompletionHook(job);
   }
@@ -267,10 +347,13 @@ export function normalizeCancelledWorkflowState(state: WorkflowJobState): void {
 }
 
 /** Count running workflow jobs (status === "running"). */
-export function getRunningWorkflowCount(): number {
+export function getRunningWorkflowCount(
+  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
+): number {
   let count = 0;
   for (const st of workflowJobRegistry.values()) {
-    if (st.status === "running") count++;
+    if (st.status === "running" && workflowJobBelongsToOwner(st, owner))
+      count++;
   }
   return count;
 }

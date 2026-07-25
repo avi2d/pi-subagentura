@@ -20,9 +20,10 @@ import {
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
+  getWorkflowJobForOwner,
   normalizeCancelledWorkflowState,
   startWorkflowJob,
-  workflowJobRegistry,
+  workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { renderProgress } from "./workflow-ui";
@@ -44,6 +45,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
 import { getOrchestrationContext } from "./orchestration-context";
+import {
+  getActiveSessionContextToken,
+  type ActiveSessionContextToken,
+  type SessionContextRef,
+} from "./session-context";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -106,8 +112,15 @@ export function formatWorkflowNotificationSummary(
   return `${job.error ?? "Workflow did not produce a result."}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`;
 }
 
-export function registerWorkflowTool(pi: ExtensionAPI): void {
+export function registerWorkflowTool(
+  pi: ExtensionAPI,
+  sessionContext?: SessionContextRef,
+): void {
   debugLog("info", "workflow_registered", {});
+  const owner = (): ActiveSessionContextToken | undefined =>
+    sessionContext
+      ? { id: sessionContext.id, generation: sessionContext.generation }
+      : getActiveSessionContextToken();
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(ctx: any): WorkflowAgentRunner {
     return async ({
@@ -402,6 +415,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             baseOpts,
             jobStartedAt,
             notifyWorkflowCompletion,
+            owner(),
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -505,7 +519,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }),
     }),
     async execute(_id: string, params: any): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -568,7 +582,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       params: any,
       signal?: AbortSignal,
     ): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -679,7 +693,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }),
     }),
     async execute(_id: string, params: any): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -887,6 +901,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         },
         Date.now(),
         notifyWorkflowCompletion,
+        owner(),
       );
       return { job, meta };
     };
@@ -1050,7 +1065,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       description:
         "List running and completed workflow jobs with status, agent counts, output tokens, total usage, and elapsed time.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        const text = renderWorkflowJobs();
+        const text = renderWorkflowJobs(owner());
         ctx.ui.notify("📋 Workflow status listed.");
         sendCommandMessage(text);
       },
@@ -1060,7 +1075,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        const action = await showWorkflowTree(ctx.ui);
+        const action = await showWorkflowTree(ctx.ui, owner());
         if (action.kind === "cancel") {
           sendCommandMessage(`Workflow ${action.workflowId} cancelled.`);
         }
@@ -1167,11 +1182,13 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     ].join("\n");
   }
 
-  function renderWorkflowJobs(): string {
+  function renderWorkflowJobs(
+    owner: ActiveSessionContextToken | undefined,
+  ): string {
     const lines: string[] = [];
     const now = Date.now();
     let count = 0;
-    for (const st of workflowJobRegistry.values()) {
+    for (const st of workflowJobsForOwner(owner)) {
       count++;
       const elapsed = formatElapsed(now - st.startedAt);
       const s = st.snapshot;

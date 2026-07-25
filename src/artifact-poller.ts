@@ -43,7 +43,12 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
 
-import { getRunningWorkflowCount, workflowJobRegistry } from "./workflow-jobs";
+import {
+  getRunningWorkflowCount,
+  workflowJobBelongsToOwner,
+  workflowJobRegistry,
+} from "./workflow-jobs";
+import type { ActiveSessionContextToken } from "./session-context";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
@@ -119,16 +124,22 @@ let pollInFlight: Promise<void> | undefined;
  * Backwards-compatible with sub-agents that finished during parent downtime:
  * we walk the artifact log in physical byte order and advance eventByteCursor.
  */
-export function pollArtifactChanges(pi: ExtensionAPI): Promise<void> {
+export function pollArtifactChanges(
+  pi: ExtensionAPI,
+  owner?: ActiveSessionContextToken,
+): Promise<void> {
   if (pollInFlight) return pollInFlight;
-  const poll = runPollArtifactChanges(pi);
+  const poll = runPollArtifactChanges(pi, owner);
   pollInFlight = poll;
   return poll.finally(() => {
     if (pollInFlight === poll) pollInFlight = undefined;
   });
 }
 
-async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
+async function runPollArtifactChanges(
+  pi: ExtensionAPI,
+  owner?: ActiveSessionContextToken,
+): Promise<void> {
   // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
   // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
   // pi ctx) try again. A stale extension context after session replacement is the most likely cause.
@@ -328,8 +339,8 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
       }
       // Workflow TUI footer + widget: show running async workflows.
       try {
-        const wfCount = getRunningWorkflowCount();
-        const workflowRows = formatWorkflowWidgetRows(Date.now());
+        const wfCount = getRunningWorkflowCount(owner);
+        const workflowRows = formatWorkflowWidgetRows(Date.now(), owner);
         ui.setStatus(
           WORKFLOW_FOOTER_KEY,
           wfCount > 0
@@ -355,9 +366,13 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
   }
 }
 
-function formatWorkflowWidgetRows(now: number): string[] {
+function formatWorkflowWidgetRows(
+  now: number,
+  owner?: ActiveSessionContextToken,
+): string[] {
   const rows: string[] = [];
   for (const st of workflowJobRegistry.values()) {
+    if (!workflowJobBelongsToOwner(st, owner)) continue;
     if (st.status !== "running") continue;
     const s = st.snapshot;
     const parts = [
