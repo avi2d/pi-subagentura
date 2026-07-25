@@ -1,5 +1,7 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { closeSync, lstatSync, openSync, readSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
@@ -8,6 +10,10 @@ import {
 
 export const INTERACTIVE_SUPERVISOR_SHORTCUT = "ctrl+alt+a";
 const DEFAULT_REFRESH_INTERVAL_MS = 1_000;
+const DETAIL_OUTPUT_MAX_BYTES = 4 * 1024;
+const DETAIL_EVENTS_MAX_BYTES = 8 * 1024;
+const DETAIL_PREVIEW_MAX_CHARS = 512;
+const DETAIL_EVENT_COUNT = 3;
 
 export type InteractiveSupervisorAction = { kind: "close" };
 type SupervisorDone = (action: InteractiveSupervisorAction) => void;
@@ -336,6 +342,7 @@ function formatDetails(
   state: InteractiveSubagentState,
   width: number,
 ): string[] {
+  const artifactDetails = readArtifactDetails(state);
   const fields = [
     `Task: ${state.task}`,
     `Model: ${state.model ?? "default"}`,
@@ -343,9 +350,96 @@ function formatDetails(
     `cwd: ${state.cwd}`,
     `Artifact: ${state.artifactDir}`,
     `Pi session: ${state.sessionFile}`,
+    `Lifecycle: ${artifactDetails.lifecycle}`,
+    `Recent events: ${artifactDetails.events}`,
+    `Output preview: ${artifactDetails.output}`,
     `Attach: ${state.attachCommand}`,
   ];
   return fields.map((field) => trunc(`│     ${field}`, width));
+}
+
+function readArtifactDetails(state: InteractiveSubagentState): {
+  lifecycle: string;
+  events: string;
+  output: string;
+} {
+  const lifecycle = state.lifecycle
+    ? compactText(
+        [
+          state.lifecycle.currentTurnId &&
+            `turn=${state.lifecycle.currentTurnId}`,
+          state.lifecycle.completionOutcome &&
+            `completion=${state.lifecycle.completionOutcome}`,
+          state.lifecycle.processStatus &&
+            `process=${state.lifecycle.processStatus}`,
+          state.lifecycle.parentCancelled && "parent-cancelled",
+        ]
+          .filter(Boolean)
+          .join(" · "),
+      ) || "active"
+    : "not folded yet";
+  const events = summarizeRecentEvents(
+    readBoundedFileTail(
+      join(state.artifactDir, "events.ndjson"),
+      DETAIL_EVENTS_MAX_BYTES,
+    ),
+  );
+  const output = compactText(
+    readBoundedFileTail(
+      join(state.artifactDir, "output.md"),
+      DETAIL_OUTPUT_MAX_BYTES,
+    ),
+  );
+  return {
+    lifecycle,
+    events: events || "none yet",
+    output: output || "none yet",
+  };
+}
+
+function readBoundedFileTail(filePath: string, maxBytes: number): string {
+  let fd: number | undefined;
+  try {
+    if (!lstatSync(filePath).isFile()) return "";
+    const size = statSync(filePath).size;
+    const bytes = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(bytes);
+    fd = openSync(filePath, "r");
+    if (bytes > 0) readSync(fd, buffer, 0, bytes, size - bytes);
+    return buffer.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function summarizeRecentEvents(content: string): string {
+  const summaries: string[] = [];
+  for (const line of content.trim().split("\n")) {
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (typeof event.type !== "string") continue;
+      const detail =
+        typeof event.outcome === "string"
+          ? event.outcome
+          : typeof event.name === "string"
+            ? event.name
+            : undefined;
+      summaries.push(detail ? `${event.type}(${detail})` : event.type);
+    } catch {
+      /* A bounded tail may begin in the middle of an event record. */
+    }
+  }
+  return summaries.slice(-DETAIL_EVENT_COUNT).join(" → ");
+}
+
+function compactText(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, DETAIL_PREVIEW_MAX_CHARS);
 }
 
 function statusIcon(status: InteractiveSubagentState["status"]): string {

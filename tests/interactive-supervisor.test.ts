@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   InteractiveSupervisorComponent,
   formatSupervisorSummary,
@@ -12,6 +15,14 @@ import {
 } from "../src/interactive-tmux";
 import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
 import { registerInteractiveSupervisor } from "../src/interactive-supervisor-registration";
+
+const tempDirs: string[] = [];
+
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "interactive-supervisor-"));
+  tempDirs.push(dir);
+  return dir;
+}
 
 function state(
   id: string,
@@ -39,6 +50,9 @@ afterEach(() => {
   interactiveSubagentRegistry.clear();
   __resetMuxInstances();
   vi.useRealTimers();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("interactive supervisor", () => {
@@ -81,6 +95,46 @@ describe("interactive supervisor", () => {
 
     expect(done).toHaveBeenCalledWith({ kind: "close" });
     expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it("shows bounded lifecycle events and artifact output in details", () => {
+    const artifactDir = join(tempDir(), "artifact");
+    mkdirSync(artifactDir, { recursive: true });
+    writeFileSync(
+      join(artifactDir, "events.ndjson"),
+      [
+        JSON.stringify({ type: "turn_started", turnId: "turn-1" }),
+        JSON.stringify({ type: "tool_activity", name: "read" }),
+        JSON.stringify({ type: "completion", outcome: "done" }),
+      ].join("\n") + "\n",
+    );
+    writeFileSync(
+      join(artifactDir, "output.md"),
+      "Completed the recursive artifact inspection.\n",
+    );
+    const item = state("details", {
+      artifactDir,
+      lifecycle: {
+        currentTurnId: "turn-1",
+        completionOutcome: "done",
+        processStatus: "done",
+      },
+    });
+    interactiveSubagentRegistry.set(item.id, item);
+    const component = new InteractiveSupervisorComponent({ done: vi.fn() });
+
+    component.handleInput("\r");
+    const rendered = component.render(160).join("\n");
+
+    expect(rendered).toContain(
+      "Lifecycle: turn=turn-1 · completion=done · process=done",
+    );
+    expect(rendered).toContain(
+      "Recent events: turn_started → tool_activity(read) → completion(done)",
+    );
+    expect(rendered).toContain(
+      "Output preview: Completed the recursive artifact inspection.",
+    );
   });
 
   it("uses the direct cancellation path only for x", () => {
