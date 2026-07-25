@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  registerWorkflowTool,
   MAX_WORKFLOW_JOBS,
   cleanupWorkflowJobsForOwner,
   getWorkflowJobForActiveSession,
@@ -13,6 +14,8 @@ import {
   type WorkflowJobState,
 } from "../src/workflow";
 import {
+  getSessionContextStack,
+  registerSessionContext,
   setActiveSessionRefs,
   type ActiveSessionContextToken,
   type SessionContextRef,
@@ -68,6 +71,7 @@ describe("workflow parent session ownership", () => {
   beforeEach(() => {
     workflowJobRegistry.clear();
     setActiveSessionRefs(undefined);
+    getSessionContextStack().length = 0;
   });
 
   it("requires exact {id,generation}, treats wrong owners as missing, and cleans up only the owning lifecycle", () => {
@@ -209,5 +213,42 @@ describe("workflow parent session ownership", () => {
     expect(getWorkflowJobForActiveSession(started.id)).toBeUndefined();
     expect(getWorkflowJobForOwner(started.id, ownerA)).toBe(started);
     expect(getWorkflowJobForOwner(started.id, ownerB)).toBeUndefined();
+  });
+
+  it("delivers A completion through A while B is active", async () => {
+    const tools: any[] = [];
+    const sendA = vi.fn();
+    const sendB = vi.fn();
+    const piA = {
+      registerTool: vi.fn((tool) => tools.push(tool)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage: sendA,
+    } as any;
+    const piB = { sendMessage: sendB } as any;
+    const contextA = { ...context(50, 1), pi: piA };
+    const contextB = { ...context(60, 1), pi: piB };
+    registerSessionContext(contextA);
+    registerSessionContext(contextB);
+    setActiveSessionRefs(contextB);
+    registerWorkflowTool(piA, contextA);
+    const workflow = tools.find((tool) => tool.name === "workflow");
+
+    const started = await workflow.execute(
+      "call-a",
+      {
+        script:
+          'export const meta = { name: "owned-a", description: "d" };\nreturn "ok";',
+        async: true,
+      },
+      undefined,
+      vi.fn(),
+      { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+    );
+    await workflowJobRegistry.get(started.details.workflowId)!.promise;
+
+    expect(sendA).toHaveBeenCalledOnce();
+    expect(sendB).not.toHaveBeenCalled();
   });
 });

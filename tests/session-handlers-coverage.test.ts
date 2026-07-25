@@ -137,6 +137,27 @@ describe("session handler lifecycle callbacks", () => {
       childCtx as any,
     );
 
+    const parentWorkflow = {
+      id: "parent-workflow",
+      status: "running",
+      abort: new AbortController(),
+      parentSessionOwner: {
+        id: parent.sessionContext.id,
+        generation: parent.sessionContext.generation,
+      },
+    } as any;
+    const childWorkflow = {
+      id: "child-workflow",
+      status: "running",
+      abort: new AbortController(),
+      parentSessionOwner: {
+        id: child.sessionContext.id,
+        generation: child.sessionContext.generation,
+      },
+    } as any;
+    workflowJobRegistry.set(parentWorkflow.id, parentWorkflow);
+    workflowJobRegistry.set(childWorkflow.id, childWorkflow);
+
     jobRegistry.set("running-parent-job", {
       id: "running-parent-job",
       status: "running",
@@ -169,6 +190,9 @@ describe("session handler lifecycle callbacks", () => {
       childCtx as any,
     );
     expect(jobRegistry.size).toBe(1);
+    expect(childWorkflow.abort.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has(childWorkflow.id)).toBe(false);
+    expect(workflowJobRegistry.get(parentWorkflow.id)).toBe(parentWorkflow);
     expect((globalThis as any).__piSubagenturaPiRef).toBe(parent.pi);
     expect((globalThis as any).__piSubagenturaSessionManager).toBe(
       parentSessionManager,

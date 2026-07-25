@@ -27,6 +27,10 @@ import {
   writeOutput,
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
+import {
+  getSessionContextStack,
+  registerSessionContext,
+} from "../src/session-context";
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
 }
@@ -75,6 +79,7 @@ describe("pollArtifactChanges", () => {
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaUi = undefined;
     g.__piSubagenturaParentStreaming = false;
+    getSessionContextStack().length = 0;
   });
 
   afterEach(() => {
@@ -90,6 +95,60 @@ describe("pollArtifactChanges", () => {
     const sendMessage = installDeliverySpies();
     await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("polls and dispatches only interactive states owned by the supplied context", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const a = makeState();
+    const b = makeState();
+    a.state.parentSessionId = "session-a";
+    b.state.parentSessionId = "session-b";
+    for (const item of [a, b]) {
+      item.state.cwd = join(item.artifactDir, "..");
+      const art = artifactPath(item.state.cwd, item.id);
+      writeOutput(art, item.id);
+      appendCompletionEvent(art, {
+        turnId: `turn-${item.id}`,
+        outcome: "done",
+        source: "agent_settled",
+      });
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+    }
+    const ownerB = { id: 402, generation: 1 };
+    const sendMessage = installDeliverySpies();
+    const wrongSendMessage = vi.fn();
+    registerSessionContext({
+      id: 401,
+      generation: 1,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: wrongSendMessage,
+    };
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
+    await mod.pollArtifactChanges(
+      { sendMessage: wrongSendMessage } as any,
+      ownerB,
+    );
+
+    expect(a.state.eventByteCursor ?? 0).toBe(0);
+    expect(a.state.pendingDeliveries ?? []).toEqual([]);
+    expect(b.state.eventByteCursor).toBeGreaterThan(0);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toContain(b.id);
+    expect(sendMessage.mock.calls[0][0].content).not.toContain(a.id);
+    expect(wrongSendMessage).not.toHaveBeenCalled();
   });
 
   it("keeps running in-process jobs in the shared footer", async () => {

@@ -225,8 +225,6 @@ export function registerWorkflowTool(
   }
 
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
-    const g2 = typeof global !== "undefined" ? global : globalThis;
-    const currentPi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     const run = job.result;
     const errorCount = run?.errorCount ?? job.snapshot.errorCount;
     const presentation = getWorkflowCompletionPresentation(
@@ -240,9 +238,8 @@ export function registerWorkflowTool(
     if (run) {
       content += `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
     }
-    if (!currentPi) return false;
     try {
-      currentPi.sendMessage!(
+      pi.sendMessage!(
         {
           customType: "workflow-notify",
           content,

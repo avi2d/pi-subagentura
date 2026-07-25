@@ -17,6 +17,7 @@ import {
 } from "../src/notifications";
 import { pollArtifactChanges } from "../src/artifact-poller";
 import { rehydrateInteractiveSubagents } from "../src/rehydrate";
+import { getSessionContextStack } from "../src/session-context";
 import { writeCliScript } from "../src/subagent-artifact-cli";
 import { createPiSessionHarness } from "./helpers/pi-session-harness";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -58,6 +59,11 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
   const notify = vi.fn();
   const ui = { notify } as any;
   harness.session.extensionRunner.setUIContext(ui);
+  const sessionContext = getSessionContextStack().at(-1);
+  if (sessionContext) {
+    sessionContext.ui = ui;
+    sessionContext.sessionManager = harness.sessionManager;
+  }
   (globalThis as any).__piSubagenturaUi = ui;
   const pi = (globalThis as any).__piSubagenturaPiRef;
   const sendMessage = vi.fn(pi.sendMessage.bind(pi));
@@ -75,6 +81,7 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
     status: "running",
     notifyOnComplete: mode,
     triggerTurnOnComplete: triggerTurn,
+    parentSessionId: harness.sessionManager.getSessionId(),
     eventByteCursor: 0,
     pendingDeliveries: [],
     deliveryReceipts: [],

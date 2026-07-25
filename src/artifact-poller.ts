@@ -49,6 +49,10 @@ import {
   workflowJobRegistry,
 } from "./workflow-jobs";
 import type { ActiveSessionContextToken } from "./session-context";
+import {
+  parentSessionBelongsToOwner,
+  resolveLiveSessionContext,
+} from "./session-context";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
@@ -146,11 +150,17 @@ async function runPollArtifactChanges(
   try {
     const g2 = typeof global !== "undefined" ? global : globalThis;
     const initialPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
+    const ownerContext = owner ? resolveLiveSessionContext(owner) : undefined;
+    if (owner && !ownerContext) return;
     const interactivePi =
-      (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ?? pi;
+      ownerContext?.pi ??
+      (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ??
+      pi;
     if (!interactivePi) return;
 
-    const states = [...interactiveSubagentRegistry.values()];
+    const states = [...interactiveSubagentRegistry.values()].filter((state) =>
+      parentSessionBelongsToOwner(state.parentSessionId, owner),
+    );
     const liveness = await Promise.all(
       states.map(async (state) => {
         try {
@@ -166,13 +176,16 @@ async function runPollArtifactChanges(
     );
     const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     if (
-      (initialPiRef !== undefined && currentPiRef === undefined) ||
-      (currentPiRef !== undefined && currentPiRef !== interactivePi)
+      !owner &&
+      ((initialPiRef !== undefined && currentPiRef === undefined) ||
+        (currentPiRef !== undefined && currentPiRef !== interactivePi))
     ) {
       return;
     }
     const widgetRows: string[] = [];
-    const ui = g2.__piSubagenturaUi as ExtensionUIContext | undefined;
+    const ui =
+      ownerContext?.ui ??
+      (g2.__piSubagenturaUi as ExtensionUIContext | undefined);
     for (const [state, paneAlive] of liveness) {
       if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
@@ -296,7 +309,7 @@ async function runPollArtifactChanges(
         widgetRows.push(formatActivityRow(state));
       }
     }
-    flushDeliveries(interactivePi, ui);
+    flushDeliveries(interactivePi, ui, owner);
     for (const state of interactiveSubagentRegistry.values()) {
       const terminal =
         state.status === "cancelled" ||

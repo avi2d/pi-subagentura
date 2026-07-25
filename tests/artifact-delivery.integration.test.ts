@@ -43,6 +43,10 @@ import { __setTmuxMultiplexer } from "../src/multiplexer";
 import { pollArtifactChanges } from "../src/artifact-poller";
 import { renderSubagentNotify } from "../src/rendering";
 import { appendDeterministicTurn } from "./helpers/deterministic-artifacts";
+import {
+  getSessionContextStack,
+  registerSessionContext,
+} from "../src/session-context";
 
 const roots: string[] = [];
 
@@ -105,10 +109,73 @@ afterEach(() => {
   (globalThis as any).__piSubagenturaSessionManager = undefined;
   (globalThis as any).__piSubagenturaPiRef = undefined;
   interactiveSubagentRegistry.clear();
+  getSessionContextStack().length = 0;
   __setTmuxMultiplexer(undefined);
 });
 
 describe("artifact protocol v2 delivery", () => {
+  it("flushes only interactive deliveries owned by the supplied context", () => {
+    const artA = makeArtifact();
+    const artB = makeArtifact();
+    const stateA = {
+      ...makeState(artA.dir),
+      id: "agent-a",
+      parentSessionId: "session-a",
+    };
+    const stateB = {
+      ...makeState(artB.dir),
+      id: "agent-b",
+      parentSessionId: "session-b",
+    };
+    const ownerA = { id: 301, generation: 1 };
+    const ownerB = { id: 302, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    enqueueDelivery(stateA, {
+      deliveryId: "delivery-a",
+      subagentId: stateA.id,
+      turnId: "turn-a",
+      eventId: "event-a",
+      mode: "notify",
+      triggerTurn: false,
+      status: "done",
+      artifactDir: artA.dir,
+      message: "from-a",
+      state: "queued",
+    });
+    enqueueDelivery(stateB, {
+      deliveryId: "delivery-b",
+      subagentId: stateB.id,
+      turnId: "turn-b",
+      eventId: "event-b",
+      mode: "notify",
+      triggerTurn: false,
+      status: "done",
+      artifactDir: artB.dir,
+      message: "from-b",
+      state: "queued",
+    });
+    interactiveSubagentRegistry.set(stateA.id, stateA);
+    interactiveSubagentRegistry.set(stateB.id, stateB);
+    const sendMessage = vi.fn();
+
+    flushDeliveries({ sendMessage } as any, undefined, ownerB);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toContain("from-b");
+    expect(sendMessage.mock.calls[0][0].content).not.toContain("from-a");
+    expect(stateA.pendingDeliveries?.[0]?.state).toBe("queued");
+    expect(stateB.pendingDeliveries?.[0]?.deliveryId).toBe("delivery-b");
+  });
+
   it("reads equal and decreasing timestamps in physical byte order", () => {
     const art = makeArtifact();
     appendEvent(art, { ts: 10, type: "started", status: "running" });

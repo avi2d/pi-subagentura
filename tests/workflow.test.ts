@@ -2064,7 +2064,7 @@ describe("registerWorkflowTool", () => {
     expect(deleted.content[0].text).toContain("Could not delete workflow");
   });
 
-  it("notifies the current parent and triggers a turn when a background workflow completes", async () => {
+  it("notifies the captured parent when a background workflow completes", async () => {
     const tools: Array<{ name: string; execute: Function }> = [];
     const staleSendMessage = vi.fn();
     const sendMessage = vi.fn();
@@ -2098,7 +2098,7 @@ describe("registerWorkflowTool", () => {
 
       await job.promise;
 
-      expect(sendMessage).toHaveBeenCalledWith(
+      expect(staleSendMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           customType: "workflow-notify",
           content: expect.stringContaining(
@@ -2107,8 +2107,8 @@ describe("registerWorkflowTool", () => {
         }),
         { deliverAs: "followUp", triggerTurn: true },
       );
-      expect(staleSendMessage).not.toHaveBeenCalled();
-      expect(sendMessage.mock.calls[0][0].content).not.toContain(
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(staleSendMessage.mock.calls[0][0].content).not.toContain(
         "final result",
       );
       workflowJobRegistry.delete(job.id);

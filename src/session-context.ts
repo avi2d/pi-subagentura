@@ -147,3 +147,23 @@ export function isSessionContextTokenLive(
 ): boolean {
   return !token || resolveLiveSessionContext(token) !== undefined;
 }
+
+export function sessionIdForContextToken(
+  token: ActiveSessionContextToken | undefined,
+): string | undefined {
+  if (!token) return undefined;
+  try {
+    return resolveLiveSessionContext(token)?.sessionManager?.getSessionId?.();
+  } catch {
+    return undefined;
+  }
+}
+
+export function parentSessionBelongsToOwner(
+  parentSessionId: string | undefined,
+  owner: ActiveSessionContextToken | undefined,
+): boolean {
+  if (!owner) return true;
+  const ownerSessionId = sessionIdForContextToken(owner);
+  return ownerSessionId !== undefined && parentSessionId === ownerSessionId;
+}

@@ -8,7 +8,11 @@
  * Preserves idle interactive panes (they consume no tokens).
  * Preserves done/error/cancelled jobs and workflows.
  */
-import { jobRegistry, scheduleJobCleanup } from "./helpers";
+import {
+  inProcessJobBelongsToOwner,
+  jobRegistry,
+  scheduleJobCleanup,
+} from "./helpers";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
@@ -18,6 +22,7 @@ import {
   workflowJobsForOwner,
 } from "./workflow-jobs";
 import type { ActiveSessionContextToken } from "./session-context";
+import { parentSessionBelongsToOwner } from "./session-context";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -52,7 +57,9 @@ export async function cancelAllFlows(
   };
 
   // Snapshot every known child before the first potentially slow abort.
-  const interactiveStates = [...interactiveSubagentRegistry.values()];
+  const interactiveStates = [...interactiveSubagentRegistry.values()].filter(
+    (state) => parentSessionBelongsToOwner(state.parentSessionId, owner),
+  );
   for (const state of interactiveStates) {
     if (state.status !== "running") continue;
     state.cancellationSnapshot = snapshotInteractiveContext({
@@ -68,7 +75,7 @@ export async function cancelAllFlows(
     addSnapshot(state.cancellationSnapshot);
   }
   const jobs = [...jobRegistry.values()].filter(
-    (job) => job.status === "running",
+    (job) => job.status === "running" && inProcessJobBelongsToOwner(job, owner),
   );
   const jobCancellation = {
     source: "cancel_all" as const,

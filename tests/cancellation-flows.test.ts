@@ -82,6 +82,10 @@ import {
   interactiveSubagentRegistry,
   cancelInteractiveSubagent,
 } from "../src/interactive-tmux";
+import {
+  getSessionContextStack,
+  registerSessionContext,
+} from "../src/session-context";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -634,6 +638,68 @@ describe("cancelAllFlows helper", () => {
     expect(result.jobsAborted).toBe(0);
     expect(result.workflowsAborted).toBe(0);
     expect(result.interactiveKilled).toBe(0);
+  });
+
+  it("cancels only in-process and interactive flows owned by the caller", async () => {
+    const { cancelAllFlows } = await import("../src/cancel-all-flows");
+    const ownerA = { id: 101, generation: 1 };
+    const ownerB = { id: 202, generation: 1 };
+    getSessionContextStack().length = 0;
+    registerSessionContext({
+      ...ownerA,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-a" },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-b" },
+    });
+    const abortA = vi.fn();
+    const abortB = vi.fn();
+    jobRegistry.set("job-a", {
+      id: "job-a",
+      status: "running",
+      session: { abort: abortA },
+      deliveryOwner: {
+        pi: {} as any,
+        sessionContextId: ownerA.id,
+        sessionContextGeneration: ownerA.generation,
+      },
+    } as any);
+    jobRegistry.set("job-b", {
+      id: "job-b",
+      status: "running",
+      session: { abort: abortB },
+      deliveryOwner: {
+        pi: {} as any,
+        sessionContextId: ownerB.id,
+        sessionContextGeneration: ownerB.generation,
+      },
+    } as any);
+    interactiveSubagentRegistry.set("interactive-a", {
+      id: "interactive-a",
+      status: "running",
+      parentSessionId: "session-a",
+    } as any);
+    interactiveSubagentRegistry.set("interactive-b", {
+      id: "interactive-b",
+      status: "running",
+      parentSessionId: "session-b",
+    } as any);
+    vi.mocked(cancelInteractiveSubagent).mockImplementation((id: string) =>
+      interactiveSubagentRegistry.get(id),
+    );
+
+    const result = await cancelAllFlows(ownerB);
+
+    expect(abortA).not.toHaveBeenCalled();
+    expect(abortB).toHaveBeenCalledOnce();
+    expect(cancelInteractiveSubagent).toHaveBeenCalledWith("interactive-b");
+    expect(cancelInteractiveSubagent).not.toHaveBeenCalledWith("interactive-a");
+    expect(result.jobsAborted).toBe(1);
+    expect(result.interactiveKilled).toBe(1);
+    getSessionContextStack().length = 0;
   });
 });
 

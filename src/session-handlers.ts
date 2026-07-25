@@ -47,7 +47,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
   });
   pi.on("agent_settled", () => {
     g2.__piSubagenturaParentStreaming = false;
-    flushDeliveries(pi, g2.__piSubagenturaUi);
+    flushDeliveries(pi, sessionContext.ui, {
+      id: sessionContext.id,
+      generation: sessionContext.generation,
+    });
     flushInProcessDeliveries();
   });
 
@@ -138,6 +141,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       removeSessionContext(sessionContext.id);
       setActiveSessionRefs(contextStack[contextStack.length - 1]);
       g2.__piSubagenturaParentStreaming = false;
+
+      // Context-owned workflows must be torn down even when a nested session
+      // remains active above or below this handler in the global stack.
+      cleanupWorkflowJobsForOwner(shutdownOwner);
 
       if (!wasTop || contextStack.length > 0) {
         // Non-top handlers belong to nested sessions; restore parent refs only.
@@ -231,10 +238,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           }
         }
       }
-
-      // Workflow workers are bound to this exact parent lifecycle. Suppress
-      // completion before aborting so late settlement cannot notify a replacement.
-      cleanupWorkflowJobsForOwner(shutdownOwner);
 
       jobRegistry.clear();
       g2.__piSubagenturaPiRef = undefined;

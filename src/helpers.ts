@@ -240,6 +240,17 @@ if (!g.__piSubagenturaRegistry) {
 
 export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 
+export function inProcessJobBelongsToOwner(
+  job: JobState,
+  owner: { id: number; generation: number } | undefined,
+): boolean {
+  if (!owner) return true;
+  return (
+    job.deliveryOwner?.sessionContextId === owner.id &&
+    job.deliveryOwner?.sessionContextGeneration === owner.generation
+  );
+}
+
 declare global {
   var __piSubagenturaRegistry: Map<string, JobState> | undefined;
   var __piSubagenturaInteractiveRegistry:
