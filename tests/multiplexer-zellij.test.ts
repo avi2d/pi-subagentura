@@ -505,6 +505,116 @@ describe("multiplexer-zellij", () => {
   });
 
   /* ------------------------------------------------------------------ */
+  /*  structured focus + bounded capture                                 */
+  /* ------------------------------------------------------------------ */
+
+  it("exposes structured focus and bounded capture capabilities", async () => {
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+    expect(new ZellijMultiplexer().capabilities).toEqual({
+      structuredFocus: true,
+      boundedCapture: true,
+      nativeOverlay: false,
+    });
+  });
+
+  it("focusPane targets the supplied session and background tab", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "");
+      },
+      execFileSync: () => "",
+    }));
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    await new ZellijMultiplexer().focusPane({
+      paneId: "42",
+      windowName: "demo",
+      session: "pi-subagent-abc123",
+    });
+
+    expect(calls).toEqual([
+      ["--session", "pi-subagent-abc123", "action", "go-to-tab-name", "demo"],
+    ]);
+  });
+
+  it("focusPane targets a normalized split pane id", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "");
+      },
+      execFileSync: () => "",
+    }));
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    await new ZellijMultiplexer().focusPane({
+      paneId: "terminal_42",
+      session: "main",
+    });
+
+    expect(calls).toEqual([
+      ["--session", "main", "action", "focus-pane-id", "42"],
+    ]);
+  });
+
+  it("capturePane dumps a session-scoped pane and bounds output by lines and bytes", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "one\ntwo\nthree\nfour");
+      },
+      execFileSync: () => "",
+    }));
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    const result = await new ZellijMultiplexer().capturePane(
+      { paneId: "terminal_42", session: "main" },
+      { maxLines: 2, maxBytes: 7 },
+    );
+
+    expect(calls[0]).toEqual([
+      "--session",
+      "main",
+      "action",
+      "dump-screen",
+      "--pane-id",
+      "42",
+      "/dev/stdout",
+    ]);
+    expect(result).toEqual({ output: "ee\nfour", truncated: true });
+  });
+
+  /* ------------------------------------------------------------------ */
   /*  session threading + isPaneAlive exited-guard / normalization       */
   /* ------------------------------------------------------------------ */
 

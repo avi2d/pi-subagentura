@@ -28,8 +28,39 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import type { Multiplexer } from "./multiplexer";
+import type {
+  CapturePaneOptions,
+  CapturePaneResult,
+  Multiplexer,
+  PaneRef,
+} from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
+
+function boundCaptureOutput(
+  output: string,
+  opts: CapturePaneOptions,
+): CapturePaneResult {
+  const maxLines = Math.max(0, Math.floor(opts.maxLines));
+  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
+  let truncated = false;
+  let bounded = output;
+  const lines = bounded.split("\n");
+  if (maxLines > 0 && lines.length > maxLines) {
+    bounded = lines.slice(-maxLines).join("\n");
+    truncated = true;
+  } else if (maxLines === 0 && bounded.length > 0) {
+    bounded = "";
+    truncated = true;
+  }
+  const bytes = Buffer.byteLength(bounded, "utf8");
+  if (bytes > maxBytes) {
+    bounded = Buffer.from(bounded, "utf8")
+      .subarray(bytes - maxBytes)
+      .toString("utf8");
+    truncated = true;
+  }
+  return { output: bounded, truncated };
+}
 
 /** Sanitize a free-form name into a safe segment for zellij tab/session names. */
 function safeSegment(value: string): string {
@@ -54,6 +85,11 @@ function normalizePaneId(raw: string): string {
 
 export class ZellijMultiplexer implements Multiplexer {
   readonly name = "zellij" as const;
+  readonly capabilities = {
+    structuredFocus: true,
+    boundedCapture: true,
+    nativeOverlay: false,
+  } as const;
 
   /**
    * True iff `zellij` is on PATH. Binary-only — symmetric with
@@ -351,6 +387,55 @@ export class ZellijMultiplexer implements Multiplexer {
     } catch {
       // Best effort — pane may already be dead.
     }
+  }
+
+  focusPane(ref: PaneRef): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const focusArgs = ref.windowName
+        ? [
+            ...this.sessionFlag(ref.session),
+            "action",
+            "go-to-tab-name",
+            ref.windowName,
+          ]
+        : [
+            ...this.sessionFlag(ref.session),
+            "action",
+            "focus-pane-id",
+            normalizePaneId(ref.paneId),
+          ];
+      execFile("zellij", focusArgs, { timeout: 5000 }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  capturePane(
+    ref: PaneRef,
+    opts: CapturePaneOptions,
+  ): Promise<CapturePaneResult> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        "zellij",
+        [
+          ...this.sessionFlag(ref.session),
+          "action",
+          "dump-screen",
+          "--pane-id",
+          normalizePaneId(ref.paneId),
+          "/dev/stdout",
+        ],
+        { encoding: "utf8", maxBuffer: opts.maxBytes * 2, timeout: 5000 },
+        (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(boundCaptureOutput(stdout, opts));
+        },
+      );
+    });
   }
 
   /**

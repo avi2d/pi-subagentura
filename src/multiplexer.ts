@@ -31,6 +31,32 @@ import { assertNever } from "./artifact";
 /** Names of the supported multiplexer backends. Kept narrow on purpose. */
 export type MuxName = "tmux" | "zellij";
 
+/** Backend-neutral structured reference to a durable mux pane. */
+export interface PaneRef {
+  readonly paneId: string;
+  readonly windowName?: string;
+  readonly session?: string;
+}
+
+/** Optional transport features supported by a multiplexer backend. */
+export interface MultiplexerCapabilities {
+  readonly structuredFocus: boolean;
+  readonly boundedCapture: boolean;
+  readonly nativeOverlay: boolean;
+}
+
+/** Bounds applied by backend-neutral pane capture. */
+export interface CapturePaneOptions {
+  readonly maxBytes: number;
+  readonly maxLines: number;
+}
+
+/** Result of a bounded pane capture operation. */
+export interface CapturePaneResult {
+  readonly output: string;
+  readonly truncated: boolean;
+}
+
 /**
  * Per-spawn state about how a child pane was created. The state is set on
  * `InteractiveSubagentState.mux` at spawn time and never changes — all later
@@ -39,6 +65,7 @@ export type MuxName = "tmux" | "zellij";
  */
 export interface Multiplexer {
   readonly name: MuxName;
+  readonly capabilities: MultiplexerCapabilities;
 
   /**
    * True iff this backend's binary is on PATH AND a server is currently
@@ -140,6 +167,15 @@ export interface Multiplexer {
    *                 tmux ignores it).
    */
   killPane(paneId: string, session?: string): void;
+
+  /** Focus the referenced pane or its containing window/tab. */
+  focusPane(ref: PaneRef): Promise<void>;
+
+  /** Capture bounded pane output without blocking the parent event loop. */
+  capturePane(
+    ref: PaneRef,
+    opts: CapturePaneOptions,
+  ): Promise<CapturePaneResult>;
 
   /**
    * Build the user-facing commands to attach to (or focus) the child's pane.

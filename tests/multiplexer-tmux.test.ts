@@ -614,6 +614,102 @@ describe("multiplexer-tmux", () => {
   });
 
   /* ------------------------------------------------------------------ */
+  /*  structured focus + bounded capture                                 */
+  /* ------------------------------------------------------------------ */
+
+  it("exposes structured focus and bounded capture capabilities", async () => {
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    expect(new TmuxMultiplexer().capabilities).toEqual({
+      structuredFocus: true,
+      boundedCapture: true,
+      nativeOverlay: false,
+    });
+  });
+
+  it("focusPane selects a background window from PaneRef without building attach strings", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "");
+      },
+      execFileSync: () => {
+        throw new Error("focusPane must not call display-message");
+      },
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await new TmuxMultiplexer().focusPane({
+      paneId: "%42",
+      windowName: "demo",
+    });
+
+    expect(calls).toEqual([["select-window", "-t", "demo"]]);
+  });
+
+  it("focusPane selects a split pane by pane id", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "");
+      },
+      execFileSync: () => "",
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await new TmuxMultiplexer().focusPane({ paneId: "%42" });
+
+    expect(calls).toEqual([["select-pane", "-t", "%42"]]);
+  });
+
+  it("capturePane uses tmux capture-pane and bounds output by lines and bytes", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "one\ntwo\nthree\nfour");
+      },
+      execFileSync: () => "",
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    const result = await new TmuxMultiplexer().capturePane(
+      { paneId: "%42" },
+      { maxLines: 2, maxBytes: 7 },
+    );
+
+    expect(calls[0]).toEqual(["capture-pane", "-p", "-t", "%42", "-S", "-2"]);
+    expect(result).toEqual({ output: "ee\nfour", truncated: true });
+  });
+
+  /* ------------------------------------------------------------------ */
   /*  readPaneExitCode — command contract (subset; detailed tests in     */
   /*  interactive-tmux.test.ts cover return values)                      */
   /* ------------------------------------------------------------------ */

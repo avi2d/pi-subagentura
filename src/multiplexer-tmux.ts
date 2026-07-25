@@ -23,8 +23,39 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import type { Multiplexer } from "./multiplexer";
+import type {
+  CapturePaneOptions,
+  CapturePaneResult,
+  Multiplexer,
+  PaneRef,
+} from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
+
+function boundCaptureOutput(
+  output: string,
+  opts: CapturePaneOptions,
+): CapturePaneResult {
+  const maxLines = Math.max(0, Math.floor(opts.maxLines));
+  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
+  let truncated = false;
+  let bounded = output;
+  const lines = bounded.split("\n");
+  if (maxLines > 0 && lines.length > maxLines) {
+    bounded = lines.slice(-maxLines).join("\n");
+    truncated = true;
+  } else if (maxLines === 0 && bounded.length > 0) {
+    bounded = "";
+    truncated = true;
+  }
+  const bytes = Buffer.byteLength(bounded, "utf8");
+  if (bytes > maxBytes) {
+    bounded = Buffer.from(bounded, "utf8")
+      .subarray(bytes - maxBytes)
+      .toString("utf8");
+    truncated = true;
+  }
+  return { output: bounded, truncated };
+}
 
 /**
  * Optional test/CI isolation for real tmux integration tests.
@@ -91,6 +122,11 @@ function safeSegment(value: string): string {
 
 export class TmuxMultiplexer implements Multiplexer {
   readonly name = "tmux" as const;
+  readonly capabilities = {
+    structuredFocus: true,
+    boundedCapture: true,
+    nativeOverlay: false,
+  } as const;
 
   /** Shared detached session used when the parent is outside tmux. */
   private detachedSessionName?: string;
@@ -380,6 +416,46 @@ export class TmuxMultiplexer implements Multiplexer {
     } catch {
       // Best effort — pane may already be dead.
     }
+  }
+
+  focusPane(ref: PaneRef): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const args = ref.windowName
+        ? withTmuxSocket(["select-window", "-t", ref.windowName])
+        : withTmuxSocket(["select-pane", "-t", ref.paneId]);
+      execFile("tmux", args, { timeout: 5000 }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  capturePane(
+    ref: PaneRef,
+    opts: CapturePaneOptions,
+  ): Promise<CapturePaneResult> {
+    const lines = Math.max(0, Math.floor(opts.maxLines));
+    return new Promise((resolve, reject) => {
+      execFile(
+        "tmux",
+        withTmuxSocket([
+          "capture-pane",
+          "-p",
+          "-t",
+          ref.paneId,
+          "-S",
+          `-${lines}`,
+        ]),
+        { encoding: "utf8", maxBuffer: opts.maxBytes * 2, timeout: 5000 },
+        (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(boundCaptureOutput(stdout, opts));
+        },
+      );
+    });
   }
 
   buildAttachCommands(opts: { paneId: string; windowName?: string }): {
