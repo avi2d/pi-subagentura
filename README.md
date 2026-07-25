@@ -100,7 +100,7 @@ The extension registers 21 public tools for parent agents.
 | `subagent_with_context`             | Delegate with the parent conversation                          |
 | `subagent_isolated`                 | Delegate with a fresh context                                  |
 | `get_subagent_status`               | Inspect an async in-process job                                |
-| `get_subagent_result`               | Wait for and return an async job result                        |
+| `get_subagent_result`               | Retrieve current or final async job output                     |
 | `cancel_subagent`                   | Cancel an async job                                            |
 | `prune_subagent_jobs`               | Remove completed and failed jobs                               |
 | `list_available_models`             | List configured model identifiers                              |
@@ -280,11 +280,14 @@ Parameters:
 
 #### `get_subagent_result`
 
-Block until an async subagent job completes, then return the final output and usage summary. If the job is already done, it returns immediately.
+Retrieve an async subagent job's current or final result and usage summary. A
+running job returns immediately unless explicit bounded waiting is requested.
 
 Parameters:
 
 - `jobId` — required job ID returned by the async spawn
+- `wait` — optional; set to `true` to wait for a running job
+- `timeoutMs` — optional wait timeout from 1 to 300,000 ms; defaults to 30,000 ms
 
 #### `cancel_subagent`
 

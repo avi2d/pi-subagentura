@@ -537,6 +537,16 @@ describe("get_subagent_result tool", () => {
     );
   });
 
+  it("describes immediate retrieval and optional bounded waiting", () => {
+    expect(toolDef.description).toContain(
+      "returns immediately with live status",
+    );
+    expect(toolDef.description).toContain("Pass wait: true");
+    expect(toolDef.description).not.toContain(
+      "Block until an async subagent job completes",
+    );
+  });
+
   it("returns immediately for a running job unless waiting is explicit", async () => {
     const jobId = "running-without-wait";
     let resolveJob!: (value: SubagentResult) => void;

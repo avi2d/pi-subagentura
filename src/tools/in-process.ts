@@ -811,7 +811,8 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
     name: "get_subagent_result",
     label: "Get Subagent Result",
     description: [
-      "Block until an async subagent job completes, then return the final output and usage summary.",
+      "Retrieve an async subagent job's current or final result and usage summary.",
+      "A running job returns immediately with live status unless waiting is explicit. Pass wait: true to wait up to timeoutMs.",
       "ONLY call this tool when the user explicitly asks you to wait for or collect a specific async result.",
       "Do not call it immediately after spawning async sub-agents; completion injection handles normal background fan-out.",
     ].join("\n"),
