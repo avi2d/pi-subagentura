@@ -116,7 +116,7 @@ describe("validateSchema additionalProperties", () => {
     ]);
   });
 
-  it("keeps schema-valued additionalProperties permissive", () => {
+  it("rejects unsupported schema-valued additionalProperties", () => {
     expect(
       validateSchema(
         { known: "ok", extra: 42 },
@@ -126,7 +126,7 @@ describe("validateSchema additionalProperties", () => {
           additionalProperties: { type: "string" },
         },
       ),
-    ).toEqual([]);
+    ).toEqual(["$.additionalProperties: expected boolean"]);
   });
 });
 
@@ -138,6 +138,47 @@ describe("validateSchema array cardinality", () => {
     expect(validateSchema([1, 2], { type: "array", maxItems: 1 })).toEqual([
       "$: expected <= 1 items, got 2",
     ]);
+  });
+
+  it("rejects unsupported tuple-style items during preflight", () => {
+    expect(
+      validateSchema([1], {
+        type: "array",
+        items: [],
+      }),
+    ).toEqual(["$.items: expected object"]);
+  });
+});
+
+describe("workflow schema preflight", () => {
+  it.each([
+    {
+      schema: {
+        type: "object",
+        additionalProperties: { type: "string" },
+      },
+      error: "$.additionalProperties: expected boolean",
+    },
+    {
+      schema: { type: "array", items: [] },
+      error: "$.items: expected object",
+    },
+  ])("rejects $error before spawning an agent", async ({ schema, error }) => {
+    let calls = 0;
+    const script = `
+      export const meta = { name: "invalid-schema", description: "test" };
+      return await agent("return a value", { schema: ${JSON.stringify(schema)} });
+    `;
+
+    await expect(
+      runWorkflow(script, {
+        runAgent: async () => {
+          calls++;
+          return ok("null");
+        },
+      }),
+    ).rejects.toThrow(error);
+    expect(calls).toBe(0);
   });
 });
 

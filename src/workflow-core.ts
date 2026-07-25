@@ -451,13 +451,11 @@ export function validateSchemaDefinition(schema: any, path = "$"): string[] {
     }
   }
 
-  if (schema.additionalProperties !== undefined) {
-    const ap = schema.additionalProperties;
-    if (typeof ap !== "boolean") {
-      errs.push(
-        ...validateSchemaDefinition(ap, `${path}.additionalProperties`),
-      );
-    }
+  if (
+    schema.additionalProperties !== undefined &&
+    typeof schema.additionalProperties !== "boolean"
+  ) {
+    errs.push(`${path}.additionalProperties: expected boolean`);
   }
 
   if (
@@ -488,10 +486,12 @@ export function validateSchemaDefinition(schema: any, path = "$"): string[] {
 
   if (
     schema.items !== undefined &&
-    (schema.items === null || typeof schema.items !== "object")
+    (schema.items === null ||
+      typeof schema.items !== "object" ||
+      Array.isArray(schema.items))
   ) {
     errs.push(`${path}.items: expected object`);
-  } else if (schema.items !== undefined && !Array.isArray(schema.items)) {
+  } else if (schema.items !== undefined) {
     errs.push(...validateSchemaDefinition(schema.items, `${path}.items`));
   }
 
