@@ -326,6 +326,42 @@ describe("artifact protocol v2 delivery", () => {
     ]);
   });
 
+  it("queues an explicit omission message for oversized completion output", async () => {
+    const art = makeArtifact();
+    const state = makeState(art.dir);
+    state.notifyOnComplete = "inject";
+    state.triggerTurnOnComplete = false;
+    state.eventByteCursor = 0;
+    interactiveSubagentRegistry.set(state.id, state);
+    (globalThis as any).__piSubagenturaInteractiveRegistry =
+      interactiveSubagentRegistry;
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
+    const bytes = MAX_OUTPUT_SNAPSHOT_BYTES + 1;
+    writeOutput(art, "");
+    writeFileSync(art.outputFile, Buffer.alloc(bytes, 120));
+    const completion = appendCompletionEvent(art, {
+      turnId: "oversized-poller-turn",
+      outcome: "done",
+      source: "agent_settled",
+      eventId: "oversized-poller-event",
+    })!;
+    const sendMessage = vi.fn();
+
+    await pollArtifactChanges({ sendMessage } as any);
+
+    expect(completion.output).toBeUndefined();
+    expect(state.pendingDeliveries).toContainEqual(
+      expect.objectContaining({
+        eventId: "oversized-poller-event",
+        output: undefined,
+        message: `Output omitted: ${bytes} bytes exceeds the ${MAX_OUTPUT_SNAPSHOT_BYTES}-byte snapshot limit.`,
+      }),
+    );
+  });
+
   it("deduplicates late explicit completion for the same turn", () => {
     const art = makeArtifact();
     writeOutput(art, "answer");

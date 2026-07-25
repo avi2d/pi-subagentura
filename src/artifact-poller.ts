@@ -96,6 +96,19 @@ function deliveryStatusFromEvent(ev: CompletionEvent): CompletionOutcome {
       return assertNever(ev);
   }
 }
+
+function deliveryMessageFromEvent(ev: CompletionEvent): string | undefined {
+  if (ev.type !== "completion") {
+    return "message" in ev ? ev.message : undefined;
+  }
+  if (ev.errorMessage) return ev.errorMessage;
+  if (ev.message) return ev.message;
+  if (ev.outputError?.code === "output_too_large") {
+    return `Output omitted: ${ev.outputError.bytes} bytes exceeds the ${ev.outputError.maxBytes}-byte snapshot limit.`;
+  }
+  return ev.outputError?.message;
+}
+
 let pollInFlight: Promise<void> | undefined;
 // ── Poller ─────────────────────────────────────────────────────────────
 
@@ -202,14 +215,39 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
           status,
           artifactDir: state.artifactDir,
           output: v2?.output,
-          message:
-            v2?.errorMessage ??
-            v2?.message ??
-            (v2?.outputError?.code === "output_too_large"
-              ? `Output omitted: ${v2.outputError.bytes} bytes exceeds the ${v2.outputError.maxBytes}-byte snapshot limit.`
-              : v2?.outputError?.message) ??
-            ("message" in ev ? ev.message : undefined),
+          message: deliveryMessageFromEvent(ev),
           state: "queued",
+        });
+      }
+      for (const issue of batch.issues) {
+        const mode = state.notifyOnComplete ?? "inject";
+        const triggerTurn =
+          mode === "inject"
+            ? state.triggerTurnOnComplete !== false
+            : state.triggerTurnOnComplete === true;
+        const identity = `record-overflow-${issue.startOffset}`;
+        enqueueDelivery(state, {
+          deliveryId: deliveryIdFor({
+            parentSessionId: state.parentSessionId ?? "pi",
+            subagentId: state.id,
+            turnId: identity,
+            mode,
+          }),
+          subagentId: state.id,
+          turnId: identity,
+          eventId: identity,
+          mode,
+          triggerTurn,
+          status: "error",
+          artifactDir: state.artifactDir,
+          message: `Artifact record at byte ${issue.startOffset} exceeded the ${issue.maxBytes}-byte limit and was skipped.`,
+          state: "queued",
+        });
+      }
+      if (batch.issues.length > 0 && state.parentSessionId) {
+        updateInteractiveState(state.cwd, state.id, (entry) => {
+          entry.pendingDeliveries = state.pendingDeliveries ?? [];
+          entry.deliveryReceipts = state.deliveryReceipts ?? [];
         });
       }
       nextCursor = batch.endOffset;

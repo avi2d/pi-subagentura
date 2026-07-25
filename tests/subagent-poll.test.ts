@@ -21,6 +21,8 @@ import {
   artifactPath,
   eventLogEndOffset,
   loadInteractiveStates,
+  MAX_EVENT_RECORD_BYTES,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
   readEventRecords,
   writeOutput,
 } from "../src/artifact";
@@ -706,6 +708,61 @@ describe("pollArtifactChanges", () => {
       });
       expect(sendUserMessage).not.toHaveBeenCalled();
       expect(state.pendingDeliveries?.[0]?.state).toBe("dispatchAttempted");
+    });
+
+    it("persists oversized completion delivery metadata before advancing the event cursor", async () => {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const multiplexer = await import("../src/multiplexer");
+      const { state, artifactDir } = makeState();
+      state.notifyOnComplete = "inject";
+      state.triggerTurnOnComplete = false;
+      state.cwd = join(artifactDir, "..");
+      state.parentSessionId = "pi";
+      appendInteractiveState(state.cwd, {
+        id: state.id,
+        paneId: state.paneId,
+        mux: state.mux,
+        artifactDir: state.artifactDir,
+        sessionFile: state.sessionFile,
+        notifyOnComplete: "inject",
+        triggerTurnOnComplete: false,
+        parentSessionId: "pi",
+      });
+      mod.interactiveSubagentRegistry.set(state.id, state);
+      multiplexer.__setTmuxMultiplexer({
+        isPaneAlive: () => true,
+        isPaneAliveAsync: async () => true,
+      } as any);
+      const art = artifactPath(join(artifactDir, ".."), state.id);
+      const raw =
+        JSON.stringify({
+          version: 2,
+          eventId: "adversarial-oversized-event",
+          turnId: "adversarial-oversized-turn",
+          ts: 1,
+          type: "completion",
+          outcome: "error",
+          source: "explicit",
+          errorMessage: "x".repeat(MAX_EVENT_RECORD_BYTES + 1),
+        }) + "\n";
+      mkdirSync(art.dir, { recursive: true });
+      writeFileSync(art.statusFile, raw);
+      const sendMessage = installDeliverySpies();
+
+      await mod.pollArtifactChanges({ sendMessage } as any);
+
+      const persisted = loadInteractiveStates(state.cwd)?.states[state.id];
+      expect(persisted?.eventByteCursor).toBe(eventLogEndOffset(art));
+      expect(persisted?.pendingDeliveries).toContainEqual(
+        expect.objectContaining({
+          eventId: "record-overflow-0",
+          turnId: "record-overflow-0",
+          status: "error",
+          message: `Artifact record at byte 0 exceeded the ${MAX_EVENT_RECORD_BYTES}-byte limit and was skipped.`,
+        }),
+      );
+      multiplexer.__setTmuxMultiplexer(undefined);
     });
 
     it("uses attributed sendMessage when state.notifyOnComplete is unset (default: inject)", async () => {

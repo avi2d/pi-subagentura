@@ -244,6 +244,13 @@ export interface EventRecord {
   legacy: boolean;
 }
 
+export interface EventReadIssue {
+  kind: "record_too_large";
+  startOffset: number;
+  endOffset: number;
+  maxBytes: number;
+}
+
 export const MAX_EVENT_BATCH_BYTES = 256 * 1024;
 export const MAX_EVENT_RECORD_BYTES = 4 * MAX_EVENT_BATCH_BYTES;
 export const MAX_EVENT_ID_LENGTH = 128;
@@ -251,6 +258,13 @@ export const MAX_TURN_ID_LENGTH = 256;
 export const MAX_EVENT_TEXT_LENGTH = 2_000;
 export const MAX_TOOL_NAME_LENGTH = 128;
 export const MAX_OUTPUT_SNAPSHOT_BYTES = 1024 * 1024;
+
+export function boundedOptionalEventText(
+  value: unknown,
+  maxLength = MAX_EVENT_TEXT_LENGTH,
+): string | undefined {
+  return typeof value === "string" ? value.slice(0, maxLength) : undefined;
+}
 
 export interface SubagentArtifact {
   id: string;
@@ -364,10 +378,45 @@ export function outputPathForTurn(art: SubagentArtifact, turn: number): string {
  * would compute the same N — but a guard inside would be brittle. Trust the caller.
  */
 export function snapshotOutput(art: SubagentArtifact, turn: number): void {
-  if (!existsSync(art.outputFile)) return;
+  let fd: number | undefined;
+  let content: Buffer;
+  try {
+    fd = openSync(art.outputFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_OUTPUT_SNAPSHOT_BYTES) return;
+    content = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytesRead = readSync(
+        fd,
+        content,
+        offset,
+        content.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    content = content.subarray(0, offset);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog("warn", "legacy_snapshot_output_unavailable", {
+        artifactId: art.id,
+        turn,
+      });
+    }
+    return;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* legacy snapshot content is already bounded in memory */
+      }
+    }
+  }
   const target = outputPathForTurn(art, turn);
   const tmp = target + ".tmp";
-  const content = readFileSync(art.outputFile, "utf8");
   writeFileSync(tmp, content, { mode: 0o600 });
   renameSync(tmp, target);
 }
@@ -473,6 +522,8 @@ export function appendCompletionEvent(
     if (existing) return null;
     const eventId = params.eventId ?? newEventId();
     const snapshot = snapshotOutputForEvent(art, eventId);
+    const message = boundedOptionalEventText(params.message);
+    const errorMessage = boundedOptionalEventText(params.errorMessage);
     const event: CompletionEventV2 = {
       version: 2,
       eventId,
@@ -484,8 +535,8 @@ export function appendCompletionEvent(
       source: params.source,
       ...snapshot,
       ...(params.exitCode === undefined ? {} : { exitCode: params.exitCode }),
-      ...(params.message ? { message: params.message } : {}),
-      ...(params.errorMessage ? { errorMessage: params.errorMessage } : {}),
+      ...(message ? { message } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
     };
     appendEvent(art, event);
     return event;
@@ -593,13 +644,6 @@ export function readOutputForTurnId(
 
 // ── Reads ───────────────────────────────────────────────────────────
 
-function boundedEventString(
-  value: unknown,
-  maxLength = MAX_EVENT_TEXT_LENGTH,
-): string | undefined {
-  return typeof value === "string" ? value.slice(0, maxLength) : undefined;
-}
-
 function normalizeEvent(
   value: unknown,
   startOffset: number,
@@ -610,9 +654,9 @@ function normalizeEvent(
   if (typeof obj.ts !== "number" || !Number.isFinite(obj.ts) || obj.ts < 0) {
     return null;
   }
-  const message = boundedEventString(obj.message);
-  const summary = boundedEventString(obj.summary);
-  const tool = boundedEventString(obj.tool, MAX_TOOL_NAME_LENGTH);
+  const message = boundedOptionalEventText(obj.message);
+  const summary = boundedOptionalEventText(obj.summary);
+  const tool = boundedOptionalEventText(obj.tool, MAX_TOOL_NAME_LENGTH);
   const exitCode =
     typeof obj.exitCode === "number" && Number.isSafeInteger(obj.exitCode)
       ? obj.exitCode
@@ -750,7 +794,7 @@ function normalizeEvent(
         outputError,
         exitCode,
         message,
-        errorMessage: boundedEventString(obj.errorMessage),
+        errorMessage: boundedOptionalEventText(obj.errorMessage),
         summary,
       },
       legacy: false,
@@ -812,17 +856,18 @@ export function readEventRecords(
 export function readEventBatch(
   art: SubagentArtifact,
   fromOffset = 0,
-): { records: EventRecord[]; endOffset: number } {
+): { records: EventRecord[]; issues: EventReadIssue[]; endOffset: number } {
   let fd: number | undefined;
   let size = 0;
   try {
     fd = openSync(art.statusFile, "r");
     size = statSync(art.statusFile).size;
   } catch {
-    return { records: [], endOffset: fromOffset };
+    return { records: [], issues: [], endOffset: fromOffset };
   }
   const offset = Math.max(0, Math.min(fromOffset, size));
   let content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
+  let oversizedEndOffset: number | undefined;
   try {
     if (content.byteLength > 0) {
       readSync(fd, content, 0, content.length, offset);
@@ -840,11 +885,50 @@ export function readEventBatch(
         readSync(fd, next, 0, next.length, offset + content.byteLength);
         content = Buffer.concat([content, next]);
       }
+      if (
+        content.indexOf(0x0a) < 0 &&
+        content.byteLength >= MAX_EVENT_RECORD_BYTES &&
+        offset + content.byteLength < size
+      ) {
+        let scanOffset = offset + content.byteLength;
+        const scan = Buffer.alloc(MAX_EVENT_BATCH_BYTES);
+        while (scanOffset < size) {
+          const bytesRead = readSync(
+            fd,
+            scan,
+            0,
+            Math.min(scan.length, size - scanOffset),
+            scanOffset,
+          );
+          if (bytesRead === 0) break;
+          const newline = scan.subarray(0, bytesRead).indexOf(0x0a);
+          if (newline >= 0) {
+            const lineBytes = scanOffset + newline - offset;
+            if (lineBytes > MAX_EVENT_RECORD_BYTES) {
+              oversizedEndOffset = scanOffset + newline + 1;
+            } else {
+              content = Buffer.concat([content, Buffer.from("\n")]);
+            }
+            break;
+          }
+          scanOffset += bytesRead;
+        }
+      }
     }
   } finally {
     closeSync(fd);
   }
   const records: EventRecord[] = [];
+  const issues: EventReadIssue[] = [];
+  if (oversizedEndOffset !== undefined) {
+    issues.push({
+      kind: "record_too_large",
+      startOffset: offset,
+      endOffset: oversizedEndOffset,
+      maxBytes: MAX_EVENT_RECORD_BYTES,
+    });
+    return { records, issues, endOffset: oversizedEndOffset };
+  }
   let start = 0;
   let endOffset = offset;
   while (start < content.byteLength) {
@@ -892,7 +976,7 @@ export function readEventBatch(
   ) {
     endOffset = offset + content.byteLength;
   }
-  return { records, endOffset };
+  return { records, issues, endOffset };
 }
 
 export function eventLogEndOffset(art: SubagentArtifact): number {

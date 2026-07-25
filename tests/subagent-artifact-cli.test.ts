@@ -11,6 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { CLI_SOURCE, writeCliScript } from "../src/subagent-artifact-cli";
+import {
+  MAX_EVENT_TEXT_LENGTH,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
+} from "../src/artifact";
 
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-cli-"));
@@ -108,6 +112,25 @@ describe("subagent-artifact CLI", () => {
       expect(ev.exitCode).toBe(1);
     });
 
+    it("records outputError instead of snapshotting oversized output.md", () => {
+      const bytes = MAX_OUTPUT_SNAPSHOT_BYTES + 1;
+      writeFileSync(join(tmp, "output.md"), Buffer.alloc(bytes, 120));
+
+      const r = runCli(tmp, ["done", "0"]);
+
+      expect(r.status).toBe(0);
+      const ev = JSON.parse(
+        readFileSync(join(tmp, "events.ndjson"), "utf8").trim(),
+      );
+      expect(ev.output).toBeUndefined();
+      expect(ev.outputError).toEqual({
+        code: "output_too_large",
+        bytes,
+        maxBytes: MAX_OUTPUT_SNAPSHOT_BYTES,
+      });
+      expect(existsSync(join(tmp, "outputs", `${ev.eventId}.md`))).toBe(false);
+    });
+
     it("serializes concurrent completion writers for one turn", async () => {
       const cliPath = join(tmp, "cli.mjs");
       writeCliScript(cliPath);
@@ -160,6 +183,18 @@ describe("subagent-artifact CLI", () => {
       expect(ev.outcome).toBe("error");
       expect(ev.status).toBe("error");
       expect(ev.message).toBe("boom");
+    });
+
+    it("bounds generated CLI error text", () => {
+      const message = "x".repeat(MAX_EVENT_TEXT_LENGTH + 10);
+      const r = runCli(tmp, ["error", message]);
+
+      expect(r.status).toBe(0);
+      const ev = JSON.parse(
+        readFileSync(join(tmp, "events.ndjson"), "utf8").trim(),
+      );
+      expect(ev.message).toBe("x".repeat(MAX_EVENT_TEXT_LENGTH));
+      expect(ev.errorMessage).toBe("x".repeat(MAX_EVENT_TEXT_LENGTH));
     });
   });
 

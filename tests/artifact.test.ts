@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  appendCompletionEvent,
   appendEvent,
   appendInteractiveState,
   artifactPath,
@@ -31,6 +32,7 @@ import {
   loadInteractiveStates,
   MAX_EVENT_TEXT_LENGTH,
   MAX_EVENT_BATCH_BYTES,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
   MAX_TOOL_NAME_LENGTH,
   outputPathForTurn,
   readEvents,
@@ -290,7 +292,22 @@ describe("artifact", () => {
     expect((events[0] as any).eventId).toBe("oversized-completion");
   });
 
-  it("advances cursor for records larger than MAX_EVENT_RECORD_BYTES", () => {
+  it("bounds first-party completion text so the record remains readable", () => {
+    const art = artifactPath(root, "bounded-completion");
+    const event = appendCompletionEvent(art, {
+      turnId: "bounded-turn",
+      outcome: "error",
+      source: "agent_settled",
+      message: "m".repeat(MAX_EVENT_TEXT_LENGTH + 10),
+      errorMessage: "e".repeat(MAX_EVENT_TEXT_LENGTH + 10),
+    });
+
+    expect(event?.message).toBe("m".repeat(MAX_EVENT_TEXT_LENGTH));
+    expect(event?.errorMessage).toBe("e".repeat(MAX_EVENT_TEXT_LENGTH));
+    expect(readEvents(art)).toContainEqual(event);
+  });
+
+  it("reports one deterministic issue for an oversized physical record", () => {
     const art = artifactPath(root, "ultra-oversized-event");
     ensureArtifactDir(art);
     const event = {
@@ -307,13 +324,22 @@ describe("artifact", () => {
 
     const first = readEventBatch(art, 0);
 
-    expect(first.endOffset).toBeGreaterThan(0);
-
-    const second = readEventBatch(art, first.endOffset);
-
-    expect(second.endOffset).toBeGreaterThan(first.endOffset);
-
-    expect(readEvents(art)).toEqual([]);
+    const expectedEnd = statSync(art.statusFile).size;
+    expect(first.records).toEqual([]);
+    expect(first.issues).toEqual([
+      {
+        kind: "record_too_large",
+        startOffset: 0,
+        endOffset: expectedEnd,
+        maxBytes: MAX_EVENT_RECORD_BYTES,
+      },
+    ]);
+    expect(first.endOffset).toBe(expectedEnd);
+    expect(readEventBatch(art, first.endOffset)).toEqual({
+      records: [],
+      issues: [],
+      endOffset: expectedEnd,
+    });
   });
 
   describe("readOutput", () => {
@@ -410,6 +436,19 @@ describe("artifact", () => {
       const art = artifactPath(root, "snap4");
       // No writeOutput call — output.md doesn't exist.
       snapshotOutput(art, 1);
+      expect(existsSync(outputPathForTurn(art, 1))).toBe(false);
+    });
+
+    it("snapshotOutput does not read or copy oversized output.md", () => {
+      const art = artifactPath(root, "snap-oversized");
+      ensureArtifactDir(art);
+      writeFileSync(
+        art.outputFile,
+        Buffer.alloc(MAX_OUTPUT_SNAPSHOT_BYTES + 1, 120),
+      );
+
+      snapshotOutput(art, 1);
+
       expect(existsSync(outputPathForTurn(art, 1))).toBe(false);
     });
 
