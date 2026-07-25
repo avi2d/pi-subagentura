@@ -1,13 +1,12 @@
-/**
- * Session lifecycle handlers and interactive poller setup.
- *
+/** Session lifecycle handlers and interactive poller setup.
+
  * Extracted from src/subagent.ts so the extension entrypoint can stay focused
  * on registration and public exports.
  */
 
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deleteInteractiveStatesFile } from "./artifact";
-import { pollArtifactChanges } from "./artifact-poller";
+import { clearSessionParsers, pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
 import { flushInProcessDeliveries } from "./notifications";
 import { jobRegistry } from "./helpers";
@@ -18,14 +17,27 @@ import {
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
-import { workflowJobRegistry } from "./workflow-jobs";
+import { cleanupWorkflowJobsForOwner } from "./workflow-jobs";
+import {
+  advanceSessionContextGeneration,
+  createSessionContextRef,
+  getSessionContextStack,
+  registerSessionContext,
+  removeSessionContext,
+  setActiveSessionRefs,
+  type ActiveSessionContextToken,
+  type SessionContextRef,
+} from "./session-context";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
-export function registerSessionHandlers(pi: ExtensionAPI): void {
+export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
+  const sessionContext = createSessionContextRef(pi);
   const g2 = getGlobalState() as any;
+  registerSessionContext(sessionContext);
+  setActiveSessionRefs(sessionContext);
 
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaParentStreaming = false;
@@ -35,7 +47,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   });
   pi.on("agent_settled", () => {
     g2.__piSubagenturaParentStreaming = false;
-    flushDeliveries(pi, g2.__piSubagenturaUi);
+    flushDeliveries(pi, sessionContext.ui, {
+      id: sessionContext.id,
+      generation: sessionContext.generation,
+    });
     flushInProcessDeliveries();
   });
 
@@ -43,8 +58,22 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The handler is registered on every default-export invocation; the last one wins,
   // which is the same pi the poller uses via __piSubagenturaPiRef.
   pi.on("session_start", (event, ctx) => {
+    const previousOwner: ActiveSessionContextToken = {
+      id: sessionContext.id,
+      generation: sessionContext.generation,
+    };
+    cleanupWorkflowJobsForOwner(previousOwner);
+    advanceSessionContextGeneration(sessionContext.id);
+    removeSessionContext(sessionContext.id);
+    sessionContext.ui = ctx.ui;
+    sessionContext.sessionManager = ctx.sessionManager;
+    registerSessionContext(sessionContext);
+    setActiveSessionRefs(sessionContext);
     g2.__piSubagenturaUi = ctx.ui;
     g2.__piSubagenturaSessionManager = ctx.sessionManager;
+    g2.__piSubagenturaPiRef = pi;
+    g2.__piSubagenturaParentStreaming = false;
+
     // Rehydrate on startup (resumed session after quit), reload, and resume.
     // The session ID filter ensures only subagents created in this specific session
     // are rehydrated. On 'new' and 'fork' we skip — those are explicit fresh starts.
@@ -76,9 +105,14 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
   // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
     const handle = setInterval(() => {
-      void pollArtifactChanges(pi).catch((err) => {
-        console.error("[subagentura] artifact poll failed", err);
-      });
+      for (const context of [...getSessionContextStack()]) {
+        void pollArtifactChanges(context.pi, {
+          id: context.id,
+          generation: context.generation,
+        }).catch((err) => {
+          console.error("[subagentura] artifact poll failed", err);
+        });
+      }
     }, 5000);
     // Don't pin the event loop on a long-lived parent. unref() lets the process exit
     // cleanly when nothing else is keeping it alive (no other ref'd handles).
@@ -94,6 +128,30 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       ctx: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
     ) => {
       const g2 = getGlobalState() as any;
+      const contextStack = getSessionContextStack();
+      const contextIndex = contextStack.findIndex(
+        (entry) => entry.id === sessionContext.id,
+      );
+      if (contextIndex < 0) return;
+
+      const wasTop = contextIndex === contextStack.length - 1;
+      const shutdownOwner: ActiveSessionContextToken = {
+        id: sessionContext.id,
+        generation: sessionContext.generation,
+      };
+      advanceSessionContextGeneration(sessionContext.id);
+      removeSessionContext(sessionContext.id);
+      setActiveSessionRefs(contextStack[contextStack.length - 1]);
+      g2.__piSubagenturaParentStreaming = false;
+
+      // Context-owned workflows must be torn down even when a nested session
+      // remains active above or below this handler in the global stack.
+      cleanupWorkflowJobsForOwner(shutdownOwner);
+
+      if (!wasTop || contextStack.length > 0) {
+        // Non-top handlers belong to nested sessions; restore parent refs only.
+        return;
+      }
 
       // Stop the global poller so it doesn't fire after we're gone. Without
       // clearInterval the handle would keep the event loop alive across restarts.
@@ -119,6 +177,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       // setInterval before clearInterval ran) finds an empty registry and its
       // for-loop iterates over zero entries — no work, no notification delivery.
       try {
+        clearSessionParsers();
         interactiveSubagentRegistry.clear();
       } catch {
         /* best effort */
@@ -141,9 +200,21 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
         }
       }
 
+      let shutdownInitiator: string | undefined;
+      try {
+        shutdownInitiator = ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        shutdownInitiator = undefined;
+      }
+      const shutdownCancellation = {
+        source: "session_shutdown" as const,
+        initiator: shutdownInitiator,
+        reason: `session_shutdown (${event?.reason ?? "unknown"})`,
+      };
       // Snapshot all in-process jobs before any abort can wait for idle.
       for (const job of jobRegistry.values()) {
         if (job.status !== "running") continue;
+        job.cancellation = { ...shutdownCancellation, at: Date.now() };
         job.cancellationSnapshot = snapshotInProcessSession({
           kind: "in-process",
           jobId: job.id,
@@ -153,28 +224,24 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
           activeTool: job.liveStatus?.activeTool,
           partialOutput: job.liveStatus?.output,
           source: "session_shutdown",
+          initiator: shutdownCancellation.initiator,
+          reason: shutdownCancellation.reason,
         });
       }
-      // Abort all running subagent sessions before clearing
+      // Abort all running subagent sessions before clearing. Prefer the
+      // controller so descendants are torn down too.
       for (const job of jobRegistry.values()) {
         if (job.status === "running") {
           try {
-            job.session.abort().catch(() => {});
+            if (job.abort) job.abort.abort(shutdownCancellation);
+            else job.session.abort().catch(() => {});
           } catch {
             /* session may already be disposed */
           }
         }
       }
 
-      // Workflow workers are bound to this parent context. Suppress completion
-      // before aborting so late settlement cannot notify a replacement session.
-      for (const workflow of workflowJobRegistry.values()) {
-        workflow.suppressCompletionNotification = true;
-        if (workflow.status === "running") workflow.abort.abort();
-      }
-
       jobRegistry.clear();
-      workflowJobRegistry.clear();
       g2.__piSubagenturaPiRef = undefined;
       g2.__piSubagenturaSessionManager = undefined;
       g2.__piSubagenturaParentStreaming = false;
@@ -189,4 +256,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       }
     },
   );
+
+  return sessionContext;
 }

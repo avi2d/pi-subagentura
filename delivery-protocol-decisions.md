@@ -17,15 +17,11 @@ Status: accepted requirements for the delivery-protocol redesign patch.
 
 ## Parent delivery modes
 
-- `inject` is the default. Persist the full turn output as an attributed custom
-  message in the parent context and automatically trigger the main agent.
-- `notify` persists a pointer-only custom message in the parent context without
-  triggering a turn. The main agent sees the pointer when the user next prompts.
-- `notify` with `triggerTurnOnComplete: true` persists the pointer and wakes the
-  main agent immediately.
-- `inject` with `triggerTurnOnComplete: false` persists the full output without
-  waking the main agent.
-- Async in-process tools default to `inject`, matching interactive sub-agents.
+- `inject` persists the full turn output as an attributed custom message in the parent context.
+- `notify` persists a pointer-only custom message in the parent context without injecting output.
+- `notify` with `triggerTurnOnComplete: true` persists the pointer and wakes the main agent immediately.
+- `inject` with `triggerTurnOnComplete: false` persists the full output without waking the main agent.
+- Async in-process tools continue to default to `inject`; the public `subagent_interactive` tool defaults to `notify` with `triggerTurnOnComplete: true`.
 
 ## Required patch changes
 

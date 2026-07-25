@@ -1,10 +1,14 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
   getWorkflowCompletionPresentation,
-  workflowJobRegistry,
+  normalizeCancelledWorkflowState,
+  workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { formatWorkflowUsage } from "./workflow-core";
+import type { ActiveSessionContextToken } from "./session-context";
+
+const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
 
 export type WorkflowTreeAction =
   { kind: "cancel"; workflowId: string } | { kind: "close" };
@@ -13,6 +17,7 @@ type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 
 interface WorkflowTreeOptions {
   done: WorkflowTreeDone;
+  owner?: ActiveSessionContextToken;
   requestRender?: () => void;
   notify?: (message: string) => void;
 }
@@ -68,7 +73,7 @@ export class WorkflowTreeComponent {
   }
 
   handleInput(data: string): void {
-    const jobs = selectableJobs();
+    const jobs = selectableJobs(this.opts.owner);
     if (data === "q" || data === "\x1b") {
       this.opts.done({ kind: "close" });
       return;
@@ -113,7 +118,7 @@ export class WorkflowTreeComponent {
 
   private rows(): WorkflowRow[] {
     const rows: WorkflowRow[] = [];
-    for (const job of workflowJobRegistry.values()) {
+    for (const job of workflowJobsForOwner(this.opts.owner)) {
       const isExpanded = this.expanded.has(job.id);
       rows.push({
         job,
@@ -143,6 +148,7 @@ export class WorkflowTreeComponent {
     }
     job.abort.abort();
     job.status = "cancelled";
+    normalizeCancelledWorkflowState(job);
     this.opts.notify?.(`Cancelled workflow ${job.id}.`);
     this.changed();
     this.opts.done({ kind: "cancel", workflowId: job.id });
@@ -156,6 +162,7 @@ export class WorkflowTreeComponent {
 
 export async function showWorkflowTree(
   ui: ExtensionUIContext,
+  owner?: ActiveSessionContextToken,
 ): Promise<WorkflowTreeAction> {
   const custom = (ui as any).custom;
   if (typeof custom !== "function") {
@@ -172,6 +179,7 @@ export async function showWorkflowTree(
     ) =>
       new WorkflowTreeComponent({
         done,
+        owner,
         requestRender: () => tui.requestRender?.(),
         notify: (message) => ui.notify(message),
       }),
@@ -186,8 +194,8 @@ export async function showWorkflowTree(
   );
 }
 
-function selectableJobs(): WorkflowJobState[] {
-  return [...workflowJobRegistry.values()];
+function selectableJobs(owner?: ActiveSessionContextToken): WorkflowJobState[] {
+  return workflowJobsForOwner(owner);
 }
 
 function formatWorkflowSummary(job: WorkflowJobState): string {
@@ -219,6 +227,38 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
       depth: 1,
       selectable: false,
       text: `◆ phase: ${phase}`,
+    });
+  }
+  const records = job.snapshot.agentRecords ?? [];
+  const agentRows = records.slice(-MAX_WORKFLOW_TREE_AGENT_ROWS);
+  const omittedForUi =
+    (job.snapshot.agentRecordsOmitted ?? 0) +
+    Math.max(0, records.length - agentRows.length);
+  if (omittedForUi > 0) {
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: `… ${omittedForUi} older agent records omitted`,
+    });
+  }
+  for (const record of agentRows) {
+    const marker =
+      record.status === "running"
+        ? "→"
+        : record.status === "error"
+          ? "✗"
+          : record.status === "cancelled"
+            ? "⊘"
+            : "✓";
+    const label = `${record.label ?? "agent"} #${record.agentId}`;
+    const model = record.model ? ` @${record.model}` : "";
+    const phase = record.phase ? ` (${record.phase})` : "";
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: `${marker} ${record.status} ${label}${model}${phase}`,
     });
   }
   if (job.snapshot.lastMessage) {

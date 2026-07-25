@@ -8,12 +8,21 @@
  * Preserves idle interactive panes (they consume no tokens).
  * Preserves done/error/cancelled jobs and workflows.
  */
-import { jobRegistry, scheduleJobCleanup } from "./helpers";
+import {
+  inProcessJobBelongsToOwner,
+  jobRegistry,
+  scheduleJobCleanup,
+} from "./helpers";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
 } from "./interactive-tmux";
-import { workflowJobRegistry } from "./workflow-jobs";
+import {
+  normalizeCancelledWorkflowState,
+  workflowJobsForOwner,
+} from "./workflow-jobs";
+import type { ActiveSessionContextToken } from "./session-context";
+import { parentSessionBelongsToOwner } from "./session-context";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -28,7 +37,9 @@ export interface CancelAllResult {
   snapshots?: CancellationSnapshotReceipt[];
 }
 
-export async function cancelAllFlows(): Promise<CancelAllResult> {
+export async function cancelAllFlows(
+  owner?: ActiveSessionContextToken,
+): Promise<CancelAllResult> {
   const result: CancelAllResult = {
     jobsAborted: 0,
     workflowsAborted: 0,
@@ -46,7 +57,9 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   };
 
   // Snapshot every known child before the first potentially slow abort.
-  const interactiveStates = [...interactiveSubagentRegistry.values()];
+  const interactiveStates = [...interactiveSubagentRegistry.values()].filter(
+    (state) => parentSessionBelongsToOwner(state.parentSessionId, owner),
+  );
   for (const state of interactiveStates) {
     if (state.status !== "running") continue;
     state.cancellationSnapshot = snapshotInteractiveContext({
@@ -62,9 +75,15 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
     addSnapshot(state.cancellationSnapshot);
   }
   const jobs = [...jobRegistry.values()].filter(
-    (job) => job.status === "running",
+    (job) => job.status === "running" && inProcessJobBelongsToOwner(job, owner),
   );
+  const jobCancellation = {
+    source: "cancel_all" as const,
+    initiator: "cancel_all_flows",
+    reason: "cancel-all-flows aborted every running flow",
+  };
   for (const job of jobs) {
+    job.cancellation = { ...jobCancellation, at: Date.now() };
     job.cancellationSnapshot = snapshotInProcessSession({
       kind: "in-process",
       jobId: job.id,
@@ -74,12 +93,17 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
       activeTool: job.liveStatus?.activeTool,
       partialOutput: job.liveStatus?.output,
       source: "cancel_all",
+      initiator: jobCancellation.initiator,
+      reason: jobCancellation.reason,
     });
     addSnapshot(job.cancellationSnapshot);
   }
   for (const job of jobs) {
     try {
-      await job.session.abort();
+      // Prefer the controller so the abort handler cascades to descendants;
+      // fall back to a direct session abort for jobs spawned without one.
+      if (job.abort) job.abort.abort(jobCancellation);
+      else await job.session.abort();
     } catch {
       /* session may already be disposed */
     }
@@ -89,15 +113,18 @@ export async function cancelAllFlows(): Promise<CancelAllResult> {
   }
 
   // 2. Abort all running workflows
-  for (const workflow of workflowJobRegistry.values()) {
+  for (const workflow of workflowJobsForOwner(owner)) {
     if (workflow.status === "running") {
       workflow.suppressCompletionNotification = true;
       workflow.abort.abort();
       workflow.status = "cancelled";
+      result.workflowsAborted++;
+    }
+    if (workflow.status === "cancelled") {
+      normalizeCancelledWorkflowState(workflow);
       for (const receipt of workflow.cancellationSnapshots ?? []) {
         addSnapshot(receipt);
       }
-      result.workflowsAborted++;
     }
   }
 

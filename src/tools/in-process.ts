@@ -13,9 +13,10 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { FOOTER_KEY } from "../artifact-poller";
+import { updateRunningSubagentFooter } from "../artifact-poller";
 import { cleanupOldArtifacts, type CleanupResult } from "../artifact";
 import {
+  abortJobTree,
   buildLiveUpdate,
   debugLog,
   formatUsage,
@@ -23,18 +24,25 @@ import {
   pruneCompletedJobs,
   scheduleJobCleanup,
   startSubagentJob,
+  type JobDeliveryOwner,
   type JobState,
   type JobStatus,
   type SubagentLiveStatus,
   type SubagentResult,
   type Usage,
 } from "../helpers";
+import { resolveSpawnDepth } from "../orchestration-context";
+import {
+  getActiveSessionContextToken,
+  isSessionContextTokenLive,
+} from "../session-context";
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
   completionTriggersTurn,
   deliverNotification,
   formatCompletionDeliveryBehavior,
+  notifyInProcessCompletionWithoutDelivery,
 } from "../notifications";
 import { interactiveSubagentRegistry } from "../interactive-tmux";
 import { renderSubagentCall, renderSubagentResult } from "../rendering";
@@ -70,23 +78,110 @@ type InProcessSubagentDetails =
     }
   | { status: "cancelled" | "not_found"; jobId?: string };
 
-function getRunningJobCount(): number {
-  return [...jobRegistry.values()].filter((job) => job.status === "running")
-    .length;
+function updateRunningFooter(ctx: RunningFooterContext): void {
+  updateRunningSubagentFooter(ctx.ui);
 }
 
-function updateRunningFooter(ctx: RunningFooterContext): void {
-  const runningCount = getRunningJobCount();
-  try {
-    ctx.ui.setStatus(
-      FOOTER_KEY,
-      runningCount > 0
-        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} running`
-        : undefined,
-    );
-  } catch {
-    /* ctx stale */
+const ZERO_USAGE: Usage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  cost: 0,
+  turns: 0,
+};
+
+interface SpawnContext {
+  sessionManager?: { getSessionId?: () => string };
+}
+
+/** Resolve depth/ownership for a new spawn, plus the root session id for logs. */
+function resolveSpawn(ctx: SpawnContext) {
+  const spawn = resolveSpawnDepth();
+  let rootSessionId = spawn.rootSessionId;
+  if (!rootSessionId) {
+    try {
+      rootSessionId = ctx.sessionManager?.getSessionId?.();
+    } catch {
+      rootSessionId = undefined;
+    }
   }
+  return { ...spawn, rootSessionId };
+}
+
+function captureDeliveryOwner(
+  pi: ExtensionAPI,
+  ctx: SpawnContext,
+  token: ReturnType<typeof getActiveSessionContextToken>,
+): JobDeliveryOwner {
+  let sessionId: string | undefined;
+  try {
+    sessionId = ctx.sessionManager?.getSessionId?.();
+  } catch {
+    /* A stale parent context has no reliable session identity. */
+  }
+  return {
+    pi,
+    sessionId,
+    sessionContextId: token?.id,
+    sessionContextGeneration: token?.generation,
+  };
+}
+
+function discardAsyncSpawn(
+  abort: AbortController,
+  session: { abort: () => Promise<unknown> },
+  disposeBeforeStart?: () => void,
+): void {
+  disposeBeforeStart?.();
+  const reason = {
+    source: "session_shutdown" as const,
+    reason: "parent session shut down before async spawn registration",
+  };
+  try {
+    abort.abort(reason);
+  } catch {
+    /* controller may already be aborted */
+  }
+  try {
+    void Promise.resolve(session.abort()).catch(() => {
+      /* child session may already be disposed */
+    });
+  } catch {
+    /* child session may already be disposed */
+  }
+}
+
+function cancelledAsyncSpawnResult(): AgentToolResult<InProcessSubagentDetails> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: "Async sub-agent spawn cancelled during session shutdown.",
+      },
+    ],
+    details: { status: "cancelled" },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
+}
+
+/** Tool result returned when a spawn would exceed the orchestration depth cap. */
+function depthLimitResult(
+  limit: number,
+): AgentToolResult<InProcessSubagentDetails> {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Orchestration depth limit reached (max ${limit}). ` +
+          `You are a leaf worker — complete this task directly instead of ` +
+          `delegating to another sub-agent.`,
+      },
+    ],
+    details: { status: "error", usage: ZERO_USAGE },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
 }
 
 function createAsyncJobErrorResult(error: unknown): SubagentResult {
@@ -114,17 +209,26 @@ function settleAsyncJob(
   ctx: RunningFooterContext,
 ): void {
   if (jobState.status === "cancelled") return;
+  if (result.cancelled) {
+    jobState.status = "cancelled";
+    jobState.result = result;
+    scheduleJobCleanup(jobId, true);
+    updateRunningFooter(ctx);
+    return;
+  }
   jobState.status = result.isError ? "error" : "done";
   jobState.result = result;
   scheduleJobCleanup(jobId, false, jobState.maxAge);
 
-  if (
+  const shouldDeliver =
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
     !jobState.resultRetrieved &&
-    (jobState.activeResultWaits ?? 0) === 0
-  ) {
+    (jobState.activeResultWaits ?? 0) === 0;
+  if (shouldDeliver) {
     deliverNotification(jobState, result);
+  } else if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
+    notifyInProcessCompletionWithoutDelivery(jobState, result);
   }
 
   updateRunningFooter(ctx);
@@ -153,9 +257,11 @@ async function runSubagent(
   defaultModel: Model<any> | undefined,
   parentModelRegistry: ModelRegistry | undefined,
   thinkingLevel?: ThinkingLevel,
+  depth?: number,
+  rootSessionId?: string,
 ): Promise<SubagentResult> {
   try {
-    const { jobPromise, modelWarning } = await startSubagentJob({
+    const { jobPromise, modelWarning, start } = await startSubagentJob({
       task,
       persona,
       modelOverride,
@@ -166,7 +272,10 @@ async function runSubagent(
       defaultModel,
       parentModelRegistry,
       thinkingLevel,
+      depth,
+      rootSessionId,
     });
+    start?.();
     const result = await jobPromise;
     if (modelWarning && !result.isError) {
       result.output = `${modelWarning}\n---\n${result.output}`;
@@ -216,9 +325,10 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
       '  - task: "Continue debugging while we plan next steps", async: true, notifyOnComplete: "notify"',
       '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
       "",
-      "For async (background) execution, the main agent continues immediately.",
-      'Async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" for a UI-only hint.',
-      "Use async only if user asked to do so or is willing to continue the conversation.",
+      "Runs async (background) BY DEFAULT so the parent turn stays responsive — pass async: false only for a single short sub-agent whose result you need inline.",
+      "When fanning out multiple sub-agents (e.g. one per PR/file), leave async at its default so they run concurrently without blocking the parent.",
+      'The main agent continues immediately; async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" to persist a pointer-only completion in parent context without injecting the full output.',
+      "Nested orchestration depth is capped (SUBAGENTURA_MAX_ORCHESTRATION_DEPTH, default 3); over-deep spawns are refused and the sub-agent should do the work itself.",
       "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
       "Both modes show the user a completion notification.",
       "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
@@ -226,10 +336,11 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runAsync = params.async ?? true;
       debugLog("info", "tool_call", {
         toolName: "subagent_with_context",
         toolCallId: _toolCallId,
-        async: params.async ?? false,
+        async: runAsync,
         taskLength: params.task?.length ?? 0,
         persona: params.persona ?? null,
         model: params.model ?? null,
@@ -239,6 +350,9 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         maxAge: params.maxAge ?? null,
       });
 
+      const spawn = resolveSpawn(ctx);
+      if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
+
       const branch = ctx.sessionManager.getBranch();
       const messages = branch
         .filter(
@@ -246,7 +360,9 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         )
         .map((e) => e.message);
 
-      if (params.async === true) {
+      const spawnContextToken = getActiveSessionContextToken();
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
+      if (runAsync) {
         if (messages.length === 0) {
           return {
             content: [
@@ -260,6 +376,8 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
+        // Own the child's session so any ancestor abort cascades to it.
+        const abort = new AbortController();
         const {
           jobId,
           jobPromise,
@@ -268,19 +386,27 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           modelLabel,
           modelWarning,
           thinkingLevel,
+          start,
+          disposeBeforeStart,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
           modelOverride: params.model,
           cwd: targetCwd,
           contextText: conversationText,
-          signal: undefined,
+          signal: abort.signal,
           onUpdate: undefined,
           defaultModel: ctx.model,
           maxAge: params.maxAge,
           parentModelRegistry: ctx.modelRegistry,
           thinkingLevel: params.thinkingLevel,
+          depth: spawn.childDepth,
+          rootSessionId: spawn.rootSessionId,
         });
+        if (!isSessionContextTokenLive(spawnContextToken)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
+          return cancelledAsyncSpawnResult();
+        }
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -291,6 +417,9 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           thinkingLevel,
+          abort,
+          parentJobId: spawn.parentJobId,
+          depth: spawn.childDepth,
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
@@ -298,6 +427,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
                 ? "notify"
                 : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -306,6 +436,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         updateRunningFooter(ctx);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
+        start?.();
 
         return {
           content: [
@@ -356,7 +487,16 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         ctx.model,
         ctx.modelRegistry,
         params.thinkingLevel,
+        spawn.childDepth,
+        spawn.rootSessionId,
       );
+
+      if (result.cancelled) {
+        return {
+          content: [{ type: "text", text: result.output }],
+          details: { status: "cancelled" },
+        };
+      }
 
       const usageStr = formatUsage(result.usage, result.model);
       const details: InProcessSubagentDetails = {
@@ -409,18 +549,21 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       '  - task: "Give me a second opinion on this approach", model: "anthropic/claude-sonnet-4-5"',
       '  - task: "Analyze this code without context contamination", async: true, notifyOnComplete: "inject"',
       "",
-      "For async (background) execution, the main agent continues immediately.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Runs async (background) BY DEFAULT so the parent turn stays responsive — pass async: false only for a single short sub-agent whose result you need inline.",
+      "When fanning out multiple sub-agents (e.g. one per PR/file), leave async at its default so they run concurrently without blocking the parent.",
+      "The main agent continues immediately. Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Nested orchestration depth is capped (SUBAGENTURA_MAX_ORCHESTRATION_DEPTH, default 3); over-deep spawns are refused and the sub-agent should do the work itself.",
       "Both modes show the user a completion notification.",
       "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
     ].join("\n"),
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runAsync = params.async ?? true;
       debugLog("info", "tool_call", {
         toolName: "subagent_isolated",
         toolCallId: _toolCallId,
-        async: params.async ?? false,
+        async: runAsync,
         taskLength: params.task?.length ?? 0,
         persona: params.persona ?? null,
         model: params.model ?? null,
@@ -430,8 +573,15 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         maxAge: params.maxAge ?? null,
       });
 
-      if (params.async === true) {
+      const spawn = resolveSpawn(ctx);
+      if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
+
+      const spawnContextToken = getActiveSessionContextToken();
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
+      if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
+        // Own the child's session so any ancestor abort cascades to it.
+        const abort = new AbortController();
         const {
           jobId,
           jobPromise,
@@ -440,19 +590,27 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           modelLabel,
           modelWarning,
           thinkingLevel,
+          start,
+          disposeBeforeStart,
         } = await startSubagentJob({
           task: params.task,
           persona: params.persona,
           modelOverride: params.model,
           cwd: targetCwd,
           contextText: null,
-          signal: undefined,
+          signal: abort.signal,
           onUpdate: undefined,
           defaultModel: ctx.model,
           maxAge: params.maxAge,
           parentModelRegistry: ctx.modelRegistry,
           thinkingLevel: params.thinkingLevel,
+          depth: spawn.childDepth,
+          rootSessionId: spawn.rootSessionId,
         });
+        if (!isSessionContextTokenLive(spawnContextToken)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
+          return cancelledAsyncSpawnResult();
+        }
         const jobState: JobState = {
           id: jobId,
           status: "running",
@@ -463,6 +621,9 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           promise: jobPromise,
           modelLabel,
           thinkingLevel,
+          abort,
+          parentJobId: spawn.parentJobId,
+          depth: spawn.childDepth,
           notifyOnComplete:
             params.notifyOnComplete === "inject"
               ? "inject"
@@ -470,6 +631,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
                 ? "notify"
                 : "inject",
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
         };
@@ -478,6 +640,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         updateRunningFooter(ctx);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
+        start?.();
 
         return {
           content: [
@@ -516,7 +679,16 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         ctx.model,
         ctx.modelRegistry,
         params.thinkingLevel,
+        spawn.childDepth,
+        spawn.rootSessionId,
       );
+
+      if (result.cancelled) {
+        return {
+          content: [{ type: "text", text: result.output }],
+          details: { status: "cancelled" },
+        };
+      }
 
       const usageStr = formatUsage(result.usage, result.model);
       const details: InProcessSubagentDetails = {
@@ -638,8 +810,12 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "get_subagent_result",
     label: "Get Subagent Result",
-    description:
-      "Block until an async subagent job completes, then return the final output and usage summary.",
+    description: [
+      "Retrieve an async subagent job's current or final result and usage summary.",
+      "A running job returns immediately with live status unless waiting is explicit. Pass wait: true to wait up to timeoutMs.",
+      "ONLY call this tool when the user explicitly asks you to wait for or collect a specific async result.",
+      "Do not call it immediately after spawning async sub-agents; completion injection handles normal background fan-out.",
+    ].join("\n"),
     parameters: ResultParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -690,29 +866,98 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         };
       }
 
-      // Active waits suppress settlement notifications without treating an
-      // aborted wait as a retrieved result.
-      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
-      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
-      try {
-        waitResult = await abortableWait(job.promise, signal);
-      } finally {
-        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
-      }
-      if (waitResult.aborted) {
+      if (job.status === "running" && params.wait !== true) {
+        const live = buildLiveUpdate(job.liveStatus, job.modelLabel);
+        const currentText =
+          (live.content?.[0] as { type: "text"; text: string } | undefined)
+            ?.text || "";
         return {
+          ...live,
           content: [
             {
               type: "text",
-              text: `Wait for job ${params.jobId} cancelled.`,
+              text: currentText
+                ? `${currentText}\n\nJob ${params.jobId} continues in the background.`
+                : `Job ${params.jobId} continues in the background.`,
             },
+          ],
+          details: {
+            ...(live.details as Record<string, unknown>),
+            jobId: params.jobId,
+          },
+        };
+      }
+
+      // Active waits suppress settlement notifications while they are running,
+      // without treating an aborted wait as a retrieved result.
+      job.activeResultWaits = (job.activeResultWaits ?? 0) + 1;
+      let timedOut = false;
+      let waitResult: Awaited<ReturnType<typeof abortableWait<SubagentResult>>>;
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      let parentAbortHandler: (() => void) | undefined;
+      const waitTimeoutMs = Math.min(
+        Math.max(params.timeoutMs ?? 30_000, 1),
+        300_000,
+      );
+      let waitActive = true;
+      const releaseActiveResultWait = (): void => {
+        if (!waitActive) return;
+        waitActive = false;
+        job.activeResultWaits = Math.max(0, (job.activeResultWaits ?? 1) - 1);
+      };
+      const waitController = new AbortController();
+      const cleanup = (): void => {
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        if (signal && parentAbortHandler) {
+          signal.removeEventListener("abort", parentAbortHandler);
+        }
+        releaseActiveResultWait();
+      };
+      parentAbortHandler = () => {
+        releaseActiveResultWait();
+        waitController.abort(signal?.reason);
+      };
+      if (signal) {
+        signal.addEventListener("abort", parentAbortHandler);
+      }
+      if (job.status === "running") {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          releaseActiveResultWait();
+          waitController.abort("timeout");
+        }, waitTimeoutMs);
+      }
+      try {
+        waitResult = await abortableWait(job.promise, waitController.signal);
+      } finally {
+        cleanup();
+      }
+      if (waitResult.aborted) {
+        if (timedOut) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Timed out while waiting for job ${params.jobId} after ${waitTimeoutMs}ms.`,
+              },
+            ],
+            details: {
+              jobId: params.jobId,
+              status: "wait_timeout",
+              timeoutMs: waitTimeoutMs,
+            },
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            { type: "text", text: `Wait for job ${params.jobId} cancelled.` },
           ],
           details: { jobId: params.jobId, status: "wait_cancelled" },
           isError: true,
         };
       }
       const result = waitResult.value!;
-
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
 
@@ -728,7 +973,6 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-
       const usageStr = formatUsage(result.usage, result.model);
       const details: InProcessSubagentDetails = {
         status: result.isError ? "error" : "done",
@@ -737,7 +981,6 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
         usageSummary: usageStr,
         thinkingLevel: result.thinkingLevel,
       };
-
       return {
         content: [
           {
@@ -814,6 +1057,20 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
         };
       }
 
+      let initiator: string | undefined;
+      try {
+        initiator = (
+          ctx as { sessionManager?: { getSessionId?: () => string } }
+        ).sessionManager?.getSessionId?.();
+      } catch {
+        initiator = undefined;
+      }
+      const info = {
+        source: "cancel_subagent" as const,
+        initiator,
+        reason: `cancel_subagent tool cancelled job ${params.jobId}`,
+      };
+      job.cancellation = { ...info, at: Date.now() };
       job.cancellationSnapshot = snapshotInProcessSession({
         kind: "in-process",
         jobId: job.id,
@@ -823,9 +1080,12 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
         activeTool: job.liveStatus.activeTool,
         partialOutput: job.liveStatus.output,
         source: "cancel_subagent",
+        initiator: info.initiator,
+        reason: info.reason,
       });
       try {
-        await job.session.abort();
+        // Aborts this job AND cascades to every descendant it owns.
+        abortJobTree(params.jobId, info);
       } catch {
         /* Session may already be disposed; abort is best-effort */
       }

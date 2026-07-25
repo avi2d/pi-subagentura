@@ -22,6 +22,12 @@ import {
 } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
+import {
+  parentSessionBelongsToOwner,
+  resolveLiveSessionContext,
+  type ActiveSessionContextToken,
+} from "./session-context";
+import { inProcessJobBelongsToOwner } from "./helpers";
 
 export const MAX_DELIVERY_RECORDS = 32;
 export const MAX_DELIVERY_QUEUE_BYTES = 256 * 1024;
@@ -30,6 +36,32 @@ export const MAX_FLUSH_BYTES = 64 * 1024;
 /** Maximum immutable output snapshot accepted from the artifact protocol. */
 export const MAX_ARTIFACT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_FORMATTED_IDENTIFIER = 96;
+
+function runningInProcessJobCount(owner?: ActiveSessionContextToken): number {
+  const g = globalThis as any;
+  const registry = g.__piSubagenturaRegistry;
+  if (!(registry instanceof Map)) return 0;
+  return [...registry.values()].filter((job) => {
+    const status = (job as { status?: unknown })?.status;
+    return status === "running" && inProcessJobBelongsToOwner(job, owner);
+  }).length;
+}
+
+function runningInProcessJobsNote(owner?: ActiveSessionContextToken): string {
+  const remaining = runningInProcessJobCount(owner);
+  if (remaining <= 0) return "";
+  const noun = remaining === 1 ? "job" : "jobs";
+  const verb = remaining === 1 ? "is" : "are";
+  return `${remaining} in-process sub-agent ${noun} ${verb} still running\nDo not claim all review work is complete yet`;
+}
+
+function appendRunningJobsNote(
+  content: string,
+  owner?: ActiveSessionContextToken,
+): string {
+  const note = runningInProcessJobsNote(owner);
+  return note ? `${content}\n${note}` : content;
+}
 
 function boundedIdentifier(value: unknown, fallback: string): string {
   if (typeof value !== "string" || value.length === 0) return fallback;
@@ -81,7 +113,9 @@ function persistState(state: InteractiveSubagentState): void {
   if (!state.parentSessionId) return;
   updateInteractiveState(state.cwd, state.id, (entry) => {
     entry.eventByteCursor = state.eventByteCursor ?? 0;
-    entry.sessionByteCursor = state.lastDeliveredSessionByte ?? 0;
+    entry.sessionByteCursor =
+      state.sessionObservedByteCursor ?? state.lastDeliveredSessionByte ?? 0;
+    entry.sessionPartialLineStart = state.sessionPartialLineStart ?? null;
     entry.activeTurnId = state.activeTurnId;
     entry.pendingDeliveries = state.pendingDeliveries ?? [];
     entry.deliveryReceipts = state.deliveryReceipts ?? [];
@@ -262,11 +296,15 @@ function pointer(intent: PersistedDeliveryIntent): string {
   return `Output: ${output}\nActivity log: ${intent.artifactDir}/events.ndjson`;
 }
 
-function formatIntent(intent: PersistedDeliveryIntent): string {
+function formatIntent(
+  intent: PersistedDeliveryIntent,
+  owner?: ActiveSessionContextToken,
+): string {
   const header = `[Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}, turn ${boundedIdentifier(intent.turnId, "unknown")}, ${intent.status}]`;
   const output = intent.mode === "inject" ? readBoundedOutput(intent) : null;
   const message =
     typeof intent.message === "string" ? sanitizeOutput(intent.message) : "";
+
   const body =
     intent.mode === "notify"
       ? message
@@ -277,26 +315,32 @@ function formatIntent(intent: PersistedDeliveryIntent): string {
           ? `\n${message}`
           : "\n(no immutable output available)"
         : `\n<untrusted-subagent-output>\n${output || "(empty output)"}\n</untrusted-subagent-output>`;
-  return truncateUtf8(`${header}${body}\n${pointer(intent)}`, MAX_FLUSH_BYTES);
+  return appendRunningJobsNote(
+    truncateUtf8(`${header}${body}\n${pointer(intent)}`, MAX_FLUSH_BYTES),
+    owner,
+  );
 }
 
 export function flushDeliveries(
   pi: ExtensionAPI,
   ui: ExtensionUIContext | undefined,
+  owner?: ActiveSessionContextToken,
 ): void {
   const g = globalThis as any;
-  reconcileAllDeliveryReceipts();
+  reconcileAllDeliveryReceipts(owner);
   const llm: Array<{
     state: InteractiveSubagentState;
     intent: PersistedDeliveryIntent;
     content: string;
   }> = [];
   for (const state of g.__piSubagenturaInteractiveRegistry?.values?.() ?? []) {
+    if (!parentSessionBelongsToOwner(state.parentSessionId, owner)) continue;
     for (const intent of state.pendingDeliveries ?? []) {
       if (intent.state === "dispatchAttempted") continue;
-      llm.push({ state, intent, content: formatIntent(intent) });
+      llm.push({ state, intent, content: formatIntent(intent, owner) });
     }
   }
+  const runningJobsCount = runningInProcessJobCount(owner);
   if (llm.length === 0) return;
   const selected: typeof llm = [];
   let bytes = 0;
@@ -327,6 +371,7 @@ export function flushDeliveries(
             : selected.some(({ intent }) => intent.status === "cancelled")
               ? "cancelled"
               : "done",
+          remainingRunningJobs: runningJobsCount,
           error: selected.some(({ intent }) => intent.status === "error"),
         },
       },
@@ -351,7 +396,7 @@ export function flushDeliveries(
     intent.state = "dispatchAttempted";
     persistState(state);
   }
-  reconcileAllDeliveryReceipts();
+  reconcileAllDeliveryReceipts(owner);
 }
 
 export function reconcileDeliveryReceipts(
@@ -391,11 +436,16 @@ export function reconcileDeliveryReceipts(
   persistState(state);
 }
 
-export function reconcileAllDeliveryReceipts(): void {
+export function reconcileAllDeliveryReceipts(
+  owner?: ActiveSessionContextToken,
+): void {
   const g = globalThis as any;
-  const entries = g.__piSubagenturaSessionManager?.getEntries?.();
+  const entries = owner
+    ? resolveLiveSessionContext(owner)?.sessionManager?.getEntries?.()
+    : g.__piSubagenturaSessionManager?.getEntries?.();
   if (!Array.isArray(entries)) return;
   for (const state of g.__piSubagenturaInteractiveRegistry?.values?.() ?? []) {
+    if (!parentSessionBelongsToOwner(state.parentSessionId, owner)) continue;
     reconcileDeliveryReceipts(state, entries);
   }
 }

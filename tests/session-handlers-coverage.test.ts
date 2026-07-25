@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { jobRegistry } from "../src/helpers";
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
+import { updateRunningSubagentFooter } from "../src/artifact-poller";
 import { workflowJobRegistry } from "../src/workflow-jobs";
+import { appendEvent, artifactPath } from "../src/artifact";
+import { __setTmuxMultiplexer } from "../src/multiplexer";
 
 function registerHandlers() {
   const handlers = new Map<string, Function[]>();
@@ -17,8 +20,8 @@ function registerHandlers() {
     }),
     sendMessage: vi.fn(),
   };
-  registerSessionHandlers(pi as any);
-  return { handlers, pi };
+  const sessionContext = registerSessionHandlers(pi as any);
+  return { handlers, pi, sessionContext };
 }
 
 describe("session handler lifecycle callbacks", () => {
@@ -36,6 +39,11 @@ describe("session handler lifecycle callbacks", () => {
     globalState.__piSubagenturaUi = undefined;
     globalState.__piSubagenturaSessionManager = undefined;
     globalState.__piSubagenturaParentStreaming = false;
+    const contextStack = globalState.__piSubagenturaSessionContextStack;
+    if (Array.isArray(contextStack)) {
+      contextStack.length = 0;
+    }
+    globalState.__piSubagenturaSessionContextIdCounter = 0;
   });
 
   afterEach(() => {
@@ -45,11 +53,12 @@ describe("session handler lifecycle callbacks", () => {
     jobRegistry.clear();
     workflowJobRegistry.clear();
     interactiveSubagentRegistry.clear();
+    __setTmuxMultiplexer(undefined);
     rmSync(root, { recursive: true, force: true });
   });
 
   it("tracks streaming state, captures session context, and shuts down jobs", async () => {
-    const { handlers, pi } = registerHandlers();
+    const { handlers, pi, sessionContext } = registerHandlers();
     const sessionManager = {
       getSessionId: () => "parent-session",
       getEntries: () => [],
@@ -82,6 +91,10 @@ describe("session handler lifecycle callbacks", () => {
       id: "workflow-1",
       status: "running",
       abort: workflowAbort,
+      parentSessionOwner: {
+        id: sessionContext.id,
+        generation: sessionContext.generation,
+      },
     } as any);
 
     await handlers.get("session_shutdown")![1]({ reason: "quit" }, ctx);
@@ -93,5 +106,153 @@ describe("session handler lifecycle callbacks", () => {
     expect(workflowJobRegistry.size).toBe(0);
     expect((globalThis as any).__piSubagenturaPiRef).toBeUndefined();
     expect(pi.on).toHaveBeenCalled();
+  });
+
+  it("keeps parent async jobs and footer visible after nested session shutdown", () => {
+    const parent = registerHandlers();
+    const child = registerHandlers();
+    const parentUi = { setStatus: vi.fn() };
+    const parentSessionManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    const childSessionManager = {
+      getSessionId: () => "child-session",
+      getEntries: () => [],
+    };
+    const parentCtx = {
+      cwd: root,
+      ui: parentUi,
+      sessionManager: parentSessionManager,
+    };
+    const childCtx = {
+      cwd: root,
+      ui: parentUi,
+      sessionManager: childSessionManager,
+    };
+
+    parent.handlers.get("session_start")![0](
+      { reason: "startup" },
+      parentCtx as any,
+    );
+    child.handlers.get("session_start")![0](
+      { reason: "startup" },
+      childCtx as any,
+    );
+
+    const parentWorkflow = {
+      id: "parent-workflow",
+      status: "running",
+      abort: new AbortController(),
+      parentSessionOwner: {
+        id: parent.sessionContext.id,
+        generation: parent.sessionContext.generation,
+      },
+    } as any;
+    const childWorkflow = {
+      id: "child-workflow",
+      status: "running",
+      abort: new AbortController(),
+      parentSessionOwner: {
+        id: child.sessionContext.id,
+        generation: child.sessionContext.generation,
+      },
+    } as any;
+    workflowJobRegistry.set(parentWorkflow.id, parentWorkflow);
+    workflowJobRegistry.set(childWorkflow.id, childWorkflow);
+
+    jobRegistry.set("running-parent-job", {
+      id: "running-parent-job",
+      status: "running",
+      liveStatus: {
+        turn: 0,
+        output: "",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+        },
+      },
+      session: { abort: vi.fn() },
+      startedAt: Date.now(),
+      promise: new Promise<never>(() => {}),
+    } as any);
+
+    updateRunningSubagentFooter(parentUi as any);
+    expect(parentUi.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent active",
+    );
+    parentUi.setStatus.mockClear();
+
+    child.handlers.get("session_shutdown")![1](
+      { reason: "agent_settled" },
+      childCtx as any,
+    );
+    expect(jobRegistry.size).toBe(1);
+    expect(childWorkflow.abort.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has(childWorkflow.id)).toBe(false);
+    expect(workflowJobRegistry.get(parentWorkflow.id)).toBe(parentWorkflow);
+    expect((globalThis as any).__piSubagenturaPiRef).toBe(parent.pi);
+    expect((globalThis as any).__piSubagenturaSessionManager).toBe(
+      parentSessionManager,
+    );
+
+    updateRunningSubagentFooter(parentUi as any);
+    expect(parentUi.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent active",
+    );
+  });
+
+  it("polls every live owner from the single global interval", async () => {
+    const parent = registerHandlers();
+    const child = registerHandlers();
+    const parentManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    const childManager = {
+      getSessionId: () => "child-session",
+      getEntries: () => [],
+    };
+    parent.handlers.get("session_start")![0](
+      { reason: "startup" },
+      { cwd: root, ui: {}, sessionManager: parentManager },
+    );
+    child.handlers.get("session_start")![0](
+      { reason: "startup" },
+      { cwd: root, ui: {}, sessionManager: childManager },
+    );
+    const makeState = (id: string, parentSessionId: string) => {
+      const art = artifactPath(root, id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      return {
+        id,
+        paneId: `%${id}`,
+        cwd: root,
+        artifactDir: art.dir,
+        sessionFile: join(root, `${id}.jsonl`),
+        startedAt: Date.now(),
+        mux: "tmux",
+        status: "running",
+        parentSessionId,
+      } as any;
+    };
+    const parentState = makeState("parent-agent", "parent-session");
+    const childState = makeState("child-agent", "child-session");
+    interactiveSubagentRegistry.set(parentState.id, parentState);
+    interactiveSubagentRegistry.set(childState.id, childState);
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(parentState.eventByteCursor).toBeGreaterThan(0);
+    expect(childState.eventByteCursor).toBeGreaterThan(0);
   });
 });

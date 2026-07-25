@@ -19,7 +19,7 @@
  * Exit codes: 0 on success, 2 on usage error (missing env var / unknown cmd).
  */
 
-import { MAX_OUTPUT_SNAPSHOT_BYTES } from "./artifact";
+import { MAX_EVENT_TEXT_LENGTH, MAX_OUTPUT_SNAPSHOT_BYTES } from "./artifact";
 
 /**
  * The body of the CLI as a string, written verbatim to
@@ -58,6 +58,9 @@ mkdirSync(dir, { recursive: true, mode: 0o700 });
 const statusFile = join(dir, "events.ndjson");
 const activeTurnFile = join(dir, "active-turn.json");
 const MAX_OUTPUT_SNAPSHOT_BYTES = ${MAX_OUTPUT_SNAPSHOT_BYTES};
+const MAX_EVENT_TEXT_LENGTH = ${MAX_EVENT_TEXT_LENGTH};
+const boundedOptionalEventText = (value) =>
+  typeof value === "string" ? value.slice(0, MAX_EVENT_TEXT_LENGTH) : undefined;
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
@@ -198,9 +201,9 @@ switch (cmd) {
     break;
   }
   case "error":
+    const errorMessage = boundedOptionalEventText(arg ?? "unknown error");
     completion("error", "explicit", {
-      message: arg ?? "unknown error",
-      errorMessage: arg ?? "unknown error",
+      ...(errorMessage ? { message: errorMessage, errorMessage } : {}),
     });
     break;
   case "cancelled":

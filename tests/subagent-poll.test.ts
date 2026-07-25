@@ -21,10 +21,18 @@ import {
   artifactPath,
   eventLogEndOffset,
   loadInteractiveStates,
+  MAX_EVENT_RECORD_BYTES,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
   readEventRecords,
   writeOutput,
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
+import {
+  advanceSessionContextGeneration,
+  getSessionContextStack,
+  registerSessionContext,
+  removeSessionContext,
+} from "../src/session-context";
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
 }
@@ -68,17 +76,85 @@ describe("pollArtifactChanges", () => {
   beforeEach(() => {
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    g.__piSubagenturaRegistry?.clear?.();
     g.__piSubagenturaWorkflowJobs?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaUi = undefined;
     g.__piSubagenturaParentStreaming = false;
+    getSessionContextStack().length = 0;
   });
 
   afterEach(() => {
     (globalThis as any).__piSubagenturaParentStreaming = false;
+    (globalThis as any).__piSubagenturaRegistry?.clear?.();
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
     vi.doUnmock("node:child_process");
   });
+
+  async function pollUntilOwnerInvalidation(
+    invalidate: (owner: { id: number; generation: number }) => void,
+  ) {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const item = makeState();
+    item.state.parentSessionId = "session-a";
+    item.state.cwd = join(item.artifactDir, "..");
+    const art = artifactPath(item.state.cwd, item.id);
+    appendCompletionEvent(art, {
+      turnId: `turn-${item.id}`,
+      outcome: "done",
+      source: "agent_settled",
+    });
+    appendInteractiveState(item.state.cwd, {
+      id: item.id,
+      paneId: item.state.paneId,
+      mux: item.state.mux,
+      artifactDir: item.state.artifactDir,
+      sessionFile: item.state.sessionFile,
+    });
+    const persistedBefore = loadInteractiveStates(item.state.cwd)?.states[
+      item.id
+    ];
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    const owner = { id: 701, generation: 1 };
+    const sendMessage = vi.fn();
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    registerSessionContext({
+      ...owner,
+      pi: { sendMessage } as any,
+      ui: { notify: vi.fn(), setStatus, setWidget } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    let releaseLiveness!: () => void;
+    let livenessStarted = false;
+    const blockedLiveness = new Promise<void>((resolve) => {
+      releaseLiveness = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => {
+        livenessStarted = true;
+        await blockedLiveness;
+        return true;
+      },
+    } as any);
+
+    const polling = mod.pollArtifactChanges({} as any, owner);
+    await Promise.resolve();
+    expect(livenessStarted).toBe(true);
+    invalidate(owner);
+    releaseLiveness();
+    await polling;
+
+    return {
+      state: item.state,
+      persistedBefore,
+      sendMessage,
+      setStatus,
+      setWidget,
+    };
+  }
 
   it("does nothing when registry is empty", async () => {
     const mod =
@@ -86,6 +162,158 @@ describe("pollArtifactChanges", () => {
     const sendMessage = installDeliverySpies();
     await mod.pollArtifactChanges({ sendMessage } as any);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("polls and dispatches only interactive states owned by the supplied context", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const a = makeState();
+    const b = makeState();
+    a.state.parentSessionId = "session-a";
+    b.state.parentSessionId = "session-b";
+    for (const item of [a, b]) {
+      item.state.cwd = join(item.artifactDir, "..");
+      const art = artifactPath(item.state.cwd, item.id);
+      writeOutput(art, item.id);
+      appendCompletionEvent(art, {
+        turnId: `turn-${item.id}`,
+        outcome: "done",
+        source: "agent_settled",
+      });
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+    }
+    const ownerB = { id: 402, generation: 1 };
+    const sendMessage = installDeliverySpies();
+    const wrongSendMessage = vi.fn();
+    registerSessionContext({
+      id: 401,
+      generation: 1,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: wrongSendMessage,
+    };
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
+    await mod.pollArtifactChanges(
+      { sendMessage: wrongSendMessage } as any,
+      ownerB,
+    );
+
+    expect(a.state.eventByteCursor ?? 0).toBe(0);
+    expect(a.state.pendingDeliveries ?? []).toEqual([]);
+    expect(b.state.eventByteCursor).toBeGreaterThan(0);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toContain(b.id);
+    expect(sendMessage.mock.calls[0][0].content).not.toContain(a.id);
+    expect(wrongSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not coalesce concurrent polls from different owners", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const a = makeState();
+    const b = makeState();
+    a.state.parentSessionId = "session-a";
+    a.state.paneId = "%a";
+    b.state.parentSessionId = "session-b";
+    b.state.paneId = "%b";
+    for (const item of [a, b]) {
+      item.state.cwd = join(item.artifactDir, "..");
+      const art = artifactPath(item.state.cwd, item.id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+    }
+    const ownerA = { id: 501, generation: 1 };
+    const ownerB = { id: 502, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    let releaseA!: () => void;
+    const blockedA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: (paneId: string) =>
+        paneId === "%a" ? blockedA.then(() => true) : Promise.resolve(true),
+    } as any);
+
+    const pollA = mod.pollArtifactChanges({} as any, ownerA);
+    await Promise.resolve();
+    const pollB = mod.pollArtifactChanges({} as any, ownerB);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const bProcessedWhileAWasBlocked = (b.state.eventByteCursor ?? 0) > 0;
+    releaseA();
+    await Promise.all([pollA, pollB]);
+
+    expect(bProcessedWhileAWasBlocked).toBe(true);
+  });
+
+  it("abandons mutation when its owner is removed during liveness", async () => {
+    const result = await pollUntilOwnerInvalidation((owner) => {
+      removeSessionContext(owner.id);
+    });
+
+    expect(result.state.eventByteCursor ?? 0).toBe(0);
+    expect(result.state.pendingDeliveries ?? []).toEqual([]);
+    expect(result.state.status).toBe("running");
+    expect(
+      loadInteractiveStates(result.state.cwd)?.states[result.state.id],
+    ).toEqual(result.persistedBefore);
+    expect(result.sendMessage).not.toHaveBeenCalled();
+    expect(result.setStatus).not.toHaveBeenCalled();
+    expect(result.setWidget).not.toHaveBeenCalled();
+  });
+
+  it("abandons mutation when its owner generation advances during liveness", async () => {
+    const result = await pollUntilOwnerInvalidation((owner) => {
+      advanceSessionContextGeneration(owner.id);
+    });
+
+    expect(result.state.eventByteCursor ?? 0).toBe(0);
+    expect(result.state.pendingDeliveries ?? []).toEqual([]);
+    expect(result.state.status).toBe("running");
+    expect(
+      loadInteractiveStates(result.state.cwd)?.states[result.state.id],
+    ).toEqual(result.persistedBefore);
+    expect(result.sendMessage).not.toHaveBeenCalled();
+    expect(result.setStatus).not.toHaveBeenCalled();
+    expect(result.setWidget).not.toHaveBeenCalled();
+  });
+
+  it("keeps running in-process jobs in the shared footer", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    mod.jobRegistry.set("async-1", { status: "running" } as any);
+    const setStatus = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      setStatus,
+      setWidget: vi.fn(),
+    };
+
+    await mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
+
+    expect(setStatus).toHaveBeenCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent active",
+    );
   });
 
   it("keeps the event loop responsive while async liveness is pending", async () => {
@@ -380,6 +608,7 @@ describe("pollArtifactChanges", () => {
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState();
     mod.interactiveSubagentRegistry.set(state.id, state);
+    mod.jobRegistry.set("still-running", { status: "running" } as any);
     const art = artifactPath(join(artifactDir, ".."), state.id);
     appendEvent(art, { ts: 1, type: "started", status: "running" });
     appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
@@ -396,6 +625,10 @@ describe("pollArtifactChanges", () => {
     expect(call.content).toContain("Output:");
     expect(call.content).toContain("Activity log:");
     expect(call.content).not.toContain("read_subagent_artifact");
+    expect(call.content).toContain(
+      "1 in-process sub-agent job is still running",
+    );
+    expect(call.details.remainingRunningJobs).toBe(1);
     expect(state.eventByteCursor).toBe(eventLogEndOffset(art));
   });
 
@@ -681,6 +914,61 @@ describe("pollArtifactChanges", () => {
       });
       expect(sendUserMessage).not.toHaveBeenCalled();
       expect(state.pendingDeliveries?.[0]?.state).toBe("dispatchAttempted");
+    });
+
+    it("persists oversized completion delivery metadata before advancing the event cursor", async () => {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const multiplexer = await import("../src/multiplexer");
+      const { state, artifactDir } = makeState();
+      state.notifyOnComplete = "inject";
+      state.triggerTurnOnComplete = false;
+      state.cwd = join(artifactDir, "..");
+      state.parentSessionId = "pi";
+      appendInteractiveState(state.cwd, {
+        id: state.id,
+        paneId: state.paneId,
+        mux: state.mux,
+        artifactDir: state.artifactDir,
+        sessionFile: state.sessionFile,
+        notifyOnComplete: "inject",
+        triggerTurnOnComplete: false,
+        parentSessionId: "pi",
+      });
+      mod.interactiveSubagentRegistry.set(state.id, state);
+      multiplexer.__setTmuxMultiplexer({
+        isPaneAlive: () => true,
+        isPaneAliveAsync: async () => true,
+      } as any);
+      const art = artifactPath(join(artifactDir, ".."), state.id);
+      const raw =
+        JSON.stringify({
+          version: 2,
+          eventId: "adversarial-oversized-event",
+          turnId: "adversarial-oversized-turn",
+          ts: 1,
+          type: "completion",
+          outcome: "error",
+          source: "explicit",
+          errorMessage: "x".repeat(MAX_EVENT_RECORD_BYTES + 1),
+        }) + "\n";
+      mkdirSync(art.dir, { recursive: true });
+      writeFileSync(art.statusFile, raw);
+      const sendMessage = installDeliverySpies();
+
+      await mod.pollArtifactChanges({ sendMessage } as any);
+
+      const persisted = loadInteractiveStates(state.cwd)?.states[state.id];
+      expect(persisted?.eventByteCursor).toBe(eventLogEndOffset(art));
+      expect(persisted?.pendingDeliveries).toContainEqual(
+        expect.objectContaining({
+          eventId: "record-overflow-0",
+          turnId: "record-overflow-0",
+          status: "error",
+          message: `Artifact record at byte 0 exceeded the ${MAX_EVENT_RECORD_BYTES}-byte limit and was skipped.`,
+        }),
+      );
+      multiplexer.__setTmuxMultiplexer(undefined);
     });
 
     it("uses attributed sendMessage when state.notifyOnComplete is unset (default: inject)", async () => {
@@ -998,11 +1286,11 @@ describe("pollArtifactChanges", () => {
   // ── Bug B regression tests (stale footer/widget for closed sub-agents) ──
   // When a sub-agent is "exited" (terminal, pane dead) the for-loop at line
   // ~518 of subagent.ts must still tail-read the session log (for user-role
-  // revival), but it must NOT contribute to the `runningCount` footer or
+  // revival, but it must NOT contribute to the active footer count or
   // the `widgetRows` list. `idle` sub-agents (between turns, REPL open) are
-  // still live and DO contribute to the running count.
+  // still live and DO contribute to the active count.
   describe("footer/widget (Bug B)", () => {
-    it("AC-B1: counts running + idle as 'running'; excludes exited from both footer and widget", async () => {
+    it("AC-B1: counts running + idle as 'active'; excludes exited from both footer and widget", async () => {
       // Mock display-message to branch on paneId:
       //   running-pane and idle-pane → alive (return success)
       //   exited-pane              → dead (throw)
@@ -1080,7 +1368,7 @@ describe("pollArtifactChanges", () => {
 
       expect(setStatus).toHaveBeenCalledWith(
         "subagentura-running",
-        "⚡ 2 sub-agents running",
+        "⚡ 2 sub-agents active",
       );
       expect(setWidget).toHaveBeenCalledWith(
         "subagentura-activity",
@@ -1094,6 +1382,75 @@ describe("pollArtifactChanges", () => {
       expect(idle.status).toBe("idle");
       expect(running.status).toBe("running");
 
+      delete (globalThis as any).__piSubagenturaUi;
+    });
+
+    it("AC-B1b: rehydrates a completed live pane as idle and ready", async () => {
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({
+        execFileSync: (_file: string, args: string[]) => {
+          if (args[0] === "display-message") return Buffer.from("#99");
+          return "";
+        },
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "#99"),
+      }));
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const cwd = makeTmp();
+      const id = "rehydrated-idle";
+      const artifactDir = join(cwd, id);
+      mkdirSync(artifactDir, { recursive: true });
+      const art = artifactPath(cwd, id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      appendEvent(art, {
+        ts: 2,
+        type: "done",
+        status: "done",
+        exitCode: 0,
+      });
+      appendInteractiveState(cwd, {
+        id,
+        paneId: "%idle-pane",
+        windowName: "demo",
+        mux: "tmux",
+        artifactDir,
+        sessionFile: "/tmp/sess.jsonl",
+        parentSessionId: "pi",
+        eventByteCursor: eventLogEndOffset(art),
+        lifecycle: {
+          completionTurnId: "turn-1",
+          completionOutcome: "done",
+          completionSource: "explicit",
+        },
+      });
+      mod.rehydrateInteractiveSubagents(cwd, "pi");
+      const state = mod.interactiveSubagentRegistry.get(id)!;
+      expect(state.status).toBe("idle");
+      const setStatus = vi.fn();
+      const setWidget = vi.fn();
+      (globalThis as any).__piSubagenturaUi = { setStatus, setWidget };
+
+      await mod.pollArtifactChanges({
+        sendMessage: vi.fn(),
+        sendUserMessage: vi.fn(),
+      } as any);
+
+      expect(state.status).toBe("idle");
+      expect(setStatus).toHaveBeenCalledWith(
+        "subagentura-running",
+        "⚡ 1 sub-agent active",
+      );
+      const widgetRows = setWidget.mock.calls[0][1] as string[];
+      expect(widgetRows).toContain(
+        "○ rehydrated-idle: idle — ready for follow-up",
+      );
+      expect(widgetRows.join("\n")).not.toContain("starting");
+      expect(widgetRows.join("\n")).not.toContain("stale");
       delete (globalThis as any).__piSubagenturaUi;
     });
 
@@ -1152,7 +1509,7 @@ describe("pollArtifactChanges", () => {
       delete (globalThis as any).__piSubagenturaUi;
     });
 
-    it("AC-B3: all-running registry shows correct count (regression guard)", async () => {
+    it("AC-B3: combines interactive and in-process footer counts", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
         execFileSync: (_file: string, args: string[]) => {
@@ -1168,6 +1525,7 @@ describe("pollArtifactChanges", () => {
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      mod.jobRegistry.set("async-1", { status: "running" } as any);
 
       const a = makeState().state;
       a.id = "a";
@@ -1187,7 +1545,7 @@ describe("pollArtifactChanges", () => {
 
       expect(setStatus).toHaveBeenCalledWith(
         "subagentura-running",
-        "⚡ 2 sub-agents running",
+        "⚡ 3 sub-agents active",
       );
       const widgetArgs = setWidget.mock.calls[0];
       expect(widgetArgs[1].length).toBe(2);
@@ -1205,6 +1563,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     g.__piSubagenturaInteractiveRegistry?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaSessionManager = undefined;
+    getSessionContextStack().length = 0;
   });
 
   function makePersistedState(): {
@@ -1240,6 +1599,32 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     });
     return { id, cwd, state };
   }
+
+  it("does not remove another owner's persisted terminal state", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { cwd, id, state } = makePersistedState();
+    state.parentSessionId = "session-b";
+    state.status = "exited";
+    mod.interactiveSubagentRegistry.set(id, state);
+    const ownerA = { id: 601, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      id: 602,
+      generation: 1,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+
+    await mod.pollArtifactChanges({} as any, ownerA);
+
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+  });
 
   it("keeps terminal state until the custom-message receipt is visible", async () => {
     vi.resetModules();

@@ -92,6 +92,10 @@ import {
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
 } from "../src/tools/in-process";
+import {
+  DEFAULT_MAX_ORCHESTRATION_DEPTH,
+  withOrchestrationContext,
+} from "../src/orchestration-context";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -283,10 +287,11 @@ describe("subagent_isolated tool", () => {
 
   it("passes null context to startSubagentJob (sync path)", async () => {
     const ctx = mockCtx();
-    // isolated tool doesn't consult getBranch at all, so no messages needed
+    // isolated tool doesn't consult getBranch at all, so no messages needed.
+    // async now defaults to true, so pass async: false to exercise the sync path.
     const result = await toolDef.execute(
       "call-1",
-      { task: "analyze code" },
+      { task: "analyze code", async: false },
       undefined,
       undefined,
       ctx,
@@ -299,6 +304,45 @@ describe("subagent_isolated tool", () => {
     // Result should come from the mocked runSubagent path
     expect(result.content[0].text).toBe("task completed");
     expect(result.details.status).toBe("done");
+  });
+
+  it("defaults to async (background) when the flag is omitted", async () => {
+    const ctx = mockCtx();
+    const result = await toolDef.execute(
+      "call-async-default",
+      { task: "analyze code" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    // Async path returns immediately with a started job, not inline output.
+    expect(result.details.status).toBe("started");
+    expect(result.content[0].text).toMatch(/^Job .* started/);
+    // The owning controller must be wired so ancestor aborts can cascade.
+    expect(mockStartSubagentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: expect.any(AbortSignal), depth: 1 }),
+    );
+  });
+
+  it("refuses to spawn once the orchestration depth cap is reached", async () => {
+    const ctx = mockCtx();
+    const result = await withOrchestrationContext(
+      { ownerJobId: "deep-parent", depth: DEFAULT_MAX_ORCHESTRATION_DEPTH },
+      () =>
+        toolDef.execute(
+          "call-too-deep",
+          { task: "spawn yet another reviewer" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/depth limit reached/i);
+    // No job should have been spawned.
+    expect(mockStartSubagentJob).not.toHaveBeenCalled();
   });
 
   it("registers with BaseParams schema", () => {
@@ -484,6 +528,101 @@ describe("get_subagent_result tool", () => {
     toolDef = getToolDef(api, "get_subagent_result");
   });
 
+  it("warns agents to wait only when explicitly requested", () => {
+    expect(toolDef.description).toContain(
+      "ONLY call this tool when the user explicitly asks you to wait",
+    );
+    expect(toolDef.description).toContain(
+      "Do not call it immediately after spawning async sub-agents",
+    );
+  });
+
+  it("describes immediate retrieval and optional bounded waiting", () => {
+    expect(toolDef.description).toContain(
+      "returns immediately with live status",
+    );
+    expect(toolDef.description).toContain("Pass wait: true");
+    expect(toolDef.description).not.toContain(
+      "Block until an async subagent job completes",
+    );
+  });
+
+  it("returns immediately for a running job unless waiting is explicit", async () => {
+    const jobId = "running-without-wait";
+    let resolveJob!: (value: SubagentResult) => void;
+    const jobPromise = new Promise<SubagentResult>((resolve) => {
+      resolveJob = resolve;
+    });
+    const job = createJobState({ id: jobId, promise: jobPromise });
+    jobRegistry.set(jobId, job);
+
+    const executePromise = toolDef.execute(
+      "call-1",
+      { jobId },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    const raced = await Promise.race([
+      executePromise.then((result: any) => ({
+        kind: "result" as const,
+        result,
+      })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 20),
+      ),
+    ]);
+
+    resolveJob(defaultSuccessResult);
+    await executePromise;
+    expect(raced.kind).toBe("result");
+    if (raced.kind !== "result") return;
+    expect(raced.result.details.status).toBe("running");
+    expect(raced.result.content[0].text).toContain(
+      "continues in the background",
+    );
+    expect(job.resultRetrieved).toBeFalsy();
+  });
+
+  it("bounds an explicit wait and leaves the job running after timeout", async () => {
+    const jobId = "bounded-explicit-wait";
+    let resolveJob!: (value: SubagentResult) => void;
+    const jobPromise = new Promise<SubagentResult>((resolve) => {
+      resolveJob = resolve;
+    });
+    const job = createJobState({ id: jobId, promise: jobPromise });
+    jobRegistry.set(jobId, job);
+
+    const executePromise = toolDef.execute(
+      "call-1",
+      { jobId, wait: true, timeoutMs: 10 },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    const raced = await Promise.race([
+      executePromise.then((result: any) => ({
+        kind: "result" as const,
+        result,
+      })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 30),
+      ),
+    ]);
+
+    resolveJob(defaultSuccessResult);
+    await executePromise;
+    expect(raced.kind).toBe("result");
+    if (raced.kind !== "result") return;
+    expect(raced.result.details).toMatchObject({
+      jobId,
+      status: "wait_timeout",
+      timeoutMs: 10,
+    });
+    expect(job.status).toBe("running");
+    expect(job.resultRetrieved).toBeFalsy();
+  });
+
   it("returns not_found for unknown jobId", async () => {
     const result = await toolDef.execute(
       "call-1",
@@ -574,10 +713,10 @@ describe("get_subagent_result tool", () => {
     });
     jobRegistry.set(jobId, job);
 
-    // Start execute – it will set resultRetrieved=true then await the promise
+    // Start execute and wait for completion so cancellation race can be observed.
     const executePromise = toolDef.execute(
       "call-1",
-      { jobId },
+      { jobId, wait: true },
       undefined,
       undefined,
       mockCtx(),

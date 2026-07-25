@@ -790,6 +790,29 @@ describe("formatActivityRow", () => {
     expect(result).toBe("\u25b6 helper-1: reading main.ts (2s ago)");
   });
 
+  it("renders idle agents as ready for follow-up without stale activity", () => {
+    const result = formatActivityRow({
+      name: "helper-idle",
+      lastToolSummary: "stale tool",
+      lastActivityAt: 3000,
+      id: "x",
+      task: "",
+      paneId: "",
+      sessionFile: "",
+      cwd: "",
+      startedAt: 0,
+      status: "idle",
+      mux: "tmux",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+      artifactDir: "",
+    });
+    expect(result).toBe("○ helper-idle: idle — ready for follow-up");
+    expect(result).not.toContain("stale tool");
+    expect(result).not.toContain("starting");
+  });
+
   it("formats row without lastActivityAt (no ago suffix)", () => {
     const result = formatActivityRow({
       name: "helper-2",

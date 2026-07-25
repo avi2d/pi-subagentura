@@ -37,6 +37,7 @@ import {
   formatCompletionDeliveryBehavior,
 } from "../notifications";
 import { InteractiveParams } from "../schemas";
+import { updateRunningSubagentFooter } from "../artifact-poller";
 
 const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
@@ -119,11 +120,18 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
       "Both completion modes show the user a notification.",
-      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
+      'Defaults: notifyOnComplete="notify" and triggerTurnOnComplete=true.',
+      "The default stores only an artifact pointer (output is not injected) and automatically starts the next parent turn after pointer delivery.",
+      "Explicit triggerTurnOnComplete=false disables the automatic turn for either mode.",
     ].join("\n"),
     parameters: InteractiveParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const completionMode = params.notifyOnComplete ?? "notify";
+      const triggerTurn = completionTriggersTurn(
+        completionMode,
+        params.triggerTurnOnComplete ?? true,
+      );
       debugLog("info", "tool_call", {
         toolName: "subagent_interactive",
         toolCallId: _toolCallId,
@@ -131,7 +139,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
         includeContext: params.includeContext ?? false,
-        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
+        notifyOnComplete: completionMode,
+        triggerTurnOnComplete: triggerTurn,
       });
 
       let contextText: string | null = null;
@@ -148,11 +157,6 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
       const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
       const targetCwd = params.cwd ?? ctx.cwd;
-      const completionMode = params.notifyOnComplete ?? "inject";
-      const triggerTurn = completionTriggersTurn(
-        completionMode,
-        params.triggerTurnOnComplete,
-      );
 
       try {
         const state = launchInteractiveSubagent({
@@ -164,12 +168,13 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
           notifyOnComplete: completionMode,
-          triggerTurnOnComplete: params.triggerTurnOnComplete,
+          triggerTurnOnComplete: triggerTurn,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
           thinkingLevel: params.thinkingLevel,
         });
+        updateRunningSubagentFooter(ctx.ui);
 
         const displayMode = state.windowName
           ? "background (new window/tab)"
@@ -258,8 +263,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       pruneDeadInteractiveSubagents();
+      updateRunningSubagentFooter(ctx.ui);
       const states = params.jobId
         ? [interactiveSubagentRegistry.get(params.jobId)].filter(
             (s): s is InteractiveSubagentState => Boolean(s),
@@ -323,6 +329,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      updateRunningSubagentFooter(ctx.ui);
       const snapshotText = state.cancellationSnapshot?.path
         ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
         : state.cancellationSnapshot?.error
@@ -688,8 +695,9 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     ].join("\n"),
     parameters: Type.Object({}),
 
-    async execute(): Promise<any> {
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx): Promise<any> {
       pruneDeadInteractiveSubagents();
+      updateRunningSubagentFooter(ctx.ui);
       const states = [...interactiveSubagentRegistry.values()];
       const summary = states.map((s) => {
         const art = getArtifactForState(s);

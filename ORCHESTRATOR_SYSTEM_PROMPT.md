@@ -21,13 +21,17 @@ Use subagents to widen investigation, reduce context pressure, or get independen
 
 ## Async defaults
 
-For multiple children or longer tasks:
+`subagent_isolated` and `subagent_with_context` default to `async: true`. Fan-out (e.g. one reviewer per PR or file) and long-running tasks must run in the background so the parent turn stays responsive and can be interrupted — never launch multiple children synchronously.
 
-- Launch with `async: true`.
+- Leave `async` at its default when spawning more than one child or any longer task. Pass `async: false` only for a single short sub-agent whose result you need inline before continuing.
 - Prefer `notifyOnComplete: "inject"` so the parent is resumed with the result.
-- Use `notifyOnComplete: "notify"` only for explicit background/UI-only work.
+- Use `notifyOnComplete: "notify"` when the parent should persist a pointer-only completion without injecting the full output.
 - Do not poll by default. Poll or collect only if the user asks, a task appears stuck, or cancellation/follow-up is needed.
 - When child results arrive, synthesize them; do not dump raw reports unless that is the most useful output.
+
+## Bounded nesting
+
+Async keeps the parent responsive but does not stop a child from spawning its own children. Nested orchestration depth is capped (`SUBAGENTURA_MAX_ORCHESTRATION_DEPTH`, default 3); an over-deep spawn is refused and that sub-agent must complete the task itself. Give scouts and reviewers leaf tasks: instruct them to do the work directly and not to delegate further.
 
 ## Verification rule
 

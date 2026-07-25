@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  appendCompletionEvent,
   appendEvent,
   appendInteractiveState,
   artifactPath,
@@ -26,10 +27,12 @@ import {
   isTurnTerminal,
   lastEvent,
   listArtifacts,
+  MAX_EVENT_RECORD_BYTES,
   listOutputTurns,
   loadInteractiveStates,
   MAX_EVENT_TEXT_LENGTH,
   MAX_EVENT_BATCH_BYTES,
+  MAX_OUTPUT_SNAPSHOT_BYTES,
   MAX_TOOL_NAME_LENGTH,
   outputPathForTurn,
   readEvents,
@@ -42,6 +45,7 @@ import {
   snapshotOutput,
   stateFilePath,
   writeOutput,
+  withInteractiveStateLock,
   type InteractiveSubagentPersistedStateV2,
   type SubagentEvent,
 } from "../src/artifact";
@@ -267,6 +271,77 @@ describe("artifact", () => {
     expect(records).toBe(count);
   });
 
+  it("does not skip a valid event larger than the physical batch size", () => {
+    const art = artifactPath(root, "oversized-event");
+    ensureArtifactDir(art);
+    const event = {
+      version: 2,
+      eventId: "oversized-completion",
+      turnId: "oversized-turn",
+      ts: 1,
+      type: "completion",
+      outcome: "error",
+      source: "agent_settled",
+      errorMessage: "x".repeat(MAX_EVENT_BATCH_BYTES + 1024),
+    };
+    writeFileSync(art.statusFile, JSON.stringify(event) + "\n");
+
+    const events = readEvents(art);
+
+    expect(events).toHaveLength(1);
+    expect((events[0] as any).eventId).toBe("oversized-completion");
+  });
+
+  it("bounds first-party completion text so the record remains readable", () => {
+    const art = artifactPath(root, "bounded-completion");
+    const event = appendCompletionEvent(art, {
+      turnId: "bounded-turn",
+      outcome: "error",
+      source: "agent_settled",
+      message: "m".repeat(MAX_EVENT_TEXT_LENGTH + 10),
+      errorMessage: "e".repeat(MAX_EVENT_TEXT_LENGTH + 10),
+    });
+
+    expect(event?.message).toBe("m".repeat(MAX_EVENT_TEXT_LENGTH));
+    expect(event?.errorMessage).toBe("e".repeat(MAX_EVENT_TEXT_LENGTH));
+    expect(readEvents(art)).toContainEqual(event);
+  });
+
+  it("reports one deterministic issue for an oversized physical record", () => {
+    const art = artifactPath(root, "ultra-oversized-event");
+    ensureArtifactDir(art);
+    const event = {
+      version: 2,
+      eventId: "ultra-oversized-completion",
+      turnId: "ultra-oversized-turn",
+      ts: 1,
+      type: "completion",
+      outcome: "done",
+      source: "agent_settled",
+      errorMessage: "x".repeat(MAX_EVENT_RECORD_BYTES + 1024),
+    };
+    writeFileSync(art.statusFile, JSON.stringify(event) + "\n");
+
+    const first = readEventBatch(art, 0);
+
+    const expectedEnd = statSync(art.statusFile).size;
+    expect(first.records).toEqual([]);
+    expect(first.issues).toEqual([
+      {
+        kind: "record_too_large",
+        startOffset: 0,
+        endOffset: expectedEnd,
+        maxBytes: MAX_EVENT_RECORD_BYTES,
+      },
+    ]);
+    expect(first.endOffset).toBe(expectedEnd);
+    expect(readEventBatch(art, first.endOffset)).toEqual({
+      records: [],
+      issues: [],
+      endOffset: expectedEnd,
+    });
+  });
+
   describe("readOutput", () => {
     it("returns null when output.md doesn't exist", () => {
       const art = artifactPath(root, "a");
@@ -361,6 +436,19 @@ describe("artifact", () => {
       const art = artifactPath(root, "snap4");
       // No writeOutput call — output.md doesn't exist.
       snapshotOutput(art, 1);
+      expect(existsSync(outputPathForTurn(art, 1))).toBe(false);
+    });
+
+    it("snapshotOutput does not read or copy oversized output.md", () => {
+      const art = artifactPath(root, "snap-oversized");
+      ensureArtifactDir(art);
+      writeFileSync(
+        art.outputFile,
+        Buffer.alloc(MAX_OUTPUT_SNAPSHOT_BYTES + 1, 120),
+      );
+
+      snapshotOutput(art, 1);
+
       expect(existsSync(outputPathForTurn(art, 1))).toBe(false);
     });
 
@@ -688,6 +776,53 @@ describe("persisted interactive state helpers", () => {
     legacyCutoverOffset: 0,
   };
 
+  it("does not steal a stale-looking lock owned by a live process", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    mkdirSync(piDir, { recursive: true, mode: 0o700 });
+    const metadata = JSON.stringify({ pid: process.pid, token: "live-owner" });
+    writeFileSync(lock, metadata, { mode: 0o600 });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    expect(() => withInteractiveStateLock(root, () => undefined)).toThrow(
+      /timed out acquiring interactive state lock/,
+    );
+    expect(readFileSync(lock, "utf8")).toBe(metadata);
+  });
+
+  it("does not unlink a replacement lock during owner cleanup", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    const replacement = JSON.stringify({
+      pid: process.pid,
+      token: "replacement",
+    });
+    withInteractiveStateLock(root, () => {
+      rmSync(lock);
+      writeFileSync(lock, replacement, { mode: 0o600 });
+    });
+    expect(readFileSync(lock, "utf8")).toBe(replacement);
+  });
+
+  it("fails closed when a recovery claim already exists", () => {
+    const piDir = join(root, ".pi");
+    const lock = join(piDir, "subagentura-state.lock");
+    const recoveryLock = `${lock}.recovery`;
+    mkdirSync(piDir, { recursive: true, mode: 0o700 });
+    const deadOwner = JSON.stringify({ pid: 999_999_999, token: "dead" });
+    const existingRecovery = JSON.stringify({
+      pid: 999_999_999,
+      token: "recovery-owner",
+    });
+    writeFileSync(lock, deadOwner, { mode: 0o600 });
+    writeFileSync(recoveryLock, existingRecovery, { mode: 0o600 });
+    expect(() => withInteractiveStateLock(root, () => undefined)).toThrow(
+      /timed out acquiring interactive state lock/,
+    );
+    expect(readFileSync(lock, "utf8")).toBe(deadOwner);
+    expect(readFileSync(recoveryLock, "utf8")).toBe(existingRecovery);
+  });
+
   it("stateFilePath returns <cwd>/.pi/subagentura-state.json", () => {
     expect(stateFilePath(root)).toBe(
       join(root, ".pi", "subagentura-state.json"),
@@ -994,6 +1129,36 @@ describe("persisted interactive state helpers", () => {
     appendInteractiveState(root, updated);
 
     expect(loadInteractiveStates(root)?.states["abc12345"]?.paneId).toBe("%99");
+  });
+
+  it("preserves updates from concurrent parents using the same cwd", () => {
+    saveInteractiveStates(root, {
+      schemaVersion: 2,
+      parent: "pi",
+      states: {},
+    });
+    const firstParent = loadInteractiveStates(root)!;
+    const secondParent = loadInteractiveStates(root)!;
+    firstParent.states.aaaaaaaa = {
+      ...SAMPLE,
+      id: "aaaaaaaa",
+      artifactDir: "/tmp/artifacts/aaaaaaaa",
+      parentSessionId: "parent-a",
+    };
+    secondParent.states.bbbbbbbb = {
+      ...SAMPLE,
+      id: "bbbbbbbb",
+      artifactDir: "/tmp/artifacts/bbbbbbbb",
+      parentSessionId: "parent-b",
+    };
+
+    saveInteractiveStates(root, firstParent);
+    saveInteractiveStates(root, secondParent);
+
+    expect(Object.keys(loadInteractiveStates(root)!.states).sort()).toEqual([
+      "aaaaaaaa",
+      "bbbbbbbb",
+    ]);
   });
 
   it("removeInteractiveState drops the entry by id", () => {

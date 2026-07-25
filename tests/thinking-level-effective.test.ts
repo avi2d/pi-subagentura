@@ -75,6 +75,7 @@ describe("startSubagentJob effective thinking level", () => {
     mockCreateAgentSession.mockResolvedValue({ session });
 
     const started = await startSubagentJob(params("high"));
+    started.start();
     const result = await started.jobPromise;
 
     expect(mockBuildSessionOptions.mock.calls[0][1]).toMatchObject({
@@ -90,6 +91,7 @@ describe("startSubagentJob effective thinking level", () => {
     mockCreateAgentSession.mockResolvedValue({ session });
 
     const started = await startSubagentJob(params());
+    started.start();
     const result = await started.jobPromise;
 
     expect(mockBuildSessionOptions.mock.calls[0][1]).not.toHaveProperty(
@@ -98,5 +100,20 @@ describe("startSubagentJob effective thinking level", () => {
     expect(started.thinkingLevel).toBeUndefined();
     expect(started.liveStatus.thinkingLevel).toBeUndefined();
     expect(result.thinkingLevel).toBeUndefined();
+  });
+
+  it("disposes a prepared session without starting its prompt", async () => {
+    const session = createSession("medium");
+    mockCreateAgentSession.mockResolvedValue({ session });
+
+    const prepared = await startSubagentJob(params());
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    prepared.disposeBeforeStart();
+    const result = await prepared.jobPromise;
+
+    expect(result.cancelled).toBe(true);
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(session.dispose).toHaveBeenCalledOnce();
   });
 });

@@ -63,6 +63,10 @@ export interface InProcessSnapshotInput {
   partialOutput?: string;
   startedAt?: number;
   source: CancellationSnapshotSource;
+  /** Session/tool-call id or symbolic origin that initiated the cancel. */
+  initiator?: string;
+  /** Human-readable cancellation reason. */
+  reason?: string;
 }
 
 export interface InteractiveSnapshotInput {
@@ -272,6 +276,8 @@ function buildInProcessPayload(
     errors,
     cancellation: {
       source: input.source,
+      initiator: input.initiator,
+      reason: input.reason,
       jobId: input.jobId,
       parentSessionId: input.parentSessionId,
       startedAt: input.startedAt,

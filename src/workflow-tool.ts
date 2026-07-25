@@ -20,8 +20,10 @@ import {
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
+  getWorkflowJobForOwner,
+  normalizeCancelledWorkflowState,
   startWorkflowJob,
-  workflowJobRegistry,
+  workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { renderProgress } from "./workflow-ui";
@@ -42,6 +44,12 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
+import { getOrchestrationContext } from "./orchestration-context";
+import {
+  getActiveSessionContextToken,
+  type ActiveSessionContextToken,
+  type SessionContextRef,
+} from "./session-context";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -59,15 +67,14 @@ async function waitForCancellationReceipts(
   state: WorkflowJobState,
 ): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const settled = state.promise.then(
-    () => undefined,
-    () => undefined,
-  );
+  const pendingRuns = [...(state.activeAgentRuns ?? [])];
+  if (pendingRuns.length === 0) return;
+
   const grace = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, CANCELLATION_RECEIPT_GRACE_MS);
   });
   try {
-    await Promise.race([settled, grace]);
+    await Promise.race([Promise.all(pendingRuns).then(() => undefined), grace]);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -105,8 +112,15 @@ export function formatWorkflowNotificationSummary(
   return `${job.error ?? "Workflow did not produce a result."}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`;
 }
 
-export function registerWorkflowTool(pi: ExtensionAPI): void {
+export function registerWorkflowTool(
+  pi: ExtensionAPI,
+  sessionContext?: SessionContextRef,
+): void {
   debugLog("info", "workflow_registered", {});
+  const owner = (): ActiveSessionContextToken | undefined =>
+    sessionContext
+      ? { id: sessionContext.id, generation: sessionContext.generation }
+      : getActiveSessionContextToken();
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(ctx: any): WorkflowAgentRunner {
     return async ({
@@ -116,6 +130,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       signal,
       isolation,
       label,
+      schema,
       thinkingLevel,
       onProgress,
       onCancellationSnapshot,
@@ -166,7 +181,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         }
       }
       // In-process path: explicit isolation:"in-process" or fallback from failed process isolation
-      const { jobPromise } = await startSubagentJob({
+      const { jobPromise, start } = await startSubagentJob({
         task: prompt,
         persona,
         modelOverride: model,
@@ -190,7 +205,11 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         onCancellationSnapshot,
         cancellationSource: "workflow",
         thinkingLevel,
+        ...(isolation === "in-process" && schema !== undefined
+          ? { workflowStructuredOutputSchema: schema }
+          : {}),
       });
+      start?.();
       return jobPromise;
     };
   }
@@ -206,8 +225,6 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
   }
 
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
-    const g2 = typeof global !== "undefined" ? global : globalThis;
-    const currentPi = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     const run = job.result;
     const errorCount = run?.errorCount ?? job.snapshot.errorCount;
     const presentation = getWorkflowCompletionPresentation(
@@ -221,9 +238,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     if (run) {
       content += `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
     }
-    if (!currentPi) return false;
     try {
-      currentPi.sendMessage!(
+      pi.sendMessage!(
         {
           customType: "workflow-notify",
           content,
@@ -257,6 +273,8 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "Workflow scripts are trusted agent-authored code, not arbitrary user input;",
       "the VM sandbox limits accidental Node globals but is not a security boundary.",
       "Do not run untrusted/user-supplied JavaScript as a workflow.",
+      "In-process sub-agents cannot invoke this tool; this topology is unsupported",
+      "until cross-registry cancellation is implemented (GitHub issue #62).",
       "",
       "Script shape:",
       "  export const meta = { name: 'my-flow', description: '...', phases: [{ title: 'Scan' }] };",
@@ -266,7 +284,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "",
       "Injected helpers/globals:",
       "  agent(prompt, opts?)   -> spawn one isolated sub-agent. opts: { schema?, label?, phase?,",
-      "                            model?, persona?, isolation?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
+      "                            model?, persona?, isolation?, agentType?, thinkingLevel? (off|minimal|low|medium|high|xhigh|max) }. Without schema returns the final text;",
       "                            with schema returns a value validated against the supported JSON Schema",
       "                            subset (type, enum, required/properties, additionalProperties, items,",
       "                            minItems, maxItems), or null after retries. Returns null on error",
@@ -276,13 +294,26 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "  parallel(thunks)       -> run `() => Promise` thunks concurrently (barrier); failures -> null.",
       "  pipeline(items, ...st) -> stream each item through stages, no barrier between stages.",
       "  workflow(name, args?)  -> run a saved workflow inline (one level deep).",
-      "  phase(title) / log(msg)-> progress UI only.  args -> your `args`.  budget -> soft completed-output-token target; parallel in-flight calls may overshoot.",
+      "  phase(title) / log(msg)-> progress UI only. args -> your `args`; cwd -> immutable parent working directory; budget -> soft completed-output-token target; parallel in-flight calls may overshoot.",
       "",
       "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
       "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
+    promptSnippet:
+      "Orchestrate decomposable multi-agent work with trusted raw JavaScript workflows.",
+    promptGuidelines: [
+      "Use workflows only for decomposable multi-agent work; handle simple or sequential tasks directly.",
+      "Pass raw JavaScript with no markdown fences. Include a top-level pure-literal `export const meta = { name, description, phases? }`.",
+      "Do not use TypeScript, imports, require, fs, or other Node APIs. Date.now(), Math.random(), and argless new Date() are unavailable.",
+      "Available globals are agent, parallel, pipeline, workflow, phase, log, args, immutable cwd, budget, console, guarded Date, and guarded Math.",
+      "Call phase(title) at real work-group transitions. Agent phase defaults to the current phase; an explicit agent phase overrides it.",
+      "parallel() takes thunks such as `() => agent(...)`; pipeline() streams each item through every stage independently, with no barrier between stages.",
+      "Give agent calls unique short labels, include enough task context and relevant paths, and treat failed agents or stages as null.",
+      "Use only the documented plain JSON Schema subset for schema outputs; in-process agents use native structured output while process agents use validated textual JSON fallback.",
+      "Filter or handle null results, then use a final synthesis agent when the workflow needs one coherent answer.",
+    ],
     parameters: Type.Object({
       script: Type.Optional(
         Type.String({
@@ -321,6 +352,18 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       onUpdate: any,
       ctx: any,
     ): Promise<any> {
+      const orchestrationContext = getOrchestrationContext();
+      if (orchestrationContext) {
+        const error =
+          "Workflow tool unavailable inside an in-process sub-agent orchestration context; " +
+          "this topology is unsupported until cross-registry cancellation is implemented " +
+          "(GitHub issue #62).";
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${error}` }],
+          details: { status: "error", error },
+          isError: true,
+        };
+      }
       const script: string | null =
         typeof params.script === "string" && params.script.trim()
           ? params.script
@@ -341,6 +384,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       const runAgent = makeRunAgent(ctx);
       const baseOpts = {
         args: params.args,
+        cwd: ctx.cwd,
         budgetTotal: params.budget ?? null,
         runAgent,
         loadWorkflow: (n: string) => loadWorkflowScript(n),
@@ -368,6 +412,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             baseOpts,
             jobStartedAt,
             notifyWorkflowCompletion,
+            owner(),
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -471,7 +516,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }),
     }),
     async execute(_id: string, params: any): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -534,7 +579,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       params: any,
       signal?: AbortSignal,
     ): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -645,7 +690,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }),
     }),
     async execute(_id: string, params: any): Promise<any> {
-      const st = workflowJobRegistry.get(params.workflowId);
+      const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
         return {
           content: [
@@ -656,6 +701,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         };
       }
       if (st.status === "cancelled") {
+        if (cancellationSnapshotsEnabled()) {
+          await waitForCancellationReceipts(st);
+          normalizeCancelledWorkflowState(st);
+        }
         return {
           content: [
             { type: "text", text: `Workflow ${st.id} is already cancelled.` },
@@ -664,6 +713,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             status: "cancelled",
             workflowId: st.id,
             cancelled: true,
+            snapshots: [...(st.cancellationSnapshots ?? [])],
           },
         };
       }
@@ -684,8 +734,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       }
       st.abort.abort();
       st.status = "cancelled";
+      normalizeCancelledWorkflowState(st);
       if (cancellationSnapshotsEnabled()) {
         await waitForCancellationReceipts(st);
+        normalizeCancelledWorkflowState(st);
       }
       return {
         content: [{ type: "text", text: `Workflow ${st.id} cancelled.` }],
@@ -839,12 +891,14 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         script,
         {
           args: argsValue,
+          cwd: ctx.cwd,
           budgetTotal: null,
           runAgent: makeRunAgent(ctx),
           loadWorkflow: (n: string) => loadWorkflowScript(n),
         },
         Date.now(),
         notifyWorkflowCompletion,
+        owner(),
       );
       return { job, meta };
     };
@@ -1008,7 +1062,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       description:
         "List running and completed workflow jobs with status, agent counts, output tokens, total usage, and elapsed time.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        const text = renderWorkflowJobs();
+        const text = renderWorkflowJobs(owner());
         ctx.ui.notify("📋 Workflow status listed.");
         sendCommandMessage(text);
       },
@@ -1018,7 +1072,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        const action = await showWorkflowTree(ctx.ui);
+        const action = await showWorkflowTree(ctx.ui, owner());
         if (action.kind === "cancel") {
           sendCommandMessage(`Workflow ${action.workflowId} cancelled.`);
         }
@@ -1125,11 +1179,13 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
     ].join("\n");
   }
 
-  function renderWorkflowJobs(): string {
+  function renderWorkflowJobs(
+    owner: ActiveSessionContextToken | undefined,
+  ): string {
     const lines: string[] = [];
     const now = Date.now();
     let count = 0;
-    for (const st of workflowJobRegistry.values()) {
+    for (const st of workflowJobsForOwner(owner)) {
       count++;
       const elapsed = formatElapsed(now - st.startedAt);
       const s = st.snapshot;

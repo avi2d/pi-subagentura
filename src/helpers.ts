@@ -31,10 +31,15 @@ import {
   createCompatibleSessionRuntime,
 } from "./pi-sdk-compat";
 import {
+  createWorkflowStructuredOutputTool,
+  type WorkflowStructuredOutputCapture,
+} from "./workflow-structured-output";
+import {
   snapshotInProcessSession,
   type CancellationSnapshotReceipt,
   type CancellationSnapshotSource,
 } from "./cancellation-snapshots";
+import { withOrchestrationContext } from "./orchestration-context";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 // ── Debug Logging ─────────────────────────────────────────────────
 
@@ -123,6 +128,9 @@ export type SubagentResult =
       usage: Usage;
       model?: string;
       thinkingLevel?: ThinkingLevel;
+      /** Set when the sub-agent was aborted before producing a final answer. */
+      cancelled?: boolean;
+      workflowStructuredOutput?: WorkflowStructuredOutputCapture;
     }
   | {
       isError: true;
@@ -130,7 +138,10 @@ export type SubagentResult =
       usage: Usage;
       model?: undefined;
       thinkingLevel?: ThinkingLevel;
+      /** Never set on the error branch; present so the union can be probed. */
+      cancelled?: undefined;
       errorMessage: string;
+      workflowStructuredOutput?: WorkflowStructuredOutputCapture;
     };
 
 export interface SubagentLiveStatus {
@@ -149,6 +160,14 @@ export type JobStatus = "running" | "done" | "error" | "cancelled";
 /** Notification delivery mode for async subagent completion */
 export type NotifyOnComplete = "notify" | "inject";
 
+export interface JobDeliveryOwner {
+  /** Pi API identity captured when the async job was spawned. */
+  pi: ExtensionAPI;
+  sessionId?: string;
+  sessionContextId?: number;
+  sessionContextGeneration?: number;
+}
+
 export interface JobState {
   id: string;
   status: JobStatus;
@@ -163,6 +182,8 @@ export interface JobState {
   thinkingLevel?: ThinkingLevel;
   /** Notification mode requested by spawner's notifyOnComplete param */
   notifyOnComplete?: NotifyOnComplete;
+  /** Delivery owner captured at async spawn time. */
+  deliveryOwner?: JobDeliveryOwner;
   /** Whether completion notifications should trigger a parent LLM turn. */
   triggerTurnOnComplete?: boolean;
   /** At-most-once delivery guard */
@@ -175,6 +196,26 @@ export interface JobState {
   maxAge?: number;
   /** Most recent cancellation snapshot receipt, when snapshots are enabled. */
   cancellationSnapshot?: CancellationSnapshotReceipt;
+  /**
+   * Controller wired to this job's session (async jobs only). Aborting it
+   * cancels the session AND cascades to any descendants this job owns.
+   */
+  abort?: AbortController;
+  /** Job id of the owning parent sub-agent (undefined for root-parent spawns). */
+  parentJobId?: string;
+  /** Orchestration depth of this job. Root parent's direct children are 1. */
+  depth?: number;
+  /** Recorded when a cancel path fires, for observability and result shaping. */
+  cancellation?: CancellationInfo & { at: number };
+}
+
+/** Who/why a cancellation happened — threaded to logs and snapshots. */
+export interface CancellationInfo {
+  source: CancellationSnapshotSource;
+  /** Session id, tool-call id, or symbolic origin (e.g. "user_escape"). */
+  initiator?: string;
+  /** Human-readable reason preserved in logs and the snapshot. */
+  reason?: string;
 }
 
 // ── Job Registry ────────────────────────────────────────────────────
@@ -199,6 +240,17 @@ if (!g.__piSubagenturaRegistry) {
 
 export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 
+export function inProcessJobBelongsToOwner(
+  job: JobState,
+  owner: { id: number; generation: number } | undefined,
+): boolean {
+  if (!owner) return true;
+  return (
+    job.deliveryOwner?.sessionContextId === owner.id &&
+    job.deliveryOwner?.sessionContextGeneration === owner.generation
+  );
+}
+
 declare global {
   var __piSubagenturaRegistry: Map<string, JobState> | undefined;
   var __piSubagenturaInteractiveRegistry:
@@ -206,7 +258,7 @@ declare global {
   var __piSubagenturaPiRef: ExtensionAPI | undefined;
   var __piSubagenturaUi: ExtensionUIContext | undefined;
   var __piSubagenturaSessionManager:
-    { getEntries?: () => unknown[] } | undefined;
+    { getEntries?: () => unknown[]; getSessionId?: () => string } | undefined;
   var __piSubagenturaInjectCount: number | undefined;
   var __piSubagenturaInteractivePollerHandle:
     ReturnType<typeof setInterval> | undefined;
@@ -244,6 +296,94 @@ export function pruneCompletedJobs(): number {
     }
   }
   return removed;
+}
+
+/**
+ * Recover a structured {@link CancellationInfo} from an AbortSignal.
+ *
+ * Our own cancel paths call `controller.abort(info)`, so `signal.reason` is the
+ * CancellationInfo object. When Pi core aborts a parent turn (e.g. the user
+ * pressed Escape) the reason is a DOMException/Error/string — we surface its
+ * message and fall back to the given source.
+ */
+export function readCancellationInfo(
+  signal: AbortSignal | undefined,
+  fallbackSource: CancellationSnapshotSource,
+): CancellationInfo {
+  const reason = signal?.reason;
+  if (
+    reason &&
+    typeof reason === "object" &&
+    "source" in (reason as Record<string, unknown>)
+  ) {
+    return reason as CancellationInfo;
+  }
+  const message =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : undefined;
+  return { source: fallbackSource, reason: message };
+}
+
+/**
+ * Abort every running async job the given owner spawned, recursively.
+ *
+ * Each async job's controller fires its own abort handler (snapshot →
+ * session.abort → cascade), so aborting a controller propagates the cancel
+ * through the whole ownership subtree. Sync jobs are not registered here; their
+ * descendants are reached from the sync job's own abort handler via {@link cascadeChildAborts}.
+ * Returns the ids that were signalled.
+ */
+export function cascadeChildAborts(
+  ownerJobId: string,
+  info: CancellationInfo,
+): string[] {
+  const signalled: string[] = [];
+  for (const [childId, child] of jobRegistry) {
+    if (child.parentJobId !== ownerJobId) continue;
+    if (child.status !== "running") continue;
+    child.cancellation = { ...info, at: Date.now() };
+    // Mark cancelled up front so late settlement cannot flip it to done/error
+    // and no completion notification fires for an aborted child.
+    child.status = "cancelled";
+    scheduleJobCleanup(childId, true);
+    signalled.push(childId);
+    if (child.abort) {
+      try {
+        child.abort.abort(info);
+      } catch {
+        /* controller may already be aborted */
+      }
+    } else {
+      child.session.abort().catch(() => {});
+      signalled.push(...cascadeChildAborts(childId, info));
+    }
+  }
+  return signalled;
+}
+
+/**
+ * Cancel a specific async job and its owned descendants. Records the
+ * cancellation metadata, then aborts the job's controller (which snapshots and
+ * tears down the session) and cascades to children.
+ */
+export function abortJobTree(jobId: string, info: CancellationInfo): string[] {
+  const job = jobRegistry.get(jobId);
+  if (!job || job.status !== "running") return [];
+  job.cancellation = { ...info, at: Date.now() };
+  const cascaded = cascadeChildAborts(jobId, info);
+  if (job.abort) {
+    try {
+      job.abort.abort(info);
+    } catch {
+      /* already aborted */
+    }
+  } else {
+    job.session.abort().catch(() => {});
+  }
+  return [jobId, ...cascaded];
 }
 
 export function scheduleJobCleanup(
@@ -367,10 +507,19 @@ export interface StartSubagentJobParams {
   maxAge?: number;
   /** Parent session's model registry for resolving extension-added models (e.g. minimax) */
   parentModelRegistry?: ModelRegistry;
+  /** Optional JSON Schema delivered via a workflow structured-output tool in in-process mode. */
+  workflowStructuredOutputSchema?: unknown;
   onCancellationSnapshot?: (receipt: CancellationSnapshotReceipt) => void;
   cancellationSource?: CancellationSnapshotSource;
   /** Thinking/reasoning level. Pass through to createAgentSession. */
   thinkingLevel?: ThinkingLevel;
+  /**
+   * Orchestration depth of THIS job (root parent's direct child = 1). Bound
+   * into the async context so nested spawns can see their own depth.
+   */
+  depth?: number;
+  /** Top-level parent session id, propagated for observability. */
+  rootSessionId?: string;
 }
 
 export interface StartSubagentJobResult {
@@ -378,6 +527,10 @@ export interface StartSubagentJobResult {
   jobPromise: Promise<SubagentResult>;
   session: AgentSession;
   liveStatus: SubagentLiveStatus;
+  /** Begin prompt execution after the caller validates and registers the job. */
+  start: () => void;
+  /** Settle and dispose a prepared session without ever starting its prompt. */
+  disposeBeforeStart: () => void;
   modelLabel?: string;
   /** Effective session level after model-capability clamping. */
   thinkingLevel?: ThinkingLevel;
@@ -386,10 +539,10 @@ export interface StartSubagentJobResult {
 }
 
 /**
- * Create a subagent session and start its prompt execution.
+ * Prepare a subagent session for prompt execution.
  *
- * Returns immediately with { jobId, jobPromise, session, liveStatus }.
- * The jobPromise resolves to a SubagentResult when the subagent completes.
+ * The caller must invoke `start()` after validating and registering the job.
+ * `disposeBeforeStart()` settles and cleans up without invoking the prompt.
  * The liveStatus object is mutated in real-time by the event subscriber.
  *
  * This is the shared core used by both sync (runSubagent) and async paths.
@@ -407,9 +560,12 @@ export async function startSubagentJob(
     onUpdate,
     defaultModel,
     parentModelRegistry,
+    workflowStructuredOutputSchema,
     onCancellationSnapshot,
     cancellationSource,
     thinkingLevel,
+    depth,
+    rootSessionId,
   } = params;
 
   // Enforce registry size cap before adding a new job
@@ -504,11 +660,22 @@ export async function startSubagentJob(
     model: modelLabel ?? "default",
     cwd,
   });
+  const {
+    tool: workflowStructuredOutputTool,
+    capture: workflowStructuredOutput,
+  } =
+    workflowStructuredOutputSchema === undefined
+      ? { tool: undefined, capture: undefined }
+      : createWorkflowStructuredOutputTool(workflowStructuredOutputSchema);
+
   const sessionOptions = buildSessionOptions(sessionRuntime, {
     sessionManager: SessionManager.inMemory(),
     model: targetModel,
     cwd,
     ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(workflowStructuredOutputTool
+      ? { customTools: [workflowStructuredOutputTool] }
+      : {}),
   });
   const session = (
     await createAgentSession(
@@ -528,19 +695,37 @@ export async function startSubagentJob(
   // Wire abort signal
   if (signal) {
     handleAbort = () => {
-      debugLog("warn", "job_abort", { jobId });
-      const receipt = snapshotInProcessSession({
-        kind: "in-process",
+      const info = readCancellationInfo(signal, cancellationSource ?? "signal");
+      debugLog("warn", "job_abort", {
         jobId,
-        session,
-        cwd,
-        model: modelLabel,
-        activeTool: liveStatus.activeTool,
-        partialOutput: liveStatus.output,
-        source: cancellationSource ?? "signal",
+        source: info.source,
+        initiator: info.initiator ?? null,
+        reason: info.reason ?? null,
+        depth: depth ?? null,
+        rootSessionId: rootSessionId ?? null,
       });
-      onCancellationSnapshot?.(receipt);
+      // Only take a snapshot when a receiver was wired (workflow path). The
+      // in-process cancel sites snapshot before aborting to capture pre-abort
+      // state, so snapshotting again here would be redundant.
+      if (onCancellationSnapshot) {
+        onCancellationSnapshot(
+          snapshotInProcessSession({
+            kind: "in-process",
+            jobId,
+            session,
+            cwd,
+            model: modelLabel,
+            activeTool: liveStatus.activeTool,
+            partialOutput: liveStatus.output,
+            source: info.source,
+            initiator: info.initiator,
+            reason: info.reason,
+          }),
+        );
+      }
       session.abort().catch(() => {});
+      // Cancellation is transitive: tear down every descendant this job owns.
+      cascadeChildAborts(jobId, info);
     };
     if (signal.aborted) {
       handleAbort();
@@ -636,14 +821,109 @@ export async function startSubagentJob(
     promptPreview: finalPrompt.slice(0, 500),
   });
 
-  // Launch the prompt in a promise chain (NOT awaited — returns immediately).
-  // The jobPromise represents the full lifecycle: prompt → extraction → cleanup.
+  const attachWorkflowStructuredOutput = <T extends SubagentResult>(
+    result: T,
+  ): T =>
+    workflowStructuredOutput === undefined
+      ? result
+      : ({ ...result, workflowStructuredOutput } as T);
+
+  // Prompt execution is gated so async callers can validate ownership and
+  // register the job before any model or tool side effects are possible.
+  let startGateResolve!: () => void;
+  let started = false;
+  let disposedBeforeStart = false;
+  const startGate = new Promise<void>((resolve) => {
+    startGateResolve = resolve;
+  });
+  const start = (): void => {
+    if (started || disposedBeforeStart) return;
+    started = true;
+    startGateResolve();
+  };
+  const disposePreparedSession = (): void => {
+    if (started || disposedBeforeStart) return;
+    disposedBeforeStart = true;
+    startGateResolve();
+  };
+  let result: SubagentResult = {
+    isError: true,
+    output: "(no output)",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 0,
+    },
+    model: undefined,
+    thinkingLevel: effectiveThinkingLevel,
+    errorMessage: "No subagent result captured.",
+  };
   const jobPromise = (async (): Promise<SubagentResult> => {
-    let result!: SubagentResult;
     try {
+      await startGate;
+      if (disposedBeforeStart || signal?.aborted) {
+        const info = readCancellationInfo(
+          signal,
+          cancellationSource ?? "signal",
+        );
+        result = {
+          isError: false,
+          cancelled: true,
+          output: `Sub-agent cancelled before start${info.reason ? `: ${info.reason}` : ""}.`,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+          },
+          model: session.model
+            ? `${session.model.provider}/${session.model.id}`
+            : undefined,
+          thinkingLevel: effectiveThinkingLevel,
+        };
+        return result;
+      }
       debugLog("info", "prompt_start", { jobId });
-      await session.prompt(finalPrompt);
+      // Bind ownership + depth so any nested sub-agent spawned during this
+      // prompt can discover its owner (for cascade) and its depth (for the cap).
+      await withOrchestrationContext(
+        { ownerJobId: jobId, depth: depth ?? 0, rootSessionId },
+        () => session.prompt(finalPrompt),
+      );
       debugLog("info", "prompt_complete", { jobId });
+
+      // Aborted before completion → return an explicit cancelled result rather
+      // than a false empty success. Pi resolves prompt() on abort (it does not
+      // throw), so without this check an aborted job looks like `done` output.
+      if (signal?.aborted) {
+        const info = readCancellationInfo(
+          signal,
+          cancellationSource ?? "signal",
+        );
+        result = {
+          isError: false,
+          cancelled: true,
+          output: `Sub-agent cancelled before completion${info.reason ? `: ${info.reason}` : ""}.`,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+          },
+          model: session.model
+            ? `${session.model.provider}/${session.model.id}`
+            : undefined,
+          thinkingLevel: effectiveThinkingLevel,
+        };
+        return result;
+      }
 
       // Extract final assistant output
       const messages = session.agent.state.messages;
@@ -697,16 +977,16 @@ export async function startSubagentJob(
       }
 
       if (session.agent.state.errorMessage) {
-        result = {
+        result = attachWorkflowStructuredOutput({
           isError: true,
           output: finalOutput || "(no output)",
           usage,
           model: undefined,
           thinkingLevel: effectiveThinkingLevel,
           errorMessage: session.agent.state.errorMessage,
-        };
+        });
       } else {
-        result = {
+        result = attachWorkflowStructuredOutput({
           isError: false,
           output: finalOutput || "(no output)",
           usage,
@@ -714,7 +994,7 @@ export async function startSubagentJob(
             ? `${session.model.provider}/${session.model.id}`
             : undefined,
           thinkingLevel: effectiveThinkingLevel,
-        };
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -725,7 +1005,7 @@ export async function startSubagentJob(
         stack: stack ?? null,
         errorName: err instanceof Error ? err.name : typeof err,
       });
-      result = {
+      result = attachWorkflowStructuredOutput({
         output: `Sub-agent crashed: ${msg}`,
         usage: {
           input: 0,
@@ -739,7 +1019,7 @@ export async function startSubagentJob(
         thinkingLevel: effectiveThinkingLevel,
         isError: true,
         errorMessage: msg,
-      };
+      });
     } finally {
       debugLog("info", "job_complete", {
         jobId,
@@ -767,6 +1047,8 @@ export async function startSubagentJob(
     jobPromise,
     session,
     liveStatus,
+    start,
+    disposeBeforeStart: disposePreparedSession,
     modelLabel,
     thinkingLevel: effectiveThinkingLevel,
     modelWarning,

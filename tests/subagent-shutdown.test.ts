@@ -29,6 +29,7 @@ import { jobRegistry } from "../src/helpers";
 import { workflowJobRegistry } from "../src/workflow";
 import registerExtension, { pollArtifactChanges } from "../src/subagent";
 import { __setTmuxMultiplexer } from "../src/multiplexer";
+import { getActiveSessionContextToken } from "../src/session-context";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -101,7 +102,13 @@ describe("session_shutdown handler", () => {
     const g = globalThis as any;
     g.__piSubagenturaInteractivePollerHandle = undefined;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    const contextStack = g.__piSubagenturaSessionContextStack;
+    if (Array.isArray(contextStack)) contextStack.length = 0;
+    g.__piSubagenturaSessionContextIdCounter = 0;
     g.__piSubagenturaPiRef = undefined;
+    g.__piSubagenturaUi = undefined;
+    g.__piSubagenturaSessionManager = undefined;
+    g.__piSubagenturaParentStreaming = false;
     jobRegistry.clear();
     workflowJobRegistry.clear();
     __setTmuxMultiplexer({
@@ -265,9 +272,11 @@ describe("session_shutdown handler", () => {
         phases: [],
       },
     };
-    workflowJobRegistry.set(workflow.id, workflow);
-
     const { shutdownHandler } = setupExtension();
+    Object.assign(workflow, {
+      parentSessionOwner: getActiveSessionContextToken(),
+    });
+    workflowJobRegistry.set(workflow.id, workflow);
     shutdownHandler!();
 
     expect(abortSpy).toHaveBeenCalledTimes(1);

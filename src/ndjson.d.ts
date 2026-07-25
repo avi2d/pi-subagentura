@@ -3,6 +3,8 @@ declare module "ndjson" {
 
   interface NdjsonOptions {
     strict?: boolean;
+    maxLength?: number;
+    skipOverflow?: boolean;
   }
 
   export function parse(options?: NdjsonOptions): Transform;

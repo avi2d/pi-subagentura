@@ -394,15 +394,17 @@ describe("session-log tail-read", () => {
     // Only the complete line was processed.
 
     expect(events.filter((e) => e.type === "tool_activity")).toHaveLength(1);
-    // Cursor advances to the end of the read window (the partial bytes are now buffered inside the
-    // ndjson parser). Re-reading them next tick would re-feed the parser and double-emit, so the new
-    // design lets the cursor sweep past the partial and relies on the parser to track line state.
+    // The observed cursor advances, while the replay point remains at the
+    // complete line boundary.
     expect(state.lastDeliveredSessionByte).toBe(
       Buffer.byteLength(complete + partial, "utf8"),
     );
+    expect(state.sessionPartialLineStart).toBe(
+      Buffer.byteLength(complete, "utf8"),
+    );
   });
 
-  it("re-reads a partial line once it is completed on a later poll", async () => {
+  it("completes a buffered partial line on a later poll", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const { state, artifactDir } = makeState({});
@@ -426,11 +428,13 @@ describe("session-log tail-read", () => {
     const complete = JSON.stringify(entry) + "\n";
     const partial = '{ "type": "mess';
     writeFileSync(state.sessionFile, complete + partial);
-    // First poll: ndjson parser buffers the partial internally. The cursor sweeps to the end of
-    // the read window so the next tick only reads NEW bytes (not the buffered partial).
+    // First poll: record both the observed end and the safe replay boundary.
     await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBe(
       Buffer.byteLength(complete + partial, "utf8"),
+    );
+    expect(state.sessionPartialLineStart).toBe(
+      Buffer.byteLength(complete, "utf8"),
     );
 
     // Second poll: child finishes writing the partial. We need to APPEND to
@@ -445,6 +449,7 @@ describe("session-log tail-read", () => {
       Buffer.byteLength(complete + partial, "utf8") +
         Buffer.byteLength(appended, "utf8"),
     );
+    expect(state.sessionPartialLineStart).toBeUndefined();
     const art = artifactPath(join(artifactDir, ".."), state.id);
     const events = readEvents(art);
     // Now BOTH tool_activity events should be present.
@@ -525,7 +530,7 @@ describe("session-log tail-read", () => {
     // Footer status shows count.
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent running",
+      "⚡ 1 sub-agent active",
     );
     // Widget shows the activity row. Workflow widget is also cleared in the same poll.
     const activityWidgetCall = setWidget.mock.calls.find(
@@ -538,7 +543,7 @@ describe("session-log tail-read", () => {
     expect(lines[0]).toContain("rg TODO src/");
   });
 
-  it("clears the widget and footer when no sub-agents are running", async () => {
+  it("clears the widget and footer when no sub-agents are active", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     // Empty registry.
@@ -667,10 +672,9 @@ describe("session-log tail-read", () => {
     // cursor should have been reset, so it now points past the new content
     expect(state.lastDeliveredSessionByte).toBe(4);
   });
-  // ── New tests for the ndjson refactor ──────────────────────────────────────────────────
-  // The 4 cases below cover the bug class that triggered the refactor: hand-rolled partial-line
-  // + cursor logic could pin a poller on a single line larger than the 1 MiB cap. The new design uses
-  // the `ndjson` library which buffers partial lines internally across polls.
+  // ── Bounded streaming parser regression coverage ─────────────────────────
+  // A runtime read cursor allows multi-tick lines while the persisted cursor
+  // remains at the last complete boundary for safe replay after reload.
 
   it("processes a single JSONL line larger than 1 MiB (the original cap)", async () => {
     const mod =
@@ -700,10 +704,12 @@ describe("session-log tail-read", () => {
     const line = JSON.stringify({ ...entry, _big: bigPayload });
     writeFileSync(state.sessionFile, line + "\n");
 
-    // First poll: ndjson reads up to 1 MiB (the defensive cap), buffers the rest internally.
+    // The observed cursor advances, while the replay point remains at the start
+    // of the incomplete line.
     await mod.pollArtifactChanges({} as any);
     const afterFirst = state.lastDeliveredSessionByte ?? 0;
-    expect(afterFirst).toBe(1 * 1024 * 1024); // defensive cap was hit
+    expect(afterFirst).toBe(1 * 1024 * 1024);
+    expect(state.sessionPartialLineStart).toBe(0);
 
     const art = artifactPath(join(artifactDir, ".."), state.id);
     // The complete line has not arrived yet, so no events should be emitted.
@@ -711,9 +717,8 @@ describe("session-log tail-read", () => {
       readEvents(art).filter((e) => e.type === "tool_activity"),
     ).toHaveLength(0);
 
-    // Second poll: cursor at 1 MiB, file has another ~0.5 MiB left. The ndjson parser combines the
-    // buffered partial with the new bytes and emits the completed line. The cursor advances to the end
-    // of the file. The OLD code would have re-read the same 1 MiB over and over and never advanced.
+    // The second poll resumes from the observed cursor and emits the completed
+    // line without re-reading the buffered prefix.
     await mod.pollArtifactChanges({} as any);
     expect(state.lastDeliveredSessionByte).toBeGreaterThan(afterFirst);
     const activityAfterSecond = readEvents(art).filter(
@@ -746,6 +751,212 @@ describe("session-log tail-read", () => {
     const activity = readEvents(art).filter((e) => e.type === "tool_activity");
     expect(activity).toHaveLength(2);
     expect(activity[1]).toMatchObject({ tool: "read", summary: "/tmp/x" });
+  });
+
+  it("replays a partial line from its durable cursor after reload", async () => {
+    const first =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({});
+    const entry = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-reload",
+            name: "bash",
+            arguments: { command: "echo after reload" },
+          },
+        ],
+        timestamp: 1700000000000,
+      },
+    };
+    const line = JSON.stringify(entry);
+    const splitAt = Math.floor(line.length / 2);
+    state.lastDeliveredSessionByte = 0;
+    first.interactiveSubagentRegistry.set(state.id, state);
+    writeFileSync(state.sessionFile, line.slice(0, splitAt));
+
+    await first.pollArtifactChanges({} as any);
+    expect(state.lastDeliveredSessionByte).toBe(splitAt);
+    expect(state.sessionPartialLineStart).toBe(0);
+
+    first.interactiveSubagentRegistry.clear();
+    const second =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const rehydrated = {
+      ...state,
+      lastDeliveredSessionByte: state.sessionPartialLineStart,
+      sessionObservedByteCursor: state.lastDeliveredSessionByte,
+    };
+    second.interactiveSubagentRegistry.set(rehydrated.id, rehydrated);
+    appendFileSync(state.sessionFile, line.slice(splitAt) + "\n");
+
+    await second.pollArtifactChanges({} as any);
+
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    expect(
+      readEvents(art).filter((event) => event.type === "tool_activity"),
+    ).toMatchObject([{ tool: "bash", summary: "echo after reload" }]);
+  });
+
+  it("rewinds a buffered partial line when parsers are cleared", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { clearSessionParsers } = await import("../src/artifact-poller");
+    const { state, artifactDir } = makeState({});
+    const entry = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-cleared",
+            name: "bash",
+            arguments: { command: "echo after clear" },
+          },
+        ],
+      },
+    };
+    const line = JSON.stringify(entry);
+    const splitAt = Math.floor(line.length / 2);
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    writeFileSync(state.sessionFile, line.slice(0, splitAt));
+    await mod.pollArtifactChanges({} as any);
+    expect(state.lastDeliveredSessionByte).toBe(splitAt);
+
+    clearSessionParsers();
+    expect(state.lastDeliveredSessionByte).toBe(0);
+    expect(state.sessionObservedByteCursor).toBe(splitAt);
+    appendFileSync(state.sessionFile, line.slice(splitAt) + "\n");
+    await mod.pollArtifactChanges({} as any);
+
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    expect(
+      readEvents(art).filter((event) => event.type === "tool_activity"),
+    ).toMatchObject([{ tool: "bash", summary: "echo after clear" }]);
+  });
+
+  it("detects reload-time truncation against the persisted observed cursor", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({});
+    const entry = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-truncated",
+            name: "read",
+            arguments: { path: "/tmp/replaced-session" },
+          },
+        ],
+      },
+    };
+    const line = JSON.stringify(entry) + "\n";
+    state.lastDeliveredSessionByte = 10;
+    state.sessionPartialLineStart = 10;
+    state.sessionObservedByteCursor = Buffer.byteLength(line, "utf8") + 10;
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    writeFileSync(state.sessionFile, line);
+
+    await mod.pollArtifactChanges({} as any);
+
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    expect(
+      readEvents(art).filter((event) => event.type === "tool_activity"),
+    ).toMatchObject([{ tool: "read", summary: "/tmp/replaced-session" }]);
+  });
+
+  it("replaces parser state when a rehydrated object reuses an id", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({});
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    writeFileSync(state.sessionFile, '{ "type": "mess');
+    await mod.pollArtifactChanges({} as any);
+
+    const replacement: InteractiveSubagentState = {
+      ...state,
+      lastDeliveredSessionByte: 0,
+      sessionPartialLineStart: undefined,
+    };
+    const entry = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-reused",
+            name: "bash",
+            arguments: { command: "echo reused" },
+          },
+        ],
+      },
+    };
+    writeFileSync(state.sessionFile, JSON.stringify(entry) + "\n");
+    mod.interactiveSubagentRegistry.set(state.id, replacement);
+
+    await mod.pollArtifactChanges({} as any);
+
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    expect(
+      readEvents(art).filter((event) => event.type === "tool_activity"),
+    ).toMatchObject([{ tool: "bash", summary: "echo reused" }]);
+  });
+
+  it("drops an oversized line and resumes at the next record", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { state, artifactDir } = makeState({});
+    mod.interactiveSubagentRegistry.set(state.id, state);
+    const oversized = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-oversized",
+            name: "bash",
+            arguments: { command: "echo should be dropped" },
+          },
+        ],
+      },
+      payload: "x".repeat(3 * 1024 * 1024),
+    };
+    writeFileSync(state.sessionFile, JSON.stringify(oversized) + "\n");
+
+    for (let poll = 0; poll < 4; poll++) {
+      await mod.pollArtifactChanges({} as any);
+    }
+
+    const next = {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "t-after-overflow",
+            name: "read",
+            arguments: { path: "/tmp/after-overflow" },
+          },
+        ],
+      },
+    };
+    appendFileSync(state.sessionFile, JSON.stringify(next) + "\n");
+    await mod.pollArtifactChanges({} as any);
+
+    const art = artifactPath(join(artifactDir, ".."), state.id);
+    expect(
+      readEvents(art).filter((event) => event.type === "tool_activity"),
+    ).toMatchObject([{ tool: "read", summary: "/tmp/after-overflow" }]);
   });
 
   it("resets the cursor and parser on file truncation", async () => {

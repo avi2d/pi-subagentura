@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { JobState, SubagentResult } from "../src/helpers";
+import {
+  jobRegistry,
+  type JobState,
+  type SubagentResult,
+} from "../src/helpers";
 import {
   deliverArtifactNotification,
   deliverNotification,
@@ -51,9 +55,12 @@ function cleanGlobals() {
   const globalState = globalThis as any;
   globalState.__piSubagenturaPiRef = undefined;
   globalState.__piSubagenturaUi = undefined;
+  globalState.__piSubagenturaSessionManager = undefined;
+  globalState.__piSubagenturaActiveSessionContextId = undefined;
   globalState.__piSubagenturaParentStreaming = false;
   globalState.__piSubagenturaPendingJobDeliveries = [];
   globalState.__piSubagenturaInProcessFlushScheduled = false;
+  jobRegistry.clear();
 }
 
 describe("in-process completion delivery queue", () => {
@@ -82,11 +89,34 @@ describe("in-process completion delivery queue", () => {
     expect(job.notificationDelivered).toBe(true);
   });
 
+  it("reports other running in-process jobs in completion messages", () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    jobRegistry.set(
+      "still-running",
+      makeJobState({ id: "still-running", status: "running" }),
+    );
+
+    deliverNotification(makeJobState(), SUCCESS_RESULT);
+
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toContain(
+      "1 in-process sub-agent job is still running",
+    );
+    expect(sendMessage.mock.calls[0][0].content).toContain(
+      "Do not claim all review work is complete yet",
+    );
+    expect(sendMessage.mock.calls[0][0].details.remainingRunningJobs).toBe(1);
+  });
+
   it("retains a failed dispatch and retries it with a fresh context", () => {
     const staleSend = vi.fn(() => {
       throw new Error("stale context");
     });
-    (globalThis as any).__piSubagenturaPiRef = { sendMessage: staleSend };
+    const pi: { sendMessage: (...args: any[]) => any } = {
+      sendMessage: staleSend,
+    };
+    (globalThis as any).__piSubagenturaPiRef = pi;
     const job = makeJobState();
 
     deliverNotification(job, SUCCESS_RESULT);
@@ -94,7 +124,8 @@ describe("in-process completion delivery queue", () => {
     expect(job.notificationDelivered).toBeFalsy();
 
     const freshSend = vi.fn();
-    (globalThis as any).__piSubagenturaPiRef = { sendMessage: freshSend };
+    pi.sendMessage = freshSend;
+    (globalThis as any).__piSubagenturaPiRef = pi;
     flushInProcessDeliveries();
 
     expect(freshSend).toHaveBeenCalledOnce();
@@ -164,6 +195,67 @@ describe("in-process completion delivery queue", () => {
       triggerTurn: false,
     });
     expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("does not deliver a queued completion into a replacement parent session", async () => {
+    const firstSessionSend = vi.fn();
+    const secondSessionSend = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: firstSessionSend,
+    };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-a",
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const job = makeJobState({ notifyOnComplete: "notify" });
+
+    deliverNotification(job, SUCCESS_RESULT);
+    await Promise.resolve();
+    expect(firstSessionSend).not.toHaveBeenCalled();
+
+    (globalThis as any).__piSubagenturaPiRef = {
+      sendMessage: secondSessionSend,
+    };
+    (globalThis as any).__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-b",
+    };
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    flushInProcessDeliveries();
+
+    expect(secondSessionSend).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBeFalsy();
+  });
+
+  it("does not deliver a queued completion into a replacement session context", async () => {
+    const firstSessionSend = vi.fn();
+    const secondSessionSend = vi.fn();
+    const globalState = globalThis as any;
+    globalState.__piSubagenturaActiveSessionContextId = 1;
+    globalState.__piSubagenturaPiRef = {
+      sendMessage: firstSessionSend,
+    };
+    globalState.__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-a",
+    };
+    globalState.__piSubagenturaParentStreaming = true;
+    const job = makeJobState({ notifyOnComplete: "notify" });
+
+    deliverNotification(job, SUCCESS_RESULT);
+    await Promise.resolve();
+    expect(firstSessionSend).not.toHaveBeenCalled();
+
+    globalState.__piSubagenturaActiveSessionContextId = 2;
+    globalState.__piSubagenturaPiRef = {
+      sendMessage: secondSessionSend,
+    };
+    globalState.__piSubagenturaSessionManager = {
+      getSessionId: () => "parent-session-a",
+    };
+    globalState.__piSubagenturaParentStreaming = false;
+    flushInProcessDeliveries();
+
+    expect(secondSessionSend).not.toHaveBeenCalled();
+    expect(job.notificationDelivered).toBeFalsy();
   });
 });
 

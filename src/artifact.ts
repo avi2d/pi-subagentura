@@ -244,12 +244,27 @@ export interface EventRecord {
   legacy: boolean;
 }
 
+export interface EventReadIssue {
+  kind: "record_too_large";
+  startOffset: number;
+  endOffset: number;
+  maxBytes: number;
+}
+
 export const MAX_EVENT_BATCH_BYTES = 256 * 1024;
+export const MAX_EVENT_RECORD_BYTES = 4 * MAX_EVENT_BATCH_BYTES;
 export const MAX_EVENT_ID_LENGTH = 128;
 export const MAX_TURN_ID_LENGTH = 256;
 export const MAX_EVENT_TEXT_LENGTH = 2_000;
 export const MAX_TOOL_NAME_LENGTH = 128;
 export const MAX_OUTPUT_SNAPSHOT_BYTES = 1024 * 1024;
+
+export function boundedOptionalEventText(
+  value: unknown,
+  maxLength = MAX_EVENT_TEXT_LENGTH,
+): string | undefined {
+  return typeof value === "string" ? value.slice(0, maxLength) : undefined;
+}
 
 export interface SubagentArtifact {
   id: string;
@@ -363,10 +378,45 @@ export function outputPathForTurn(art: SubagentArtifact, turn: number): string {
  * would compute the same N — but a guard inside would be brittle. Trust the caller.
  */
 export function snapshotOutput(art: SubagentArtifact, turn: number): void {
-  if (!existsSync(art.outputFile)) return;
+  let fd: number | undefined;
+  let content: Buffer;
+  try {
+    fd = openSync(art.outputFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_OUTPUT_SNAPSHOT_BYTES) return;
+    content = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const bytesRead = readSync(
+        fd,
+        content,
+        offset,
+        content.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    content = content.subarray(0, offset);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog("warn", "legacy_snapshot_output_unavailable", {
+        artifactId: art.id,
+        turn,
+      });
+    }
+    return;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* legacy snapshot content is already bounded in memory */
+      }
+    }
+  }
   const target = outputPathForTurn(art, turn);
   const tmp = target + ".tmp";
-  const content = readFileSync(art.outputFile, "utf8");
   writeFileSync(tmp, content, { mode: 0o600 });
   renameSync(tmp, target);
 }
@@ -472,6 +522,8 @@ export function appendCompletionEvent(
     if (existing) return null;
     const eventId = params.eventId ?? newEventId();
     const snapshot = snapshotOutputForEvent(art, eventId);
+    const message = boundedOptionalEventText(params.message);
+    const errorMessage = boundedOptionalEventText(params.errorMessage);
     const event: CompletionEventV2 = {
       version: 2,
       eventId,
@@ -483,8 +535,8 @@ export function appendCompletionEvent(
       source: params.source,
       ...snapshot,
       ...(params.exitCode === undefined ? {} : { exitCode: params.exitCode }),
-      ...(params.message ? { message: params.message } : {}),
-      ...(params.errorMessage ? { errorMessage: params.errorMessage } : {}),
+      ...(message ? { message } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
     };
     appendEvent(art, event);
     return event;
@@ -592,13 +644,6 @@ export function readOutputForTurnId(
 
 // ── Reads ───────────────────────────────────────────────────────────
 
-function boundedEventString(
-  value: unknown,
-  maxLength = MAX_EVENT_TEXT_LENGTH,
-): string | undefined {
-  return typeof value === "string" ? value.slice(0, maxLength) : undefined;
-}
-
 function normalizeEvent(
   value: unknown,
   startOffset: number,
@@ -609,9 +654,9 @@ function normalizeEvent(
   if (typeof obj.ts !== "number" || !Number.isFinite(obj.ts) || obj.ts < 0) {
     return null;
   }
-  const message = boundedEventString(obj.message);
-  const summary = boundedEventString(obj.summary);
-  const tool = boundedEventString(obj.tool, MAX_TOOL_NAME_LENGTH);
+  const message = boundedOptionalEventText(obj.message);
+  const summary = boundedOptionalEventText(obj.summary);
+  const tool = boundedOptionalEventText(obj.tool, MAX_TOOL_NAME_LENGTH);
   const exitCode =
     typeof obj.exitCode === "number" && Number.isSafeInteger(obj.exitCode)
       ? obj.exitCode
@@ -749,7 +794,7 @@ function normalizeEvent(
         outputError,
         exitCode,
         message,
-        errorMessage: boundedEventString(obj.errorMessage),
+        errorMessage: boundedOptionalEventText(obj.errorMessage),
         summary,
       },
       legacy: false,
@@ -811,24 +856,79 @@ export function readEventRecords(
 export function readEventBatch(
   art: SubagentArtifact,
   fromOffset = 0,
-): { records: EventRecord[]; endOffset: number } {
+): { records: EventRecord[]; issues: EventReadIssue[]; endOffset: number } {
   let fd: number | undefined;
   let size = 0;
   try {
     fd = openSync(art.statusFile, "r");
     size = statSync(art.statusFile).size;
   } catch {
-    return { records: [], endOffset: fromOffset };
+    return { records: [], issues: [], endOffset: fromOffset };
   }
   const offset = Math.max(0, Math.min(fromOffset, size));
-  const content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
+  let content = Buffer.alloc(Math.min(MAX_EVENT_BATCH_BYTES, size - offset));
+  let oversizedEndOffset: number | undefined;
   try {
-    if (content.byteLength > 0)
+    if (content.byteLength > 0) {
       readSync(fd, content, 0, content.length, offset);
+      while (
+        content.indexOf(0x0a) < 0 &&
+        offset + content.byteLength < size &&
+        content.byteLength < MAX_EVENT_RECORD_BYTES
+      ) {
+        const remaining = Math.min(
+          MAX_EVENT_BATCH_BYTES,
+          size - offset - content.byteLength,
+          MAX_EVENT_RECORD_BYTES - content.byteLength,
+        );
+        const next = Buffer.alloc(remaining);
+        readSync(fd, next, 0, next.length, offset + content.byteLength);
+        content = Buffer.concat([content, next]);
+      }
+      if (
+        content.indexOf(0x0a) < 0 &&
+        content.byteLength >= MAX_EVENT_RECORD_BYTES &&
+        offset + content.byteLength < size
+      ) {
+        let scanOffset = offset + content.byteLength;
+        const scan = Buffer.alloc(MAX_EVENT_BATCH_BYTES);
+        while (scanOffset < size) {
+          const bytesRead = readSync(
+            fd,
+            scan,
+            0,
+            Math.min(scan.length, size - scanOffset),
+            scanOffset,
+          );
+          if (bytesRead === 0) break;
+          const newline = scan.subarray(0, bytesRead).indexOf(0x0a);
+          if (newline >= 0) {
+            const lineBytes = scanOffset + newline - offset;
+            if (lineBytes > MAX_EVENT_RECORD_BYTES) {
+              oversizedEndOffset = scanOffset + newline + 1;
+            } else {
+              content = Buffer.concat([content, Buffer.from("\n")]);
+            }
+            break;
+          }
+          scanOffset += bytesRead;
+        }
+      }
+    }
   } finally {
     closeSync(fd);
   }
   const records: EventRecord[] = [];
+  const issues: EventReadIssue[] = [];
+  if (oversizedEndOffset !== undefined) {
+    issues.push({
+      kind: "record_too_large",
+      startOffset: offset,
+      endOffset: oversizedEndOffset,
+      maxBytes: MAX_EVENT_RECORD_BYTES,
+    });
+    return { records, issues, endOffset: oversizedEndOffset };
+  }
   let start = 0;
   let endOffset = offset;
   while (start < content.byteLength) {
@@ -871,12 +971,12 @@ export function readEventBatch(
   }
   if (
     endOffset === offset &&
-    content.byteLength === MAX_EVENT_BATCH_BYTES &&
+    content.byteLength > 0 &&
     offset + content.byteLength < size
   ) {
     endOffset = offset + content.byteLength;
   }
-  return { records, endOffset };
+  return { records, issues, endOffset };
 }
 
 export function eventLogEndOffset(art: SubagentArtifact): number {
@@ -1203,6 +1303,8 @@ export interface PersistedLifecycleFold {
 export interface InteractiveSubagentPersistedStateV2 extends InteractiveSubagentPersistedStateV1 {
   eventByteCursor: number;
   sessionByteCursor: number;
+  /** Null means the cursor ends at a line boundary; absent means legacy state. */
+  sessionPartialLineStart?: number | null;
   activeTurnId?: string;
   pendingDeliveries: PersistedDeliveryIntent[];
   deliveryReceipts: string[];
@@ -1474,6 +1576,16 @@ function migrateStatePayload(
           : {}),
         eventByteCursor: cursor(entry.eventByteCursor, cutoverOffset),
         sessionByteCursor: cursor(entry.sessionByteCursor, 0),
+        ...(entry.sessionPartialLineStart === null
+          ? { sessionPartialLineStart: null }
+          : typeof entry.sessionPartialLineStart === "number"
+            ? {
+                sessionPartialLineStart: cursor(
+                  entry.sessionPartialLineStart,
+                  0,
+                ),
+              }
+            : {}),
         ...(typeof entry.activeTurnId === "string"
           ? { activeTurnId: entry.activeTurnId }
           : {}),
@@ -1572,20 +1684,208 @@ export function saveInteractiveStates(
   if (!current || current.schemaVersion !== CURRENT_STATE_SCHEMA_VERSION) {
     throw new Error(`unsupported schemaVersion: ${payload.schemaVersion}`);
   }
+  withInteractiveStateLock(cwd, () => {
+    const existing = loadInteractiveStates(cwd);
+    writeInteractiveStatesUnlocked(cwd, {
+      ...current,
+      states: { ...(existing?.states ?? {}), ...current.states },
+    });
+  });
+}
+
+const STATE_LOCK_TIMEOUT_MS = 2_000;
+const STATE_LOCK_STALE_MS = 30_000;
+const stateLockWaiter = new Int32Array(new SharedArrayBuffer(4));
+type StateLockOwner = { pid: number; token: string };
+
+function readStateLockOwner(lock: string): StateLockOwner | undefined {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(lock, "utf8"),
+    ) as Partial<StateLockOwner>;
+    const pid = parsed.pid;
+    const token = parsed.token;
+    if (
+      typeof pid === "number" &&
+      Number.isSafeInteger(pid) &&
+      pid > 0 &&
+      typeof token === "string" &&
+      token.length > 0
+    ) {
+      return { pid, token };
+    }
+  } catch {
+    /* A partial or legacy lock is recoverable after its lease ages out. */
+  }
+  return undefined;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function releaseStateLock(
+  lock: string,
+  fd: number,
+  ownerMetadata: string,
+  acquiredDevice: number,
+  acquiredInode: number,
+): void {
+  closeSync(fd);
+  try {
+    const currentFd = openSync(lock, constants.O_RDONLY);
+    const current = fstatSync(currentFd);
+    closeSync(currentFd);
+    if (current.dev !== acquiredDevice || current.ino !== acquiredInode) return;
+    if (readFileSync(lock, "utf8") !== ownerMetadata) return;
+    unlinkSync(lock);
+  } catch {
+    /* A recovery path may have already removed or replaced this lock. */
+  }
+}
+
+function releaseStateRecoveryLock(
+  lock: string,
+  fd: number,
+  ownerMetadata: string,
+): void {
+  closeSync(fd);
+  try {
+    if (readFileSync(lock, "utf8") === ownerMetadata) unlinkSync(lock);
+  } catch {
+    /* A recovery path may have already removed or replaced this claim. */
+  }
+}
+
+export function withInteractiveStateLock<T>(cwd: string, action: () => T): T {
+  const piDir = join(cwd, ".pi");
+  const lock = join(piDir, "subagentura-state.lock");
+  const recoveryLock = `${lock}.recovery`;
+  mkdirSync(piDir, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + STATE_LOCK_TIMEOUT_MS;
+  const ownerMetadata = JSON.stringify({
+    pid: process.pid,
+    token: randomUUID(),
+  });
+  const recoveryMetadata = JSON.stringify({
+    pid: process.pid,
+    token: randomUUID(),
+  });
+  let fd: number | undefined;
+  let recoveryFd: number | undefined;
+  let acquiredDevice = 0;
+  let acquiredInode = 0;
+  while (fd === undefined) {
+    try {
+      fd = openSync(lock, "wx", 0o600);
+      writeFileSync(fd, ownerMetadata);
+      const acquired = fstatSync(fd);
+      acquiredDevice = acquired.dev;
+      acquiredInode = acquired.ino;
+      if (recoveryFd !== undefined) {
+        releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        recoveryFd = undefined;
+      }
+    } catch (error: any) {
+      if (fd !== undefined) {
+        closeSync(fd);
+        fd = undefined;
+        try {
+          unlinkSync(lock);
+        } catch {
+          /* Another process may have recovered an incomplete lock. */
+        }
+      }
+      if (error?.code !== "EEXIST") {
+        if (recoveryFd !== undefined) {
+          releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        }
+        throw error;
+      }
+      if (recoveryFd === undefined) {
+        try {
+          recoveryFd = openSync(recoveryLock, "wx", 0o600);
+          writeFileSync(recoveryFd, recoveryMetadata);
+        } catch (recoveryError: any) {
+          if (recoveryFd !== undefined) {
+            closeSync(recoveryFd);
+            recoveryFd = undefined;
+            try {
+              unlinkSync(recoveryLock);
+            } catch {
+              /* Another contender may own the recovery claim. */
+            }
+          }
+          if (recoveryError?.code !== "EEXIST") throw recoveryError;
+          // Existing recovery claims are never reclaimed automatically.
+        }
+      }
+      if (recoveryFd !== undefined) {
+        try {
+          if (!existsSync(lock)) continue;
+          const owner = readStateLockOwner(lock);
+          const lockAge = Date.now() - statSync(lock).mtimeMs;
+          const stale = !owner && lockAge > STATE_LOCK_STALE_MS;
+          if (owner && isProcessAlive(owner.pid)) {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          } else if (stale || (owner && !isProcessAlive(owner.pid))) {
+            unlinkSync(lock);
+            continue;
+          } else {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          }
+        } catch {
+          if (recoveryFd !== undefined) {
+            releaseStateRecoveryLock(
+              recoveryLock,
+              recoveryFd,
+              recoveryMetadata,
+            );
+            recoveryFd = undefined;
+          }
+        }
+      }
+      if (Date.now() >= deadline) {
+        if (recoveryFd !== undefined) {
+          releaseStateRecoveryLock(recoveryLock, recoveryFd, recoveryMetadata);
+        }
+        throw new Error(`timed out acquiring interactive state lock: ${lock}`);
+      }
+      Atomics.wait(stateLockWaiter, 0, 0, 10);
+    }
+  }
+  try {
+    return action();
+  } finally {
+    releaseStateLock(lock, fd, ownerMetadata, acquiredDevice, acquiredInode);
+  }
+}
+
+function writeInteractiveStatesUnlocked(
+  cwd: string,
+  payload: InteractiveSubagentStateFile,
+): void {
   const file = stateFilePath(cwd);
-
-  mkdirSync(join(cwd, ".pi"), { recursive: true, mode: 0o700 });
-
-  const tmp = file + ".tmp";
-
-  writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 });
-
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
   renameSync(tmp, file);
 }
-// SAFETY: load-modify-write is not atomic across concurrent callers.
-// Safe today only because a pi session is single-event-loop and never
-// calls this re-entrantly. Do NOT call from parallel async paths without
-// adding a write lock.
+
 /**
  * Convenience: load (or create fresh) + add/overwrite entry by id + save.
  * Called from hot paths (spawn) where a write failure must not break the parent.
@@ -1595,33 +1895,32 @@ export function appendInteractiveState(
   entry:
     InteractiveSubagentPersistedStateV1 | InteractiveSubagentPersistedStateV2,
 ): void {
-  const current = loadInteractiveStates(cwd) ?? {
-    schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
-
-    parent: "pi",
-
-    states: {},
-  };
-
-  const art = artifactPath(
-    dirname(entry.artifactDir),
-    basename(entry.artifactDir),
-  );
-  current.states[entry.id] = {
-    ...entry,
-    eventByteCursor: "eventByteCursor" in entry ? entry.eventByteCursor : 0,
-    sessionByteCursor:
-      "sessionByteCursor" in entry ? entry.sessionByteCursor : 0,
-    pendingDeliveries:
-      "pendingDeliveries" in entry ? entry.pendingDeliveries : [],
-    deliveryReceipts: "deliveryReceipts" in entry ? entry.deliveryReceipts : [],
-    legacyCutoverOffset:
-      "legacyCutoverOffset" in entry
-        ? entry.legacyCutoverOffset
-        : eventLogEndOffset(art),
-  };
-
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd) ?? {
+      schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
+      parent: "pi",
+      states: {},
+    };
+    const art = artifactPath(
+      dirname(entry.artifactDir),
+      basename(entry.artifactDir),
+    );
+    current.states[entry.id] = {
+      ...entry,
+      eventByteCursor: "eventByteCursor" in entry ? entry.eventByteCursor : 0,
+      sessionByteCursor:
+        "sessionByteCursor" in entry ? entry.sessionByteCursor : 0,
+      pendingDeliveries:
+        "pendingDeliveries" in entry ? entry.pendingDeliveries : [],
+      deliveryReceipts:
+        "deliveryReceipts" in entry ? entry.deliveryReceipts : [],
+      legacyCutoverOffset:
+        "legacyCutoverOffset" in entry
+          ? entry.legacyCutoverOffset
+          : eventLogEndOffset(art),
+    };
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
 
 export function updateInteractiveState(
@@ -1629,39 +1928,35 @@ export function updateInteractiveState(
   id: string,
   update: (entry: InteractiveSubagentPersistedStateV2) => void,
 ): void {
-  const current = loadInteractiveStates(cwd);
-  const entry = current?.states[id];
-  if (!current || !entry) return;
-  update(entry);
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd);
+    const entry = current?.states[id];
+    if (!current || !entry) return;
+    update(entry);
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
-
-// SAFETY: load-modify-write is not atomic across concurrent callers.
-// Safe today only because a pi session is single-event-loop and never
-// calls this re-entrantly. Do NOT call from parallel async paths without
-// adding a write lock.
 /**
  * Convenience: load + drop entry by id + save. No-op if absent or file missing.
  */
 export function removeInteractiveState(cwd: string, id: string): void {
-  const current = loadInteractiveStates(cwd);
-
-  if (!current) return;
-
-  if (!(id in current.states)) return;
-
-  delete current.states[id];
-
-  saveInteractiveStates(cwd, current);
+  withInteractiveStateLock(cwd, () => {
+    const current = loadInteractiveStates(cwd);
+    if (!current || !(id in current.states)) return;
+    delete current.states[id];
+    writeInteractiveStatesUnlocked(cwd, current);
+  });
 }
 /**
  * Delete the state file outright. Used on session_shutdown(reason="new") to
  * give the next session a clean slate. No-op if the file doesn't exist.
  */
 export function deleteInteractiveStatesFile(cwd: string): void {
-  try {
-    unlinkSync(stateFilePath(cwd));
-  } catch {
-    /* best effort — file may not exist */
-  }
+  withInteractiveStateLock(cwd, () => {
+    try {
+      unlinkSync(stateFilePath(cwd));
+    } catch {
+      /* best effort — file may not exist */
+    }
+  });
 }

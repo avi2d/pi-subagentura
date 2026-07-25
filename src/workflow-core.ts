@@ -110,22 +110,23 @@ export interface WorkflowAgentOpts {
   /** Thinking/reasoning level for the sub-agent. Clamped to model capabilities. */
   thinkingLevel?: ThinkingLevel;
 }
-
 export type WorkflowAgentProgress =
   | {
       kind: "phase";
       phase: string;
       message?: string;
       label?: string;
+      agentId?: number;
     }
   | {
       kind: "log";
       message: string;
       phase?: string;
       label?: string;
+      agentId?: number;
     };
 
-/** Injectable spawn function — the real one wraps startSubagentJob / launchInteractiveSubagent. */
+/** Injectable spawn function — wraps in-process or process-backed agents. */
 export type WorkflowAgentRunner = (req: {
   prompt: string;
   persona?: string;
@@ -133,7 +134,8 @@ export type WorkflowAgentRunner = (req: {
   signal?: AbortSignal;
   isolation?: string;
   label?: string;
-  /** Thinking/reasoning level for the sub-agent. */
+  schema?: unknown;
+  /** Thinking/reasoning for the sub-agent. */
   thinkingLevel?: ThinkingLevel;
   /**
    * Optional callback for emitting progress events from inside the runner.
@@ -159,6 +161,7 @@ export type WorkflowProgress =
       phase: string;
       message?: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -172,6 +175,7 @@ export type WorkflowProgress =
       phase?: string;
       message: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -185,6 +189,7 @@ export type WorkflowProgress =
       phase?: string;
       message?: string;
       label?: string;
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -198,6 +203,8 @@ export type WorkflowProgress =
       phase?: string;
       message?: string;
       label?: string;
+      status?: "done" | "error";
+      agentId?: number;
       agentsSpawned: number;
       errorCount: number;
       /** @deprecated Output-token count; use usage.totalTokens. */
@@ -206,6 +213,16 @@ export type WorkflowProgress =
       runningCount: number;
       model?: string;
     };
+
+export interface WorkflowAgentRecord {
+  agentId: number;
+  phase?: string;
+  label?: string;
+  model?: string;
+  status: "running" | "done" | "error" | "cancelled";
+}
+
+export const MAX_WORKFLOW_AGENT_RECORDS = 50;
 
 export type WorkflowProgressUpdate = {
   [K in WorkflowProgress["kind"]]: Omit<
@@ -243,6 +260,8 @@ export class WorkflowExecutionError extends Error {
 
 export interface RunWorkflowOptions {
   args?: unknown;
+  /** Parent execution directory exposed to workflow scripts as immutable `cwd`. */
+  cwd?: string;
   /** Soft completed-output-token target; in-flight parallel calls may overshoot. */
   budgetTotal?: number | null;
   runAgent: WorkflowAgentRunner;
@@ -266,32 +285,29 @@ export { parseWorkflow };
 
 // ── Minimal JSON-Schema validation (dependency-free) ─────────────────
 
-/** Strip markdown fences and extract the first balanced JSON value from free-form model text. */
+/**
+ * Parse model output as strict JSON.
+ *
+ * We only accept:
+ * - The full trimmed output if it is valid JSON, or
+ * - A fenced code block whose full content is valid JSON.
+ */
 export function extractJson(text: string): string | null {
-  let s = text.trim();
-  const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(s);
-  if (fence) s = fence[1].trim();
-  const start = s.search(/[[{]/);
-  if (start === -1) return null;
-  const open = s[start];
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  let i = start;
-  let inStr: string | null = null;
-  for (; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (c === "\\") i++;
-      else if (c === inStr) inStr = null;
-      continue;
-    }
-    if (c === '"' || c === "'") inStr = c;
-    else if (c === open) depth++;
-    else if (c === close) {
-      depth--;
-      if (depth === 0) return s.slice(start, i + 1);
+  const candidates: string[] = [];
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  if (fenced) candidates.push(fenced[1].trim());
+  candidates.push(text.trim());
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      /* invalid candidate */
     }
   }
+
   return null;
 }
 
@@ -301,6 +317,9 @@ export function validateSchema(
   schema: any,
   path = "$",
 ): string[] {
+  const schemaErrors = validateSchemaDefinition(schema, path);
+  if (schemaErrors.length > 0) return schemaErrors;
+
   if (!schema || typeof schema !== "object") return [];
   const errs: string[] = [];
   const t = schema.type as string | string[] | undefined;
@@ -367,6 +386,128 @@ export function validateSchema(
   return errs;
 }
 
+export function validateSchemaDefinition(schema: any, path = "$"): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return [`${path}: schema must be an object`];
+  }
+
+  const errs: string[] = [];
+  const allowed = new Set([
+    "type",
+    "enum",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "minItems",
+    "maxItems",
+  ]);
+
+  for (const key of Object.keys(schema)) {
+    if (allowed.has(key)) continue;
+    errs.push(`${path}: unsupported schema key "${key}"`);
+  }
+
+  const validTypes = new Set([
+    "object",
+    "array",
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "null",
+  ]);
+  if (schema.type !== undefined) {
+    if (Array.isArray(schema.type)) {
+      for (const t of schema.type) {
+        if (typeof t !== "string") {
+          errs.push(
+            `${path}.type: expected string type name, got ${jsType(t)}`,
+          );
+          continue;
+        }
+        if (!validTypes.has(t)) {
+          errs.push(`${path}.type: unsupported type "${t}"`);
+        }
+      }
+    } else if (typeof schema.type === "string") {
+      if (!validTypes.has(schema.type)) {
+        errs.push(`${path}.type: unsupported type "${schema.type}"`);
+      }
+    } else {
+      errs.push(`${path}.type: expected string or array`);
+    }
+  }
+
+  if (schema.enum !== undefined && !Array.isArray(schema.enum)) {
+    errs.push(`${path}.enum: expected array`);
+  }
+
+  if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required)) {
+      errs.push(`${path}.required: expected string array`);
+    } else if (!schema.required.every((k: unknown) => typeof k === "string")) {
+      errs.push(`${path}.required: expected string array`);
+    }
+  }
+
+  if (
+    schema.additionalProperties !== undefined &&
+    typeof schema.additionalProperties !== "boolean"
+  ) {
+    errs.push(`${path}.additionalProperties: expected boolean`);
+  }
+
+  if (
+    schema.properties !== undefined &&
+    (schema.properties === null ||
+      typeof schema.properties !== "object" ||
+      Array.isArray(schema.properties))
+  ) {
+    errs.push(`${path}.properties: expected object`);
+  }
+
+  if (typeof schema.minItems !== "undefined") {
+    if (!Number.isInteger(schema.minItems) || schema.minItems < 0) {
+      errs.push(`${path}.minItems: expected non-negative integer`);
+    }
+  }
+  if (typeof schema.maxItems !== "undefined") {
+    if (!Number.isInteger(schema.maxItems) || schema.maxItems < 0) {
+      errs.push(`${path}.maxItems: expected non-negative integer`);
+    } else if (
+      schema.minItems !== undefined &&
+      Number.isInteger(schema.minItems) &&
+      schema.maxItems < schema.minItems
+    ) {
+      errs.push(`${path}.maxItems: must be >= minItems`);
+    }
+  }
+
+  if (
+    schema.items !== undefined &&
+    (schema.items === null ||
+      typeof schema.items !== "object" ||
+      Array.isArray(schema.items))
+  ) {
+    errs.push(`${path}.items: expected object`);
+  } else if (schema.items !== undefined) {
+    errs.push(...validateSchemaDefinition(schema.items, `${path}.items`));
+  }
+
+  if (
+    schema.properties &&
+    typeof schema.properties === "object" &&
+    !Array.isArray(schema.properties)
+  ) {
+    for (const [k, sub] of Object.entries(schema.properties)) {
+      errs.push(...validateSchemaDefinition(sub, `${path}.${k}`));
+    }
+  }
+
+  return errs;
+}
+
 function matchesType(v: unknown, ty: string): boolean {
   switch (ty) {
     case "object":
@@ -384,7 +525,7 @@ function matchesType(v: unknown, ty: string): boolean {
     case "null":
       return v === null;
     default:
-      return true;
+      return false;
   }
 }
 

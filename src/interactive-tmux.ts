@@ -188,13 +188,12 @@ export interface InteractiveSubagentState {
   lifecycle?: PersistedLifecycleFold;
   /** @deprecated Legacy v1 timestamp cursor retained for API compatibility. */
   lastDeliveredEventTs?: number;
-  /**
-   * Byte offset into the child's session JSONL that we have already processed.
-   * The poller tail-reads the session file from this offset each tick and synthesizes
-   * `tool_activity` events for any new tool calls. Same at-most-once guarantee as
-   * `eventByteCursor`, with an independent cursor for the session stream.
-   */
+  /** Byte offset through which session JSONL bytes were fed to the parser. */
   lastDeliveredSessionByte?: number;
+  /** Start of the parser's current incomplete line, if one exists. */
+  sessionPartialLineStart?: number;
+  /** Persisted pre-reload cursor used once for truncation detection. */
+  sessionObservedByteCursor?: number;
   /** Most recent tool_activity summary, for the TUI widget. */
   lastToolSummary?: string;
   lastToolName?: string;
@@ -215,7 +214,8 @@ export interface InteractiveSubagentState {
   notifyOnComplete?: "notify" | "inject";
   /**
    * When true, the attributed custom completion message triggers a parent turn.
-   * Inject mode defaults to true; notify mode defaults to false.
+   * The public subagent_interactive tool defaults this to true for both modes;
+   * legacy states may retain an explicit false value.
    */
   triggerTurnOnComplete?: boolean;
   /** @deprecated Legacy v1 inject cursor retained for API compatibility. */
@@ -418,9 +418,9 @@ export function launchInteractiveSubagent(params: {
   /** Spawn in a detached named window (invisible) instead of a visible split. */
   background?: boolean;
   /**
-   * Notification delivery mode requested by the spawner. "inject" (default)
-   * persists full output and triggers a turn; "notify" persists a pointer and
-   * does not trigger unless explicitly requested.
+   * Notification delivery mode requested by the spawner. The public
+   * `subagent_interactive` tool passes `"notify"` by default; explicit callers
+   * choose `"inject"` when full output delivery is required.
    */
   notifyOnComplete?: "notify" | "inject";
   /** Whether notify-mode completion messages should trigger a parent LLM turn. */

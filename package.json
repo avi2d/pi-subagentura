@@ -5,6 +5,12 @@
   "author": "lmn451",
   "license": "MIT",
   "main": "src/subagent.ts",
+  "exports": {
+    ".": "./src/subagent.ts",
+    "./workflow": {
+      "types": "./types/workflow.d.ts"
+    }
+  },
   "type": "module",
   "keywords": [
     "pi-package",
@@ -38,6 +44,7 @@
     "examples/workflows/README.md",
     "examples/workflows/*.mjs",
     "skills/ralplan",
+    "types/workflow.d.ts",
     "src/ndjson.d.ts",
     "src/notifications.ts",
     "src/rendering.ts",
@@ -47,6 +54,7 @@
     "src/child-protocol.ts",
     "src/delivery.ts",
     "src/helpers.ts",
+    "src/orchestration-context.ts",
     "src/pi-sdk-compat.ts",
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
@@ -56,6 +64,7 @@
     "src/multiplexer-zellij.ts",
     "src/rehydrate.ts",
     "src/session-handlers.ts",
+    "src/session-context.ts",
     "src/subagent.ts",
     "src/subagent-artifact-cli.ts",
     "src/workflow.ts",
@@ -64,6 +73,7 @@
     "src/workflow-script.mjs",
     "src/workflow-script.d.mts",
     "src/workflow-worker.ts",
+    "src/workflow-structured-output.ts",
     "src/workflow-worker-thread.mjs",
     "src/workflow-jobs.ts",
     "src/workflow-ui.ts",
@@ -126,6 +136,7 @@
     "vitest": "^4.1.0"
   },
   "dependencies": {
+    "acorn": "^8.14.0",
     "is-path-inside": "^4.0.0",
     "ndjson": "^2.0.0"
   }

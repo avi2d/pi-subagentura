@@ -22,6 +22,8 @@ function makeJob(overrides: Partial<WorkflowJobState> = {}): WorkflowJobState {
       currentPhase: "Scan",
       lastMessage: "→ started scout",
       runningCount: 1,
+      agentRecords: [],
+      agentRecordsOmitted: 0,
     },
     ...overrides,
   };
@@ -52,6 +54,80 @@ describe("WorkflowTreeComponent", () => {
     const expanded = component.render(100).join("\n");
     expect(expanded).toContain("◆ phase: Scan");
     expect(expanded).toContain("→ started scout");
+  });
+
+  it("renders latest agent rows with omission count", () => {
+    workflowJobRegistry.set(
+      "wf_test",
+      makeJob({
+        snapshot: {
+          ...makeJob().snapshot,
+          phases: ["Scan"],
+          agentRecords: Array.from({ length: 50 }, (_, index) => ({
+            agentId: index + 2,
+            label: "reused",
+            model: "test/model",
+            status: "done" as const,
+          })),
+          agentRecordsOmitted: 1,
+        },
+      }),
+    );
+
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+    component.handleInput("\r");
+    const expanded = component.render(220).join("\n");
+
+    expect(expanded).toContain("… 31 older agent records omitted");
+    expect(expanded).toContain("✓ done reused #51 @test/model");
+    expect(expanded).toContain("✓ done reused #32 @test/model");
+    expect(expanded).not.toContain("reused #31");
+  });
+
+  it("shows duplicate labels with stable attempt IDs", () => {
+    workflowJobRegistry.set(
+      "wf_test",
+      makeJob({
+        snapshot: {
+          ...makeJob().snapshot,
+          phases: [],
+          agentRecords: [
+            {
+              agentId: 1,
+              label: "worker",
+              model: "m-1",
+              status: "done",
+            },
+            {
+              agentId: 2,
+              label: "worker",
+              model: "m-2",
+              status: "error",
+            },
+          ],
+          agentRecordsOmitted: 0,
+        },
+      }),
+    );
+
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+    component.handleInput("\r");
+    const expanded = component.render(220).join("\n");
+
+    expect(expanded).toContain("✓ done worker #1 @m-1");
+    expect(expanded).toContain("✗ error worker #2 @m-2");
+  });
+
+  it("handles legacy snapshots without agent records", () => {
+    const job = makeJob();
+    delete job.snapshot.agentRecords;
+    delete job.snapshot.agentRecordsOmitted;
+    workflowJobRegistry.set(job.id, job);
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+
+    component.handleInput("\r");
+
+    expect(component.render(100).join("\n")).toContain("→ started scout");
   });
 
   it("navigates, clamps, and collapses selected workflows", () => {
@@ -87,7 +163,12 @@ describe("WorkflowTreeComponent", () => {
   });
 
   it("cancels the selected running workflow with c", () => {
-    const job = makeJob();
+    const job = makeJob({
+      snapshot: {
+        ...makeJob().snapshot,
+        agentRecords: [{ agentId: 1, status: "running" }],
+      },
+    });
     const abortSpy = vi.spyOn(job.abort, "abort");
     workflowJobRegistry.set(job.id, job);
     const done = vi.fn();
@@ -98,6 +179,8 @@ describe("WorkflowTreeComponent", () => {
 
     expect(abortSpy).toHaveBeenCalledTimes(1);
     expect(job.status).toBe("cancelled");
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
     expect(notify).toHaveBeenCalledWith("Cancelled workflow wf_test.");
     expect(done).toHaveBeenCalledWith({
       kind: "cancel",
