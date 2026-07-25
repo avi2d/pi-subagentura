@@ -122,9 +122,13 @@ describe("interactive lineage path safety", () => {
     const dir = await tempDir();
     const paths = await resolveLineageStorePaths(dir, "root/with/slashes");
     const expectedHash = hashLineageRoot("root/with/slashes");
+    const canonicalDir = await fs.realpath(dir);
 
     expect(hashLineageRoot("root/with/slashes")).toBe(expectedHash);
     expect(path.basename(paths.treeDir)).toBe(expectedHash);
+    expect(paths.treeDir).toBe(
+      path.join(canonicalDir, "subagentura", "trees", expectedHash),
+    );
     expect(paths.nodesDir).toBe(path.join(paths.treeDir, "nodes"));
   });
 
@@ -133,10 +137,11 @@ describe("interactive lineage path safety", () => {
     const inside = path.join(dir, "inside");
     await fs.mkdir(inside);
     await fs.writeFile(path.join(inside, "file.txt"), "ok");
+    const canonicalInside = await fs.realpath(inside);
 
     await expect(
       safeContainedPath(dir, path.join(inside, "file.txt")),
-    ).resolves.toBe(path.join(inside, "file.txt"));
+    ).resolves.toBe(path.join(canonicalInside, "file.txt"));
     await expect(
       safeContainedPath(dir, path.join(dir, "..", "outside")),
     ).rejects.toThrow(/escapes lineage root/);
@@ -155,11 +160,14 @@ describe("interactive lineage path safety", () => {
     const inside = path.join(dir, "inside");
     await fs.mkdir(inside);
     await fs.symlink(dir, alias);
+    const canonicalInside = await fs.realpath(inside);
 
     await expect(
       safeContainedPath(alias, path.join(alias, "inside")),
-    ).resolves.toBe(inside);
-    await expect(safeContainedPath(alias, inside)).resolves.toBe(inside);
+    ).resolves.toBe(canonicalInside);
+    await expect(safeContainedPath(alias, inside)).resolves.toBe(
+      canonicalInside,
+    );
   });
 });
 

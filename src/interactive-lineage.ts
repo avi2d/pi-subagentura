@@ -166,6 +166,8 @@ export async function safeContainedPath(
   root: string,
   candidate: string,
 ): Promise<string> {
+  // Return the root's real-path form so callers get the same value whether the
+  // input used a platform alias such as macOS /var or its /private/var target.
   return resolveContainedRealPath(root, candidate);
 }
 
@@ -627,11 +629,20 @@ async function resolveContainedRealPath(
   const rootAbsolute = path.resolve(root);
   const rootReal = await fs.realpath(root);
   const candidateAbsolute = path.resolve(rootAbsolute, candidate);
-  const relative = containedRelativePath(
+  let relative = containedRelativePath(
     rootAbsolute,
     rootReal,
     candidateAbsolute,
   );
+  if (relative === undefined) {
+    try {
+      const candidateReal = await fs.realpath(candidateAbsolute);
+      relative = containedRelativePath(rootReal, rootReal, candidateReal);
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+    }
+  }
+  if (relative === undefined) throw new Error("path escapes lineage root");
   const resolved = path.resolve(rootReal, relative);
   await assertPathHasNoSymlinkEscape(rootReal, resolved);
   return resolved;
@@ -641,7 +652,7 @@ function containedRelativePath(
   rootAbsolute: string,
   rootReal: string,
   candidateAbsolute: string,
-): string {
+): string | undefined {
   for (const base of new Set([rootAbsolute, rootReal])) {
     const relative = path.relative(base, candidateAbsolute);
     if (
@@ -651,7 +662,7 @@ function containedRelativePath(
       return relative;
     }
   }
-  throw new Error("path escapes lineage root");
+  return undefined;
 }
 
 async function assertPathHasNoSymlinkEscape(
