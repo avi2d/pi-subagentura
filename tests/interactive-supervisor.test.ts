@@ -5,9 +5,12 @@ import {
   showInteractiveSupervisor,
 } from "../src/interactive-supervisor-ui";
 import {
+  captureInteractiveSubagent,
+  focusInteractiveSubagent,
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "../src/interactive-tmux";
+import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
 
 function state(
   id: string,
@@ -33,6 +36,7 @@ function state(
 
 afterEach(() => {
   interactiveSubagentRegistry.clear();
+  __resetMuxInstances();
   vi.useRealTimers();
 });
 
@@ -122,5 +126,37 @@ describe("interactive supervisor", () => {
       expect.stringContaining("only available in Pi TUI sessions"),
       "info",
     );
+  });
+
+  it("routes focus and bounded capture through the creating mux", async () => {
+    const focusPane = vi.fn().mockResolvedValue(undefined);
+    const capturePane = vi.fn().mockResolvedValue({
+      output: "recent output",
+      truncated: false,
+    });
+    __setTmuxMultiplexer({ focusPane, capturePane } as never);
+    const item = state("mux-route", {
+      paneId: "%42",
+      windowName: "agent-window",
+      muxSession: "agent-session",
+    });
+
+    await focusInteractiveSubagent(item);
+    const capture = await captureInteractiveSubagent(item, {
+      maxBytes: 1024,
+      maxLines: 20,
+    });
+
+    const paneRef = {
+      paneId: "%42",
+      windowName: "agent-window",
+      session: "agent-session",
+    };
+    expect(focusPane).toHaveBeenCalledWith(paneRef);
+    expect(capturePane).toHaveBeenCalledWith(paneRef, {
+      maxBytes: 1024,
+      maxLines: 20,
+    });
+    expect(capture.output).toBe("recent output");
   });
 });

@@ -42,10 +42,13 @@ import {
 } from "./artifact";
 import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
 import {
+  type CapturePaneOptions,
+  type CapturePaneResult,
   getMux,
   NoMultiplexerAvailableError,
   type MuxName,
   type Multiplexer,
+  type PaneRef,
 } from "./multiplexer";
 import {
   snapshotInteractiveContext,
@@ -618,6 +621,27 @@ export function launchInteractiveSubagent(params: {
  */
 function getMuxForState(state: InteractiveSubagentState): Multiplexer {
   return getMux({ preference: state.mux });
+}
+
+export function paneRefForState(state: InteractiveSubagentState): PaneRef {
+  return {
+    paneId: state.paneId,
+    windowName: state.windowName,
+    session: state.muxSession,
+  };
+}
+
+export function focusInteractiveSubagent(
+  state: InteractiveSubagentState,
+): Promise<void> {
+  return getMuxForState(state).focusPane(paneRefForState(state));
+}
+
+export function captureInteractiveSubagent(
+  state: InteractiveSubagentState,
+  options: CapturePaneOptions,
+): Promise<CapturePaneResult> {
+  return getMuxForState(state).capturePane(paneRefForState(state), options);
 }
 
 /**
