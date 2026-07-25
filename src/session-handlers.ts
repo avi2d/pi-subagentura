@@ -9,7 +9,7 @@ import { deleteInteractiveStatesFile } from "./artifact";
 import { clearSessionParsers, pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
 import { flushInProcessDeliveries } from "./notifications";
-import { jobRegistry } from "./helpers";
+import { inProcessJobBelongsToOwner, jobRegistry } from "./helpers";
 import { snapshotInProcessSession } from "./cancellation-snapshots";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
 import {
@@ -141,6 +141,12 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
         id: sessionContext.id,
         generation: sessionContext.generation,
       };
+      let shutdownSessionId: string | undefined;
+      try {
+        shutdownSessionId = ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        shutdownSessionId = undefined;
+      }
       advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
       setActiveSessionRefs(contextStack[contextStack.length - 1]);
@@ -151,7 +157,45 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       cleanupWorkflowJobsForOwner(shutdownOwner);
 
       if (!wasTop || contextStack.length > 0) {
-        // Non-top handlers belong to nested sessions; restore parent refs only.
+        const preserveInteractivePanes =
+          event?.reason === "reload" ||
+          event?.reason === "resume" ||
+          event?.reason === "quit";
+        const ownedStates = [...interactiveSubagentRegistry.values()].filter(
+          (state) => state.parentSessionId === shutdownSessionId,
+        );
+        for (const state of ownedStates) {
+          interactiveSubagentRegistry.delete(state.id);
+          if (
+            !preserveInteractivePanes &&
+            (state.status === "running" || state.status === "idle")
+          ) {
+            try {
+              cancelInteractiveSubagentByState(state);
+            } catch {
+              /* best effort */
+            }
+          }
+        }
+
+        const cancellation = {
+          source: "session_shutdown" as const,
+          initiator: shutdownSessionId,
+          reason: `session_shutdown (${event?.reason ?? "unknown"})`,
+        };
+        for (const [jobId, job] of jobRegistry.entries()) {
+          if (!inProcessJobBelongsToOwner(job, shutdownOwner)) continue;
+          if (job.status === "running") {
+            job.cancellation = { ...cancellation, at: Date.now() };
+            try {
+              if (job.abort) job.abort.abort(cancellation);
+              else void job.session.abort().catch(() => {});
+            } catch {
+              /* session may already be disposed */
+            }
+          }
+          jobRegistry.delete(jobId);
+        }
         return;
       }
 
@@ -202,15 +246,9 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
         }
       }
 
-      let shutdownInitiator: string | undefined;
-      try {
-        shutdownInitiator = ctx?.sessionManager?.getSessionId?.();
-      } catch {
-        shutdownInitiator = undefined;
-      }
       const shutdownCancellation = {
         source: "session_shutdown" as const,
-        initiator: shutdownInitiator,
+        initiator: shutdownSessionId,
         reason: `session_shutdown (${event?.reason ?? "unknown"})`,
       };
       // Snapshot all in-process jobs before any abort can wait for idle.
