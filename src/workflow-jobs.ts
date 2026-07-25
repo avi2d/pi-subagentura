@@ -4,6 +4,7 @@ import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
   type RunWorkflowOptions,
+  type WorkflowAgentRunner,
   type WorkflowAgentRecord,
   type WorkflowProgress,
   type WorkflowRunResult,
@@ -46,6 +47,8 @@ export interface WorkflowJobState {
   suppressCompletionNotification?: boolean;
   /** Receipts captured by nested agents during workflow cancellation. */
   cancellationSnapshots?: CancellationSnapshotReceipt[];
+  /** Active runner lifecycles that must drain before cancellation receipts are final. */
+  activeAgentRuns?: Set<Promise<void>>;
   /** Set when notification attempts are exhausted. Prevents re-logging. */
   _notificationExhausted?: boolean;
   /** Synchronous reentrant guard — set while the delivery callback is in flight. */
@@ -70,6 +73,25 @@ export const MAX_WORKFLOW_JOBS = 100;
 
 /** Maximum notification delivery attempts before giving up. */
 export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
+
+async function runTrackedWorkflowAgent(
+  state: WorkflowJobState,
+  runner: WorkflowAgentRunner,
+  request: Parameters<WorkflowAgentRunner>[0],
+): Promise<Awaited<ReturnType<WorkflowAgentRunner>>> {
+  let release!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const activeRuns = (state.activeAgentRuns ??= new Set());
+  activeRuns.add(settled);
+  try {
+    return await runner(request);
+  } finally {
+    activeRuns.delete(settled);
+    release();
+  }
+}
 
 /** Start a workflow running in the background. Returns the job id immediately. */
 export function startWorkflowJob(
@@ -122,9 +144,12 @@ export function startWorkflowJob(
     completionNotification: onComplete,
     completionNotificationDelivered: false,
     cancellationSnapshots: [],
+    activeAgentRuns: new Set(),
   };
   state.promise = runWorkflow(script, {
     ...opts,
+    runAgent: (request) =>
+      runTrackedWorkflowAgent(state, opts.runAgent, request),
     signal: abort.signal,
     onProgress: (p) => {
       state.snapshot.agentsSpawned = p.agentsSpawned;

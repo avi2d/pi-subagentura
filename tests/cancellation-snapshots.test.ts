@@ -15,7 +15,7 @@ import { registerInProcessSubagentTools } from "../src/tools/in-process";
 import { cancelAllFlows } from "../src/cancel-all-flows";
 import { registerSessionHandlers } from "../src/session-handlers";
 import { registerWorkflowTool } from "../src/workflow-tool";
-import { workflowJobRegistry } from "../src/workflow-jobs";
+import { startWorkflowJob, workflowJobRegistry } from "../src/workflow-jobs";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -381,7 +381,10 @@ describe("cancellation snapshots", () => {
         tools[tool.name] = tool;
       },
     } as any);
-    const controller = new AbortController();
+    let markAgentEntered!: () => void;
+    const agentEntered = new Promise<void>((resolve) => {
+      markAgentEntered = resolve;
+    });
     const receipt: CancellationSnapshotReceipt = {
       schemaVersion: 1,
       kind: "interactive",
@@ -391,37 +394,50 @@ describe("cancellation snapshots", () => {
       key: "async-workflow-receipt",
       path: "/private/async-workflow-snapshot.json",
     };
-    const state: any = {
-      id: "wf_snapshot_wait",
-      name: "snapshot-wait",
-      status: "running",
-      abort: controller,
-      cancellationSnapshots: [],
-      snapshot: { agentsSpawned: 1, runningCount: 1 },
-    };
-    state.promise = new Promise((_resolve, reject) => {
-      controller.signal.addEventListener(
-        "abort",
-        () => {
-          setTimeout(() => {
-            state.cancellationSnapshots.push(receipt);
-            reject(new Error("Workflow aborted."));
-          }, 0);
+    const state = startWorkflowJob(
+      "snapshot-wait",
+      'export const meta = { name: "snapshot-wait", description: "test" }; return await agent("work");',
+      {
+        runAgent: async ({ signal, onCancellationSnapshot }) => {
+          markAgentEntered();
+          return new Promise<never>((_resolve, reject) => {
+            const abort = () => {
+              setTimeout(() => {
+                onCancellationSnapshot?.(receipt);
+                reject(new Error("Workflow aborted."));
+              }, 25);
+            };
+            if (signal?.aborted) abort();
+            else signal?.addEventListener("abort", abort, { once: true });
+          });
         },
-        { once: true },
-      );
-    });
-    workflowJobRegistry.set(state.id, state);
+      },
+    );
+    await agentEntered;
+    const settlement = state.promise.catch((error: unknown) => error);
 
-    const result = await tools.cancel_workflow.execute(
+    const firstCancellation = tools.cancel_workflow.execute(
       "cancel-call",
       { workflowId: state.id },
       undefined,
       undefined,
     );
-    await expect(state.promise).rejects.toThrow("Workflow aborted");
+    const concurrentCancellation = tools.cancel_workflow.execute(
+      "concurrent-cancel-call",
+      { workflowId: state.id },
+      undefined,
+      undefined,
+    );
+    const [result, concurrentResult] = await Promise.all([
+      firstCancellation,
+      concurrentCancellation,
+    ]);
+    await expect(settlement).resolves.toMatchObject({
+      message: "Workflow aborted.",
+    });
 
     expect(result.details.snapshots).toContainEqual(receipt);
+    expect(concurrentResult.details.snapshots).toContainEqual(receipt);
   });
 
   it("snapshots in-process jobs before session shutdown aborts them", async () => {

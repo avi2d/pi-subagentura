@@ -61,15 +61,14 @@ async function waitForCancellationReceipts(
   state: WorkflowJobState,
 ): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const settled = state.promise.then(
-    () => undefined,
-    () => undefined,
-  );
+  const pendingRuns = [...(state.activeAgentRuns ?? [])];
+  if (pendingRuns.length === 0) return;
+
   const grace = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, CANCELLATION_RECEIPT_GRACE_MS);
   });
   try {
-    await Promise.race([settled, grace]);
+    await Promise.race([Promise.all(pendingRuns).then(() => undefined), grace]);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -691,7 +690,10 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
         };
       }
       if (st.status === "cancelled") {
-        normalizeCancelledWorkflowState(st);
+        if (cancellationSnapshotsEnabled()) {
+          await waitForCancellationReceipts(st);
+          normalizeCancelledWorkflowState(st);
+        }
         return {
           content: [
             { type: "text", text: `Workflow ${st.id} is already cancelled.` },
@@ -700,6 +702,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
             status: "cancelled",
             workflowId: st.id,
             cancelled: true,
+            snapshots: [...(st.cancellationSnapshots ?? [])],
           },
         };
       }
