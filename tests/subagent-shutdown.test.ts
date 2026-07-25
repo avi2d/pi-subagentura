@@ -29,6 +29,7 @@ import { jobRegistry } from "../src/helpers";
 import { workflowJobRegistry } from "../src/workflow";
 import registerExtension, { pollArtifactChanges } from "../src/subagent";
 import { __setTmuxMultiplexer } from "../src/multiplexer";
+import { getActiveSessionContextToken } from "../src/session-context";
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -271,9 +272,11 @@ describe("session_shutdown handler", () => {
         phases: [],
       },
     };
-    workflowJobRegistry.set(workflow.id, workflow);
-
     const { shutdownHandler } = setupExtension();
+    Object.assign(workflow, {
+      parentSessionOwner: getActiveSessionContextToken(),
+    });
+    workflowJobRegistry.set(workflow.id, workflow);
     shutdownHandler!();
 
     expect(abortSpy).toHaveBeenCalledTimes(1);
