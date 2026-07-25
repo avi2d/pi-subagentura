@@ -81,6 +81,7 @@ These commands are intended for people at the Pi prompt.
 | `/list-workflows`   | Alias for `/workflows`                                            |
 | `/workflow-status`  | List workflow jobs and their live or terminal status              |
 | `/workflow-tree`    | Open the interactive workflow progress tree                       |
+| `/subagents`        | Open the interactive sub-agent supervisor (`Ctrl+Alt+A`)          |
 | `/delete-workflow`  | Delete a saved workflow by name or picker                         |
 | `/cancel-all-flows` | Cancel active jobs, workflows, and running interactive sub-agents |
 

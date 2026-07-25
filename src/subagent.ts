@@ -31,6 +31,7 @@ import {
 } from "./helpers";
 import { registerWorkflowTool } from "./workflow";
 import {
+  registerInteractiveChildMaintenanceTools,
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
 } from "./tools/in-process";
@@ -39,6 +40,7 @@ import { registerSessionHandlers } from "./session-handlers";
 import { registerChildProtocol } from "./child-protocol";
 import { registerCancelAllFlows } from "./cancel-all-flows-registration";
 import { renderSubagentNotify } from "./rendering";
+import { registerInteractiveSupervisor } from "./interactive-supervisor-registration";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
 /**
@@ -84,6 +86,13 @@ const ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENTURA_CHILD === "1") {
     registerChildProtocol(pi);
+    if (typeof pi.registerMessageRenderer === "function") {
+      pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
+    }
+    registerSessionHandlers(pi);
+    registerInteractiveSubagentTools(pi);
+    registerInteractiveChildMaintenanceTools(pi);
+    registerInteractiveSupervisor(pi);
     return;
   }
   if (typeof pi.registerMessageRenderer !== "function") {
@@ -108,6 +117,7 @@ export default function (pi: ExtensionAPI) {
   registerInProcessSubagentTools(pi);
   registerInteractiveSubagentTools(pi);
   registerInProcessMaintenanceTools(pi);
+  registerInteractiveSupervisor(pi);
 
   // ── Cancel-all-flows shortcut and command ──────────────────────
   registerCancelAllFlows(pi, sessionContext);

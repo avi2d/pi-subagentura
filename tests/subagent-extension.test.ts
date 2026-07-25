@@ -6,6 +6,8 @@ function mockApi(overrides: Record<string, any> = {}) {
     registerTool: vi.fn(),
     registerMessageRenderer: vi.fn(),
     registerFlag: vi.fn(),
+    registerCommand: vi.fn(),
+    registerShortcut: vi.fn(),
     getFlag: vi.fn().mockReturnValue(false),
     on: vi.fn(),
     ...overrides,
@@ -51,6 +53,14 @@ describe("extension registration", () => {
         "workflow",
       ].sort(),
     );
+    expect(api.registerCommand).toHaveBeenCalledWith(
+      "subagents",
+      expect.any(Object),
+    );
+    expect(api.registerShortcut).toHaveBeenCalledWith(
+      "ctrl+alt+a",
+      expect.any(Object),
+    );
   });
 
   it("registers the --orchestrator flag", () => {
@@ -79,7 +89,7 @@ describe("extension registration", () => {
     expect(result.systemPrompt.startsWith("base prompt\n\n")).toBe(true);
   });
 
-  it("registers only protocol hooks in child mode", () => {
+  it("registers a minimal interactive runtime in child mode", () => {
     const previous = process.env.PI_SUBAGENTURA_CHILD;
     const previousArtifactDir = process.env.ARTIFACT_DIR;
     process.env.PI_SUBAGENTURA_CHILD = "1";
@@ -87,6 +97,8 @@ describe("extension registration", () => {
     const api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerCommand: vi.fn(),
+      registerShortcut: vi.fn(),
       on: vi.fn(),
     };
 
@@ -99,16 +111,47 @@ describe("extension registration", () => {
       else process.env.ARTIFACT_DIR = previousArtifactDir;
     }
 
-    expect(api.registerTool).not.toHaveBeenCalled();
-    expect(api.registerMessageRenderer).not.toHaveBeenCalled();
-    expect(api.on.mock.calls.map(([event]) => event)).toEqual([
-      "before_agent_start",
-      "turn_start",
-      "before_provider_request",
-      "tool_execution_start",
-      "tool_execution_end",
-      "agent_end",
-      "agent_settled",
-    ]);
+    const names = api.registerTool.mock.calls
+      .map(([tool]: any[]) => tool.name)
+      .sort();
+    expect(names).toEqual(
+      [
+        "cancel_interactive_subagent",
+        "cleanup_subagent_artifacts",
+        "get_interactive_subagent_status",
+        "list_available_models",
+        "list_subagent_artifacts",
+        "read_subagent_artifact",
+        "send_interactive_subagent_message",
+        "subagent_interactive",
+      ].sort(),
+    );
+    expect(names).not.toContain("workflow");
+    expect(names).not.toContain("subagent_with_context");
+    expect(api.registerMessageRenderer).toHaveBeenCalledWith(
+      "subagent-notify",
+      expect.any(Function),
+    );
+    expect(api.registerCommand).toHaveBeenCalledWith(
+      "subagents",
+      expect.any(Object),
+    );
+    expect(api.registerShortcut).toHaveBeenCalledWith(
+      "ctrl+alt+a",
+      expect.any(Object),
+    );
+    expect(api.on.mock.calls.map(([event]) => event)).toEqual(
+      expect.arrayContaining([
+        "before_agent_start",
+        "turn_start",
+        "before_provider_request",
+        "tool_execution_start",
+        "tool_execution_end",
+        "agent_end",
+        "agent_settled",
+        "session_start",
+        "session_shutdown",
+      ]),
+    );
   });
 });

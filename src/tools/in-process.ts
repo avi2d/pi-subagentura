@@ -1402,3 +1402,10 @@ export function registerInProcessMaintenanceTools(pi: ExtensionAPI): void {
   registerPruneSubagentJobsTool(pi);
   registerCleanupArtifactsTool(pi);
 }
+
+export function registerInteractiveChildMaintenanceTools(
+  pi: ExtensionAPI,
+): void {
+  registerListAvailableModelsTool(pi);
+  registerCleanupArtifactsTool(pi);
+}

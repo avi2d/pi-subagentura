@@ -59,6 +59,8 @@
     "src/tools/in-process.ts",
     "src/tools/interactive.ts",
     "src/interactive-tmux.ts",
+    "src/interactive-supervisor-registration.ts",
+    "src/interactive-supervisor-ui.ts",
     "src/multiplexer.ts",
     "src/multiplexer-tmux.ts",
     "src/multiplexer-zellij.ts",

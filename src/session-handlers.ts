@@ -28,6 +28,7 @@ import {
   type ActiveSessionContextToken,
   type SessionContextRef,
 } from "./session-context";
+import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -95,6 +96,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
   });
 
   pi.on("session_shutdown", () => {
+    closeActiveInteractiveSupervisor();
     // Don't null the ui ref here — the poller may still fire one last tick on shutdown,
     // and stale ctx errors are already caught at the call sites.
   });
