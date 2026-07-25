@@ -1180,11 +1180,11 @@ export function formatInteractiveState(
   ];
   if (state.windowName) lines.push(`Window: ${state.windowName}`);
   if (state.exitCode !== undefined) lines.push(`Exit code: ${state.exitCode}`);
-  lines.push(
-    `Artifact: ${state.artifactDir}`,
-    `Session: ${state.sessionFile}`,
-    `Attach: ${state.attachCommand}`,
-    `Focus: ${state.selectPaneCommand}`,
-  );
+  lines.push(`Artifact: ${state.artifactDir}`);
+  if (!(state.mux === "tmux" && process.env.TMUX)) {
+    lines.push(`Attach: ${state.attachCommand}`);
+  }
+  lines.push(`Focus: ${state.selectPaneCommand}`);
+  lines.push(`Session: ${state.sessionFile}`);
   return lines.join("\n");
 }

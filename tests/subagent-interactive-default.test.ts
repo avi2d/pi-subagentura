@@ -26,7 +26,12 @@ vi.mock("../src/interactive-tmux", async (importOriginal) => {
 });
 
 import registerExtension from "../src/subagent";
-import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import {
+  formatInteractiveState,
+  interactiveSubagentRegistry,
+} from "../src/interactive-tmux";
+
+const savedTmux = process.env.TMUX;
 
 /** Minimal ctx for the tool's execute signature. */
 function mockCtx() {
@@ -112,6 +117,61 @@ describe("subagent_interactive tool lifecycle", () => {
   afterEach(() => {
     interactiveSubagentRegistry.clear();
     vi.clearAllMocks();
+    if (savedTmux === undefined) delete process.env.TMUX;
+    else process.env.TMUX = savedTmux;
+  });
+
+  it("shows focus instead of nested attach guidance inside tmux", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    process.env.TMUX = "/tmp/tmux.sock,1,0";
+
+    const insideResult = await toolDef.execute(
+      "call-inside-tmux",
+      { task: "research X" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(insideResult.content[0].text).not.toContain("Attach: tmux attach");
+    expect(insideResult.content[0].text).toContain("Focus: tmux select-pane");
+    const insideStatus = formatInteractiveState(mockInteractiveState() as any);
+    expect(insideStatus).not.toContain("Attach: tmux attach");
+    expect(insideStatus).toContain("Focus: tmux select-pane");
+
+    delete process.env.TMUX;
+    const outsideResult = await toolDef.execute(
+      "call-outside-tmux",
+      { task: "research X" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(outsideResult.content[0].text).toContain("Attach: tmux attach");
+    expect(formatInteractiveState(mockInteractiveState() as any)).toContain(
+      "Attach: tmux attach",
+    );
+
+    process.env.TMUX = "/tmp/tmux.sock,1,0";
+    const zellijState = {
+      ...mockInteractiveState(),
+      mux: "zellij",
+      attachCommand: "zellij attach child-session",
+      selectPaneCommand: "zellij action focus-pane --pane-id 42",
+    };
+    mockLaunchInteractiveSubagent.mockReturnValueOnce(zellijState);
+    const zellijResult = await toolDef.execute(
+      "call-zellij",
+      { task: "research X" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(zellijResult.content[0].text).toContain(
+      "Attach: zellij attach child-session",
+    );
+    expect(formatInteractiveState(zellijState as any)).toContain(
+      "Attach: zellij attach child-session",
+    );
   });
 
   it("defaults to notify + automatic triggering when both params are omitted", async () => {

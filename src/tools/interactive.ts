@@ -179,6 +179,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
         const displayMode = state.windowName
           ? "background (new window/tab)"
           : "visible split";
+        const locationLines = [`Artifact: ${state.artifactDir}`];
+        if (!(state.mux === "tmux" && process.env.TMUX)) {
+          locationLines.push(`Attach: ${state.attachCommand}`);
+        }
+        locationLines.push(`Focus: ${state.selectPaneCommand}`);
+        locationLines.push(`Session: ${state.sessionFile}`);
         return {
           content: [
             {
@@ -186,7 +192,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
               text:
                 `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
                 `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
-                `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+                locationLines.join("\n"),
             },
           ],
           details: {

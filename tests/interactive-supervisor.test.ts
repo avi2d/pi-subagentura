@@ -17,6 +17,7 @@ import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
 import { registerInteractiveSupervisor } from "../src/interactive-supervisor-registration";
 
 const tempDirs: string[] = [];
+const savedTmux = process.env.TMUX;
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "interactive-supervisor-"));
@@ -50,6 +51,8 @@ afterEach(() => {
   interactiveSubagentRegistry.clear();
   __resetMuxInstances();
   vi.useRealTimers();
+  if (savedTmux === undefined) delete process.env.TMUX;
+  else process.env.TMUX = savedTmux;
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -135,6 +138,37 @@ describe("interactive supervisor", () => {
     expect(rendered).toContain(
       "Output preview: Completed the recursive artifact inspection.",
     );
+  });
+
+  it("prefers focus inside tmux while preserving attach elsewhere", () => {
+    const renderDetails = (item: InteractiveSubagentState): string => {
+      interactiveSubagentRegistry.clear();
+      interactiveSubagentRegistry.set(item.id, item);
+      const component = new InteractiveSupervisorComponent({ done: vi.fn() });
+      component.handleInput("\r");
+      return component.render(160).join("\n");
+    };
+
+    process.env.TMUX = "/tmp/tmux.sock,1,0";
+    const insideTmux = renderDetails(state("inside-tmux"));
+    expect(insideTmux).not.toContain("Attach: tmux attach");
+    expect(insideTmux).toContain("Focus: tmux select-pane");
+
+    delete process.env.TMUX;
+    const outsideTmux = renderDetails(state("outside-tmux"));
+    expect(outsideTmux).toContain("Attach: tmux attach");
+    expect(outsideTmux).toContain("Focus: tmux select-pane");
+
+    process.env.TMUX = "/tmp/tmux.sock,1,0";
+    const zellij = renderDetails(
+      state("zellij", {
+        mux: "zellij",
+        attachCommand: "zellij attach child-session",
+        selectPaneCommand: "zellij action focus-pane --pane-id 42",
+      }),
+    );
+    expect(zellij).toContain("Attach: zellij attach child-session");
+    expect(zellij).toContain("Focus: zellij action focus-pane");
   });
 
   it("uses the direct cancellation path only for x", () => {

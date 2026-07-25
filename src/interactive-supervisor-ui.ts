@@ -353,8 +353,11 @@ function formatDetails(
     `Lifecycle: ${artifactDetails.lifecycle}`,
     `Recent events: ${artifactDetails.events}`,
     `Output preview: ${artifactDetails.output}`,
-    `Attach: ${state.attachCommand}`,
   ];
+  if (!(state.mux === "tmux" && process.env.TMUX)) {
+    fields.push(`Attach: ${state.attachCommand}`);
+  }
+  fields.push(`Focus: ${state.selectPaneCommand}`);
   return fields.map((field) => trunc(`│     ${field}`, width));
 }
 
