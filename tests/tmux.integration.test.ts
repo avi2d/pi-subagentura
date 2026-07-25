@@ -10,13 +10,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
   launchInteractiveSubagent,
   sendCommandToPane,
 } from "../src/interactive-tmux";
+import {
+  projectLineageStore,
+  resolveLineageStorePaths,
+} from "../src/interactive-lineage";
 import { __resetMuxInstances } from "../src/multiplexer";
 
 const socket =
@@ -30,6 +34,9 @@ const savedEnv = {
   ZELLIJ_SESSION_NAME: process.env.ZELLIJ_SESSION_NAME,
   PI_SUBAGENTURA_TMUX_SOCKET: process.env.PI_SUBAGENTURA_TMUX_SOCKET,
   PI_CODING_AGENT_SESSION_DIR: process.env.PI_CODING_AGENT_SESSION_DIR,
+  PI_SUBAGENTURA_AGENT_ID: process.env.PI_SUBAGENTURA_AGENT_ID,
+  PI_SUBAGENTURA_ROOT_ID: process.env.PI_SUBAGENTURA_ROOT_ID,
+  PI_SUBAGENTURA_DEPTH: process.env.PI_SUBAGENTURA_DEPTH,
   ZDOTDIR: process.env.ZDOTDIR,
 };
 
@@ -127,6 +134,9 @@ afterEach(() => {
   restoreEnv("ZELLIJ_SESSION_NAME");
   restoreEnv("PI_SUBAGENTURA_TMUX_SOCKET");
   restoreEnv("PI_CODING_AGENT_SESSION_DIR");
+  restoreEnv("PI_SUBAGENTURA_AGENT_ID");
+  restoreEnv("PI_SUBAGENTURA_ROOT_ID");
+  restoreEnv("PI_SUBAGENTURA_DEPTH");
   restoreEnv("ZDOTDIR");
 
   rmSync(tempRoot, {
@@ -215,4 +225,54 @@ test("cancel writes the cancellation marker and kills the tmux pane", async () =
 
   expect(cancelled?.status).toBe("cancelled");
   expect(existsSync(join(state.artifactDir, ".cancelled"))).toBe(true);
+});
+
+test("launches and projects a recursive child hierarchy across cwd values", async () => {
+  const childCwd = mkdtempSync(join(tempRoot, "child-workspace-"));
+  const grandchildCwd = mkdtempSync(join(tempRoot, "grandchild-workspace-"));
+  const rootId = "tmux-recursive-root";
+  process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
+  delete process.env.PI_SUBAGENTURA_AGENT_ID;
+  delete process.env.PI_SUBAGENTURA_DEPTH;
+
+  const child = launchInteractiveSubagent({
+    name: "Recursive child",
+    task: "spawn a nested child",
+    cwd: childCwd,
+    parentSessionId: "root-owner",
+    muxPreference: "tmux",
+    background: true,
+  });
+  process.env.PI_SUBAGENTURA_AGENT_ID = child.id;
+  process.env.PI_SUBAGENTURA_DEPTH = "1";
+  const grandchild = launchInteractiveSubagent({
+    name: "Recursive grandchild",
+    task: "nested fake work",
+    cwd: grandchildCwd,
+    parentSessionId: "child-owner",
+    muxPreference: "tmux",
+    background: true,
+  });
+
+  const paths = await resolveLineageStorePaths(
+    process.env.PI_CODING_AGENT_SESSION_DIR!,
+    rootId,
+  );
+  const projection = await projectLineageStore(
+    paths.nodesDir,
+    basename(paths.treeDir),
+    () => false,
+  );
+
+  expect(projection.roots.map((node) => node.manifest.agentId)).toEqual([
+    child.id,
+  ]);
+  expect(projection.roots[0]?.manifest.cwd).toBe(childCwd);
+  expect(
+    projection.roots[0]?.children.map((node) => node.manifest.agentId),
+  ).toEqual([grandchild.id]);
+  expect(projection.roots[0]?.children[0]?.manifest.cwd).toBe(grandchildCwd);
+
+  cancelInteractiveSubagent(grandchild.id);
+  cancelInteractiveSubagent(child.id);
 });

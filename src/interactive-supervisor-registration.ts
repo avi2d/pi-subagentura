@@ -8,7 +8,7 @@ import {
 } from "./interactive-supervisor-ui";
 import {
   cancelInteractiveSubagent,
-  cancelInteractiveSubagentByState,
+  cancelInteractiveDescendantByState,
   captureInteractiveSubagent,
   focusInteractiveSubagent,
   interactiveSubagentRegistry,
@@ -180,7 +180,7 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
           (candidate) => candidate.state.id === id,
         );
         if (!item?.actionable) return undefined;
-        cancelInteractiveSubagentByState(item.state);
+        cancelInteractiveDescendantByState(item.state);
         return item.state;
       },
       cancelSubtree: async (state) => {
@@ -207,7 +207,7 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
           cancel: async (node) => {
             const nodeState = stateForNode(node);
             if (!cancelInteractiveSubagent(nodeState.id)) {
-              cancelInteractiveSubagentByState(nodeState);
+              cancelInteractiveDescendantByState(nodeState);
             }
           },
         });

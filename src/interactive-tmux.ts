@@ -873,7 +873,10 @@ export function cancelInteractiveSubagent(
   return state;
 }
 
-function appendCancellation(state: InteractiveSubagentState): void {
+function appendCancellation(
+  state: InteractiveSubagentState,
+  acknowledgeDelivery = true,
+): void {
   let turnId = "process";
   try {
     const active = JSON.parse(
@@ -901,6 +904,7 @@ function appendCancellation(state: InteractiveSubagentState): void {
     });
   }
   if (!completion) return;
+  if (!acknowledgeDelivery) return;
   const mode = state.notifyOnComplete ?? "inject";
   const deliveryId = deliveryIdFor({
     parentSessionId: state.parentSessionId ?? "pi",
@@ -912,6 +916,38 @@ function appendCancellation(state: InteractiveSubagentState): void {
   // transition already accounts for it. Persist a synthetic receipt before pane
   // teardown so polling or rehydrate cannot inject a duplicate completion.
   acknowledgeDeliveryWithoutDispatch(state, deliveryId);
+}
+
+/**
+ * Cancel a persisted descendant without claiming its completion in the root
+ * session. The descendant's owning Pi process remains responsible for polling
+ * the durable completion and delivering it to its own session.
+ */
+export function cancelInteractiveDescendantByState(
+  state: InteractiveSubagentState,
+): InteractiveSubagentState {
+  state.cancellationSnapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source: "cancel_interactive_subagent",
+  });
+  try {
+    writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
+  } catch {
+    /* best effort; the owner will reconcile the durable pane state */
+  }
+  appendCancellation(state, false);
+  state.status = "cancelled";
+  const mux = getMuxForState(state);
+  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+    mux.killPane(state.paneId, state.muxSession);
+  }
+  return state;
 }
 
 /**
