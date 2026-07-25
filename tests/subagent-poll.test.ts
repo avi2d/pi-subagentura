@@ -151,6 +151,54 @@ describe("pollArtifactChanges", () => {
     expect(wrongSendMessage).not.toHaveBeenCalled();
   });
 
+  it("does not coalesce concurrent polls from different owners", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const a = makeState();
+    const b = makeState();
+    a.state.parentSessionId = "session-a";
+    a.state.paneId = "%a";
+    b.state.parentSessionId = "session-b";
+    b.state.paneId = "%b";
+    for (const item of [a, b]) {
+      item.state.cwd = join(item.artifactDir, "..");
+      const art = artifactPath(item.state.cwd, item.id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+    }
+    const ownerA = { id: 501, generation: 1 };
+    const ownerB = { id: 502, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    let releaseA!: () => void;
+    const blockedA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: (paneId: string) =>
+        paneId === "%a" ? blockedA.then(() => true) : Promise.resolve(true),
+    } as any);
+
+    const pollA = mod.pollArtifactChanges({} as any, ownerA);
+    await Promise.resolve();
+    const pollB = mod.pollArtifactChanges({} as any, ownerB);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const bProcessedWhileAWasBlocked = (b.state.eventByteCursor ?? 0) > 0;
+    releaseA();
+    await Promise.all([pollA, pollB]);
+
+    expect(bProcessedWhileAWasBlocked).toBe(true);
+  });
+
   it("keeps running in-process jobs in the shared footer", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1416,6 +1464,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     g.__piSubagenturaInteractiveRegistry?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaSessionManager = undefined;
+    getSessionContextStack().length = 0;
   });
 
   function makePersistedState(): {
@@ -1451,6 +1500,32 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     });
     return { id, cwd, state };
   }
+
+  it("does not remove another owner's persisted terminal state", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const { cwd, id, state } = makePersistedState();
+    state.parentSessionId = "session-b";
+    state.status = "exited";
+    mod.interactiveSubagentRegistry.set(id, state);
+    const ownerA = { id: 601, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
+    });
+    registerSessionContext({
+      id: 602,
+      generation: 1,
+      pi: { sendMessage: vi.fn() } as any,
+      sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
+    });
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+
+    await mod.pollArtifactChanges({} as any, ownerA);
+
+    expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
+  });
 
   it("keeps terminal state until the custom-message receipt is visible", async () => {
     vi.resetModules();

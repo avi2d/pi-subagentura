@@ -7,6 +7,8 @@ import { interactiveSubagentRegistry } from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
 import { updateRunningSubagentFooter } from "../src/artifact-poller";
 import { workflowJobRegistry } from "../src/workflow-jobs";
+import { appendEvent, artifactPath } from "../src/artifact";
+import { __setTmuxMultiplexer } from "../src/multiplexer";
 
 function registerHandlers() {
   const handlers = new Map<string, Function[]>();
@@ -51,6 +53,7 @@ describe("session handler lifecycle callbacks", () => {
     jobRegistry.clear();
     workflowJobRegistry.clear();
     interactiveSubagentRegistry.clear();
+    __setTmuxMultiplexer(undefined);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -203,5 +206,53 @@ describe("session handler lifecycle callbacks", () => {
       "subagentura-running",
       "⚡ 1 sub-agent active",
     );
+  });
+
+  it("polls every live owner from the single global interval", async () => {
+    const parent = registerHandlers();
+    const child = registerHandlers();
+    const parentManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    const childManager = {
+      getSessionId: () => "child-session",
+      getEntries: () => [],
+    };
+    parent.handlers.get("session_start")![0](
+      { reason: "startup" },
+      { cwd: root, ui: {}, sessionManager: parentManager },
+    );
+    child.handlers.get("session_start")![0](
+      { reason: "startup" },
+      { cwd: root, ui: {}, sessionManager: childManager },
+    );
+    const makeState = (id: string, parentSessionId: string) => {
+      const art = artifactPath(root, id);
+      appendEvent(art, { ts: 1, type: "started", status: "running" });
+      return {
+        id,
+        paneId: `%${id}`,
+        cwd: root,
+        artifactDir: art.dir,
+        sessionFile: join(root, `${id}.jsonl`),
+        startedAt: Date.now(),
+        mux: "tmux",
+        status: "running",
+        parentSessionId,
+      } as any;
+    };
+    const parentState = makeState("parent-agent", "parent-session");
+    const childState = makeState("child-agent", "child-session");
+    interactiveSubagentRegistry.set(parentState.id, parentState);
+    interactiveSubagentRegistry.set(childState.id, childState);
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(parentState.eventByteCursor).toBeGreaterThan(0);
+    expect(childState.eventByteCursor).toBeGreaterThan(0);
   });
 });

@@ -105,12 +105,14 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
   // The poller survives parent restarts through persisted artifacts and byte cursors.
   if (!g2.__piSubagenturaInteractivePollerHandle) {
     const handle = setInterval(() => {
-      void pollArtifactChanges(pi, {
-        id: sessionContext.id,
-        generation: sessionContext.generation,
-      }).catch((err) => {
-        console.error("[subagentura] artifact poll failed", err);
-      });
+      for (const context of [...getSessionContextStack()]) {
+        void pollArtifactChanges(context.pi, {
+          id: context.id,
+          generation: context.generation,
+        }).catch((err) => {
+          console.error("[subagentura] artifact poll failed", err);
+        });
+      }
     }, 5000);
     // Don't pin the event loop on a long-lived parent. unref() lets the process exit
     // cleanly when nothing else is keeping it alive (no other ref'd handles).

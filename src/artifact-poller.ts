@@ -118,8 +118,12 @@ function deliveryMessageFromEvent(ev: CompletionEvent): string | undefined {
   return ev.outputError?.message;
 }
 
-let pollInFlight: Promise<void> | undefined;
+const pollsInFlight = new Map<string, Promise<void>>();
 // ── Poller ─────────────────────────────────────────────────────────────
+
+function pollOwnerKey(owner: ActiveSessionContextToken | undefined): string {
+  return owner ? `${owner.id}:${owner.generation}` : "unscoped";
+}
 
 /**
  * Poll the artifact directory of every running interactive sub-agent and fire a
@@ -132,11 +136,13 @@ export function pollArtifactChanges(
   pi: ExtensionAPI,
   owner?: ActiveSessionContextToken,
 ): Promise<void> {
-  if (pollInFlight) return pollInFlight;
+  const key = pollOwnerKey(owner);
+  const inFlight = pollsInFlight.get(key);
+  if (inFlight) return inFlight;
   const poll = runPollArtifactChanges(pi, owner);
-  pollInFlight = poll;
+  pollsInFlight.set(key, poll);
   return poll.finally(() => {
-    if (pollInFlight === poll) pollInFlight = undefined;
+    if (pollsInFlight.get(key) === poll) pollsInFlight.delete(key);
   });
 }
 
@@ -310,7 +316,8 @@ async function runPollArtifactChanges(
       }
     }
     flushDeliveries(interactivePi, ui, owner);
-    for (const state of interactiveSubagentRegistry.values()) {
+    for (const state of states) {
+      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       const terminal =
         state.status === "cancelled" ||
         state.status === "exited" ||
