@@ -29,6 +29,8 @@ describe("multiplexer-zellij", () => {
 
   afterEach(() => {
     vi.doUnmock("node:child_process");
+    delete process.env.ZELLIJ;
+    delete process.env.ZELLIJ_SESSION_NAME;
   });
 
   /* ------------------------------------------------------------------ */
@@ -515,8 +517,44 @@ describe("multiplexer-zellij", () => {
     expect(new ZellijMultiplexer().capabilities).toEqual({
       structuredFocus: true,
       boundedCapture: true,
-      nativeOverlay: false,
+      nativeOverlay: true,
     });
+  });
+
+  it("opens a floating native viewer only when attached to zellij", async () => {
+    process.env.ZELLIJ = "0";
+    process.env.ZELLIJ_SESSION_NAME = "main";
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      return "";
+    });
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    await expect(
+      new ZellijMultiplexer().showNativeViewer("Agent", "bounded output"),
+    ).resolves.toBe(true);
+    expect(calls[0]).toEqual(
+      expect.arrayContaining([
+        "--session",
+        "main",
+        "new-pane",
+        "--floating",
+        "Agent",
+      ]),
+    );
+  });
+
+  it("declines native floating presentation outside zellij", async () => {
+    delete process.env.ZELLIJ;
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+    await expect(
+      new ZellijMultiplexer().showNativeViewer("Agent", "output"),
+    ).resolves.toBe(false);
   });
 
   it("focusPane targets the supplied session and background tab", async () => {

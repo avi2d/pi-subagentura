@@ -624,8 +624,36 @@ describe("multiplexer-tmux", () => {
     expect(new TmuxMultiplexer().capabilities).toEqual({
       structuredFocus: true,
       boundedCapture: true,
-      nativeOverlay: false,
+      nativeOverlay: true,
     });
+  });
+
+  it("opens a transient native popup only when attached to tmux", async () => {
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const calls: string[][] = [];
+    installMockExec((args) => {
+      calls.push(args);
+      return "";
+    });
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().showNativeViewer("Agent", "bounded output"),
+    ).resolves.toBe(true);
+    expect(calls[0]).toContain("display-popup");
+    expect(calls[0]).toContain("Agent");
+  });
+
+  it("declines native popup presentation outside tmux", async () => {
+    delete process.env.TMUX;
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    await expect(
+      new TmuxMultiplexer().showNativeViewer("Agent", "output"),
+    ).resolves.toBe(false);
   });
 
   it("focusPane selects a background window from PaneRef without building attach strings", async () => {

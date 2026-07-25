@@ -88,7 +88,7 @@ export class ZellijMultiplexer implements Multiplexer {
   readonly capabilities = {
     structuredFocus: true,
     boundedCapture: true,
-    nativeOverlay: false,
+    nativeOverlay: true,
   } as const;
 
   /**
@@ -436,6 +436,32 @@ export class ZellijMultiplexer implements Multiplexer {
         },
       );
     });
+  }
+
+  async showNativeViewer(title: string, content: string): Promise<boolean> {
+    if (!process.env.ZELLIJ) return false;
+    const command = `printf '%s\\n' ${shellEscape(content)}; printf '\\nPress Enter to close'; read _`;
+    try {
+      execFileSync(
+        "zellij",
+        [
+          ...this.sessionFlag(process.env.ZELLIJ_SESSION_NAME),
+          "action",
+          "new-pane",
+          "--floating",
+          "--name",
+          title.slice(0, 120),
+          "--",
+          "sh",
+          "-lc",
+          command,
+        ],
+        { stdio: "ignore", timeout: 5000 },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -177,6 +177,9 @@ export interface Multiplexer {
     opts: CapturePaneOptions,
   ): Promise<CapturePaneResult>;
 
+  /** Show bounded supervisor content in an optional backend-native surface. */
+  showNativeViewer(title: string, content: string): Promise<boolean>;
+
   /**
    * Build the user-facing commands to attach to (or focus) the child's pane.
    *
