@@ -148,6 +148,19 @@ describe("interactive lineage path safety", () => {
       safeContainedPath(dir, path.join(link, "file.txt")),
     ).rejects.toThrow(/symlink/);
   });
+
+  it("accepts paths expressed through either a root alias or its real path", async () => {
+    const dir = await tempDir();
+    const alias = path.join(await tempDir(), "root-alias");
+    const inside = path.join(dir, "inside");
+    await fs.mkdir(inside);
+    await fs.symlink(dir, alias);
+
+    await expect(
+      safeContainedPath(alias, path.join(alias, "inside")),
+    ).resolves.toBe(inside);
+    await expect(safeContainedPath(alias, inside)).resolves.toBe(inside);
+  });
 });
 
 describe("interactive lineage projection", () => {

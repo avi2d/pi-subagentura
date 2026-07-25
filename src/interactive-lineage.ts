@@ -9,7 +9,6 @@ import {
   promises as fs,
 } from "node:fs";
 import path from "node:path";
-import isPathInside from "is-path-inside";
 
 export const LINEAGE_SCHEMA_VERSION = 1;
 export const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024;
@@ -625,13 +624,34 @@ async function resolveContainedRealPath(
   root: string,
   candidate: string,
 ): Promise<string> {
+  const rootAbsolute = path.resolve(root);
   const rootReal = await fs.realpath(root);
-  const resolved = path.resolve(rootReal, candidate);
-  if (resolved !== rootReal && !isPathInside(resolved, rootReal)) {
-    throw new Error("path escapes lineage root");
-  }
+  const candidateAbsolute = path.resolve(rootAbsolute, candidate);
+  const relative = containedRelativePath(
+    rootAbsolute,
+    rootReal,
+    candidateAbsolute,
+  );
+  const resolved = path.resolve(rootReal, relative);
   await assertPathHasNoSymlinkEscape(rootReal, resolved);
   return resolved;
+}
+
+function containedRelativePath(
+  rootAbsolute: string,
+  rootReal: string,
+  candidateAbsolute: string,
+): string {
+  for (const base of new Set([rootAbsolute, rootReal])) {
+    const relative = path.relative(base, candidateAbsolute);
+    if (
+      relative === "" ||
+      (!relative.startsWith("..") && !path.isAbsolute(relative))
+    ) {
+      return relative;
+    }
+  }
+  throw new Error("path escapes lineage root");
 }
 
 async function assertPathHasNoSymlinkEscape(
