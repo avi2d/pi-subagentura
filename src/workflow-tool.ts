@@ -295,7 +295,7 @@ export function registerWorkflowTool(pi: ExtensionAPI): void {
       "Orchestrate decomposable multi-agent work with trusted raw JavaScript workflows.",
     promptGuidelines: [
       "Use workflows only for decomposable multi-agent work; handle simple or sequential tasks directly.",
-      "Pass raw JavaScript with no markdown fences. The first statement must be a pure-literal `export const meta = { name, description, phases? }`.",
+      "Pass raw JavaScript with no markdown fences. Include a top-level pure-literal `export const meta = { name, description, phases? }`.",
       "Do not use TypeScript, imports, require, fs, or other Node APIs. Date.now(), Math.random(), and argless new Date() are unavailable.",
       "Available globals are agent, parallel, pipeline, workflow, phase, log, args, immutable cwd, budget, console, guarded Date, and guarded Math.",
       "Call phase(title) at real work-group transitions. Agent phase defaults to the current phase; an explicit agent phase overrides it.",

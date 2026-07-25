@@ -1909,7 +1909,8 @@ describe("registerWorkflowTool", () => {
     expect(wf.promptSnippet).toContain("decomposable multi-agent work");
     const guidance = wf.promptGuidelines.join("\n");
     expect(guidance).toContain("raw JavaScript");
-    expect(guidance).toContain("first statement");
+    expect(guidance).toContain("top-level");
+    expect(guidance).not.toContain("first statement");
     expect(guidance).toContain("immutable cwd");
     expect(guidance).toContain("parallel() takes thunks");
     expect(guidance).toContain("pipeline() streams");

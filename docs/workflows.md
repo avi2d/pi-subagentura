@@ -21,11 +21,11 @@ GitHub issue [#62](https://github.com/lmn451/pi-subagentura/issues/62).
 
 ## Authoring contract
 
-Submit raw JavaScript without markdown fences. The first statement should be a
-pure-literal `export const meta = { name, description, phases? }`; do not use
-TypeScript, imports, `require`, filesystem APIs, `Date.now()`, `Math.random()`,
-or argless `new Date()`. For editor support, reference the published ambient
-declarations at `pi-subagentura/workflow`.
+Submit raw JavaScript without markdown fences. Include a top-level pure-literal
+`export const meta = { name, description, phases? }`; helper declarations may
+appear before or after it. Do not use TypeScript, imports, `require`, filesystem
+APIs, `Date.now()`, `Math.random()`, or argless `new Date()`. For editor support,
+reference the published ambient declarations at `pi-subagentura/workflow`.
 
 Use workflows only when work decomposes into independent agents or streaming
 stages. The VM globals are `agent`, `parallel`, `pipeline`, `workflow`, `phase`,

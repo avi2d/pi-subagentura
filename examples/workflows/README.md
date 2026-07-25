@@ -42,13 +42,13 @@ workflow({
 
 ## Authoring guidance
 
-Write raw JavaScript without fences. Start with a pure-literal
-`export const meta = { name, description, phases? }` statement; do not use
-TypeScript, imports, `require`, filesystem APIs, `Date.now()`, `Math.random()`,
-or argless `new Date()`. Ambient authoring types are published at
-`pi-subagentura/workflow`. The runtime exposes `agent`, `parallel`, `pipeline`,
-`workflow`, `phase`, `log`, `args`, immutable parent `cwd`, `budget`, `console`,
-and guarded `Date`/`Math`.
+Write raw JavaScript without fences. Include a top-level pure-literal
+`export const meta = { name, description, phases? }` statement; helper
+declarations may appear before or after it. Do not use TypeScript, imports,
+`require`, filesystem APIs, `Date.now()`, `Math.random()`, or argless `new Date()`.
+Ambient authoring types are published at `pi-subagentura/workflow`. The runtime
+exposes `agent`, `parallel`, `pipeline`, `workflow`, `phase`, `log`, `args`,
+immutable parent `cwd`, `budget`, `console`, and guarded `Date`/`Math`.
 
 Use a workflow only for decomposable multi-agent work. Pass thunks to
 `parallel()`; `pipeline()` streams each item through every stage independently.
