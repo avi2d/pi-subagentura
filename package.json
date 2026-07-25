@@ -61,6 +61,7 @@
     "src/interactive-tmux.ts",
     "src/interactive-supervisor-registration.ts",
     "src/interactive-supervisor-ui.ts",
+    "src/interactive-lineage.ts",
     "src/multiplexer.ts",
     "src/multiplexer-tmux.ts",
     "src/multiplexer-zellij.ts",

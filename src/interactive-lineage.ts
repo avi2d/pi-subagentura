@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  promises as fs,
+} from "node:fs";
 import path from "node:path";
 import isPathInside from "is-path-inside";
 
@@ -139,6 +147,22 @@ export async function resolveLineageStorePaths(
   };
 }
 
+export function resolveLineageStorePathsSync(
+  sessionRoot: string,
+  rootId: string,
+): LineageStorePaths {
+  mkdirSync(sessionRoot, { recursive: true });
+  const safeSessionRoot = realpathSync(sessionRoot);
+  const rootHash = hashLineageRoot(rootId);
+  const treeDir = path.join(safeSessionRoot, "subagentura", "trees", rootHash);
+  assertPathHasNoSymlinkEscapeSync(safeSessionRoot, treeDir);
+  return {
+    treeDir,
+    rootPath: path.join(treeDir, "root.json"),
+    nodesDir: path.join(treeDir, "nodes"),
+  };
+}
+
 export async function safeContainedPath(
   root: string,
   candidate: string,
@@ -173,6 +197,33 @@ export async function writeLineageManifestAtomic(
     await fs.rename(tmpPath, filePath);
   } catch (error) {
     await fs.rm(tmpPath, { force: true });
+    throw error;
+  }
+  return filePath;
+}
+
+export function writeLineageManifestAtomicSync(
+  nodesDir: string,
+  manifest: LineageManifest,
+  bounds: Partial<LineageBounds> = {},
+): string {
+  const effectiveBounds = lineageBounds(bounds);
+  const validated = validateLineageManifest(manifest, effectiveBounds);
+  const filePath = nodeManifestPath(nodesDir, validated.agentId);
+  mkdirSync(nodesDir, { recursive: true });
+  const data = `${JSON.stringify(validated, stableJsonReplacer, 2)}\n`;
+  if (Buffer.byteLength(data) > effectiveBounds.maxManifestBytes) {
+    throw new Error("lineage manifest exceeds byte limit");
+  }
+  const tmpPath = path.join(
+    nodesDir,
+    `.${validated.agentId}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  writeFileSync(tmpPath, data, { mode: 0o600 });
+  try {
+    renameSync(tmpPath, filePath);
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
     throw error;
   }
   return filePath;
@@ -606,6 +657,29 @@ async function assertPathHasNoSymlinkEscape(
       if (isNodeError(error, "ENOENT")) {
         continue;
       }
+      throw error;
+    }
+  }
+}
+
+function assertPathHasNoSymlinkEscapeSync(
+  rootReal: string,
+  candidate: string,
+): void {
+  const relative = path.relative(rootReal, path.resolve(candidate));
+  if (relative === "") return;
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("path escapes lineage root");
+  }
+  let current = rootReal;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new Error("lineage path contains a symlink");
+      }
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) continue;
       throw error;
     }
   }

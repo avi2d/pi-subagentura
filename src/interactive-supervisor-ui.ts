@@ -13,16 +13,26 @@ export type InteractiveSupervisorAction = { kind: "close" };
 type SupervisorDone = (action: InteractiveSupervisorAction) => void;
 let activeDone: SupervisorDone | undefined;
 
-interface InteractiveSupervisorOptions {
+export interface InteractiveSupervisorItem {
+  state: InteractiveSubagentState;
+  depth: number;
+  actionable: boolean;
+  reasons?: string[];
+}
+
+export interface InteractiveSupervisorOptions {
   done: SupervisorDone;
   requestRender?: () => void;
   notify?: (message: string, level?: "info" | "warning" | "error") => void;
   cancel?: typeof cancelInteractiveSubagent;
   focus?: (state: InteractiveSubagentState) => void | Promise<void>;
   view?: (state: InteractiveSubagentState) => void | Promise<void>;
+  nativeView?: (state: InteractiveSubagentState) => void | Promise<void>;
   cancelSubtree?: (state: InteractiveSubagentState) => void | Promise<void>;
   refreshIntervalMs?: number;
   now?: () => number;
+  items?: () => InteractiveSupervisorItem[];
+  refresh?: () => void | Promise<void>;
 }
 
 export class InteractiveSupervisorComponent {
@@ -37,36 +47,37 @@ export class InteractiveSupervisorComponent {
     const refreshIntervalMs =
       opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
     if (refreshIntervalMs > 0 && opts.requestRender) {
-      this.timer = setInterval(() => this.changed(), refreshIntervalMs);
+      this.timer = setInterval(() => void this.refresh(), refreshIntervalMs);
       this.timer.unref?.();
     }
   }
 
   render(width: number): string[] {
     if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-    const states = supervisorStates();
-    this.selectedIndex = clampIndex(this.selectedIndex, states.length);
+    const items = this.items();
+    this.selectedIndex = clampIndex(this.selectedIndex, items.length);
     const lines = [
       trunc("┌ Interactive Subagents", width),
       trunc(
-        "│ ↑↓/jk select • enter/→ details • v view • f focus • a attach • x cancel • X subtree • r refresh • q/esc close",
+        "│ ↑↓/jk select • enter/→ details • v view • n native • f focus • a attach • x cancel • X subtree • r refresh • q/esc close",
         width,
       ),
     ];
 
-    if (states.length === 0) {
+    if (items.length === 0) {
       lines.push(trunc("│ No interactive subagents.", width));
     } else {
-      states.forEach((state, index) => {
+      items.forEach((item, index) => {
+        const { state } = item;
         const selected = index === this.selectedIndex;
         const expanded = this.expanded.has(state.id);
         const marker = selected ? "▶" : "○";
         lines.push(
           trunc(
-            `│ ${marker} ${expanded ? "▾" : "▸"} ${formatSupervisorSummary(
+            `│ ${"  ".repeat(item.depth)}${marker} ${expanded ? "▾" : "▸"} ${formatSupervisorSummary(
               state,
               this.now(),
-            )}`,
+            )}${item.actionable ? "" : ` · unavailable (${item.reasons?.join(", ") ?? "unsafe"})`}`,
             width,
           ),
         );
@@ -90,8 +101,8 @@ export class InteractiveSupervisorComponent {
       return;
     }
 
-    const states = supervisorStates();
-    this.selectedIndex = clampIndex(this.selectedIndex, states.length);
+    const items = this.items();
+    this.selectedIndex = clampIndex(this.selectedIndex, items.length);
     if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
       this.changed();
@@ -99,19 +110,20 @@ export class InteractiveSupervisorComponent {
     }
     if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
       this.selectedIndex = Math.min(
-        Math.max(0, states.length - 1),
+        Math.max(0, items.length - 1),
         this.selectedIndex + 1,
       );
       this.changed();
       return;
     }
     if (matchesKey(data, "r")) {
-      this.changed();
+      void this.refresh();
       return;
     }
 
-    const selected = states[this.selectedIndex];
-    if (!selected) return;
+    const selectedItem = items[this.selectedIndex];
+    if (!selectedItem) return;
+    const selected = selectedItem.state;
     if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
       this.toggle(selected.id);
       return;
@@ -126,6 +138,13 @@ export class InteractiveSupervisorComponent {
       return;
     }
     if (matchesKey(data, "x")) {
+      if (!selectedItem.actionable) {
+        this.opts.notify?.(
+          "This lineage node is not safe to act on.",
+          "warning",
+        );
+        return;
+      }
       const cancelled = (this.opts.cancel ?? cancelInteractiveSubagent)(
         selected.id,
       );
@@ -143,11 +162,29 @@ export class InteractiveSupervisorComponent {
       void this.runAction("view", selected, this.opts.view);
       return;
     }
+    if (matchesKey(data, "n")) {
+      void this.runAction("open native view", selected, this.opts.nativeView);
+      return;
+    }
     if (matchesKey(data, "f")) {
+      if (!selectedItem.actionable) {
+        this.opts.notify?.(
+          "This lineage node is not safe to focus.",
+          "warning",
+        );
+        return;
+      }
       void this.runAction("focus", selected, this.opts.focus);
       return;
     }
     if (matchesKey(data, Key.shift("x"))) {
+      if (!selectedItem.actionable) {
+        this.opts.notify?.(
+          "This lineage subtree is not safe to cancel.",
+          "warning",
+        );
+        return;
+      }
       void this.runAction("cancel subtree", selected, this.opts.cancelSubtree);
     }
   }
@@ -167,6 +204,10 @@ export class InteractiveSupervisorComponent {
     return (this.opts.now ?? Date.now)();
   }
 
+  private items(): InteractiveSupervisorItem[] {
+    return this.opts.items?.() ?? supervisorItems();
+  }
+
   private toggle(id: string): void {
     if (this.expanded.has(id)) this.expanded.delete(id);
     else this.expanded.add(id);
@@ -177,6 +218,18 @@ export class InteractiveSupervisorComponent {
     if (this.disposed) return;
     this.invalidate();
     this.opts.requestRender?.();
+  }
+
+  private async refresh(): Promise<void> {
+    if (!this.opts.refresh) {
+      this.changed();
+      return;
+    }
+    try {
+      await this.opts.refresh();
+    } finally {
+      this.changed();
+    }
   }
 
   private async runAction(
@@ -269,6 +322,14 @@ function supervisorStates(): InteractiveSubagentState[] {
     (left, right) =>
       left.startedAt - right.startedAt || left.id.localeCompare(right.id),
   );
+}
+
+function supervisorItems(): InteractiveSupervisorItem[] {
+  return supervisorStates().map((state) => ({
+    state,
+    depth: 0,
+    actionable: true,
+  }));
 }
 
 function formatDetails(

@@ -11,6 +11,7 @@ import {
   type InteractiveSubagentState,
 } from "../src/interactive-tmux";
 import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
+import { registerInteractiveSupervisor } from "../src/interactive-supervisor-registration";
 
 function state(
   id: string,
@@ -158,5 +159,80 @@ describe("interactive supervisor", () => {
       maxLines: 20,
     });
     expect(capture.output).toBe("recent output");
+  });
+
+  it("renders recursive depth, blocks unsafe nodes, and dispatches native view", async () => {
+    const root = state("root");
+    const child = state("child");
+    const notify = vi.fn();
+    const cancelSubtree = vi.fn();
+    const nativeView = vi.fn().mockResolvedValue(undefined);
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      cancelSubtree,
+      nativeView,
+      items: () => [
+        { state: root, depth: 0, actionable: true },
+        {
+          state: child,
+          depth: 1,
+          actionable: false,
+          reasons: ["stale"],
+        },
+      ],
+    });
+
+    const lines = component.render(120);
+    expect(
+      lines.some((line) => line.includes("  ○") && line.includes("child")),
+    ).toBe(true);
+    component.handleInput("j");
+    component.handleInput("X");
+    expect(cancelSubtree).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      "This lineage subtree is not safe to cancel.",
+      "warning",
+    );
+
+    component.handleInput("k");
+    component.handleInput("n");
+    await vi.waitFor(() => expect(nativeView).toHaveBeenCalledWith(root));
+  });
+
+  it("requires confirmation before the registered subtree action runs", async () => {
+    const root = state("root");
+    interactiveSubagentRegistry.set(root.id, root);
+    let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    registerInteractiveSupervisor({
+      registerCommand: (
+        _name: string,
+        command: { handler: typeof commandHandler },
+      ) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never);
+    const confirm = vi.fn().mockResolvedValue(false);
+    const custom = vi.fn(async (factory: Function) => {
+      const component = factory(
+        { requestRender: vi.fn() },
+        undefined,
+        undefined,
+        vi.fn(),
+      ) as InteractiveSupervisorComponent;
+      component.handleInput("X");
+      await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+      return { kind: "close" };
+    });
+    const ui = { custom, confirm, notify: vi.fn() };
+
+    await commandHandler?.("", { ui });
+
+    expect(confirm).toHaveBeenCalledWith(
+      "Cancel interactive subagent subtree?",
+      expect.stringContaining("retains artifacts"),
+    );
+    expect(interactiveSubagentRegistry.has(root.id)).toBe(true);
   });
 });

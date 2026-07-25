@@ -25,7 +25,14 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
@@ -55,6 +62,14 @@ import {
   type CancellationSnapshotReceipt,
   type CancellationSnapshotSource,
 } from "./cancellation-snapshots";
+import {
+  DEFAULT_MAX_DEPTH,
+  DEFAULT_MAX_NODES,
+  hashLineageRoot,
+  LINEAGE_SCHEMA_VERSION,
+  resolveLineageStorePathsSync,
+  writeLineageManifestAtomicSync,
+} from "./interactive-lineage";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
@@ -368,6 +383,7 @@ export function writeLaunchScript(
   path: string,
   command: string,
   artifactDir: string,
+  internalEnv: Record<string, string> = {},
 ): void {
   mkdirSync(dirname(path), { recursive: true });
 
@@ -394,6 +410,9 @@ export function writeLaunchScript(
     "set -e",
     `export ARTIFACT_DIR=${escape(artifactDir)}`,
     "export PI_SUBAGENTURA_CHILD=1",
+    ...Object.entries(internalEnv).map(
+      ([name, value]) => `export ${name}=${escape(value)}`,
+    ),
     `"${cliPath}" start`,
     "on_exit() {",
     "    rc=$?",
@@ -449,6 +468,53 @@ export function launchInteractiveSubagent(params: {
   const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
   const background = params.background !== false; // default true (hidden)
   const paths = createInteractiveSubagentPaths({ id, name: params.name, cwd });
+  const parentAgentId = process.env.PI_SUBAGENTURA_AGENT_ID;
+  const rootId = process.env.PI_SUBAGENTURA_ROOT_ID ?? params.parentSessionId;
+  const sessionRoot =
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT ?? defaultSessionRoot();
+  const currentDepth = Number.parseInt(
+    process.env.PI_SUBAGENTURA_DEPTH ?? "0",
+    10,
+  );
+  const maxDepth = Number.parseInt(
+    process.env.PI_SUBAGENTURA_MAX_DEPTH ?? String(DEFAULT_MAX_DEPTH),
+    10,
+  );
+  const effectiveCurrentDepth = Number.isFinite(currentDepth)
+    ? currentDepth
+    : 0;
+  const effectiveMaxDepth =
+    Number.isFinite(maxDepth) && maxDepth >= 0 ? maxDepth : DEFAULT_MAX_DEPTH;
+  const nextDepth = effectiveCurrentDepth + 1;
+  if (rootId && nextDepth > effectiveMaxDepth) {
+    throw new Error(
+      `interactive sub-agent depth ${nextDepth} exceeds max ${effectiveMaxDepth}`,
+    );
+  }
+  const configuredMaxNodes = Number.parseInt(
+    process.env.PI_SUBAGENTURA_MAX_NODES ?? String(DEFAULT_MAX_NODES),
+    10,
+  );
+  const maxNodes =
+    Number.isFinite(configuredMaxNodes) && configuredMaxNodes > 0
+      ? configuredMaxNodes
+      : DEFAULT_MAX_NODES;
+  const lineageStore =
+    rootId && params.parentSessionId
+      ? resolveLineageStorePathsSync(sessionRoot, rootId)
+      : undefined;
+  if (lineageStore) {
+    const nodeCount = existsSync(lineageStore.nodesDir)
+      ? readdirSync(lineageStore.nodesDir).filter((entry) =>
+          entry.endsWith(".json"),
+        ).length
+      : 0;
+    if (nodeCount >= maxNodes) {
+      throw new Error(
+        `interactive sub-agent tree reached max nodes ${maxNodes}`,
+      );
+    }
+  }
   const prompt = buildInteractivePrompt({
     task: params.task,
     contextText: params.contextText,
@@ -516,6 +582,7 @@ export function launchInteractiveSubagent(params: {
     id,
   });
   let persistedState = false;
+  let lineageManifestPath: string | undefined;
   // Persist as soon as the pane is addressable. A crash after this point is
   // recoverable on reload. If persistence itself fails, abort and kill the
   // pane; otherwise the child would be invisible to rehydrate after a restart.
@@ -547,6 +614,43 @@ export function launchInteractiveSubagent(params: {
       throw err;
     }
   }
+  if (rootId && params.parentSessionId) {
+    try {
+      lineageManifestPath = writeLineageManifestAtomicSync(
+        lineageStore!.nodesDir,
+        {
+          schemaVersion: LINEAGE_SCHEMA_VERSION,
+          agentId: id,
+          ...(parentAgentId ? { parentAgentId } : {}),
+          rootId,
+          rootHash: hashLineageRoot(rootId),
+          ownerSessionId: params.parentSessionId,
+          name: params.name,
+          taskPreview: params.task.replace(/\s+/g, " ").slice(0, 4096),
+          startedAt: new Date().toISOString(),
+          cwd,
+          pane: {
+            backend: mux.name,
+            paneId,
+            ...(muxSession ? { muxSession } : {}),
+            ...(windowName ? { windowName } : {}),
+          },
+          artifactDir: paths.artifactDir,
+          childSessionFile: paths.sessionFile,
+        },
+      );
+    } catch (err) {
+      if (persistedState) {
+        try {
+          removeInteractiveState(stateCwd, id);
+        } catch {
+          /* preserve the lineage error */
+        }
+      }
+      mux.killPane(paneId, muxSession);
+      throw err;
+    }
+  }
   try {
     const command = buildPiInteractiveCommand({
       sessionFile: paths.sessionFile,
@@ -557,7 +661,14 @@ export function launchInteractiveSubagent(params: {
       cwd,
       thinkingLevel: params.thinkingLevel,
     });
-    writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
+    writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir, {
+      ...(rootId ? { PI_SUBAGENTURA_ROOT_ID: rootId } : {}),
+      ...(rootId ? { PI_SUBAGENTURA_LINEAGE_SESSION_ROOT: sessionRoot } : {}),
+      PI_SUBAGENTURA_AGENT_ID: id,
+      PI_SUBAGENTURA_DEPTH: String(nextDepth),
+      PI_SUBAGENTURA_MAX_DEPTH: String(effectiveMaxDepth),
+      PI_SUBAGENTURA_MAX_NODES: String(maxNodes),
+    });
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     mux.sendKeys(
       paneId,
@@ -574,6 +685,13 @@ export function launchInteractiveSubagent(params: {
         removeInteractiveState(stateCwd, id);
       } catch {
         /* best effort — the pane kill below is the important cleanup */
+      }
+    }
+    if (lineageManifestPath) {
+      try {
+        rmSync(lineageManifestPath, { force: true });
+      } catch {
+        /* best effort */
       }
     }
     mux.killPane(paneId, muxSession);
@@ -642,6 +760,13 @@ export function captureInteractiveSubagent(
   options: CapturePaneOptions,
 ): Promise<CapturePaneResult> {
   return getMuxForState(state).capturePane(paneRefForState(state), options);
+}
+
+export function showInteractiveSubagentNativeViewer(
+  state: InteractiveSubagentState,
+  content: string,
+): Promise<boolean> {
+  return getMuxForState(state).showNativeViewer(state.name, content);
 }
 
 /**
