@@ -188,13 +188,12 @@ export interface InteractiveSubagentState {
   lifecycle?: PersistedLifecycleFold;
   /** @deprecated Legacy v1 timestamp cursor retained for API compatibility. */
   lastDeliveredEventTs?: number;
-  /**
-   * Byte offset into the child's session JSONL that we have already processed.
-   * The poller tail-reads the session file from this offset each tick and synthesizes
-   * `tool_activity` events for any new tool calls. Same at-most-once guarantee as
-   * `eventByteCursor`, with an independent cursor for the session stream.
-   */
+  /** Byte offset through which session JSONL bytes were fed to the parser. */
   lastDeliveredSessionByte?: number;
+  /** Start of the parser's current incomplete line, if one exists. */
+  sessionPartialLineStart?: number;
+  /** Persisted pre-reload cursor used once for truncation detection. */
+  sessionObservedByteCursor?: number;
   /** Most recent tool_activity summary, for the TUI widget. */
   lastToolSummary?: string;
   lastToolName?: string;

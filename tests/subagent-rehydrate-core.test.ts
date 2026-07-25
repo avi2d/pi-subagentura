@@ -165,6 +165,56 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated.autoDoneForTurnAt).toBeUndefined();
   });
 
+  it("restores a persisted partial session line from its replay point", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      windowName: state.windowName,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+    });
+    updateInteractiveState(cwd, state.id, (entry) => {
+      entry.sessionByteCursor = 200;
+      entry.sessionPartialLineStart = 125;
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd);
+
+    const rehydrated = interactiveSubagentRegistry.get(state.id)!;
+    expect(rehydrated.lastDeliveredSessionByte).toBe(125);
+    expect(rehydrated.sessionPartialLineStart).toBe(125);
+    expect(rehydrated.sessionObservedByteCursor).toBe(200);
+  });
+
+  it("conservatively replays legacy session cursors from zero", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const state = makeState(cwd, "abc12345");
+    appendInteractiveState(cwd, {
+      id: state.id,
+      paneId: state.paneId,
+      windowName: state.windowName,
+      mux: state.mux,
+      artifactDir: state.artifactDir,
+      sessionFile: state.sessionFile,
+    });
+    updateInteractiveState(cwd, state.id, (entry) => {
+      entry.sessionByteCursor = 200;
+      delete entry.sessionPartialLineStart;
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd);
+
+    const rehydrated = interactiveSubagentRegistry.get(state.id)!;
+    expect(rehydrated.lastDeliveredSessionByte).toBe(0);
+    expect(rehydrated.sessionPartialLineStart).toBeUndefined();
+    expect(rehydrated.sessionObservedByteCursor).toBe(200);
+  });
+
   it("requeues unmatched dispatchAttempted delivery after rehydrate", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");

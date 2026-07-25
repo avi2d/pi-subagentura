@@ -104,7 +104,9 @@ function persistState(state: InteractiveSubagentState): void {
   if (!state.parentSessionId) return;
   updateInteractiveState(state.cwd, state.id, (entry) => {
     entry.eventByteCursor = state.eventByteCursor ?? 0;
-    entry.sessionByteCursor = state.lastDeliveredSessionByte ?? 0;
+    entry.sessionByteCursor =
+      state.sessionObservedByteCursor ?? state.lastDeliveredSessionByte ?? 0;
+    entry.sessionPartialLineStart = state.sessionPartialLineStart ?? null;
     entry.activeTurnId = state.activeTurnId;
     entry.pendingDeliveries = state.pendingDeliveries ?? [];
     entry.deliveryReceipts = state.deliveryReceipts ?? [];

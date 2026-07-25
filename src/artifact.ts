@@ -1219,6 +1219,8 @@ export interface PersistedLifecycleFold {
 export interface InteractiveSubagentPersistedStateV2 extends InteractiveSubagentPersistedStateV1 {
   eventByteCursor: number;
   sessionByteCursor: number;
+  /** Null means the cursor ends at a line boundary; absent means legacy state. */
+  sessionPartialLineStart?: number | null;
   activeTurnId?: string;
   pendingDeliveries: PersistedDeliveryIntent[];
   deliveryReceipts: string[];
@@ -1490,6 +1492,16 @@ function migrateStatePayload(
           : {}),
         eventByteCursor: cursor(entry.eventByteCursor, cutoverOffset),
         sessionByteCursor: cursor(entry.sessionByteCursor, 0),
+        ...(entry.sessionPartialLineStart === null
+          ? { sessionPartialLineStart: null }
+          : typeof entry.sessionPartialLineStart === "number"
+            ? {
+                sessionPartialLineStart: cursor(
+                  entry.sessionPartialLineStart,
+                  0,
+                ),
+              }
+            : {}),
         ...(typeof entry.activeTurnId === "string"
           ? { activeTurnId: entry.activeTurnId }
           : {}),

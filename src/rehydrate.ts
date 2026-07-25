@@ -62,6 +62,13 @@ export function rehydrateInteractiveSubagents(
     }
 
     const startedAt = entry.lifecycle?.startedAt ?? 0;
+    const partialLineStart = entry.sessionPartialLineStart;
+    const sessionResumeCursor =
+      partialLineStart === undefined
+        ? 0
+        : partialLineStart === null
+          ? entry.sessionByteCursor
+          : partialLineStart;
 
     const attach = (() => {
       try {
@@ -91,7 +98,10 @@ export function rehydrateInteractiveSubagents(
       triggerTurnOnComplete: entry.triggerTurnOnComplete,
       parentSessionId: entry.parentSessionId ?? "pi",
       eventByteCursor: entry.eventByteCursor,
-      lastDeliveredSessionByte: entry.sessionByteCursor,
+      lastDeliveredSessionByte: sessionResumeCursor,
+      sessionPartialLineStart:
+        typeof partialLineStart === "number" ? partialLineStart : undefined,
+      sessionObservedByteCursor: entry.sessionByteCursor,
       activeTurnId: entry.activeTurnId,
       pendingDeliveries: [...entry.pendingDeliveries],
       deliveryReceipts: [...entry.deliveryReceipts],

@@ -229,7 +229,11 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
       if (state.parentSessionId) {
         updateInteractiveState(state.cwd, state.id, (entry) => {
           entry.eventByteCursor = nextCursor;
-          entry.sessionByteCursor = state.lastDeliveredSessionByte ?? 0;
+          entry.sessionByteCursor =
+            state.sessionObservedByteCursor ??
+            state.lastDeliveredSessionByte ??
+            0;
+          entry.sessionPartialLineStart = state.sessionPartialLineStart ?? null;
           entry.activeTurnId = state.activeTurnId;
           entry.pendingDeliveries = state.pendingDeliveries ?? [];
           entry.deliveryReceipts = state.deliveryReceipts ?? [];
@@ -249,6 +253,7 @@ async function runPollArtifactChanges(pi: ExtensionAPI): Promise<void> {
         state.status === "cancelled" ||
         state.status === "exited" ||
         state.status === "unknown";
+      if (terminal) destroySessionParser(state);
       if (
         terminal &&
         state.parentSessionId &&
@@ -347,41 +352,41 @@ function formatWorkflowElapsed(ms: number): string {
 
 // ── Session-log parsing state ─────────────────────────────────────────
 
+interface SessionParserState {
+  parser: ReturnType<typeof ndjson.parse>;
+  owner: InteractiveSubagentState;
+  readCursor: number;
+}
+
 /**
- * Per-state ndjson parser instance used to tail-read the child's session JSONL.
- *
- * The parser buffers partial trailing lines internally (via split2 underneath), so we can
- * safely write raw bytes from the file on every poll and let the parser emit complete JSON
- * objects as 'data' events. This replaces a hand-rolled partial-line + cursor scheme that had
- * three latent bugs:
- *   - A 1 MiB per-tick read cap combined with cursor-pinning on a missing newline caused a
- *     permanent re-read loop on any single JSONL line larger than 1 MiB (e.g. a multi-MB tool
- *     call result that the child pi runtime writes as a single line).
- *   - File truncation left the cursor pointing past EOF, silently dropping any post-truncation
- *     content.
- *   - A `require("node:fs").closeSync(fd)` call in the finally block leaked file descriptors on
- *     Node < 22.12 in some bundling paths.
- *
- * Keyed by sub-agent id; one parser per state lives for the lifetime of the process. The parser
- * is destroyed and recreated on file truncation so the buffered partial state is cleared.
+ * `readCursor` advances through bytes buffered by split2. The persisted session
+ * cursor keeps that observed file position for truncation detection, while
+ * `sessionPartialLineStart` records the replay point needed to reconstruct a
+ * partial line after reload without persisting child-controlled content.
  */
-const sessionParsers = new Map<string, ReturnType<typeof ndjson.parse>>();
+const sessionParsers = new Map<string, SessionParserState>();
 
-/** Defensive upper bound on the per-tick Buffer.alloc. With ndjson, a partial line is buffered
- * internally across polls, so the cap is no longer required for correctness — it is kept purely
- * to bound worst-case memory if the file explodes in a single tick. 1 MiB is plenty. */
+/** Bound both per-tick allocation and split2's accumulated incomplete line. */
 const MAX_SESSION_READ_BYTES = 1 * 1024 * 1024;
+const MAX_SESSION_LINE_BYTES = 2 * 1024 * 1024;
 
-/** Get-or-create the per-state session parser and wire its 'data' event to the entry handler. */
 function getOrCreateSessionParser(
   state: InteractiveSubagentState,
-): ReturnType<typeof ndjson.parse> {
+): SessionParserState {
   const existing = sessionParsers.get(state.id);
-  if (existing) return existing;
-  // strict: false → malformed lines are silently dropped instead of triggering an 'error' event
-  // that would force us to recreate the parser mid-stream. Same best-effort delivery semantics as
-  // the old hand-rolled try/catch around JSON.parse.
-  const parser = ndjson.parse({ strict: false });
+  if (existing?.owner === state) return existing;
+  if (existing) destroySessionParser(state);
+
+  const parser = ndjson.parse({
+    strict: false,
+    maxLength: MAX_SESSION_LINE_BYTES,
+    skipOverflow: true,
+  });
+  const parserState: SessionParserState = {
+    parser,
+    owner: state,
+    readCursor: state.lastDeliveredSessionByte ?? 0,
+  };
   parser.on("data", (entry: unknown) => {
     const art = artifactPath(
       dirname(state.artifactDir),
@@ -389,33 +394,53 @@ function getOrCreateSessionParser(
     );
     processSessionLogEntry(state, art, entry as any);
   });
-  // In non-strict mode the parser does not emit 'error' for bad JSON, but we still attach a no-op
-  // handler so an unhandled error event can never crash the process.
   parser.on("error", () => {
-    // Drop the broken parser so the next tick creates a fresh one. The cursor is reset in the
-    // truncation handler, so this only fires for pathological non-truncation errors.
+    if (sessionParsers.get(state.id) !== parserState) return;
+    rewindSessionParser(parserState);
     sessionParsers.delete(state.id);
+    try {
+      parser.destroy();
+    } catch {
+      /* parser is already broken; the durable cursor permits replay */
+    }
   });
-  sessionParsers.set(state.id, parser);
-  return parser;
+  sessionParsers.set(state.id, parserState);
+  return parserState;
 }
 
-/** Destroy a state's parser (used on truncation and on state removal). */
+function rewindSessionParser(parserState: SessionParserState): void {
+  const owner = parserState.owner;
+  const replayCursor = owner.sessionPartialLineStart;
+  if (replayCursor === undefined) return;
+  owner.sessionObservedByteCursor = owner.lastDeliveredSessionByte;
+  owner.lastDeliveredSessionByte = replayCursor;
+}
+
+/** Discard buffered child data without flushing an incomplete JSONL record. */
 function destroySessionParser(state: InteractiveSubagentState): void {
-  const parser = sessionParsers.get(state.id);
-  if (!parser) return;
-  try {
-    parser.end();
-  } catch {
-    // ignore — we're tearing down
-  }
+  const parserState = sessionParsers.get(state.id);
+  if (!parserState) return;
+  rewindSessionParser(parserState);
   sessionParsers.delete(state.id);
+  try {
+    parserState.parser.destroy();
+  } catch {
+    /* parser may already be destroyed */
+  }
+}
+
+/** Release every parser before the interactive registry is replaced or cleared. */
+export function clearSessionParsers(): void {
+  const parserStates = [...sessionParsers.values()];
+  for (const parserState of parserStates) {
+    destroySessionParser(parserState.owner);
+  }
 }
 
 // ── Session-log tail-reading ──────────────────────────────────────────
 
-/** Tail-read the child's session JSONL and append `tool_activity` events to events.ndjson.
- *  Updates `state.lastDeliveredSessionByte` so subsequent ticks re-read only new lines. */
+/** Tail-read the child's session JSONL and append `tool_activity` events.
+ *  Persists the observed cursor and incomplete-line replay boundary. */
 function tailReadSessionLog(
   state: InteractiveSubagentState,
   _art: SubagentArtifact,
@@ -427,24 +452,29 @@ function tailReadSessionLog(
   try {
     size = statSync(sessionFile).size;
   } catch {
-    return; // file not yet created by the child
+    return;
   }
 
-  const initialCursor = state.lastDeliveredSessionByte ?? 0;
-  if (size < initialCursor) {
-    // File shrunk under us (truncation, rotation, manual edit). Reset cursor and parser and fall
-    // through to the read below so any content already written after the truncation is processed in
-    // the same tick (e.g. test does truncateSync → writeFileSync → poll). The parser is recreated so the
-    // buffered partial state is cleared. Any duplicate tool_activity events are acceptable — the
-    // artifact log is best-effort and the LLM never sees these (TUI-widget only).
-    state.lastDeliveredSessionByte = 0;
+  let parserState = sessionParsers.get(state.id);
+  if (parserState && parserState.owner !== state) {
     destroySessionParser(state);
+    parserState = undefined;
   }
-  const cursor = state.lastDeliveredSessionByte ?? 0;
+  let cursor = parserState?.readCursor ?? state.lastDeliveredSessionByte ?? 0;
+  const observedCursor = state.sessionObservedByteCursor;
+  state.sessionObservedByteCursor = undefined;
+  if (
+    size < cursor ||
+    (observedCursor !== undefined && size < observedCursor)
+  ) {
+    state.lastDeliveredSessionByte = 0;
+    state.sessionPartialLineStart = undefined;
+    destroySessionParser(state);
+    parserState = undefined;
+    cursor = 0;
+  }
   if (size <= cursor) return;
 
-  // Defensive cap on per-tick allocation. ndjson handles partial lines correctly across writes,
-  // so a single multi-MB line split across ticks works fine — no cursor pin.
   const requested = size - cursor;
   const toRead = Math.min(requested, MAX_SESSION_READ_BYTES);
   if (toRead <= 0) return;
@@ -459,24 +489,30 @@ function tailReadSessionLog(
     const buf = Buffer.alloc(toRead);
     let bytesRead = 0;
     while (bytesRead < toRead) {
-      const n = readSync(
+      const count = readSync(
         fd,
         buf,
         bytesRead,
         toRead - bytesRead,
         cursor + bytesRead,
       );
-      if (n <= 0) break;
-      bytesRead += n;
+      if (count <= 0) break;
+      bytesRead += count;
     }
     if (bytesRead === 0) return;
-    const parser = getOrCreateSessionParser(state);
-    parser.write(buf.subarray(0, bytesRead));
-    // Always advance the cursor by the bytes we fed the parser. The parser buffers any partial
-    // trailing line internally and will emit the completed object on a later write. We do NOT
-    // rewind to the last newline the way the old code did — doing so would re-feed the same bytes
-    // to the parser and double-emit on the next tick.
-    state.lastDeliveredSessionByte = cursor + bytesRead;
+
+    parserState = getOrCreateSessionParser(state);
+    parserState.parser.write(buf.subarray(0, bytesRead));
+    parserState.readCursor = cursor + bytesRead;
+    state.lastDeliveredSessionByte = parserState.readCursor;
+    const lastNewline = buf.subarray(0, bytesRead).lastIndexOf(0x0a);
+    if (lastNewline === bytesRead - 1) {
+      state.sessionPartialLineStart = undefined;
+    } else if (lastNewline >= 0) {
+      state.sessionPartialLineStart = cursor + lastNewline + 1;
+    } else if (state.sessionPartialLineStart === undefined) {
+      state.sessionPartialLineStart = cursor;
+    }
   } finally {
     try {
       closeSync(fd);

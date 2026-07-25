@@ -6,7 +6,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { deleteInteractiveStatesFile } from "./artifact";
-import { pollArtifactChanges } from "./artifact-poller";
+import { clearSessionParsers, pollArtifactChanges } from "./artifact-poller";
 import { flushDeliveries } from "./delivery";
 import { flushInProcessDeliveries } from "./notifications";
 import { jobRegistry } from "./helpers";
@@ -157,6 +157,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): void {
       // setInterval before clearInterval ran) finds an empty registry and its
       // for-loop iterates over zero entries — no work, no notification delivery.
       try {
+        clearSessionParsers();
         interactiveSubagentRegistry.clear();
       } catch {
         /* best effort */
