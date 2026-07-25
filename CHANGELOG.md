@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-07-26
+
+### Added
+
+- Structured workflow outputs with schema validation, reusable TypeScript declarations at `pi-subagentura/workflow`, immutable `cwd`, explicit phase metadata, and bounded workflow-tree agent records.
+- Session-scoped ownership for background workflows, in-process jobs, interactive delivery, cancellation, status surfaces, and multi-owner artifact polling.
+- npm release publishing to GitHub Packages alongside the public npm registry.
+
+### Changed
+
+- In-process sub-agent calls now run asynchronously by default; pass `async: false` for a single blocking call.
+- `get_subagent_result` returns live state by default and supports explicit bounded waiting with `wait` and `timeoutMs`.
+- Interactive pointer completions trigger a parent turn by default; set `triggerTurnOnComplete: false` to persist without waking the parent.
+
+### Fixed
+
+- Completion delivery and workflow notifications no longer cross parent-session, reload, nested-context, or stale-generation boundaries.
+- Oversized and partial artifact/session records remain memory-bounded without silently losing completion identity or advancing stale cursors.
+- Cancellation propagates through nested orchestration, drains workflow receipts, and suppresses late completion after parent shutdown.
+- Published-tarball validation now checks runtime imports, worker assets, declared dependencies, and a clean production consumer install.
+
 ## [3.0.3] - 2026-07-19
 
 ### Added
@@ -68,7 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workflow `runningCount` decremented on agent failure; timeout propagates abort to in-flight work.
 - Shared workflow script parsing (`workflow-script.mjs`) used by main thread and worker thread.
 
-[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.0.3...HEAD
+[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/lmn451/pi-subagentura/compare/v3.0.3...v3.1.0
 [3.0.3]: https://github.com/lmn451/pi-subagentura/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/lmn451/pi-subagentura/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/lmn451/pi-subagentura/compare/v3.0.0...v3.0.1
