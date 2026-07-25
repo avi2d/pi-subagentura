@@ -272,13 +272,17 @@ async function executeScript(
               onProgress: (ev) => {
                 if (ev.kind === "phase") {
                   if (ev.phase) {
-                    emit({ ...ev, phase: ev.phase, agentId });
+                    emit({
+                      ...ev,
+                      phase: resolvedPhase ?? ev.phase,
+                      agentId,
+                    });
                   }
                   return;
                 }
                 emit({
                   ...ev,
-                  phase: ev.phase ?? resolvedPhase,
+                  phase: resolvedPhase ?? ev.phase,
                   agentId,
                 });
               },

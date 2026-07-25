@@ -488,6 +488,29 @@ describe("agent() + budget", () => {
     expect(phases).toEqual(["Parent", "Child", "Manual", "Parent"]);
   });
 
+  it("preserves an explicit phase over runner-emitted phases", async () => {
+    const phases: Array<string | undefined> = [];
+    const runAgent: WorkflowAgentRunner = async ({ onProgress }) => {
+      onProgress?.({ kind: "phase", phase: "Internal" });
+      onProgress?.({ kind: "log", message: "working", phase: "Internal" });
+      return ok("done");
+    };
+
+    await runWorkflow(
+      meta + `return await agent("hello", { phase: "Explicit" });`,
+      {
+        runAgent,
+        onProgress: (progress) => {
+          if (progress.kind === "phase" || progress.kind === "log") {
+            phases.push(progress.phase);
+          }
+        },
+      },
+    );
+
+    expect(phases).toEqual(["Explicit", "Explicit"]);
+  });
+
   it("returns null and counts errors when the sub-agent errors", async () => {
     const r = await runWorkflow(meta + `return await agent("x");`, {
       runAgent: async () => fail(),
