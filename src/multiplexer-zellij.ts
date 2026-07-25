@@ -36,6 +36,8 @@ import type {
 } from "./multiplexer";
 import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
 
+const MAX_CAPTURE_READ_BYTES = 1024 * 1024;
+
 function boundCaptureOutput(
   output: string,
   opts: CapturePaneOptions,
@@ -426,7 +428,11 @@ export class ZellijMultiplexer implements Multiplexer {
           normalizePaneId(ref.paneId),
           "/dev/stdout",
         ],
-        { encoding: "utf8", maxBuffer: opts.maxBytes * 2, timeout: 5000 },
+        {
+          encoding: "utf8",
+          maxBuffer: MAX_CAPTURE_READ_BYTES,
+          timeout: 5000,
+        },
         (error, stdout) => {
           if (error) {
             reject(error);

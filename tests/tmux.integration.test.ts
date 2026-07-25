@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   cancelInteractiveSubagent,
+  captureInteractiveSubagent,
+  focusInteractiveSubagent,
   interactiveSubagentRegistry,
   launchInteractiveSubagent,
   sendCommandToPane,
@@ -66,12 +68,14 @@ set -euo pipefail
 
 echo "fake pi started: $*" >> "$ARTIFACT_DIR/fake-pi.log"
 echo "fake initial result" > "$ARTIFACT_DIR/output.md"
+echo "terminal initial result"
 "$ARTIFACT_DIR/cli.mjs" done 0
 
 # Stay alive like a REPL so sendCommandToPane can deliver follow-up turns.
 while IFS= read -r line; do
   echo "followup: $line" >> "$ARTIFACT_DIR/followups.log"
   echo "fake followup result: $line" > "$ARTIFACT_DIR/output.md"
+  echo "terminal followup: $line"
   "$ARTIFACT_DIR/cli.mjs" done 0
 done
 `,
@@ -208,6 +212,76 @@ test("sends a follow-up message into the same tmux pane", async () => {
       ),
     "timed out waiting for follow-up to reach fake pi",
   );
+});
+
+test("focuses a background child window through structured pane metadata", async () => {
+  const first = launchInteractiveSubagent({
+    name: "Focus first",
+    task: "wait",
+    cwd: mkdtempSync(join(tempRoot, "focus-first-")),
+    muxPreference: "tmux",
+    background: true,
+  });
+  const second = launchInteractiveSubagent({
+    name: "Focus second",
+    task: "wait",
+    cwd: mkdtempSync(join(tempRoot, "focus-second-")),
+    muxPreference: "tmux",
+    background: true,
+  });
+
+  expect(
+    tmux([
+      "display-message",
+      "-p",
+      "-t",
+      second.paneId,
+      "#{window_active}",
+    ]).trim(),
+  ).toBe("0");
+  await focusInteractiveSubagent(second);
+  expect(
+    tmux([
+      "display-message",
+      "-p",
+      "-t",
+      second.paneId,
+      "#{window_active}",
+    ]).trim(),
+  ).toBe("1");
+
+  cancelInteractiveSubagent(second.id);
+  cancelInteractiveSubagent(first.id);
+});
+
+test("captures live pane output with byte and line bounds", async () => {
+  const state = launchInteractiveSubagent({
+    name: "Capture child",
+    task: "emit terminal output",
+    cwd: mkdtempSync(join(tempRoot, "capture-workspace-")),
+    muxPreference: "tmux",
+    background: true,
+  });
+  await waitFor(
+    () => existsSync(join(state.artifactDir, "output.md")),
+    "timed out waiting for capture child",
+  );
+
+  const full = await captureInteractiveSubagent(state, {
+    maxBytes: 4096,
+    maxLines: 200,
+  });
+  expect(full.output).toContain("terminal initial result");
+
+  const bounded = await captureInteractiveSubagent(state, {
+    maxBytes: 12,
+    maxLines: 1,
+  });
+  expect(Buffer.byteLength(bounded.output, "utf8")).toBeLessThanOrEqual(12);
+  expect(bounded.output.split("\n")).toHaveLength(1);
+  expect(bounded.truncated).toBe(true);
+
+  cancelInteractiveSubagent(state.id);
 });
 
 test("cancel writes the cancellation marker and kills the tmux pane", async () => {
