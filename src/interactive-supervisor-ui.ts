@@ -2,11 +2,13 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { closeSync, lstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
+import type { JobState } from "./helpers";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import type { WorkflowJobState } from "./workflow-jobs";
 
 export const INTERACTIVE_SUPERVISOR_SHORTCUT = "ctrl+alt+a";
 const DEFAULT_REFRESH_INTERVAL_MS = 1_000;
@@ -14,35 +16,56 @@ const DETAIL_OUTPUT_MAX_BYTES = 4 * 1024;
 const DETAIL_EVENTS_MAX_BYTES = 8 * 1024;
 const DETAIL_PREVIEW_MAX_CHARS = 512;
 const DETAIL_EVENT_COUNT = 3;
+const DETAIL_WORKFLOW_AGENT_COUNT = 20;
 
 export type InteractiveSupervisorAction = { kind: "close" };
 type SupervisorDone = (action: InteractiveSupervisorAction) => void;
 let activeDone: SupervisorDone | undefined;
 
-export interface InteractiveSupervisorItem {
-  state: InteractiveSubagentState;
+interface SupervisorItemBase {
   depth: number;
   actionable: boolean;
   reasons?: string[];
 }
+
+export interface InteractiveSupervisorItem extends SupervisorItemBase {
+  kind?: "interactive";
+  state: InteractiveSubagentState;
+}
+
+export interface InProcessSupervisorItem extends SupervisorItemBase {
+  kind: "in-process";
+  job: JobState;
+}
+
+export interface WorkflowSupervisorItem extends SupervisorItemBase {
+  kind: "workflow";
+  job: WorkflowJobState;
+}
+
+export type AsyncSupervisorItem =
+  InteractiveSupervisorItem | InProcessSupervisorItem | WorkflowSupervisorItem;
 
 export interface InteractiveSupervisorOptions {
   done: SupervisorDone;
   requestRender?: () => void;
   notify?: (message: string, level?: "info" | "warning" | "error") => void;
   cancel?: typeof cancelInteractiveSubagent;
+  cancelInProcess?: (job: JobState) => boolean;
+  cancelWorkflow?: (job: WorkflowJobState) => boolean;
   focus?: (state: InteractiveSubagentState) => void | Promise<void>;
   view?: (state: InteractiveSubagentState) => void | Promise<void>;
   nativeView?: (state: InteractiveSubagentState) => void | Promise<void>;
   cancelSubtree?: (state: InteractiveSubagentState) => void | Promise<void>;
   refreshIntervalMs?: number;
   now?: () => number;
-  items?: () => InteractiveSupervisorItem[];
+  items?: () => AsyncSupervisorItem[];
   refresh?: () => void | Promise<void>;
 }
 
 export class InteractiveSupervisorComponent {
   private selectedIndex = 0;
+  private selectedKey?: string;
   private expanded = new Set<string>();
   private cachedWidth?: number;
   private cachedLines?: string[];
@@ -61,33 +84,35 @@ export class InteractiveSupervisorComponent {
   render(width: number): string[] {
     if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
     const items = this.items();
-    this.selectedIndex = clampIndex(this.selectedIndex, items.length);
     const lines = [
-      trunc("┌ Interactive Subagents", width),
+      trunc("┌ Async Subagents", width),
       trunc(
-        "│ ↑↓/jk select • enter/→ details • v view • n native • f focus • a attach • x cancel • X subtree • r refresh • q/esc close",
+        "│ ↑↓/jk select • enter/→ details • x cancel • interactive: v/n/f/a/X • r refresh • q/esc close",
         width,
       ),
     ];
 
     if (items.length === 0) {
-      lines.push(trunc("│ No interactive subagents.", width));
+      lines.push(trunc("│ No async subagents.", width));
     } else {
       items.forEach((item, index) => {
-        const { state } = item;
         const selected = index === this.selectedIndex;
-        const expanded = this.expanded.has(state.id);
+        const itemKey = supervisorItemKey(item);
+        const expanded = this.expanded.has(itemKey);
         const marker = selected ? "▶" : "○";
+        const unavailable = item.actionable
+          ? ""
+          : ` · unavailable (${item.reasons?.join(", ") ?? "unsafe"})`;
         lines.push(
           trunc(
-            `│ ${"  ".repeat(item.depth)}${marker} ${expanded ? "▾" : "▸"} ${formatSupervisorSummary(
-              state,
+            `│ ${"  ".repeat(item.depth)}${marker} ${expanded ? "▾" : "▸"} ${formatAsyncSupervisorSummary(
+              item,
               this.now(),
-            )}${item.actionable ? "" : ` · unavailable (${item.reasons?.join(", ") ?? "unsafe"})`}`,
+            )}${unavailable}`,
             width,
           ),
         );
-        if (expanded) lines.push(...formatDetails(state, width));
+        if (expanded) lines.push(...formatAsyncDetails(item, width));
       });
     }
 
@@ -108,17 +133,13 @@ export class InteractiveSupervisorComponent {
     }
 
     const items = this.items();
-    this.selectedIndex = clampIndex(this.selectedIndex, items.length);
     if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+      this.selectIndex(items, this.selectedIndex - 1);
       this.changed();
       return;
     }
     if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-      this.selectedIndex = Math.min(
-        Math.max(0, items.length - 1),
-        this.selectedIndex + 1,
-      );
+      this.selectIndex(items, this.selectedIndex + 1);
       this.changed();
       return;
     }
@@ -129,50 +150,39 @@ export class InteractiveSupervisorComponent {
 
     const selectedItem = items[this.selectedIndex];
     if (!selectedItem) return;
-    const selected = selectedItem.state;
+    const itemKey = supervisorItemKey(selectedItem);
     if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
-      this.toggle(selected.id);
+      this.toggle(itemKey);
       return;
     }
     if (matchesKey(data, Key.left)) {
-      this.expanded.delete(selected.id);
+      this.expanded.delete(itemKey);
       this.changed();
-      return;
-    }
-    if (matchesKey(data, "a")) {
-      this.opts.notify?.(selected.attachCommand, "info");
       return;
     }
     if (matchesKey(data, "x")) {
-      if (!selectedItem.actionable) {
-        this.opts.notify?.(
-          "This lineage node is not safe to act on.",
-          "warning",
-        );
-        return;
-      }
-      const cancelled = (this.opts.cancel ?? cancelInteractiveSubagent)(
-        selected.id,
-      );
-      if (cancelled)
-        this.opts.notify?.(`Cancelled ${selected.name}.`, "warning");
-      else
-        this.opts.notify?.(
-          `Subagent ${selected.id} no longer exists.`,
-          "error",
-        );
-      this.changed();
+      this.cancelItem(selectedItem);
+      return;
+    }
+    if (matchesKey(data, "a")) {
+      const state = this.interactiveStateForAction(selectedItem, "attach");
+      if (state) this.opts.notify?.(state.attachCommand, "info");
       return;
     }
     if (matchesKey(data, "v")) {
-      void this.runAction("view", selected, this.opts.view);
+      const state = this.interactiveStateForAction(selectedItem, "view");
+      if (state) void this.runAction("view", state, this.opts.view);
       return;
     }
     if (matchesKey(data, "n")) {
-      void this.runAction("open native view", selected, this.opts.nativeView);
+      const state = this.interactiveStateForAction(selectedItem, "native view");
+      if (state)
+        void this.runAction("open native view", state, this.opts.nativeView);
       return;
     }
     if (matchesKey(data, "f")) {
+      const state = this.interactiveStateForAction(selectedItem, "focus");
+      if (!state) return;
       if (!selectedItem.actionable) {
         this.opts.notify?.(
           "This lineage node is not safe to focus.",
@@ -180,18 +190,11 @@ export class InteractiveSupervisorComponent {
         );
         return;
       }
-      void this.runAction("focus", selected, this.opts.focus);
+      void this.runAction("focus", state, this.opts.focus);
       return;
     }
     if (matchesKey(data, Key.shift("x"))) {
-      if (!selectedItem.actionable) {
-        this.opts.notify?.(
-          "This lineage subtree is not safe to cancel.",
-          "warning",
-        );
-        return;
-      }
-      void this.runAction("cancel subtree", selected, this.opts.cancelSubtree);
+      this.cancelInteractiveSubtree(selectedItem);
     }
   }
 
@@ -210,14 +213,91 @@ export class InteractiveSupervisorComponent {
     return (this.opts.now ?? Date.now)();
   }
 
-  private items(): InteractiveSupervisorItem[] {
-    return this.opts.items?.() ?? supervisorItems();
+  private items(): AsyncSupervisorItem[] {
+    const items = this.opts.items?.() ?? supervisorItems();
+    const stableIndex = this.selectedKey
+      ? items.findIndex((item) => supervisorItemKey(item) === this.selectedKey)
+      : -1;
+    this.selectedIndex =
+      stableIndex >= 0
+        ? stableIndex
+        : clampIndex(this.selectedIndex, items.length);
+    this.selectedKey = items[this.selectedIndex]
+      ? supervisorItemKey(items[this.selectedIndex])
+      : undefined;
+    return items;
+  }
+
+  private selectIndex(items: AsyncSupervisorItem[], index: number): void {
+    this.selectedIndex = clampIndex(index, items.length);
+    this.selectedKey = items[this.selectedIndex]
+      ? supervisorItemKey(items[this.selectedIndex])
+      : undefined;
   }
 
   private toggle(id: string): void {
     if (this.expanded.has(id)) this.expanded.delete(id);
     else this.expanded.add(id);
     this.changed();
+  }
+
+  private cancelItem(item: AsyncSupervisorItem): void {
+    let cancelled = false;
+    let label = "subagent";
+    if (!item.actionable) {
+      this.opts.notify?.("This async item is not safe to cancel.", "warning");
+      return;
+    }
+    if (item.kind === "in-process") {
+      cancelled = this.opts.cancelInProcess?.(item.job) ?? false;
+      label = item.job.id;
+    } else if (item.kind === "workflow") {
+      cancelled = this.opts.cancelWorkflow?.(item.job) ?? false;
+      label = item.job.name;
+    } else {
+      cancelled = Boolean(
+        (this.opts.cancel ?? cancelInteractiveSubagent)(item.state.id),
+      );
+      label = item.state.name;
+    }
+    this.opts.notify?.(
+      cancelled ? `Cancelled ${label}.` : `${label} is no longer running.`,
+      cancelled ? "warning" : "error",
+    );
+    this.changed();
+  }
+
+  private cancelInteractiveSubtree(item: AsyncSupervisorItem): void {
+    const state = interactiveState(item);
+    if (!state) {
+      this.opts.notify?.(
+        "Subtree cancellation is only available for interactive agents.",
+        "info",
+      );
+      return;
+    }
+    if (!item.actionable) {
+      this.opts.notify?.(
+        "This lineage subtree is not safe to cancel.",
+        "warning",
+      );
+      return;
+    }
+    void this.runAction("cancel subtree", state, this.opts.cancelSubtree);
+  }
+
+  private interactiveStateForAction(
+    item: AsyncSupervisorItem,
+    action: string,
+  ): InteractiveSubagentState | undefined {
+    const state = interactiveState(item);
+    if (!state) {
+      this.opts.notify?.(
+        `${action} is only available for interactive agents.`,
+        "info",
+      );
+    }
+    return state;
   }
 
   private changed(): void {
@@ -268,7 +348,7 @@ export async function showInteractiveSupervisor(
   const custom = (ui as ExtensionUIContext & { custom?: Function }).custom;
   if (typeof custom !== "function") {
     ui.notify(
-      "The interactive subagent supervisor is only available in Pi TUI sessions. Use the interactive status tools in this mode.",
+      "The async subagent supervisor is only available in Pi TUI sessions. Use the status and cancellation tools in this mode.",
       "info",
     );
     return { kind: "close" };
@@ -330,15 +410,106 @@ function supervisorStates(): InteractiveSubagentState[] {
   );
 }
 
-function supervisorItems(): InteractiveSupervisorItem[] {
+function supervisorItems(): AsyncSupervisorItem[] {
   return supervisorStates().map((state) => ({
+    kind: "interactive",
     state,
     depth: 0,
     actionable: true,
   }));
 }
 
-function formatDetails(
+function supervisorItemKey(item: AsyncSupervisorItem): string {
+  if (item.kind === "in-process") return `in-process:${item.job.id}`;
+  if (item.kind === "workflow") return `workflow:${item.job.id}`;
+  return `interactive:${item.state.id}`;
+}
+
+function interactiveState(
+  item: AsyncSupervisorItem,
+): InteractiveSubagentState | undefined {
+  if (item.kind === "in-process" || item.kind === "workflow") return undefined;
+  return item.state;
+}
+
+function formatAsyncSupervisorSummary(
+  item: AsyncSupervisorItem,
+  now: number,
+): string {
+  if (item.kind === "in-process") {
+    const job = item.job;
+    const elapsed = formatElapsed(Math.max(0, now - job.startedAt));
+    const activity = job.liveStatus.activeTool
+      ? `tool: ${job.liveStatus.activeTool.name}`
+      : `turn ${job.liveStatus.turn}`;
+    return `[in-process] ${statusIcon(job.status)} ${job.status} ${job.id} · ${elapsed} · ${activity}`;
+  }
+  if (item.kind === "workflow") {
+    const job = item.job;
+    const elapsed = formatElapsed(Math.max(0, now - job.startedAt));
+    const phase = job.snapshot.currentPhase
+      ? ` · phase: ${job.snapshot.currentPhase}`
+      : "";
+    return `[workflow] ${statusIcon(job.status)} ${job.status} ${job.name} (${job.id}) · ${elapsed} · ${job.snapshot.agentsSpawned} agents · ${job.snapshot.runningCount ?? 0} running${phase}`;
+  }
+  return `[interactive] ${formatSupervisorSummary(item.state, now)}`;
+}
+
+function formatAsyncDetails(
+  item: AsyncSupervisorItem,
+  width: number,
+): string[] {
+  if (item.kind === "in-process") {
+    return formatInProcessDetails(item.job, width);
+  }
+  if (item.kind === "workflow") {
+    return formatWorkflowDetails(item.job, width);
+  }
+  return formatInteractiveDetails(item.state, width);
+}
+
+function formatInProcessDetails(job: JobState, width: number): string[] {
+  const activeTool = job.liveStatus.activeTool?.name ?? "none";
+  const fields = [
+    `Job: ${job.id}`,
+    `Model: ${job.modelLabel ?? "default"}`,
+    `cwd: ${job.cwd ?? "unknown"}`,
+    `Turn: ${job.liveStatus.turn}`,
+    `Active tool: ${activeTool}`,
+    `Usage: ${job.liveStatus.usage.input} input · ${job.liveStatus.usage.output} output`,
+    `Output preview: ${compactText(job.liveStatus.output) || "none yet"}`,
+  ];
+  return fields.map((field) => trunc(`│     ${field}`, width));
+}
+
+function formatWorkflowDetails(job: WorkflowJobState, width: number): string[] {
+  const snapshot = job.snapshot;
+  const allRecords = snapshot.agentRecords ?? [];
+  const records = allRecords.slice(-DETAIL_WORKFLOW_AGENT_COUNT);
+  const omitted =
+    (snapshot.agentRecordsOmitted ?? 0) +
+    Math.max(0, allRecords.length - records.length);
+  const fields = [
+    `Workflow: ${job.name} (${job.id})`,
+    `Phase: ${snapshot.currentPhase ?? "none"}`,
+    `Agents: ${snapshot.agentsSpawned} total · ${snapshot.runningCount ?? 0} running`,
+    `Errors: ${snapshot.errorCount}`,
+    `Output tokens: ${snapshot.tokensSpent}`,
+    `Last activity: ${snapshot.lastMessage ?? "none yet"}`,
+  ];
+  if (omitted > 0) fields.push(`… ${omitted} older agent records omitted`);
+  for (const record of records) {
+    const label = record.label ?? "agent";
+    const model = record.model ? ` @${record.model}` : "";
+    const phase = record.phase ? ` (${record.phase})` : "";
+    fields.push(
+      `Agent: ${statusIcon(record.status)} ${record.status} ${label} #${record.agentId}${model}${phase}`,
+    );
+  }
+  return fields.map((field) => trunc(`│     ${field}`, width));
+}
+
+function formatInteractiveDetails(
   state: InteractiveSubagentState,
   width: number,
 ): string[] {
@@ -445,7 +616,7 @@ function compactText(value: string): string {
     .slice(0, DETAIL_PREVIEW_MAX_CHARS);
 }
 
-function statusIcon(status: InteractiveSubagentState["status"]): string {
+function statusIcon(status: string): string {
   switch (status) {
     case "running":
       return "→";
@@ -453,9 +624,13 @@ function statusIcon(status: InteractiveSubagentState["status"]): string {
       return "●";
     case "cancelled":
       return "⊘";
+    case "done":
     case "exited":
       return "✓";
+    case "error":
+      return "✗";
     case "unknown":
+    default:
       return "?";
   }
 }

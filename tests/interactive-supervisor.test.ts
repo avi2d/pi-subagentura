@@ -14,7 +14,16 @@ import {
   type InteractiveSubagentState,
 } from "../src/interactive-tmux";
 import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
-import { registerInteractiveSupervisor } from "../src/interactive-supervisor-registration";
+import {
+  buildAsyncSupervisorItems,
+  directSupervisorItems,
+  registerInteractiveSupervisor,
+} from "../src/interactive-supervisor-registration";
+import { jobRegistry, type JobState } from "../src/helpers";
+import {
+  workflowJobRegistry,
+  type WorkflowJobState,
+} from "../src/workflow-jobs";
 
 const tempDirs: string[] = [];
 const savedTmux = process.env.TMUX;
@@ -47,8 +56,59 @@ function state(
   };
 }
 
+function inProcessJob(id: string, overrides: Partial<JobState> = {}): JobState {
+  return {
+    id,
+    status: "running",
+    liveStatus: {
+      turn: 1,
+      output: `partial output from ${id}`,
+      usage: {
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      },
+    },
+    session: { abort: vi.fn() } as never,
+    startedAt: Date.now() - 4_000,
+    cwd: "/repo",
+    promise: Promise.resolve({}) as never,
+    ...overrides,
+  };
+}
+
+function workflowJob(
+  id: string,
+  overrides: Partial<WorkflowJobState> = {},
+): WorkflowJobState {
+  return {
+    id,
+    name: `workflow-${id}`,
+    status: "running",
+    startedAt: Date.now() - 3_000,
+    promise: Promise.resolve({}) as never,
+    abort: new AbortController(),
+    snapshot: {
+      agentsSpawned: 1,
+      errorCount: 0,
+      tokensSpent: 5,
+      phases: ["Review"],
+      currentPhase: "Review",
+      runningCount: 1,
+      agentRecords: [{ agentId: 1, label: "reviewer", status: "running" }],
+      agentRecordsOmitted: 0,
+    },
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   interactiveSubagentRegistry.clear();
+  jobRegistry.clear();
+  workflowJobRegistry.clear();
   __resetMuxInstances();
   vi.useRealTimers();
   if (savedTmux === undefined) delete process.env.TMUX;
@@ -75,6 +135,213 @@ describe("interactive supervisor", () => {
     expect(lines.some((line) => line.includes("reading"))).toBe(true);
     expect(lines.every((line) => line.length <= 72)).toBe(true);
     expect(formatSupervisorSummary(item, Date.now())).toContain("tmux");
+  });
+
+  it("renders in-process, workflow, and interactive async work", () => {
+    const processJob = inProcessJob("job-123");
+    const workflow = workflowJob("wf-123");
+    const interactive = state("interactive-123");
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        {
+          kind: "in-process",
+          job: processJob,
+          depth: 0,
+          actionable: true,
+        },
+        { kind: "workflow", job: workflow, depth: 0, actionable: true },
+        {
+          kind: "interactive",
+          state: interactive,
+          depth: 0,
+          actionable: true,
+        },
+      ],
+    });
+
+    const summaries = component.render(180).join("\n");
+    expect(summaries).toContain("Async Subagents");
+    expect(summaries).toContain("[in-process] → running job-123");
+    expect(summaries).toContain("[workflow] → running workflow-wf-123");
+    expect(summaries).toContain(
+      "[interactive] → running agent-interactive-123",
+    );
+
+    component.handleInput("\r");
+    expect(component.render(180).join("\n")).toContain(
+      "Output preview: partial output from job-123",
+    );
+    component.handleInput("j");
+    component.handleInput("\r");
+    expect(component.render(180).join("\n")).toContain(
+      "Agent: → running reviewer #1",
+    );
+  });
+
+  it("reports omitted workflow agent records", () => {
+    const records = Array.from({ length: 25 }, (_, index) => ({
+      agentId: index + 1,
+      label: "worker",
+      status: "done" as const,
+    }));
+    const workflow = workflowJob("wf-omitted", {
+      snapshot: {
+        ...workflowJob("snapshot").snapshot,
+        agentsSpawned: 27,
+        agentRecords: records,
+        agentRecordsOmitted: 2,
+      },
+    });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        { kind: "workflow", job: workflow, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("\r");
+
+    expect(component.render(180).join("\n")).toContain(
+      "… 7 older agent records omitted",
+    );
+  });
+
+  it("keeps selection on the same async item across refresh reordering", () => {
+    const first = state("first");
+    const selected = state("selected");
+    const inserted = state("inserted");
+    const cancel = vi.fn().mockReturnValue(selected);
+    let items = [first, selected].map((interactive) => ({
+      kind: "interactive" as const,
+      state: interactive,
+      depth: 0,
+      actionable: true,
+    }));
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      cancel,
+      items: () => items,
+    });
+    component.render(120);
+    component.handleInput("j");
+    items = [inserted, first, selected].map((interactive) => ({
+      kind: "interactive" as const,
+      state: interactive,
+      depth: 0,
+      actionable: true,
+    }));
+
+    component.invalidate();
+    component.render(120);
+    component.handleInput("x");
+
+    expect(cancel).toHaveBeenCalledWith(selected.id);
+  });
+
+  it("dispatches cancellation according to async work type", () => {
+    const processJob = inProcessJob("job-cancel");
+    const workflow = workflowJob("wf-cancel");
+    const interactive = state("interactive-cancel");
+    const cancelInProcess = vi.fn().mockReturnValue(true);
+    const cancelWorkflow = vi.fn().mockReturnValue(true);
+    const cancel = vi
+      .fn()
+      .mockReturnValue(state("interactive-cancel", { status: "cancelled" }));
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      cancel,
+      cancelInProcess,
+      cancelWorkflow,
+      items: () => [
+        {
+          kind: "in-process",
+          job: processJob,
+          depth: 0,
+          actionable: true,
+        },
+        { kind: "workflow", job: workflow, depth: 0, actionable: true },
+        {
+          kind: "interactive",
+          state: interactive,
+          depth: 0,
+          actionable: true,
+        },
+      ],
+    });
+
+    component.handleInput("x");
+    component.handleInput("j");
+    component.handleInput("x");
+    component.handleInput("j");
+    component.handleInput("x");
+
+    expect(cancelInProcess).toHaveBeenCalledWith(processJob);
+    expect(cancelWorkflow).toHaveBeenCalledWith(workflow);
+    expect(cancel).toHaveBeenCalledWith(interactive.id);
+  });
+
+  it("builds owner-scoped unified supervisor items", () => {
+    const owner = { id: 7, generation: 2 };
+    const processJob = inProcessJob("owned-job", {
+      deliveryOwner: {
+        pi: {} as never,
+        sessionContextId: owner.id,
+        sessionContextGeneration: owner.generation,
+      },
+    });
+    const otherProcessJob = inProcessJob("other-job", {
+      deliveryOwner: {
+        pi: {} as never,
+        sessionContextId: 99,
+        sessionContextGeneration: 1,
+      },
+    });
+    const workflow = workflowJob("owned-workflow", {
+      parentSessionOwner: owner,
+    });
+    const otherWorkflow = workflowJob("other-workflow", {
+      parentSessionOwner: { id: 99, generation: 1 },
+    });
+    jobRegistry.set(processJob.id, processJob);
+    jobRegistry.set(otherProcessJob.id, otherProcessJob);
+    workflowJobRegistry.set(workflow.id, workflow);
+    workflowJobRegistry.set(otherWorkflow.id, otherWorkflow);
+    const interactive = state("owned-interactive", {
+      parentSessionId: "owned-parent-session",
+    });
+    const otherInteractive = state("other-interactive", {
+      parentSessionId: "other-parent-session",
+    });
+    interactiveSubagentRegistry.set(interactive.id, interactive);
+    interactiveSubagentRegistry.set(otherInteractive.id, otherInteractive);
+
+    const items = buildAsyncSupervisorItems(
+      directSupervisorItems("owned-parent-session"),
+      owner,
+    );
+
+    expect(items.map((item) => item.kind)).toEqual([
+      "in-process",
+      "workflow",
+      "interactive",
+    ]);
+    expect(
+      items.some(
+        (item) => item.kind === "in-process" && item.job.id === "other-job",
+      ),
+    ).toBe(false);
+    expect(
+      items.some(
+        (item) => item.kind === "workflow" && item.job.id === "other-workflow",
+      ),
+    ).toBe(false);
+    expect(
+      items.some(
+        (item) =>
+          item.kind === "interactive" && item.state.id === "other-interactive",
+      ),
+    ).toBe(false);
   });
 
   it("navigates, expands, refreshes, and closes without cancelling", () => {
@@ -183,6 +450,51 @@ describe("interactive supervisor", () => {
 
     expect(cancel).toHaveBeenCalledWith("one");
     expect(done).not.toHaveBeenCalled();
+  });
+
+  it("cancels registered in-process jobs and workflows from the overlay", async () => {
+    const processAbort = new AbortController();
+    const processJob = inProcessJob("registered-job", { abort: processAbort });
+    const workflow = workflowJob("registered-workflow");
+    const workflowAbort = vi.spyOn(workflow.abort, "abort");
+    jobRegistry.set(processJob.id, processJob);
+    workflowJobRegistry.set(workflow.id, workflow);
+    let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    registerInteractiveSupervisor({
+      registerCommand: (
+        _name: string,
+        command: { handler: typeof commandHandler },
+      ) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never);
+    const custom = vi.fn(async (factory: Function) => {
+      const component = factory(
+        { requestRender: vi.fn() },
+        undefined,
+        undefined,
+        vi.fn(),
+      ) as InteractiveSupervisorComponent;
+      component.handleInput("x");
+      component.handleInput("j");
+      component.handleInput("x");
+      return { kind: "close" };
+    });
+    const ui = {
+      custom,
+      confirm: vi.fn(),
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+    };
+
+    await commandHandler?.("", { ui });
+
+    expect(processAbort.signal.aborted).toBe(true);
+    expect(processJob.status).toBe("cancelled");
+    expect(workflowAbort).toHaveBeenCalledOnce();
+    expect(workflow.status).toBe("cancelled");
+    expect(workflow.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
   });
 
   it("handles the toggle shortcut while focused and disposes its timer", () => {

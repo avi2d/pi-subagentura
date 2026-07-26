@@ -92,8 +92,8 @@ These commands are intended for people at the Pi prompt.
 | `/workflows`        | Select and run a saved workflow                                   |
 | `/list-workflows`   | Alias for `/workflows`                                            |
 | `/workflow-status`  | List workflow jobs and their live or terminal status              |
-| `/workflow-tree`    | Open the interactive workflow progress tree                       |
-| `/subagents`        | Open the recursive interactive supervisor (`Ctrl+Alt+A`)          |
+| `/workflow-tree`    | Open the specialized workflow progress tree                       |
+| `/subagents`        | Supervise all async work (`Ctrl+Alt+A`)                           |
 | `/delete-workflow`  | Delete a saved workflow by name or picker                         |
 | `/cancel-all-flows` | Cancel active jobs, workflows, and running interactive sub-agents |
 
@@ -382,11 +382,18 @@ reload does not unconditionally replay already-dispatched completions.
 Implementation details for crash-safe ordering and delivery recovery are in the
 [state-file invariants in the source repository](https://github.com/lmn451/pi-subagentura/blob/master/AGENTS.md#rehydrate-state-file-cwdpisubagentura-state-json).
 
-#### Interactive supervisor and recursive children
+#### Unified async supervisor and recursive children
 
-Run `/subagents` or press `Ctrl+Alt+A` to open the portable supervisor overlay.
-It projects the persisted lineage of interactive children and grandchildren,
-including descendants created from different working directories. Interactive
+Run `/subagents` or press `Ctrl+Alt+A` to open the portable async supervisor.
+It combines standalone async in-process jobs, workflow jobs and their agent
+records, and the persisted lineage of interactive children and grandchildren.
+`/workflow-tree` remains available as a specialized workflow-only view.
+
+Standalone jobs are owner-scoped to the current parent session. Expanding a
+workflow shows its recent agent attempts, phases, usage, and bounded omission
+counts. Agent records are observational; cancelling the workflow signals its
+in-flight agents. Interactive lineage can include descendants created from
+different working directories. Interactive
 children receive a minimal child runtime that can launch more interactive
 children, but does not register in-process or workflow orchestration tools.
 Recursion is bounded by default to depth 8 and 256 lineage nodes. Malformed,
@@ -394,26 +401,26 @@ orphaned, cyclic, or stale manifests remain visible but are non-actionable.
 
 The overlay supports these controls:
 
-| Key                    | Action                                                                                                                 |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `↑`/`↓`, `j`/`k`       | Select a lineage node                                                                                                  |
-| `Enter`/`→`            | Expand details, including bounded lifecycle state, recent events, and the latest `output.md` preview                   |
-| `v`                    | Capture a bounded terminal snapshot through the node's tmux/Zellij backend                                             |
-| `n`                    | Open the optional native tmux popup or Zellij floating viewer; unsupported environments remain in the portable overlay |
-| `f`                    | Focus the persisted pane/window using structured mux metadata                                                          |
-| `a`                    | Show the attach command                                                                                                |
-| `x`                    | Cancel one actionable node                                                                                             |
-| `X`                    | Confirm and cancel an actionable subtree deepest-first, continuing after individual failures                           |
-| `r`                    | Refresh lineage and pane liveness                                                                                      |
-| `q`/`Esc`/`Ctrl+Alt+A` | Close the overlay without stopping agents                                                                              |
+| Key                    | Action                                                                                            |
+| ---------------------- | ------------------------------------------------------------------------------------------------- |
+| `↑`/`↓`, `j`/`k`       | Select an async job, workflow, or interactive lineage node                                        |
+| `Enter`/`→`            | Expand type-specific activity, usage, agent records, or bounded artifact details                  |
+| `x`                    | Cancel the selected running item; workflow and in-process cancellation propagates to owned agents |
+| `v`                    | For interactive agents, capture a bounded terminal snapshot through tmux/Zellij                   |
+| `n`                    | For interactive agents, open the optional native tmux popup or Zellij floating viewer             |
+| `f`                    | For interactive agents, focus the persisted pane/window                                           |
+| `a`                    | For interactive agents, show the attach command                                                   |
+| `X`                    | For interactive agents, confirm and cancel an actionable subtree deepest-first                    |
+| `r`                    | Refresh registries, lineage, and pane liveness                                                    |
+| `q`/`Esc`/`Ctrl+Alt+A` | Close the overlay without stopping agents                                                         |
 
-Terminal capture is bounded by both bytes and lines. Expanded artifact details
-read only regular files and bound lifecycle-event reads to 8 KiB, output reads
-to 4 KiB, and displayed previews to 512 characters. Direct children remain in
-the root registry, while descendant completion delivery remains owned by the Pi
-session that spawned that descendant. Cancelling a descendant therefore does
-not inject its completion into the root session, and cancellation preserves its
-artifact directory for later inspection.
+Terminal capture is bounded by both bytes and lines. Expanded interactive
+artifact details read only regular files and bound lifecycle-event reads to 8
+KiB, output reads to 4 KiB, and displayed previews to 512 characters. Direct
+interactive children remain in the root registry, while descendant completion
+delivery remains owned by the Pi session that spawned that descendant.
+Cancelling a descendant therefore does not inject its completion into the root
+session, and cancellation preserves its artifact directory for later inspection.
 
 #### Sub-agent completion protocol
 

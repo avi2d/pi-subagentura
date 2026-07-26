@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
   INTERACTIVE_SUPERVISOR_SHORTCUT,
+  type AsyncSupervisorItem,
   type InteractiveSupervisorItem,
   showInteractiveSupervisor,
 } from "./interactive-supervisor-ui";
@@ -23,6 +24,23 @@ import {
   type ProjectedLineageNode,
 } from "./interactive-lineage";
 import { getMux, type MuxName } from "./multiplexer";
+import {
+  abortJobTree,
+  inProcessJobBelongsToOwner,
+  jobRegistry,
+  scheduleJobCleanup,
+  type JobState,
+} from "./helpers";
+import { snapshotInProcessSession } from "./cancellation-snapshots";
+import { updateRunningSubagentFooter } from "./artifact-poller";
+import {
+  normalizeCancelledWorkflowState,
+  workflowJobsForOwner,
+} from "./workflow-jobs";
+import type {
+  ActiveSessionContextToken,
+  SessionContextRef,
+} from "./session-context";
 
 const SUPERVISOR_CAPTURE_MAX_BYTES = 16 * 1024;
 const SUPERVISOR_CAPTURE_MAX_LINES = 200;
@@ -32,13 +50,72 @@ interface SupervisorProjection {
   nodes: Map<string, ProjectedLineageNode>;
 }
 
-function directSupervisorItems(): InteractiveSupervisorItem[] {
+export function directSupervisorItems(
+  sessionId?: string,
+): InteractiveSupervisorItem[] {
   return [...interactiveSubagentRegistry.values()]
+    .filter(
+      (state) => sessionId === undefined || state.parentSessionId === sessionId,
+    )
     .sort(
       (left, right) =>
         left.startedAt - right.startedAt || left.id.localeCompare(right.id),
     )
-    .map((state) => ({ state, depth: 0, actionable: true }));
+    .map((state) => ({
+      kind: "interactive",
+      state,
+      depth: 0,
+      actionable: true,
+    }));
+}
+
+export function buildAsyncSupervisorItems(
+  interactiveItems: InteractiveSupervisorItem[],
+  owner: ActiveSessionContextToken | undefined,
+): AsyncSupervisorItem[] {
+  const processJobs = [...jobRegistry.values()]
+    .filter((job) => inProcessJobBelongsToOwner(job, owner))
+    .sort(
+      (left, right) =>
+        left.startedAt - right.startedAt || left.id.localeCompare(right.id),
+    );
+  const visibleJobs = new Map(processJobs.map((job) => [job.id, job]));
+  const processItems: AsyncSupervisorItem[] = processJobs.map((job) => ({
+    kind: "in-process",
+    job,
+    depth: inProcessSupervisorDepth(job, visibleJobs),
+    actionable: job.status === "running",
+    reasons: job.status === "running" ? undefined : [job.status],
+  }));
+  const workflowItems: AsyncSupervisorItem[] = workflowJobsForOwner(owner)
+    .sort(
+      (left, right) =>
+        left.startedAt - right.startedAt || left.id.localeCompare(right.id),
+    )
+    .map((job) => ({
+      kind: "workflow",
+      job,
+      depth: 0,
+      actionable: job.status === "running",
+      reasons: job.status === "running" ? undefined : [job.status],
+    }));
+  const normalizedInteractive: AsyncSupervisorItem[] = interactiveItems.map(
+    (item) => ({ ...item, kind: "interactive" }),
+  );
+  return [...processItems, ...workflowItems, ...normalizedInteractive];
+}
+
+function inProcessSupervisorDepth(
+  job: JobState,
+  visibleJobs: Map<string, JobState>,
+  visiting = new Set<string>(),
+): number {
+  const parent = job.parentJobId ? visibleJobs.get(job.parentJobId) : undefined;
+  const nextVisiting = new Set(visiting);
+  nextVisiting.add(job.id);
+  if (!job.parentJobId || visiting.has(job.id)) return 0;
+  if (!parent) return 0;
+  return 1 + inProcessSupervisorDepth(parent, visibleJobs, nextVisiting);
 }
 
 function stateForNode(node: ProjectedLineageNode): InteractiveSubagentState {
@@ -115,6 +192,8 @@ async function loadSupervisorProjection(
     reasons: node.reasons,
   }));
   for (const state of interactiveSubagentRegistry.values()) {
+    if (sessionId !== undefined && state.parentSessionId !== sessionId)
+      continue;
     if (!seen.has(state.id)) {
       items.push({ state, depth: 0, actionable: true });
       seen.add(state.id);
@@ -126,17 +205,29 @@ async function loadSupervisorProjection(
   };
 }
 
-export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
+export function registerInteractiveSupervisor(
+  pi: ExtensionAPI,
+  sessionContext?: SessionContextRef,
+): void {
+  const owner = (): ActiveSessionContextToken | undefined =>
+    sessionContext
+      ? { id: sessionContext.id, generation: sessionContext.generation }
+      : undefined;
   const open = async (ctx: {
     ui: Parameters<typeof showInteractiveSupervisor>[0];
     sessionManager?: { getSessionId?: () => string };
   }) => {
     const sessionId = ctx.sessionManager?.getSessionId?.();
+    const activeOwner = owner();
     let projection = await loadSupervisorProjection(sessionId).catch(
       () => undefined,
     );
     await showInteractiveSupervisor(ctx.ui, {
-      items: () => projection?.items ?? directSupervisorItems(),
+      items: () =>
+        buildAsyncSupervisorItems(
+          projection?.items ?? directSupervisorItems(sessionId),
+          activeOwner,
+        ),
       refresh: async () => {
         projection = await loadSupervisorProjection(sessionId).catch(
           () => projection,
@@ -173,14 +264,30 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
           );
         }
       },
+      cancelInProcess: (job) => {
+        if (!cancelInProcessFromSupervisor(job, sessionId)) return false;
+        updateRunningSubagentFooter(ctx.ui);
+        return true;
+      },
+      cancelWorkflow: (job) => {
+        if (job.status !== "running") return false;
+        job.abort.abort();
+        job.status = "cancelled";
+        normalizeCancelledWorkflowState(job);
+        return true;
+      },
       cancel: (id) => {
         const direct = cancelInteractiveSubagent(id);
-        if (direct) return direct;
+        if (direct) {
+          updateRunningSubagentFooter(ctx.ui);
+          return direct;
+        }
         const item = projection?.items.find(
           (candidate) => candidate.state.id === id,
         );
         if (!item?.actionable) return undefined;
         cancelInteractiveDescendantByState(item.state);
+        updateRunningSubagentFooter(ctx.ui);
         return item.state;
       },
       cancelSubtree: async (state) => {
@@ -192,6 +299,7 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
         const root = projection?.nodes.get(state.id);
         if (!root) {
           cancelInteractiveSubagent(state.id);
+          updateRunningSubagentFooter(ctx.ui);
           return;
         }
         const result = await cancelLineageSubtreeBestEffort(root, {
@@ -211,6 +319,7 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
             }
           },
         });
+        updateRunningSubagentFooter(ctx.ui);
         ctx.ui.notify(
           `Subtree cancellation: ${result.cancelled.length} cancelled, ${result.alreadyTerminal.length} already terminal, ${result.stale.length} stale, ${result.failed.length} failed.`,
           result.failed.length > 0 ? "warning" : "info",
@@ -221,14 +330,45 @@ export function registerInteractiveSupervisor(pi: ExtensionAPI): void {
 
   if (typeof pi.registerShortcut === "function") {
     pi.registerShortcut(INTERACTIVE_SUPERVISOR_SHORTCUT, {
-      description: "Open the interactive subagent supervisor",
+      description: "Open the async subagent supervisor",
       handler: open,
     });
   }
   if (typeof pi.registerCommand === "function") {
     pi.registerCommand("subagents", {
-      description: "Open the interactive subagent supervisor",
+      description: "Open the async subagent supervisor",
       handler: async (_args, ctx) => open(ctx),
     });
   }
+}
+
+function cancelInProcessFromSupervisor(
+  job: JobState,
+  sessionId: string | undefined,
+): boolean {
+  const info = {
+    source: "supervisor" as const,
+    initiator: sessionId,
+    reason: `async supervisor cancelled job ${job.id}`,
+  };
+  if (job.status !== "running") return false;
+  job.cancellation = { ...info, at: Date.now() };
+  job.cancellationSnapshot = snapshotInProcessSession({
+    kind: "in-process",
+    jobId: job.id,
+    session: job.session,
+    cwd: job.cwd ?? process.cwd(),
+    parentSessionId: sessionId,
+    model: job.modelLabel,
+    activeTool: job.liveStatus.activeTool,
+    partialOutput: job.liveStatus.output,
+    startedAt: job.startedAt,
+    source: "supervisor",
+    initiator: info.initiator,
+    reason: info.reason,
+  });
+  abortJobTree(job.id, info);
+  job.status = "cancelled";
+  scheduleJobCleanup(job.id, true);
+  return true;
 }

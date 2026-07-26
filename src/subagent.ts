@@ -122,7 +122,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
   const sessionContext = registerSessionHandlers(pi);
   registerInteractiveSubagentTools(pi);
-  registerInteractiveSupervisor(pi);
+  registerInteractiveSupervisor(pi, sessionContext);
   if (onlyInteractive) {
     registerSubagentArtifactsCleanupTool(pi);
     registerSubagentModelListTool(pi);
