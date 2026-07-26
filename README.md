@@ -14,6 +14,34 @@ Start Pi with the bundled orchestrator guidance and describe the outcome you
 want. The parent can turn that request into a saved workflow, run its agents in
 the background, and keep their intermediate results out of the parent context.
 
+## Installation
+
+See [CHANGELOG.md](./CHANGELOG.md) for breaking changes between major versions.
+
+Install globally:
+
+```bash
+pi install npm:pi-subagentura
+```
+
+Install for just the current project:
+
+```bash
+pi install -l npm:pi-subagentura
+```
+
+Try it for a single run without installing:
+
+```bash
+pi -e npm:pi-subagentura
+```
+
+You can also install directly from GitHub:
+
+```bash
+pi install git:github.com/lmn451/pi-subagentura
+```
+
 ## Quick start
 
 ```text
@@ -159,34 +187,6 @@ reference points for the interaction model.
 | [OpenCode agents](https://opencode.ai/docs/agents/)                 | Simple primary/subagent model; automatic or explicit `@` invocation; custom prompts, models, tools, and permissions; built-in parent/child session navigation            | Navigation stays inside OpenCode's session UI; no separate attachable mux pane or pi-subagentura-compatible durable artifact/delivery protocol                                                                         |
 
 ![Sub-agent demo](working.png)
-
-## Installation
-
-See [CHANGELOG.md](./CHANGELOG.md) for breaking changes between major versions.
-
-Install globally:
-
-```bash
-pi install npm:pi-subagentura
-```
-
-Install for just the current project:
-
-```bash
-pi install -l npm:pi-subagentura
-```
-
-Try it for a single run without installing:
-
-```bash
-pi -e npm:pi-subagentura
-```
-
-You can also install directly from GitHub:
-
-```bash
-pi install git:github.com/lmn451/pi-subagentura
-```
 
 ## Bundled orchestration defaults
 
