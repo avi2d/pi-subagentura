@@ -8,6 +8,12 @@ import {
   showInteractiveSupervisor,
 } from "../src/interactive-supervisor-ui";
 import {
+  LINEAGE_SCHEMA_VERSION,
+  hashLineageRoot,
+  resolveLineageStorePaths,
+  writeLineageManifestAtomic,
+} from "../src/interactive-lineage";
+import {
   captureInteractiveSubagent,
   focusInteractiveSubagent,
   interactiveSubagentRegistry,
@@ -570,6 +576,82 @@ describe("interactive supervisor", () => {
       "This async item is not safe to cancel.",
       "warning",
     );
+  });
+
+  it("keeps exited projected registry children unavailable", async () => {
+    const sessionRoot = tempDir();
+    const rootId = "projected-root";
+    const artifactDir = join(sessionRoot, "artifact");
+    const paths = await resolveLineageStorePaths(sessionRoot, rootId);
+    const exited = state("projected-exited", {
+      artifactDir,
+      cwd: sessionRoot,
+      parentSessionId: rootId,
+      status: "exited",
+    });
+    const previousRootId = process.env.PI_SUBAGENTURA_ROOT_ID;
+    const previousSessionRoot = process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+    let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    let rendered = "";
+    mkdirSync(artifactDir);
+    await writeLineageManifestAtomic(paths.nodesDir, {
+      schemaVersion: LINEAGE_SCHEMA_VERSION,
+      agentId: exited.id,
+      rootId,
+      rootHash: hashLineageRoot(rootId),
+      ownerSessionId: rootId,
+      name: exited.name,
+      taskPreview: exited.task,
+      startedAt: new Date(exited.startedAt).toISOString(),
+      cwd: exited.cwd,
+      pane: { backend: "tmux", paneId: exited.paneId },
+      artifactDir,
+    });
+    interactiveSubagentRegistry.set(exited.id, exited);
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: vi.fn().mockResolvedValue(true),
+      isPaneAlive: vi.fn().mockReturnValue(false),
+    } as never);
+    process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
+    registerInteractiveSupervisor({
+      registerCommand: (
+        _name: string,
+        command: { handler: typeof commandHandler },
+      ) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never);
+    const custom = vi.fn(async (factory: Function) => {
+      const component = factory(
+        { requestRender: vi.fn() },
+        undefined,
+        undefined,
+        vi.fn(),
+      ) as InteractiveSupervisorComponent;
+      rendered = component.render(160).join("\n");
+      component.handleInput("x");
+      return { kind: "close" };
+    });
+
+    try {
+      await commandHandler?.("", {
+        ui: { custom, confirm: vi.fn(), notify: vi.fn(), setStatus: vi.fn() },
+        sessionManager: { getSessionId: () => rootId },
+      });
+
+      expect.soft(rendered).toContain("unavailable");
+      expect(exited.status).toBe("exited");
+    } finally {
+      if (previousRootId === undefined)
+        delete process.env.PI_SUBAGENTURA_ROOT_ID;
+      else process.env.PI_SUBAGENTURA_ROOT_ID = previousRootId;
+      if (previousSessionRoot === undefined)
+        delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+      else
+        process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = previousSessionRoot;
+    }
   });
 
   it("skips artifact reads for unknown sentinel artifactDir", () => {

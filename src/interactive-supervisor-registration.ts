@@ -50,6 +50,12 @@ interface SupervisorProjection {
   nodes: Map<string, ProjectedLineageNode>;
 }
 
+function isInteractiveStateActionable(
+  state: InteractiveSubagentState,
+): boolean {
+  return state.status === "running" || state.status === "idle";
+}
+
 export function directSupervisorItems(
   sessionId?: string,
 ): InteractiveSupervisorItem[] {
@@ -65,7 +71,7 @@ export function directSupervisorItems(
       kind: "interactive",
       state,
       depth: 0,
-      actionable: state.status === "running" || state.status === "idle",
+      actionable: isInteractiveStateActionable(state),
     }));
 }
 
@@ -185,12 +191,16 @@ async function loadSupervisorProjection(
       seen.add(node.manifest.agentId);
     }
   }
-  const items: InteractiveSupervisorItem[] = flattened.map((node) => ({
-    state: stateForNode(node),
-    depth: node.depth,
-    actionable: node.state === "actionable",
-    reasons: node.reasons,
-  }));
+  const items: InteractiveSupervisorItem[] = flattened.map((node) => {
+    const state = stateForNode(node);
+    return {
+      state,
+      depth: node.depth,
+      actionable:
+        node.state === "actionable" && isInteractiveStateActionable(state),
+      reasons: node.reasons,
+    };
+  });
   for (const state of interactiveSubagentRegistry.values()) {
     if (sessionId !== undefined && state.parentSessionId !== sessionId)
       continue;
@@ -198,7 +208,7 @@ async function loadSupervisorProjection(
       items.push({
         state,
         depth: 0,
-        actionable: state.status === "running" || state.status === "idle",
+        actionable: isInteractiveStateActionable(state),
       });
       seen.add(state.id);
     }
