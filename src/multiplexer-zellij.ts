@@ -34,35 +34,13 @@ import type {
   Multiplexer,
   PaneRef,
 } from "./multiplexer";
-import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
-
-const MAX_CAPTURE_READ_BYTES = 1024 * 1024;
-
-function boundCaptureOutput(
-  output: string,
-  opts: CapturePaneOptions,
-): CapturePaneResult {
-  const maxLines = Math.max(0, Math.floor(opts.maxLines));
-  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
-  let truncated = false;
-  let bounded = output;
-  const lines = bounded.split("\n");
-  if (maxLines > 0 && lines.length > maxLines) {
-    bounded = lines.slice(-maxLines).join("\n");
-    truncated = true;
-  } else if (maxLines === 0 && bounded.length > 0) {
-    bounded = "";
-    truncated = true;
-  }
-  const bytes = Buffer.byteLength(bounded, "utf8");
-  if (bytes > maxBytes) {
-    bounded = Buffer.from(bounded, "utf8")
-      .subarray(bytes - maxBytes)
-      .toString("utf8");
-    truncated = true;
-  }
-  return { output: bounded, truncated };
-}
+import {
+  boundCaptureOutput,
+  commandExists,
+  execMuxOrThrow,
+  MAX_CAPTURE_READ_BYTES,
+  shellEscape,
+} from "./multiplexer";
 
 /** Sanitize a free-form name into a safe segment for zellij tab/session names. */
 function safeSegment(value: string): string {
