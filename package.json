@@ -100,17 +100,19 @@
     ]
   },
   "scripts": {
-    "test": "vitest run --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts",
-    "test:unit": "vitest run --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts --exclude tests/pi-session-delivery.integration.test.ts",
+    "test": "vitest run --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts --exclude 'tests/terminal-e2e/**'",
+    "test:unit": "vitest run --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts --exclude tests/pi-session-delivery.integration.test.ts --exclude 'tests/terminal-e2e/**'",
     "test:pi": "vitest run tests/pi-session-delivery.integration.test.ts",
     "test:tmux": "vitest run tests/tmux.integration.test.ts",
     "test:zellij": "vitest run tests/zellij.integration.test.ts",
-    "coverage:check": "vitest run --coverage --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts",
+    "coverage:check": "vitest run --coverage --exclude tests/tmux.integration.test.ts --exclude tests/zellij.integration.test.ts --exclude 'tests/terminal-e2e/**'",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "hooks:install": "simple-git-hooks",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "test:tui": "vitest run --testTimeout=60000 tests/terminal-e2e/provider-contract.test.ts tests/terminal-e2e/network-guard.test.ts tests/terminal-e2e/harness-contract.test.ts tests/terminal-e2e/terminal.test.ts",
+    "demo:tui": "bash tests/terminal-e2e/demo.sh"
   },
   "simple-git-hooks": {
     "pre-commit": "npx lint-staged",

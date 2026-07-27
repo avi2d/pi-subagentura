@@ -87,6 +87,19 @@ jobs:
         run: npm run test:zellij
         env:
           TERM: xterm-256color
+      - name: Run terminal visual E2E tests
+        env:
+          PI_SUBAGENTURA_TMUX_SOCKET: pi-subagentura-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          TERM: xterm-256color
+          SUBAGENTURA_E2E_DIAGNOSTICS: ${{ runner.temp }}/subagentura-e2e
+        run: npm run test:tui
+      - name: Upload terminal E2E diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: terminal-e2e-${{ matrix.pi-version }}
+          path: ${{ runner.temp }}/subagentura-e2e
+          if-no-files-found: ignore
 
       - name: Format check
         run: npm run format:check
