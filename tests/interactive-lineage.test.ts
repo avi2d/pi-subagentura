@@ -11,6 +11,7 @@ import {
   projectManifests,
   readLineageManifest,
   resolveLineageStorePaths,
+  resolveLineageStorePathsSync,
   safeContainedPath,
   validateLineageManifest,
   writeLineageManifestAtomic,
@@ -130,6 +131,18 @@ describe("interactive lineage path safety", () => {
       path.join(canonicalDir, "subagentura", "trees", expectedHash),
     );
     expect(paths.nodesDir).toBe(path.join(paths.treeDir, "nodes"));
+  });
+
+  it("creates a missing session root before resolving paths", async () => {
+    const parent = await tempDir();
+    const missing = path.join(parent, "fresh-session-root");
+    expect(await fs.stat(missing).catch(() => undefined)).toBeUndefined();
+
+    const asyncPaths = await resolveLineageStorePaths(missing, "root-a");
+    const syncPaths = resolveLineageStorePathsSync(missing, "root-a");
+
+    expect((await fs.stat(missing)).isDirectory()).toBe(true);
+    expect(asyncPaths).toEqual(syncPaths);
   });
 
   it("rejects traversal and symlink components when resolving contained paths", async () => {

@@ -132,6 +132,10 @@ export async function resolveLineageStorePaths(
   sessionRoot: string,
   rootId: string,
 ): Promise<LineageStorePaths> {
+  // Match sync twin: create the session root before realpath so a fresh
+  // install does not reject with ENOENT (swallowed by the supervisor load
+  // path into a silent direct-children-only degrade).
+  await fs.mkdir(sessionRoot, { recursive: true });
   const safeSessionRoot = await resolveContainedRealPath(
     sessionRoot,
     sessionRoot,
