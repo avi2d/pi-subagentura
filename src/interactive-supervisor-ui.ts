@@ -582,7 +582,13 @@ function readBoundedFileTail(filePath: string, maxBytes: number): string {
     const buffer = Buffer.alloc(bytes);
     fd = openSync(filePath, "r");
     if (bytes > 0) readSync(fd, buffer, 0, bytes, size - bytes);
-    return buffer.toString("utf8");
+    // Drop leading UTF-8 continuation bytes so a mid-sequence cut does
+    // not decode as U+FFFD.
+    let start = 0;
+    while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) {
+      start++;
+    }
+    return buffer.subarray(start).toString("utf8");
   } catch {
     return "";
   } finally {

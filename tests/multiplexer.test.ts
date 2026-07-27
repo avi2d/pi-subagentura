@@ -140,3 +140,34 @@ describe("getMux relaxed-spawn resolution", () => {
     expect(mux.name).toBe("tmux");
   });
 });
+
+describe("boundCaptureOutput UTF-8 safety", () => {
+  it("does not start a byte-truncated preview mid-codepoint", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    // "café" is 5 bytes (é = c3 a9). maxBytes 1 lands on the continuation
+    // byte 0xa9; advancing past it must yield an empty string, not U+FFFD.
+    const midSequence = boundCaptureOutput("café", {
+      maxLines: 10,
+      maxBytes: 1,
+    });
+    expect(midSequence.truncated).toBe(true);
+    expect(midSequence.output).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(midSequence.output, "utf8")).toBeLessThanOrEqual(
+      1,
+    );
+    expect(midSequence.output).toBe("");
+
+    // maxBytes 2 lands on the lead byte of é — keep the full character.
+    const onLead = boundCaptureOutput("café", {
+      maxLines: 10,
+      maxBytes: 2,
+    });
+    expect(onLead.truncated).toBe(true);
+    expect(onLead.output).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(onLead.output, "utf8")).toBeLessThanOrEqual(2);
+    expect(onLead.output).toBe("é");
+  });
+});

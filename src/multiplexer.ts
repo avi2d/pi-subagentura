@@ -381,7 +381,12 @@ export function execMuxOrThrow(
 /** Upper bound for `execFile` maxBuffer on pane-capture subprocesses. */
 export const MAX_CAPTURE_READ_BYTES = 1024 * 1024;
 
-/** Apply line and byte bounds to captured pane output. */
+/**
+ * Apply line and byte bounds to captured pane output.
+ *
+ * When the byte cut lands mid UTF-8 sequence, the start offset advances past
+ * continuation bytes so the decoded preview never begins with U+FFFD.
+ */
 export function boundCaptureOutput(
   output: string,
   opts: CapturePaneOptions,
@@ -398,11 +403,11 @@ export function boundCaptureOutput(
     bounded = "";
     truncated = true;
   }
-  const bytes = Buffer.byteLength(bounded, "utf8");
-  if (bytes > maxBytes) {
-    bounded = Buffer.from(bounded, "utf8")
-      .subarray(bytes - maxBytes)
-      .toString("utf8");
+  const buf = Buffer.from(bounded, "utf8");
+  if (buf.length > maxBytes) {
+    let start = buf.length - maxBytes;
+    while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++;
+    bounded = buf.subarray(start).toString("utf8");
     truncated = true;
   }
   return { output: bounded, truncated };
