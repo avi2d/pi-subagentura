@@ -572,6 +572,40 @@ describe("interactive supervisor", () => {
     );
   });
 
+  it("skips artifact reads for unknown sentinel artifactDir", () => {
+    const dir = tempDir();
+    const previousCwd = process.cwd();
+    process.chdir(dir);
+    try {
+      mkdirSync("unknown");
+      writeFileSync(
+        join("unknown", "events.ndjson"),
+        `${JSON.stringify({ type: "done", outcome: "success" })}\n`,
+      );
+      writeFileSync(join("unknown", "output.md"), "should-not-appear");
+
+      const item = state("sentinel", { artifactDir: "unknown" });
+      const component = new InteractiveSupervisorComponent({
+        done: vi.fn(),
+        items: () => [
+          { kind: "interactive", state: item, depth: 0, actionable: true },
+        ],
+      });
+
+      component.handleInput("\r");
+      const lines = component.render(160);
+      expect(
+        lines.some((line) => line.includes("Recent events: none yet")),
+      ).toBe(true);
+      expect(lines.some((line) => line.includes("should-not-appear"))).toBe(
+        false,
+      );
+      expect(lines.some((line) => line.includes("success"))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
   it("reports a clear fallback outside Pi TUI sessions", async () => {
     const notify = vi.fn();
 

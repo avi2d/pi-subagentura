@@ -554,6 +554,11 @@ function readArtifactDetails(state: InteractiveSubagentState): {
           .join(" · "),
       ) || "active"
     : "not folded yet";
+  // Sentinel artifactDir means no real on-disk artifact root — do not
+  // join/read relative to the parent's cwd (e.g. ./unknown/events.ndjson).
+  if (state.artifactDir === "unknown") {
+    return { lifecycle, events: "none yet", output: "none yet" };
+  }
   const events = summarizeRecentEvents(
     readBoundedFileTail(
       join(state.artifactDir, "events.ndjson"),
