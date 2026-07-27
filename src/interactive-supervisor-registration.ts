@@ -65,7 +65,7 @@ export function directSupervisorItems(
       kind: "interactive",
       state,
       depth: 0,
-      actionable: true,
+      actionable: state.status === "running" || state.status === "idle",
     }));
 }
 
@@ -195,7 +195,11 @@ async function loadSupervisorProjection(
     if (sessionId !== undefined && state.parentSessionId !== sessionId)
       continue;
     if (!seen.has(state.id)) {
-      items.push({ state, depth: 0, actionable: true });
+      items.push({
+        state,
+        depth: 0,
+        actionable: state.status === "running" || state.status === "idle",
+      });
       seen.add(state.id);
     }
   }

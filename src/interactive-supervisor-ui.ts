@@ -417,7 +417,7 @@ function supervisorItems(): AsyncSupervisorItem[] {
     kind: "interactive",
     state,
     depth: 0,
-    actionable: true,
+    actionable: state.status === "running" || state.status === "idle",
   }));
 }
 

@@ -550,6 +550,28 @@ describe("interactive supervisor", () => {
     component.dispose();
   });
 
+  it("marks exited registry children unavailable and skips cancel", () => {
+    const exited = state("exited-child", { status: "exited" });
+    interactiveSubagentRegistry.set(exited.id, exited);
+    const cancel = vi.fn();
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      cancel,
+      notify,
+    });
+
+    const lines = component.render(120);
+    expect(lines.some((line) => line.includes("unavailable"))).toBe(true);
+
+    component.handleInput("x");
+    expect(cancel).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      "This async item is not safe to cancel.",
+      "warning",
+    );
+  });
+
   it("reports a clear fallback outside Pi TUI sessions", async () => {
     const notify = vi.fn();
 
