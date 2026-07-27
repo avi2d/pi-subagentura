@@ -518,6 +518,38 @@ describe("interactive supervisor", () => {
     expect(requestRender).not.toHaveBeenCalled();
   });
 
+  it("skips overlapping refresh ticks while a refresh is in flight", async () => {
+    vi.useFakeTimers();
+    let resolveRefresh!: () => void;
+    const refresh = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+    const requestRender = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      requestRender,
+      refresh,
+      refreshIntervalMs: 1_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    resolveRefresh();
+    await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(refresh).toHaveBeenCalledTimes(2);
+
+    component.dispose();
+  });
+
   it("reports a clear fallback outside Pi TUI sessions", async () => {
     const notify = vi.fn();
 

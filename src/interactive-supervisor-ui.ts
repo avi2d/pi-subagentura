@@ -71,6 +71,7 @@ export class InteractiveSupervisorComponent {
   private cachedLines?: string[];
   private readonly timer?: ReturnType<typeof setInterval>;
   private disposed = false;
+  private refreshing = false;
 
   constructor(private readonly opts: InteractiveSupervisorOptions) {
     const refreshIntervalMs =
@@ -307,13 +308,14 @@ export class InteractiveSupervisorComponent {
   }
 
   private async refresh(): Promise<void> {
-    if (!this.opts.refresh) {
-      this.changed();
-      return;
-    }
+    if (this.refreshing) return;
+    this.refreshing = true;
     try {
-      await this.opts.refresh();
+      // Avoid `await undefined` — that yields a microtask and breaks the
+      // no-refresh path, which previously called changed() synchronously.
+      if (this.opts.refresh) await this.opts.refresh();
     } finally {
+      this.refreshing = false;
       this.changed();
     }
   }
