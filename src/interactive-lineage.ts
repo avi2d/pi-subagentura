@@ -507,14 +507,6 @@ export async function projectManifests(
     stack: Set<string>,
   ): ProjectedLineageNode => {
     const reasonSet = new Set(nonActionableIds.get(manifest.agentId) ?? []);
-    if (depth > effectiveBounds.maxDepth) {
-      reasonSet.add("truncated");
-      issues.push({
-        kind: "truncated",
-        agentId: manifest.agentId,
-        reason: "depth cap reached",
-      });
-    }
     if (stack.has(manifest.agentId)) {
       reasonSet.add("cycle");
       issues.push({
