@@ -266,6 +266,139 @@ describe("pollArtifactChanges", () => {
     expect(bProcessedWhileAWasBlocked).toBe(true);
   });
 
+  it("retains shared activity rows when a sibling owner has none", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const sharedUi = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const a = makeState();
+    a.state.name = "agent-a";
+    a.state.parentSessionId = "session-a";
+    mod.interactiveSubagentRegistry.set(a.id, a.state);
+    const ownerA = { id: 503, generation: 1 };
+    const ownerB = { id: 504, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: sharedUi as any,
+      sessionManager: { getSessionId: () => "session-a" },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: sharedUi as any,
+      sessionManager: { getSessionId: () => "session-b" },
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any, ownerA);
+    await mod.pollArtifactChanges({} as any, ownerB);
+
+    const widgetCalls = sharedUi.setWidget.mock.calls.filter(
+      ([key]) => key === "subagentura-activity",
+    );
+    const finalRows = widgetCalls.at(-1)?.[1] as string[] | undefined;
+    expect(finalRows).toEqual(
+      expect.arrayContaining([expect.stringContaining("agent-a")]),
+    );
+  });
+
+  it("keeps activity rows isolated between distinct UIs", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const uiA = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const uiB = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const a = makeState();
+    const b = makeState();
+    a.state.name = "agent-a";
+    a.state.parentSessionId = "session-a";
+    b.state.name = "agent-b";
+    b.state.parentSessionId = "session-b";
+    mod.interactiveSubagentRegistry.set(a.id, a.state);
+    mod.interactiveSubagentRegistry.set(b.id, b.state);
+    const ownerA = { id: 505, generation: 1 };
+    const ownerB = { id: 506, generation: 1 };
+    registerSessionContext({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: uiA as any,
+      sessionManager: { getSessionId: () => "session-a" },
+    });
+    registerSessionContext({
+      ...ownerB,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: uiB as any,
+      sessionManager: { getSessionId: () => "session-b" },
+    });
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any, ownerA);
+    await mod.pollArtifactChanges({} as any, ownerB);
+
+    const rowsFor = (ui: typeof uiA): string[] => {
+      const calls = ui.setWidget.mock.calls.filter(
+        ([key]) => key === "subagentura-activity",
+      );
+      return calls.at(-1)?.[1] as string[];
+    };
+    expect(rowsFor(uiA).join("\n")).toContain("agent-a");
+    expect(rowsFor(uiA).join("\n")).not.toContain("agent-b");
+    expect(rowsFor(uiB).join("\n")).toContain("agent-b");
+    expect(rowsFor(uiB).join("\n")).not.toContain("agent-a");
+  });
+
+  it("preserves unscoped activity projection when contexts exist", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const ui = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const unowned = makeState();
+    unowned.state.name = "unowned-agent";
+    mod.interactiveSubagentRegistry.set(unowned.id, unowned.state);
+    registerSessionContext({
+      id: 507,
+      generation: 1,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: ui as any,
+      sessionManager: { getSessionId: () => "session-a" },
+    });
+    (globalThis as any).__piSubagenturaUi = ui;
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any);
+
+    const activityCalls = ui.setWidget.mock.calls.filter(
+      ([key]) => key === "subagentura-activity",
+    );
+    const finalRows = activityCalls.at(-1)?.[1] as string[] | undefined;
+    expect(finalRows).toEqual(
+      expect.arrayContaining([expect.stringContaining("unowned-agent")]),
+    );
+  });
+
   it("abandons mutation when its owner is removed during liveness", async () => {
     const result = await pollUntilOwnerInvalidation((owner) => {
       removeSessionContext(owner.id);

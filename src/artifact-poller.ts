@@ -48,8 +48,12 @@ import {
   workflowJobBelongsToOwner,
   workflowJobRegistry,
 } from "./workflow-jobs";
-import type { ActiveSessionContextToken } from "./session-context";
+import type {
+  ActiveSessionContextToken,
+  SessionContextRef,
+} from "./session-context";
 import {
+  getSessionContextStack,
   parentSessionBelongsToOwner,
   resolveLiveSessionContext,
 } from "./session-context";
@@ -88,6 +92,41 @@ export function updateRunningSubagentFooter(
   } catch {
     /* ui stale */
   }
+}
+
+/** Project current live rows after owner-scoped liveness processing completes. */
+function projectActivityWidgetRows(
+  ui: ExtensionUIContext | undefined,
+  owner: ActiveSessionContextToken | undefined,
+): string[] {
+  if (!ui) return [];
+  const contexts = getSessionContextStack();
+  const states = [...interactiveSubagentRegistry.values()].filter(
+    (state) =>
+      (state.status === "running" || state.status === "idle") &&
+      stateBelongsToUi(state, ui, owner, contexts),
+  );
+  return states.map(formatActivityRow);
+}
+
+function stateBelongsToUi(
+  state: InteractiveSubagentState,
+  ui: ExtensionUIContext,
+  owner: ActiveSessionContextToken | undefined,
+  contexts: SessionContextRef[],
+): boolean {
+  if (!owner) return true;
+  return contexts.some((context) => {
+    if (context.ui !== ui) return false;
+    let sessionId: string | undefined;
+    try {
+      sessionId = context.sessionManager?.getSessionId?.();
+    } catch {
+      /* A stale session manager cannot establish widget ownership. */
+      return false;
+    }
+    return sessionId !== undefined && state.parentSessionId === sessionId;
+  });
 }
 
 /** Derive delivery status from an already narrowed completion event. */
@@ -189,7 +228,6 @@ async function runPollArtifactChanges(
     ) {
       return;
     }
-    const widgetRows: string[] = [];
     const ui =
       ownerContext?.ui ??
       (g2.__piSubagenturaUi as ExtensionUIContext | undefined);
@@ -309,13 +347,8 @@ async function runPollArtifactChanges(
           entry.lifecycle = state.lifecycle;
         });
       }
-
-      // Keep live interactive sub-agents in the activity widget. Exited panes are
-      // still tail-read above so a later user-role entry can revive them.
-      if (state.status === "running" || state.status === "idle") {
-        widgetRows.push(formatActivityRow(state));
-      }
     }
+    const widgetRows = projectActivityWidgetRows(ui, owner);
     flushDeliveries(interactivePi, ui, owner);
     for (const state of states) {
       if (interactiveSubagentRegistry.get(state.id) !== state) continue;
