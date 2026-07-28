@@ -471,12 +471,13 @@ export class TerminalHarness {
   }
 
   diagnostics() {
-    mkdirSync(this.diagnosticsDir, { recursive: true });
+    const harnessDiagnosticsDir = join(
+      this.diagnosticsDir,
+      `${this.scenario}-${this.session}`,
+    );
+    mkdirSync(harnessDiagnosticsDir, { recursive: true });
     const writeDiagnostic = (suffix, content) => {
-      writeFileSync(
-        join(this.diagnosticsDir, `${this.scenario}-${suffix}`),
-        content,
-      );
+      writeFileSync(join(harnessDiagnosticsDir, suffix), content);
     };
     writeDiagnostic("screen.txt", this.currentScreen());
     writeDiagnostic("scrollback.txt", this.scrollback());

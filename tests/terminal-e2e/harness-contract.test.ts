@@ -1,4 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createHarness } from "./harness.mjs";
 
@@ -43,6 +46,35 @@ describe("terminal harness lifecycle", () => {
         timeout: 2_000,
       }),
     ).toThrow();
+  });
+
+  it("keeps diagnostics from repeated scenarios in separate directories", async () => {
+    const diagnosticsRoot = mkdtempSync(
+      join(tmpdir(), "subagentura-e2e-diagnostics-"),
+    );
+    const previousDiagnostics = process.env.SUBAGENTURA_E2E_DIAGNOSTICS;
+    process.env.SUBAGENTURA_E2E_DIAGNOSTICS = diagnosticsRoot;
+    const first = createHarness({ scenario: "interactive" });
+    const second = createHarness({ scenario: "interactive" });
+    try {
+      first.setupFiles();
+      second.setupFiles();
+      first.diagnostics();
+      second.diagnostics();
+      const directories = readdirSync(diagnosticsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+      expect(directories).toHaveLength(2);
+      expect(new Set(directories).size).toBe(2);
+    } finally {
+      await Promise.all([first.cleanup(false), second.cleanup(false)]);
+      if (previousDiagnostics === undefined) {
+        delete process.env.SUBAGENTURA_E2E_DIAGNOSTICS;
+      } else {
+        process.env.SUBAGENTURA_E2E_DIAGNOSTICS = previousDiagnostics;
+      }
+      rmSync(diagnosticsRoot, { recursive: true, force: true });
+    }
   });
 
   it("kills active harnesses when the test process receives SIGTERM", async () => {
