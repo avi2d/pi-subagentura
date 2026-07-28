@@ -34,6 +34,44 @@ function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
+function ensureInteractivePoller(globalState: any): void {
+  if (globalState.__piSubagenturaInteractivePollerHandle) return;
+  const handle = setInterval(() => {
+    for (const context of [...getSessionContextStack()]) {
+      void pollArtifactChanges(context.pi, {
+        id: context.id,
+        generation: context.generation,
+      }).catch((err) => {
+        console.error("[subagentura] artifact poll failed", err);
+      });
+    }
+  }, 5000);
+  handle.unref?.();
+  globalState.__piSubagenturaInteractivePollerHandle = handle;
+}
+
+// Older releases could start a poller during extension preload, before project
+// package overrides selected the live runtime. Replace that orphan on session_start.
+function discardPreSessionPollerState(globalState: any): void {
+  const contexts = [...getSessionContextStack()];
+  const hasStartedContext = contexts.some(
+    (context) => context.sessionManager !== undefined,
+  );
+  for (const context of contexts) {
+    if (context.sessionManager === undefined) {
+      removeSessionContext(context.id);
+    }
+  }
+  const handle = globalState.__piSubagenturaInteractivePollerHandle;
+  if (hasStartedContext || !handle) return;
+  try {
+    clearInterval(handle);
+  } catch {
+    /* A stale legacy handle must not block the live session's poller. */
+  }
+  globalState.__piSubagenturaInteractivePollerHandle = undefined;
+}
+
 export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
   const sessionContext = createSessionContextRef(pi);
   const g2 = getGlobalState() as any;
@@ -63,9 +101,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       id: sessionContext.id,
       generation: sessionContext.generation,
     };
+    discardPreSessionPollerState(g2);
     cleanupWorkflowJobsForOwner(previousOwner);
-    advanceSessionContextGeneration(sessionContext.id);
     removeSessionContext(sessionContext.id);
+    sessionContext.generation++;
     sessionContext.ui = ctx.ui;
     sessionContext.sessionManager = ctx.sessionManager;
     registerSessionContext(sessionContext);
@@ -93,6 +132,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
         /* best effort — rehydrate is a recovery path; failures fall back to empty registry */
       }
     }
+    ensureInteractivePoller(g2);
   });
 
   pi.on("session_shutdown", () => {
@@ -100,27 +140,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
     // Don't null the ui ref here — the poller may still fire one last tick on shutdown,
     // and stale ctx errors are already caught at the call sites.
   });
-
-  // Register notification renderer before any tools
-  // One global interval for the whole session. Each tick walks the artifact dir of
-  // every running interactive sub-agent and fires pointer notifications for new events.
-  // The poller survives parent restarts through persisted artifacts and byte cursors.
-  if (!g2.__piSubagenturaInteractivePollerHandle) {
-    const handle = setInterval(() => {
-      for (const context of [...getSessionContextStack()]) {
-        void pollArtifactChanges(context.pi, {
-          id: context.id,
-          generation: context.generation,
-        }).catch((err) => {
-          console.error("[subagentura] artifact poll failed", err);
-        });
-      }
-    }, 5000);
-    // Don't pin the event loop on a long-lived parent. unref() lets the process exit
-    // cleanly when nothing else is keeping it alive (no other ref'd handles).
-    handle.unref?.();
-    g2.__piSubagenturaInteractivePollerHandle = handle;
-  }
 
   // ── Session shutdown: abort all jobs, kill tmux panes, stop the poller ─
   (pi as any).on?.(

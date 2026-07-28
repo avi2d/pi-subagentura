@@ -89,6 +89,7 @@ describe("pollArtifactChanges", () => {
     (globalThis as any).__piSubagenturaRegistry?.clear?.();
     delete process.env.SUBAGENT_DEBUG_LOG_DIR;
     vi.doUnmock("node:child_process");
+    vi.useRealTimers();
   });
 
   async function pollUntilOwnerInvalidation(
@@ -400,9 +401,12 @@ describe("pollArtifactChanges", () => {
   });
 
   it("does not repaint unchanged poller UI", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const multiplexer = await import("../src/multiplexer");
+    const { workflowJobRegistry } = await import("../src/workflow");
     const ui = {
       notify: vi.fn(),
       setStatus: vi.fn(),
@@ -413,12 +417,28 @@ describe("pollArtifactChanges", () => {
     item.state.lastToolSummary = "reading src/main.ts";
     item.state.lastActivityAt = Date.now() - 10_000;
     mod.interactiveSubagentRegistry.set(item.id, item.state);
+    workflowJobRegistry.set("steady-workflow", {
+      id: "steady-workflow",
+      name: "steady-flow",
+      status: "running",
+      startedAt: 5_000,
+      promise: Promise.resolve({}) as any,
+      abort: new AbortController(),
+      snapshot: {
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 10,
+        phases: [],
+        runningCount: 1,
+      },
+    });
     (globalThis as any).__piSubagenturaUi = ui;
     multiplexer.__setTmuxMultiplexer({
       isPaneAliveAsync: async () => true,
     } as any);
 
     await mod.pollArtifactChanges({} as any);
+    vi.setSystemTime(25_000);
     await mod.pollArtifactChanges({} as any);
 
     const activityCalls = ui.setWidget.mock.calls.filter(

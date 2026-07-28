@@ -442,7 +442,7 @@ async function runPollArtifactChanges(
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);
-        const workflowRows = formatWorkflowWidgetRows(Date.now(), owner);
+        const workflowRows = formatWorkflowWidgetRows(owner);
         const workflowStatus =
           wfCount > 0
             ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
@@ -463,10 +463,7 @@ async function runPollArtifactChanges(
   }
 }
 
-function formatWorkflowWidgetRows(
-  now: number,
-  owner?: ActiveSessionContextToken,
-): string[] {
+function formatWorkflowWidgetRows(owner?: ActiveSessionContextToken): string[] {
   const rows: string[] = [];
   for (const st of workflowJobRegistry.values()) {
     if (!workflowJobBelongsToOwner(st, owner)) continue;
@@ -477,7 +474,6 @@ function formatWorkflowWidgetRows(
       `${s.runningCount ?? 0} running`,
       `${s.tokensSpent} output tokens`,
       ...(s.usage ? [formatWorkflowUsage(s.usage)] : []),
-      formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
     const last = s.lastMessage ? ` — ${s.lastMessage}` : "";
@@ -489,15 +485,6 @@ function formatWorkflowWidgetRows(
     rows.push(`… and ${extra} more workflow${extra === 1 ? "" : "s"}`);
   }
   return rows;
-}
-
-function formatWorkflowElapsed(ms: number): string {
-  if (ms < 0) ms = 0;
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 // ── Session-log parsing state ─────────────────────────────────────────

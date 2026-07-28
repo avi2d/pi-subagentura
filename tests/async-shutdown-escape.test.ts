@@ -87,6 +87,10 @@ describe("async spawn shutdown handoff", () => {
       const pi = { on: vi.fn(), sendMessage: vi.fn() } as any;
       registerSessionHandlers(pi);
       const ctx = fakeCtx(toolName === "subagent_with_context");
+      const sessionStart = pi.on.mock.calls.find(
+        ([name]: [string]) => name === "session_start",
+      )![1] as Function;
+      sessionStart({ reason: "new" }, ctx);
       const shutdown = pi.on.mock.calls
         .filter(([name]: [string]) => name === "session_shutdown")
         .at(-1)![1] as Function;

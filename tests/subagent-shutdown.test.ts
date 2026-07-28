@@ -3,7 +3,7 @@
  * subagent extension. The handler added in the criticals-wip commit
  * introduced four new behaviors, none of which had any test:
  *
- *   1. `handle.unref?.()` on the global poller handle
+ *   1. deferring poller startup until `session_start`, then `handle.unref?.()`
  *   2. `clearInterval` of the poller handle in `session_shutdown`
  *   3. preserving live panes on reload/resume/quit and cancelling them otherwise
  *   4. clear of `interactiveSubagentRegistry` (the fix in this branch)
@@ -55,7 +55,7 @@ function makeState(
 }
 
 /** Build a minimal ExtensionAPI mock and find the session_shutdown callback. */
-function setupExtension() {
+function setupExtension(options: { startSession?: boolean; ui?: any } = {}) {
   const api = {
     registerTool: vi.fn(),
     registerMessageRenderer: vi.fn(),
@@ -83,7 +83,28 @@ function setupExtension() {
     }
   }
 
+  if (options.startSession !== false) {
+    startRegisteredSession(api, options.ui);
+  }
+
   return { api, shutdownHandler };
+}
+
+function startRegisteredSession(api: any, ui: any = {}): void {
+  const sessionStartHandler = api.on.mock.calls.find(
+    ([event]: [string]) => event === "session_start",
+  )?.[1] as Function;
+  sessionStartHandler(
+    { reason: "new" },
+    {
+      cwd: "/tmp",
+      ui,
+      sessionManager: {
+        getSessionId: () => "parent-session",
+        getEntries: () => [],
+      },
+    },
+  );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -96,9 +117,8 @@ describe("session_shutdown handler", () => {
   let fakeHandle: { unref: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
-    // Reset global poller / registry / ref state so the default export's
-    // `if (!g.__piSubagenturaInteractivePollerHandle)` branch is taken
-    // (so we observe a fresh setInterval call in the unref test).
+    // Reset global poller / registry / ref state so `session_start` can create
+    // a fresh interval in the poller lifecycle test.
     const g = globalThis as any;
     g.__piSubagenturaInteractivePollerHandle = undefined;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
@@ -155,29 +175,34 @@ describe("session_shutdown handler", () => {
   // afterEach that references it) per AGENTS.md "declare before" rule.
   let tmpRoot: string;
 
-  it("unrefs the poller handle on extension registration", () => {
-    setupExtension();
+  it("replaces a pre-session legacy poller on session_start", () => {
+    setupExtension({ startSession: false });
+    const { api } = setupExtension({ startSession: false });
+    const globalState = globalThis as any;
+    const legacyHandle = { unref: vi.fn() };
 
-    // setInterval is gated on the global handle being undefined, so the
-    // default export called our spy and got fakeHandle back. The very
-    // next line in subagent.ts is `handle.unref?.()`.
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+    expect(globalState.__piSubagenturaSessionContextStack).toHaveLength(2);
+    globalState.__piSubagenturaInteractivePollerHandle = legacyHandle;
+
+    startRegisteredSession(api);
+
+    expect(clearIntervalSpy).toHaveBeenCalledWith(legacyHandle);
     expect(setIntervalSpy).toHaveBeenCalledTimes(1);
     expect(fakeHandle.unref).toHaveBeenCalledTimes(1);
+    expect(globalState.__piSubagenturaSessionContextStack).toHaveLength(1);
+    expect(globalState.__piSubagenturaSessionContextStack[0].pi).toBe(api);
+    expect(globalState.__piSubagenturaPiRef).toBe(api);
   });
 
   it("clearIntervals the poller in session_shutdown", () => {
-    // Pre-seed the global handle so the default export's if-guard skips
-    // the setInterval call and the handler sees the pre-seeded handle.
-    const handle = { unref: vi.fn() };
-    (globalThis as any).__piSubagenturaInteractivePollerHandle = handle;
-
     const { shutdownHandler } = setupExtension();
     expect(shutdownHandler).toBeTypeOf("function");
 
     shutdownHandler!();
 
     expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
-    expect(clearIntervalSpy).toHaveBeenCalledWith(handle);
+    expect(clearIntervalSpy).toHaveBeenCalledWith(fakeHandle);
     // The handler also nulls the global after clearing, so a re-invocation
     // would be a no-op (defensive: no double-clear).
     expect(
@@ -322,23 +347,14 @@ describe("session_shutdown handler", () => {
 
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
 
-    const { api, shutdownHandler } = setupExtension();
-
-    (globalThis as any).__piSubagenturaPiRef = api;
-    const notify = vi.fn();
-    (globalThis as any).__piSubagenturaUi = {
-      notify,
+    const ui = {
+      notify: vi.fn(),
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
+    const { api, shutdownHandler } = setupExtension({ ui });
 
-    // Capture the actual setInterval callback. setupExtension() above
-
-    // registered the poller, so setIntervalSpy.mock.calls[0][0] is the
-
-    // production callback (`() => pollArtifactChanges(pi)`) we need to
-
-    // invoke to exercise the real code path — not a hand-written wrapper.
+    // Capture the production callback installed by `session_start`.
 
     const tick = setIntervalSpy.mock.calls[0][0] as () => void;
 
@@ -396,15 +412,12 @@ describe("session_shutdown handler", () => {
       isPaneAliveAsync: async () => true,
     } as any);
 
-    const { api, shutdownHandler } = setupExtension();
-
-    (globalThis as any).__piSubagenturaPiRef = api;
-    const notify = vi.fn();
-    (globalThis as any).__piSubagenturaUi = {
-      notify,
+    const ui = {
+      notify: vi.fn(),
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
+    const { api, shutdownHandler } = setupExtension({ ui });
 
     // Capture the actual setInterval callback for the real code path.
 
@@ -418,7 +431,7 @@ describe("session_shutdown handler", () => {
     await pollArtifactChanges(api as any);
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledOnce();
+    expect(ui.notify).toHaveBeenCalledOnce();
 
     // 2. Shutdown handler runs.
 
@@ -434,7 +447,7 @@ describe("session_shutdown handler", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledOnce();
+    expect(ui.notify).toHaveBeenCalledOnce();
     __setTmuxMultiplexer(undefined);
   });
 
