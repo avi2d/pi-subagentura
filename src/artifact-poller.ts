@@ -67,13 +67,14 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
-const activityWidgetRowsByUi = new WeakMap<
+type StatusUi = Pick<ExtensionUIContext, "setStatus">;
+const widgetRowsByUi = new WeakMap<
   ExtensionUIContext,
-  string[] | undefined
+  Map<string, string[] | undefined>
 >();
-const runningFooterStatusByUi = new WeakMap<
-  Pick<ExtensionUIContext, "setStatus">,
-  string | undefined
+const footerStatusesByUi = new WeakMap<
+  StatusUi,
+  Map<string, string | undefined>
 >();
 
 function getRunningSubagentCount(): number {
@@ -86,42 +87,66 @@ function getRunningSubagentCount(): number {
   return inProcessCount + interactiveCount;
 }
 
-export function updateRunningSubagentFooter(
-  ui: Pick<ExtensionUIContext, "setStatus">,
+function updateFooterStatus(
+  ui: StatusUi,
+  key: string,
+  statusText: string | undefined,
 ): void {
-  const runningCount = getRunningSubagentCount();
-  const statusText =
-    runningCount > 0
-      ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
-      : undefined;
-  if (
-    runningFooterStatusByUi.has(ui) &&
-    runningFooterStatusByUi.get(ui) === statusText
-  ) {
-    return;
-  }
+  let statuses = footerStatusesByUi.get(ui);
+  const unchanged = statuses?.has(key) && statuses.get(key) === statusText;
+  if (unchanged) return;
   try {
-    ui.setStatus(FOOTER_KEY, statusText);
-    runningFooterStatusByUi.set(ui, statusText);
+    ui.setStatus(key, statusText);
+    if (!statuses) {
+      statuses = new Map();
+      footerStatusesByUi.set(ui, statuses);
+    }
+    statuses.set(key, statusText);
   } catch {
     /* ui stale */
   }
 }
 
-function updateActivityWidget(ui: ExtensionUIContext, rows: string[]): void {
+export function updateRunningSubagentFooter(ui: StatusUi): void {
+  const runningCount = getRunningSubagentCount();
+  const statusText =
+    runningCount > 0
+      ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
+      : undefined;
+  updateFooterStatus(ui, FOOTER_KEY, statusText);
+}
+
+function widgetRowsEqual(
+  previousRows: string[] | undefined,
+  nextRows: string[] | undefined,
+): boolean {
+  if (previousRows === undefined || nextRows === undefined) {
+    return previousRows === nextRows;
+  }
+  return (
+    previousRows.length === nextRows.length &&
+    previousRows.every((row, index) => row === nextRows[index])
+  );
+}
+
+function updateWidgetRows(
+  ui: ExtensionUIContext,
+  key: string,
+  rows: string[],
+): void {
   const nextRows = rows.length > 0 ? rows : undefined;
-  const previousRows = activityWidgetRowsByUi.get(ui);
+  let rowsByKey = widgetRowsByUi.get(ui);
+  const previousRows = rowsByKey?.get(key);
   const unchanged =
-    activityWidgetRowsByUi.has(ui) &&
-    (previousRows === undefined
-      ? nextRows === undefined
-      : nextRows !== undefined &&
-        previousRows.length === nextRows.length &&
-        previousRows.every((row, index) => row === nextRows[index]));
+    rowsByKey?.has(key) && widgetRowsEqual(previousRows, nextRows);
   if (unchanged) return;
   try {
-    ui.setWidget(WIDGET_KEY, nextRows, { placement: "belowEditor" });
-    activityWidgetRowsByUi.set(ui, nextRows ? [...nextRows] : undefined);
+    ui.setWidget(key, nextRows, { placement: "belowEditor" });
+    if (!rowsByKey) {
+      rowsByKey = new Map();
+      widgetRowsByUi.set(ui, rowsByKey);
+    }
+    rowsByKey.set(key, nextRows ? [...nextRows] : undefined);
   } catch {
     /* ui stale */
   }
@@ -413,22 +438,17 @@ async function runPollArtifactChanges(
     // Paint footer + widget. Both are TUI surfaces that never reach the LLM.
     if (ui) {
       updateRunningSubagentFooter(ui);
-      updateActivityWidget(ui, widgetRows);
+      updateWidgetRows(ui, WIDGET_KEY, widgetRows);
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);
         const workflowRows = formatWorkflowWidgetRows(Date.now(), owner);
-        ui.setStatus(
-          WORKFLOW_FOOTER_KEY,
+        const workflowStatus =
           wfCount > 0
             ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
-            : undefined,
-        );
-        ui.setWidget(
-          WORKFLOW_WIDGET_KEY,
-          workflowRows.length > 0 ? workflowRows : undefined,
-          { placement: "belowEditor" },
-        );
+            : undefined;
+        updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus);
+        updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows);
       } catch {
         /* ui stale */
       }

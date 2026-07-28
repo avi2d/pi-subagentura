@@ -399,7 +399,7 @@ describe("pollArtifactChanges", () => {
     );
   });
 
-  it("does not repaint unchanged interactive activity rows", async () => {
+  it("does not repaint unchanged poller UI", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const multiplexer = await import("../src/multiplexer");
@@ -429,6 +429,14 @@ describe("pollArtifactChanges", () => {
       ([key]) => key === "subagentura-running",
     );
     expect(footerCalls).toHaveLength(1);
+    const workflowWidgetCalls = ui.setWidget.mock.calls.filter(
+      ([key]) => key === "subagentura-workflow-activity",
+    );
+    expect(workflowWidgetCalls).toHaveLength(1);
+    const workflowFooterCalls = ui.setStatus.mock.calls.filter(
+      ([key]) => key === "subagentura-workflows",
+    );
+    expect(workflowFooterCalls).toHaveLength(1);
     expect((activityCalls[0][1] as string[])[0]).toBe(
       "▶ steady-agent: reading src/main.ts",
     );
