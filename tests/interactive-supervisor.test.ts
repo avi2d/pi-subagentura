@@ -573,7 +573,7 @@ describe("interactive supervisor", () => {
     component.handleInput("x");
     expect(cancel).not.toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith(
-      "This async item is not safe to cancel.",
+      'Cannot cancel "agent-exited-child": unavailable (status: exited).',
       "warning",
     );
   });
@@ -761,7 +761,7 @@ describe("interactive supervisor", () => {
     component.handleInput("X");
     expect(cancelSubtree).not.toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith(
-      "This lineage subtree is not safe to cancel.",
+      'Cannot cancel subtree "agent-child": unavailable (status: running; reason: stale).',
       "warning",
     );
 
@@ -804,5 +804,102 @@ describe("interactive supervisor", () => {
       expect.stringContaining("retains artifacts"),
     );
     expect(interactiveSubagentRegistry.has(root.id)).toBe(true);
+  });
+
+  it("renders an explicit legend without truncation at the minimum width", () => {
+    const component = new InteractiveSupervisorComponent({ done: vi.fn() });
+    const lines = component.render(60);
+
+    expect(lines).toContain(
+      "│ All: ↑↓/jk select · enter/→ details · ← collapse",
+    );
+    expect(lines).toContain("│ All: x cancel item · r refresh · q/esc close");
+    expect(lines).toContain(
+      "│ Interactive: v snapshot · n native viewer · f focus",
+    );
+    expect(lines).toContain(
+      "│ Interactive: a show attach cmd · X cancel subtree",
+    );
+    expect(lines.every((line) => line.length <= 60)).toBe(true);
+  });
+
+  it("labels the selected agent's attach command without changing it", () => {
+    const item = state("attach", {
+      name: "selected-agent",
+      attachCommand: "tmux attach -t exact-session --foo",
+    });
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("a");
+
+    expect(notify).toHaveBeenCalledWith(
+      "Attach command for selected-agent:\ntmux attach -t exact-session --foo",
+      "info",
+    );
+  });
+
+  it("explains why focus, item cancellation, and subtree cancellation are unavailable", () => {
+    const terminal = state("terminal", {
+      name: "terminal-agent",
+      status: "exited",
+    });
+    const completed = inProcessJob("completed-job", { status: "done" });
+    const stale = state("stale", { name: "stale-agent" });
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      items: () => [
+        {
+          kind: "interactive",
+          state: terminal,
+          depth: 0,
+          actionable: false,
+        },
+        {
+          kind: "in-process",
+          job: completed,
+          depth: 0,
+          actionable: false,
+          reasons: ["completed"],
+        },
+        {
+          kind: "interactive",
+          state: stale,
+          depth: 0,
+          actionable: false,
+          reasons: ["stale"],
+        },
+      ],
+    });
+
+    component.handleInput("f");
+    component.handleInput("j");
+    component.handleInput("x");
+    component.handleInput("j");
+    component.handleInput("X");
+
+    expect(notify).toHaveBeenNthCalledWith(
+      1,
+      'Cannot focus "terminal-agent": unavailable (status: exited).',
+      "warning",
+    );
+    expect(notify).toHaveBeenNthCalledWith(
+      2,
+      'Cannot cancel "completed-job": unavailable (status: done; reason: completed).',
+      "warning",
+    );
+    expect(notify).toHaveBeenNthCalledWith(
+      3,
+      'Cannot cancel subtree "stale-agent": unavailable (status: running; reason: stale).',
+      "warning",
+    );
   });
 });

@@ -87,10 +87,10 @@ export class InteractiveSupervisorComponent {
     const items = this.items();
     const lines = [
       trunc("┌ Async Subagents", width),
-      trunc(
-        "│ ↑↓/jk select • enter/→ details • x cancel • interactive: v/n/f/a/X • r refresh • q/esc close",
-        width,
-      ),
+      trunc("│ All: ↑↓/jk select · enter/→ details · ← collapse", width),
+      trunc("│ All: x cancel item · r refresh · q/esc close", width),
+      trunc("│ Interactive: v snapshot · n native viewer · f focus", width),
+      trunc("│ Interactive: a show attach cmd · X cancel subtree", width),
     ];
 
     if (items.length === 0) {
@@ -167,7 +167,12 @@ export class InteractiveSupervisorComponent {
     }
     if (matchesKey(data, "a")) {
       const state = this.interactiveStateForAction(selectedItem, "attach");
-      if (state) this.opts.notify?.(state.attachCommand, "info");
+      if (state) {
+        this.opts.notify?.(
+          `Attach command for ${state.name}:\n${state.attachCommand}`,
+          "info",
+        );
+      }
       return;
     }
     if (matchesKey(data, "v")) {
@@ -186,7 +191,7 @@ export class InteractiveSupervisorComponent {
       if (!state) return;
       if (!selectedItem.actionable) {
         this.opts.notify?.(
-          "This lineage node is not safe to focus.",
+          unavailableActionMessage("focus", selectedItem),
           "warning",
         );
         return;
@@ -246,7 +251,7 @@ export class InteractiveSupervisorComponent {
     let cancelled = false;
     let label = "subagent";
     if (!item.actionable) {
-      this.opts.notify?.("This async item is not safe to cancel.", "warning");
+      this.opts.notify?.(unavailableActionMessage("cancel", item), "warning");
       return;
     }
     if (item.kind === "in-process") {
@@ -279,7 +284,7 @@ export class InteractiveSupervisorComponent {
     }
     if (!item.actionable) {
       this.opts.notify?.(
-        "This lineage subtree is not safe to cancel.",
+        unavailableActionMessage("cancel subtree", item),
         "warning",
       );
       return;
@@ -432,6 +437,29 @@ function interactiveState(
 ): InteractiveSubagentState | undefined {
   if (item.kind === "in-process" || item.kind === "workflow") return undefined;
   return item.state;
+}
+
+function unavailableActionMessage(
+  action: string,
+  item: AsyncSupervisorItem,
+): string {
+  const label = supervisorItemLabel(item);
+  const status = supervisorItemStatus(item);
+  const reasons = item.reasons?.filter((reason) => reason !== status) ?? [];
+  const reason = reasons.length > 0 ? `; reason: ${reasons.join(", ")}` : "";
+  return `Cannot ${action} "${label}": unavailable (status: ${status}${reason}).`;
+}
+
+function supervisorItemLabel(item: AsyncSupervisorItem): string {
+  if (item.kind === "in-process") return item.job.id;
+  if (item.kind === "workflow") return item.job.name;
+  return item.state.name;
+}
+
+function supervisorItemStatus(item: AsyncSupervisorItem): string {
+  if (item.kind === "in-process") return item.job.status;
+  if (item.kind === "workflow") return item.job.status;
+  return item.state.status;
 }
 
 function formatAsyncSupervisorSummary(
