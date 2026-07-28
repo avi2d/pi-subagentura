@@ -388,6 +388,8 @@ Run `/subagents` or press `Ctrl+Alt+A` to open the portable async supervisor.
 It combines standalone async in-process jobs, workflow jobs and their agent
 records, and the persisted lineage of interactive children and grandchildren.
 `/workflow-tree` remains available as a specialized workflow-only view.
+The supervisor uses a subtle theme-colored dither texture to simulate a dimmed
+backdrop behind its modal controls; terminal cells do not support true blur.
 
 Standalone jobs are owner-scoped to the current parent session. Expanding a
 workflow shows its recent agent attempts, phases, usage, and bounded omission
@@ -396,8 +398,10 @@ in-flight agents. Interactive lineage can include descendants created from
 different working directories. Interactive
 children receive a minimal child runtime that can launch more interactive
 children, but does not register in-process or workflow orchestration tools.
-Recursion is bounded by default to depth 8 and 256 lineage nodes. Malformed,
-orphaned, cyclic, or stale manifests remain visible but are non-actionable.
+Recursion is bounded by default to depth 8 and 256 lineage nodes. The supervisor
+shows active, actionable work only. Cancelled, completed, malformed, orphaned,
+cyclic, and stale entries remain available through retained artifacts but are hidden
+from the overlay.
 
 The overlay supports these controls:
 
@@ -408,11 +412,20 @@ The overlay supports these controls:
 | `x`                    | Cancel the selected running item; workflow and in-process cancellation propagates to owned agents |
 | `v`                    | For interactive agents, capture a bounded terminal snapshot through tmux/Zellij                   |
 | `n`                    | For interactive agents, open the optional native tmux popup or Zellij floating viewer             |
-| `f`                    | For interactive agents, focus the persisted pane/window                                           |
+| `f`                    | For interactive agents, focus the persisted pane/window; expand first for native return controls  |
 | `a`                    | For interactive agents, show the attach command                                                   |
 | `X`                    | For interactive agents, confirm and cancel an actionable subtree deepest-first                    |
 | `r`                    | Refresh registries, lineage, and pane liveness                                                    |
 | `q`/`Esc`/`Ctrl+Alt+A` | Close the overlay without stopping agents                                                         |
+
+Interactive row prefixes identify whether the item came from the live `[registry]`
+or persisted `[lineage]`. Expanding a row shows its owner, root and parent IDs, cwd,
+artifact directory, and Pi session file. A cancelled row disappears immediately.
+
+Before pressing `f`, expand the selected interactive row to see its native return
+hint. With default keymaps, tmux uses prefix + `;` for a split pane or prefix +
+`l` for a detached window. Zellij uses `Ctrl+p`, then `p` for a split pane or
+`Ctrl+t`, then `Tab` for a named tab. Customized multiplexer keymaps may differ.
 
 Terminal capture is bounded by both bytes and lines. Expanded interactive
 artifact details read only regular files and bound lifecycle-event reads to 8

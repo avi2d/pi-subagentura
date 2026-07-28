@@ -72,6 +72,10 @@ export function directSupervisorItems(
       state,
       depth: 0,
       actionable: isInteractiveStateActionable(state),
+      origin: {
+        source: "registry",
+        ownerSessionId: state.parentSessionId,
+      },
     }));
 }
 
@@ -199,6 +203,12 @@ async function loadSupervisorProjection(
       actionable:
         node.state === "actionable" && isInteractiveStateActionable(state),
       reasons: node.reasons,
+      origin: {
+        source: "lineage",
+        rootId: node.manifest.rootId,
+        ownerSessionId: node.manifest.ownerSessionId,
+        parentAgentId: node.manifest.parentAgentId,
+      },
     };
   });
   for (const state of interactiveSubagentRegistry.values()) {
@@ -209,6 +219,10 @@ async function loadSupervisorProjection(
         state,
         depth: 0,
         actionable: isInteractiveStateActionable(state),
+        origin: {
+          source: "registry",
+          ownerSessionId: state.parentSessionId,
+        },
       });
       seen.add(state.id);
     }

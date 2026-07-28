@@ -1597,6 +1597,11 @@ describe("pollArtifactChanges", () => {
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const multiplexer = await import("../src/multiplexer");
+      multiplexer.__setTmuxMultiplexer({
+        isPaneAlive: () => true,
+        isPaneAliveAsync: async () => true,
+      } as any);
       const cwd = makeTmp();
       const id = "rehydrated-idle";
       const artifactDir = join(cwd, id);
@@ -1647,6 +1652,7 @@ describe("pollArtifactChanges", () => {
       );
       expect(widgetRows.join("\n")).not.toContain("starting");
       expect(widgetRows.join("\n")).not.toContain("stale");
+      multiplexer.__setTmuxMultiplexer(undefined);
       delete (globalThis as any).__piSubagenturaUi;
     });
 

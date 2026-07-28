@@ -170,9 +170,7 @@ describe("interactive supervisor", () => {
     expect(summaries).toContain("Async Subagents");
     expect(summaries).toContain("[in-process] → running job-123");
     expect(summaries).toContain("[workflow] → running workflow-wf-123");
-    expect(summaries).toContain(
-      "[interactive] → running agent-interactive-123",
-    );
+    expect(summaries).toContain("[registry] → running agent-interactive-123");
 
     component.handleInput("\r");
     expect(component.render(180).join("\n")).toContain(
@@ -348,6 +346,12 @@ describe("interactive supervisor", () => {
           item.kind === "interactive" && item.state.id === "other-interactive",
       ),
     ).toBe(false);
+    expect(items.find((item) => item.kind === "interactive")).toMatchObject({
+      origin: {
+        source: "registry",
+        ownerSessionId: "owned-parent-session",
+      },
+    });
   });
 
   it("navigates, expands, refreshes, and closes without cancelling", () => {
@@ -413,7 +417,7 @@ describe("interactive supervisor", () => {
     );
   });
 
-  it("prefers focus inside tmux while preserving attach elsewhere", () => {
+  it("shows mux-native return controls with focus details", () => {
     const renderDetails = (item: InteractiveSubagentState): string => {
       interactiveSubagentRegistry.clear();
       interactiveSubagentRegistry.set(item.id, item);
@@ -426,11 +430,17 @@ describe("interactive supervisor", () => {
     const insideTmux = renderDetails(state("inside-tmux"));
     expect(insideTmux).not.toContain("Attach: tmux attach");
     expect(insideTmux).toContain("Focus: tmux select-pane");
+    expect(insideTmux).toContain("Return: tmux prefix + ; (last pane)");
 
     delete process.env.TMUX;
     const outsideTmux = renderDetails(state("outside-tmux"));
     expect(outsideTmux).toContain("Attach: tmux attach");
     expect(outsideTmux).toContain("Focus: tmux select-pane");
+
+    const tmuxWindow = renderDetails(
+      state("tmux-window", { windowName: "agent-window" }),
+    );
+    expect(tmuxWindow).toContain("Return: tmux prefix + l (last window)");
 
     process.env.TMUX = "/tmp/tmux.sock,1,0";
     const zellij = renderDetails(
@@ -442,6 +452,42 @@ describe("interactive supervisor", () => {
     );
     expect(zellij).toContain("Attach: zellij attach child-session");
     expect(zellij).toContain("Focus: zellij action focus-pane");
+    expect(zellij).toContain("Return: Ctrl+p, then p (previous pane)");
+
+    const zellijTab = renderDetails(
+      state("zellij-tab", {
+        mux: "zellij",
+        windowName: "agent-tab",
+      }),
+    );
+    expect(zellijTab).toContain("Return: Ctrl+t, then Tab (last tab)");
+  });
+
+  it("shows why and from where an interactive agent is projected", () => {
+    const projected = state("projected", { parentSessionId: "owner-session" });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        {
+          kind: "interactive",
+          state: projected,
+          depth: 1,
+          actionable: true,
+          origin: {
+            source: "lineage",
+            rootId: "root-session",
+            ownerSessionId: "owner-session",
+            parentAgentId: "parent-agent",
+          },
+        },
+      ],
+    });
+
+    expect(component.render(160).join("\n")).toContain("[lineage]");
+    component.handleInput("\r");
+    expect(component.render(160).join("\n")).toContain(
+      "Origin: persisted lineage · owner=owner-session · root=root-session · parent=parent-agent",
+    );
   });
 
   it("uses the direct cancellation path only for x", () => {
@@ -456,6 +502,36 @@ describe("interactive supervisor", () => {
 
     expect(cancel).toHaveBeenCalledWith("one");
     expect(done).not.toHaveBeenCalled();
+  });
+
+  it("hides inactive items and removes an item immediately after cancellation", () => {
+    const active = state("active", { name: "active-agent" });
+    const stale = state("stale", { name: "stale-agent", status: "unknown" });
+    const cancel = vi.fn(() => {
+      active.status = "cancelled";
+      return active;
+    });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      cancel,
+      items: () => [
+        { kind: "interactive", state: active, depth: 0, actionable: true },
+        {
+          kind: "interactive",
+          state: stale,
+          depth: 0,
+          actionable: false,
+          reasons: ["stale"],
+        },
+      ],
+    });
+
+    expect(component.render(120).join("\n")).toContain("active-agent");
+    expect(component.render(120).join("\n")).not.toContain("stale-agent");
+    component.handleInput("x");
+
+    expect(cancel).toHaveBeenCalledWith(active.id);
+    expect(component.render(120).join("\n")).not.toContain("active-agent");
   });
 
   it("cancels registered in-process jobs and workflows from the overlay", async () => {
@@ -556,7 +632,7 @@ describe("interactive supervisor", () => {
     component.dispose();
   });
 
-  it("marks exited registry children unavailable and skips cancel", () => {
+  it("hides exited registry children and ignores cancellation input", () => {
     const exited = state("exited-child", { status: "exited" });
     interactiveSubagentRegistry.set(exited.id, exited);
     const cancel = vi.fn();
@@ -567,18 +643,14 @@ describe("interactive supervisor", () => {
       notify,
     });
 
-    const lines = component.render(120);
-    expect(lines.some((line) => line.includes("unavailable"))).toBe(true);
-
+    expect(component.render(120).join("\n")).not.toContain(exited.name);
     component.handleInput("x");
+
     expect(cancel).not.toHaveBeenCalled();
-    expect(notify).toHaveBeenCalledWith(
-      'Cannot cancel "agent-exited-child": unavailable (status: exited).',
-      "warning",
-    );
+    expect(notify).not.toHaveBeenCalled();
   });
 
-  it("keeps exited projected registry children unavailable", async () => {
+  it("hides exited projected registry children", async () => {
     const sessionRoot = tempDir();
     const rootId = "projected-root";
     const artifactDir = join(sessionRoot, "artifact");
@@ -631,7 +703,6 @@ describe("interactive supervisor", () => {
         vi.fn(),
       ) as InteractiveSupervisorComponent;
       rendered = component.render(160).join("\n");
-      component.handleInput("x");
       return { kind: "close" };
     });
 
@@ -641,7 +712,7 @@ describe("interactive supervisor", () => {
         sessionManager: { getSessionId: () => rootId },
       });
 
-      expect.soft(rendered).toContain("unavailable");
+      expect.soft(rendered).not.toContain(exited.name);
       expect(exited.status).toBe("exited");
     } finally {
       if (previousRootId === undefined)
@@ -688,6 +759,52 @@ describe("interactive supervisor", () => {
     }
   });
 
+  it("renders a full-screen theme backdrop behind the supervisor", async () => {
+    const hideBackdrop = vi.fn();
+    const showOverlay = vi.fn(
+      (
+        _component: { render: (width: number) => string[] },
+        _options: Record<string, unknown>,
+      ) => ({ hide: hideBackdrop }),
+    );
+    const bg = vi.fn(
+      (color: string, text: string) => `<${color}>${text}</${color}>`,
+    );
+    const fg = vi.fn(
+      (color: string, text: string) => `<${color}>${text}</${color}>`,
+    );
+    const custom = vi.fn(async (factory: Function) => {
+      factory(
+        {
+          requestRender: vi.fn(),
+          showOverlay,
+          terminal: { rows: 3 },
+        },
+        { bg, fg },
+        undefined,
+        vi.fn(),
+      );
+      return { kind: "close" };
+    });
+
+    await showInteractiveSupervisor({ custom, notify: vi.fn() } as never);
+
+    expect(showOverlay).toHaveBeenCalledOnce();
+    const [backdrop, options] = showOverlay.mock.calls[0];
+    expect(options).toEqual({
+      anchor: "center",
+      width: "100%",
+      maxHeight: "100%",
+      nonCapturing: true,
+    });
+    expect(backdrop.render(4)).toEqual([
+      "<customMessageBg><dim>░   </dim></customMessageBg>",
+      "<customMessageBg><dim>  ░ </dim></customMessageBg>",
+      "<customMessageBg><dim>░   </dim></customMessageBg>",
+    ]);
+    expect(hideBackdrop).toHaveBeenCalledOnce();
+  });
+
   it("reports a clear fallback outside Pi TUI sessions", async () => {
     const notify = vi.fn();
 
@@ -731,16 +848,12 @@ describe("interactive supervisor", () => {
     expect(capture.output).toBe("recent output");
   });
 
-  it("renders recursive depth, blocks unsafe nodes, and dispatches native view", async () => {
+  it("hides unsafe recursive nodes and dispatches native view", async () => {
     const root = state("root");
     const child = state("child");
-    const notify = vi.fn();
-    const cancelSubtree = vi.fn();
     const nativeView = vi.fn().mockResolvedValue(undefined);
     const component = new InteractiveSupervisorComponent({
       done: vi.fn(),
-      notify,
-      cancelSubtree,
       nativeView,
       items: () => [
         { state: root, depth: 0, actionable: true },
@@ -753,19 +866,10 @@ describe("interactive supervisor", () => {
       ],
     });
 
-    const lines = component.render(120);
-    expect(
-      lines.some((line) => line.includes("  ○") && line.includes("child")),
-    ).toBe(true);
-    component.handleInput("j");
-    component.handleInput("X");
-    expect(cancelSubtree).not.toHaveBeenCalled();
-    expect(notify).toHaveBeenCalledWith(
-      'Cannot cancel subtree "agent-child": unavailable (status: running; reason: stale).',
-      "warning",
-    );
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain(root.name);
+    expect(rendered).not.toContain(child.name);
 
-    component.handleInput("k");
     component.handleInput("n");
     await vi.waitFor(() => expect(nativeView).toHaveBeenCalledWith(root));
   });
@@ -820,6 +924,8 @@ describe("interactive supervisor", () => {
     expect(lines).toContain(
       "│ Interactive: a show attach cmd · X cancel subtree",
     );
+    expect(lines).toContain("│ Focus: expand first to see native return keys");
+    expect(lines).toContain("│ Sources: registry=live · lineage=persisted");
     expect(lines.every((line) => line.length <= 60)).toBe(true);
   });
 
@@ -845,7 +951,7 @@ describe("interactive supervisor", () => {
     );
   });
 
-  it("explains why focus, item cancellation, and subtree cancellation are unavailable", () => {
+  it("hides inactive items of every async type", () => {
     const terminal = state("terminal", {
       name: "terminal-agent",
       status: "exited",
@@ -880,26 +986,14 @@ describe("interactive supervisor", () => {
       ],
     });
 
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("No async subagents");
+    expect(rendered).not.toContain(terminal.name);
+    expect(rendered).not.toContain(completed.id);
+    expect(rendered).not.toContain(stale.name);
     component.handleInput("f");
-    component.handleInput("j");
     component.handleInput("x");
-    component.handleInput("j");
     component.handleInput("X");
-
-    expect(notify).toHaveBeenNthCalledWith(
-      1,
-      'Cannot focus "terminal-agent": unavailable (status: exited).',
-      "warning",
-    );
-    expect(notify).toHaveBeenNthCalledWith(
-      2,
-      'Cannot cancel "completed-job": unavailable (status: done; reason: completed).',
-      "warning",
-    );
-    expect(notify).toHaveBeenNthCalledWith(
-      3,
-      'Cannot cancel subtree "stale-agent": unavailable (status: running; reason: stale).',
-      "warning",
-    );
+    expect(notify).not.toHaveBeenCalled();
   });
 });

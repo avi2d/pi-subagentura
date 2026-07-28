@@ -1,4 +1,8 @@
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionUIContext,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
+import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { closeSync, lstatSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -28,9 +32,17 @@ interface SupervisorItemBase {
   reasons?: string[];
 }
 
+export interface InteractiveSupervisorOrigin {
+  source: "registry" | "lineage";
+  rootId?: string;
+  ownerSessionId?: string;
+  parentAgentId?: string;
+}
+
 export interface InteractiveSupervisorItem extends SupervisorItemBase {
   kind?: "interactive";
   state: InteractiveSubagentState;
+  origin?: InteractiveSupervisorOrigin;
 }
 
 export interface InProcessSupervisorItem extends SupervisorItemBase {
@@ -91,6 +103,8 @@ export class InteractiveSupervisorComponent {
       trunc("│ All: x cancel item · r refresh · q/esc close", width),
       trunc("│ Interactive: v snapshot · n native viewer · f focus", width),
       trunc("│ Interactive: a show attach cmd · X cancel subtree", width),
+      trunc("│ Focus: expand first to see native return keys", width),
+      trunc("│ Sources: registry=live · lineage=persisted", width),
     ];
 
     if (items.length === 0) {
@@ -220,7 +234,9 @@ export class InteractiveSupervisorComponent {
   }
 
   private items(): AsyncSupervisorItem[] {
-    const items = this.opts.items?.() ?? supervisorItems();
+    const items = (this.opts.items?.() ?? supervisorItems()).filter(
+      supervisorItemIsActive,
+    );
     const stableIndex = this.selectedKey
       ? items.findIndex((item) => supervisorItemKey(item) === this.selectedKey)
       : -1;
@@ -345,6 +361,58 @@ export class InteractiveSupervisorComponent {
   }
 }
 
+interface SupervisorTui {
+  requestRender?: () => void;
+  showOverlay?: TUI["showOverlay"];
+  terminal?: Pick<TUI["terminal"], "rows">;
+}
+
+function ditherBackdropLine(width: number, row: number): string {
+  const safeWidth = Math.max(0, width);
+  const offset = row % 2 === 0 ? 0 : 2;
+  return Array.from({ length: safeWidth }, (_, column) =>
+    (column + offset) % 4 === 0 ? "░" : " ",
+  ).join("");
+}
+
+class InteractiveSupervisorBackdrop implements Component {
+  constructor(
+    private readonly rows: () => number,
+    private readonly paint: (text: string) => string,
+  ) {}
+
+  render(width: number): string[] {
+    return Array.from({ length: this.rows() }, (_, row) =>
+      this.paint(ditherBackdropLine(width, row)),
+    );
+  }
+
+  invalidate(): void {}
+}
+
+function showSupervisorBackdrop(
+  tui: SupervisorTui,
+  theme: Theme | undefined,
+): OverlayHandle | undefined {
+  const backdrop = new InteractiveSupervisorBackdrop(
+    () => Math.max(1, tui.terminal?.rows ?? 1),
+    (text) => {
+      const foreground =
+        typeof theme?.fg === "function" ? theme.fg("dim", text) : text;
+      return typeof theme?.bg === "function"
+        ? theme.bg("customMessageBg", foreground)
+        : foreground;
+    },
+  );
+  if (typeof tui.showOverlay !== "function") return undefined;
+  return tui.showOverlay(backdrop, {
+    anchor: "center",
+    width: "100%",
+    maxHeight: "100%",
+    nonCapturing: true,
+  });
+}
+
 export async function showInteractiveSupervisor(
   ui: ExtensionUIContext,
   options: Omit<
@@ -353,6 +421,8 @@ export async function showInteractiveSupervisor(
   > = {},
 ): Promise<InteractiveSupervisorAction> {
   const custom = (ui as ExtensionUIContext & { custom?: Function }).custom;
+  let component: InteractiveSupervisorComponent | undefined;
+  let backdrop: OverlayHandle | undefined;
   if (typeof custom !== "function") {
     ui.notify(
       "The async subagent supervisor is only available in Pi TUI sessions. Use the status and cancellation tools in this mode.",
@@ -361,17 +431,17 @@ export async function showInteractiveSupervisor(
     return { kind: "close" };
   }
 
-  let component: InteractiveSupervisorComponent | undefined;
   try {
     return await custom.call(
       ui,
       (
-        tui: { requestRender?: () => void },
-        _theme: unknown,
+        tui: SupervisorTui,
+        theme: Theme | undefined,
         _kb: unknown,
         done: SupervisorDone,
       ) => {
         activeDone = done;
+        backdrop = showSupervisorBackdrop(tui, theme);
         component = new InteractiveSupervisorComponent({
           ...options,
           done,
@@ -392,6 +462,7 @@ export async function showInteractiveSupervisor(
   } finally {
     activeDone = undefined;
     component?.dispose();
+    backdrop?.hide();
   }
 }
 
@@ -462,6 +533,13 @@ function supervisorItemStatus(item: AsyncSupervisorItem): string {
   return item.state.status;
 }
 
+function supervisorItemIsActive(item: AsyncSupervisorItem): boolean {
+  if (!item.actionable) return false;
+  if (item.kind === "in-process") return item.job.status === "running";
+  if (item.kind === "workflow") return item.job.status === "running";
+  return item.state.status === "running" || item.state.status === "idle";
+}
+
 function formatAsyncSupervisorSummary(
   item: AsyncSupervisorItem,
   now: number,
@@ -482,7 +560,8 @@ function formatAsyncSupervisorSummary(
       : "";
     return `[workflow] ${statusIcon(job.status)} ${job.status} ${job.name} (${job.id}) · ${elapsed} · ${job.snapshot.agentsSpawned} agents · ${job.snapshot.runningCount ?? 0} running${phase}`;
   }
-  return `[interactive] ${formatSupervisorSummary(item.state, now)}`;
+  const source = item.origin?.source ?? "registry";
+  return `[${source}] ${formatSupervisorSummary(item.state, now)}`;
 }
 
 function formatAsyncDetails(
@@ -495,7 +574,7 @@ function formatAsyncDetails(
   if (item.kind === "workflow") {
     return formatWorkflowDetails(item.job, width);
   }
-  return formatInteractiveDetails(item.state, width);
+  return formatInteractiveDetails(item, width);
 }
 
 function formatInProcessDetails(job: JobState, width: number): string[] {
@@ -540,11 +619,13 @@ function formatWorkflowDetails(job: WorkflowJobState, width: number): string[] {
 }
 
 function formatInteractiveDetails(
-  state: InteractiveSubagentState,
+  item: InteractiveSupervisorItem,
   width: number,
 ): string[] {
+  const state = item.state;
   const artifactDetails = readArtifactDetails(state);
   const fields = [
+    `Origin: ${formatInteractiveOrigin(item)}`,
     `Task: ${state.task}`,
     `Model: ${state.model ?? "default"}`,
     `Pane: ${state.mux}:${state.paneId}${state.muxSession ? ` session=${state.muxSession}` : ""}`,
@@ -559,7 +640,31 @@ function formatInteractiveDetails(
     fields.push(`Attach: ${state.attachCommand}`);
   }
   fields.push(`Focus: ${state.selectPaneCommand}`);
+  fields.push(`Return: ${focusReturnHint(state)}`);
   return fields.map((field) => trunc(`│     ${field}`, width));
+}
+
+function formatInteractiveOrigin(item: InteractiveSupervisorItem): string {
+  const origin = item.origin;
+  const source =
+    origin?.source === "lineage" ? "persisted lineage" : "live registry";
+  const owner =
+    origin?.ownerSessionId ?? item.state.parentSessionId ?? "unknown";
+  const details = [source, `owner=${owner}`];
+  if (origin?.rootId) details.push(`root=${origin.rootId}`);
+  if (origin?.parentAgentId) details.push(`parent=${origin.parentAgentId}`);
+  return details.join(" · ");
+}
+
+function focusReturnHint(state: InteractiveSubagentState): string {
+  if (state.mux === "tmux") {
+    return state.windowName
+      ? "tmux prefix + l (last window)"
+      : "tmux prefix + ; (last pane)";
+  }
+  return state.windowName
+    ? "Ctrl+t, then Tab (last tab)"
+    : "Ctrl+p, then p (previous pane)";
 }
 
 function readArtifactDetails(state: InteractiveSubagentState): {

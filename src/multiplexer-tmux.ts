@@ -329,15 +329,17 @@ export class TmuxMultiplexer implements Multiplexer {
 
   isPaneAlive(paneId: string): boolean {
     try {
-      execFileSync(
+      const output = execFileSync(
         "tmux",
         withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
         {
-          stdio: "ignore",
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
           timeout: 5000,
         },
       );
-      return true;
+      // tmux 3.6 can exit 0 with blank output for a stale pane target.
+      return output.trim().length > 0;
     } catch {
       return false;
     }
@@ -349,9 +351,9 @@ export class TmuxMultiplexer implements Multiplexer {
         execFile(
           "tmux",
           withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
-          { timeout: 5000 },
-          (error) => {
-            resolve(!error);
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            resolve(!error && stdout.trim().length > 0);
           },
         );
       } catch {
