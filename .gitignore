@@ -6,3 +6,4 @@ logs/
 .omc
 .claude
 coverage/
+terminal-e2e-recordings/

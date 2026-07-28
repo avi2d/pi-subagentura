@@ -542,10 +542,18 @@ Example usage:
 ./tests/terminal-e2e/demo.sh interactive
 ```
 
-WezTerm can record the terminal stream as an asciicast:
+WezTerm can record the terminal stream as an asciicast, and the local recording wrapper converts it to VP9 WebM with `agg` and `ffmpeg`:
 
 ```bash
-wezterm record --cwd "$PWD" ./tests/terminal-e2e/demo.sh interactive
+npm run record:tui -- interactive
+# Optional explicit output path:
+npm run record:tui -- workflow "$PWD/terminal-e2e-recordings/workflow.webm"
+```
+
+The command requires `wezterm`, `agg`, and an `ffmpeg` build with `libvpx-vp9`. It keeps intermediate cast/GIF files temporary and writes only the final WebM. Direct cast recording and replay remain available:
+
+```bash
+wezterm record --cwd "$PWD" -- bash ./tests/terminal-e2e/demo.sh interactive
 wezterm replay <generated-cast-file>
 ```
 
@@ -558,7 +566,7 @@ wezterm cli get-text
 wezterm cli get-text --escapes
 ```
 
-If a GIF or video asset is eventually needed, render the asciicast with an external tool or use OS-level screen capture. Those assets should remain review/demo artifacts rather than CI assertions.
+Generated WebM files remain local review/demo artifacts under `terminal-e2e-recordings/`; they are ignored by Git and are not CI assertions.
 
 ## Implemented file layout
 
@@ -578,6 +586,7 @@ tests/terminal-e2e/
   terminal.test.ts
   demo.mjs
   demo.sh
+  record-webm.sh
 ```
 
 The harness generates the version-appropriate temporary tmux configuration at runtime.
@@ -590,7 +599,8 @@ Package scripts:
   "test:unit": "vitest run --exclude tests/tmux.integration.test.ts --exclude tests/pi-session-delivery.integration.test.ts --exclude 'tests/terminal-e2e/**'",
   "coverage:check": "vitest run --coverage --exclude tests/tmux.integration.test.ts --exclude 'tests/terminal-e2e/**'",
   "test:tui": "vitest run --testTimeout=60000 tests/terminal-e2e/provider-contract.test.ts tests/terminal-e2e/network-guard.test.ts tests/terminal-e2e/harness-contract.test.ts tests/terminal-e2e/terminal.test.ts",
-  "demo:tui": "bash tests/terminal-e2e/demo.sh"
+  "demo:tui": "bash tests/terminal-e2e/demo.sh",
+  "record:tui": "bash tests/terminal-e2e/record-webm.sh"
 }
 ```
 
