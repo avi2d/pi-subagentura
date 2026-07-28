@@ -457,7 +457,11 @@ describe("real Pi terminal E2E", () => {
       const output = completion?.output as Record<string, unknown> | undefined;
       expect(output?.bytes).toBe(0);
       expect(existsSync(resolve(String(output?.path)))).toBe(true);
-      expect(harness.currentScreen(pane?.id)).toMatch(/error|failed/i);
+      await harness.waitFor(
+        () => /error|failed/i.test(harness.currentScreen(pane?.id)),
+        "interactive child error screen",
+        20_000,
+      );
       expect(
         harness.panes().some((candidate) => candidate.id === pane?.id),
       ).toBe(true);
