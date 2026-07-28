@@ -67,6 +67,14 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+const activityWidgetRowsByUi = new WeakMap<
+  ExtensionUIContext,
+  string[] | undefined
+>();
+const runningFooterStatusByUi = new WeakMap<
+  Pick<ExtensionUIContext, "setStatus">,
+  string | undefined
+>();
 
 function getRunningSubagentCount(): number {
   const inProcessCount = [...jobRegistry.values()].filter(
@@ -82,13 +90,38 @@ export function updateRunningSubagentFooter(
   ui: Pick<ExtensionUIContext, "setStatus">,
 ): void {
   const runningCount = getRunningSubagentCount();
+  const statusText =
+    runningCount > 0
+      ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
+      : undefined;
+  if (
+    runningFooterStatusByUi.has(ui) &&
+    runningFooterStatusByUi.get(ui) === statusText
+  ) {
+    return;
+  }
   try {
-    ui.setStatus(
-      FOOTER_KEY,
-      runningCount > 0
-        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
-        : undefined,
-    );
+    ui.setStatus(FOOTER_KEY, statusText);
+    runningFooterStatusByUi.set(ui, statusText);
+  } catch {
+    /* ui stale */
+  }
+}
+
+function updateActivityWidget(ui: ExtensionUIContext, rows: string[]): void {
+  const nextRows = rows.length > 0 ? rows : undefined;
+  const previousRows = activityWidgetRowsByUi.get(ui);
+  const unchanged =
+    activityWidgetRowsByUi.has(ui) &&
+    (previousRows === undefined
+      ? nextRows === undefined
+      : nextRows !== undefined &&
+        previousRows.length === nextRows.length &&
+        previousRows.every((row, index) => row === nextRows[index]));
+  if (unchanged) return;
+  try {
+    ui.setWidget(WIDGET_KEY, nextRows, { placement: "belowEditor" });
+    activityWidgetRowsByUi.set(ui, nextRows ? [...nextRows] : undefined);
   } catch {
     /* ui stale */
   }
@@ -380,17 +413,7 @@ async function runPollArtifactChanges(
     // Paint footer + widget. Both are TUI surfaces that never reach the LLM.
     if (ui) {
       updateRunningSubagentFooter(ui);
-      try {
-        ui.setWidget(
-          WIDGET_KEY,
-          widgetRows.length > 0 ? widgetRows : undefined,
-          {
-            placement: "belowEditor",
-          },
-        );
-      } catch {
-        /* ui stale */
-      }
+      updateActivityWidget(ui, widgetRows);
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);

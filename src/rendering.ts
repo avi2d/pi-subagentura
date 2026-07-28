@@ -226,24 +226,11 @@ export function renderSubagentNotify(
   return new Text(line, 0, 0);
 }
 
-/** Format a single TUI widget row for a live sub-agent. */
+/** Format a stable row; elapsed clocks would repaint the widget on every poll. */
 export function formatActivityRow(state: InteractiveSubagentState): string {
   if (state.status === "idle") {
     return `○ ${state.name}: idle — ready for follow-up`;
   }
-  const ago = state.lastActivityAt
-    ? ` (${agoStr(Date.now() - state.lastActivityAt)})`
-    : "";
   const summary = state.lastToolSummary ?? "starting…";
-  return `▶ ${state.name}: ${summary}${ago}`;
-}
-
-function agoStr(ms: number): string {
-  if (ms < 0) ms = 0;
-  if (ms < 1000) return "just now";
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  return `${Math.floor(m / 60)}h ago`;
+  return `▶ ${state.name}: ${summary}`;
 }

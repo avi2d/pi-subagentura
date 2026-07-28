@@ -399,6 +399,41 @@ describe("pollArtifactChanges", () => {
     );
   });
 
+  it("does not repaint unchanged interactive activity rows", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const ui = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const item = makeState();
+    item.state.name = "steady-agent";
+    item.state.lastToolSummary = "reading src/main.ts";
+    item.state.lastActivityAt = Date.now() - 10_000;
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    (globalThis as any).__piSubagenturaUi = ui;
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as any);
+
+    const activityCalls = ui.setWidget.mock.calls.filter(
+      ([key]) => key === "subagentura-activity",
+    );
+    expect(activityCalls).toHaveLength(1);
+    const footerCalls = ui.setStatus.mock.calls.filter(
+      ([key]) => key === "subagentura-running",
+    );
+    expect(footerCalls).toHaveLength(1);
+    expect((activityCalls[0][1] as string[])[0]).toBe(
+      "▶ steady-agent: reading src/main.ts",
+    );
+  });
+
   it("abandons mutation when its owner is removed during liveness", async () => {
     const result = await pollUntilOwnerInvalidation((owner) => {
       removeSessionContext(owner.id);

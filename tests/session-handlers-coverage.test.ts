@@ -202,10 +202,7 @@ describe("session handler lifecycle callbacks", () => {
     );
 
     updateRunningSubagentFooter(parentUi as any);
-    expect(parentUi.setStatus).toHaveBeenLastCalledWith(
-      "subagentura-running",
-      "⚡ 1 sub-agent active",
-    );
+    expect(parentUi.setStatus).not.toHaveBeenCalled();
   });
 
   it("polls every live owner from the single global interval", async () => {
