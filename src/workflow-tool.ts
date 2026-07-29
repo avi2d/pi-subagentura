@@ -36,11 +36,7 @@ import {
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { renderProgress } from "./workflow-ui";
-import {
-  awaitInteractiveResult,
-  runWorkflow,
-  stringify,
-} from "./workflow-worker";
+import { awaitInteractiveResult, stringify } from "./workflow-worker";
 import { sanitizeOutput } from "./notifications";
 import { showWorkflowTree } from "./workflow-tree-ui";
 import {
@@ -161,7 +157,7 @@ export function registerWorkflowTool(
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(
     ctx: any,
-    ownedWorkflowId: string | undefined,
+    ownedWorkflowId: string,
     supervisorOwner: ActiveSessionContextToken | undefined,
   ): WorkflowAgentRunner {
     return async ({
@@ -502,7 +498,7 @@ export function registerWorkflowTool(
       }
 
       const workflowOwner = owner();
-      const baseOpts = (workflowId: string | undefined) => ({
+      const baseOpts = (workflowId: string) => ({
         args: params.args,
         cwd: ctx.cwd,
         budgetTotal: params.budget ?? null,
@@ -533,6 +529,7 @@ export function registerWorkflowTool(
             jobStartedAt,
             notifyWorkflowCompletion,
             workflowOwner,
+            "async",
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -556,30 +553,39 @@ export function registerWorkflowTool(
       }
 
       // ── Synchronous (block-and-stream) path ──
-      // Not tracked in workflowJobRegistry, so its children have no workflow row
-      // to group under and stay flush-left in the supervisor.
       try {
-        const run = await runWorkflow(script, {
-          ...baseOpts(undefined),
-          signal,
-          onProgress: (p) => {
-            try {
-              onUpdate?.({
-                content: [{ type: "text", text: renderProgress(p) }],
-                details: {
-                  status: "running",
-                  agentsSpawned: p.agentsSpawned,
-                  runningCount: p.runningCount,
-                  errorCount: p.errorCount,
-                  tokensSpent: p.tokensSpent,
-                  usage: p.usage,
-                },
-              });
-            } catch {
-              /* onUpdate is best-effort */
-            }
-          },
-        });
+        const meta = parseWorkflow(script).meta;
+        const syncProgress = (p: WorkflowProgress) => {
+          try {
+            onUpdate?.({
+              content: [{ type: "text", text: renderProgress(p) }],
+              details: {
+                status: "running",
+                agentsSpawned: p.agentsSpawned,
+                runningCount: p.runningCount,
+                errorCount: p.errorCount,
+                tokensSpent: p.tokensSpent,
+                usage: p.usage,
+              },
+            });
+          } catch {
+            /* onUpdate is best-effort */
+          }
+        };
+        const job = startWorkflowJob(
+          meta.name,
+          script,
+          (workflowId) => ({
+            ...baseOpts(workflowId),
+            signal,
+            onProgress: syncProgress,
+          }),
+          Date.now(),
+          undefined,
+          workflowOwner,
+          "sync",
+        );
+        const run = await job.promise;
         const resultText =
           typeof run.result === "string" ? run.result : stringify(run.result);
         const presentation = getWorkflowCompletionPresentation(
