@@ -14,6 +14,10 @@ jobs:
   test:
     name: Test (Pi ${{ matrix.pi-version }})
     runs-on: ubuntu-latest
+    # Per-test bounds exist, but nothing the runner enforces bounds vitest worker
+    # shutdown or a wedged tmux server; without this a hang burns the 360 min
+    # default across both matrix legs on every push and pull_request.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -87,10 +91,20 @@ jobs:
         run: npm run test:zellij
         env:
           TERM: xterm-256color
+
+      # Decision (was deferred): the terminal E2E suite runs on every push, pull
+      # request and the nightly cron, but only on the PINNED SDK leg. It asserts
+      # on Pi's TUI paint ("Async Subagents", "Model: subagentura-e2e/mock",
+      # 'Workflow "e2e-workflow" complete'), so on the floating `latest` leg any
+      # cosmetic upstream change would turn master red with no local change and
+      # read as a flake. Unit/integration coverage stays strict on both legs.
       - name: Run terminal visual E2E tests
+        if: matrix.pi-version == '0.80.6'
+        timeout-minutes: 8
         env:
-          PI_SUBAGENTURA_TMUX_SOCKET: pi-subagentura-e2e-${{ github.run_id }}-${{ github.run_attempt }}
-          TERM: xterm-256color
+          # The harness builds a replacement environment and picks its own
+          # per-harness tmux socket (pid + random), so only the diagnostics
+          # destination is worth setting here. Diagnostics are written on failure.
           SUBAGENTURA_E2E_DIAGNOSTICS: ${{ runner.temp }}/subagentura-e2e
         run: npm run test:tui
       - name: Upload terminal E2E diagnostics
