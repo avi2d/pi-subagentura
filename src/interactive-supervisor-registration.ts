@@ -508,7 +508,7 @@ export function registerInteractiveSupervisor(
       },
       cancelInProcess: (job) => {
         if (!cancelInProcessFromSupervisor(job, sessionId)) return false;
-        updateRunningSubagentFooter(ctx.ui);
+        updateRunningSubagentFooter(ctx.ui, owner());
         return true;
       },
       cancelWorkflow: (job) => {
@@ -521,7 +521,7 @@ export function registerInteractiveSupervisor(
       cancel: (id) => {
         const direct = cancelInteractiveSubagent(id);
         if (direct) {
-          updateRunningSubagentFooter(ctx.ui);
+          updateRunningSubagentFooter(ctx.ui, owner());
           return direct;
         }
         const item = projection?.items.find(
@@ -529,7 +529,7 @@ export function registerInteractiveSupervisor(
         );
         if (!item?.actionable) return undefined;
         cancelInteractiveDescendantByState(item.state);
-        updateRunningSubagentFooter(ctx.ui);
+        updateRunningSubagentFooter(ctx.ui, owner());
         return item.state;
       },
       cancelSubtree: async (state) => {
@@ -552,7 +552,7 @@ export function registerInteractiveSupervisor(
         if (!confirmed) return;
         if (!snapshotRoot) {
           cancelInteractiveSubagent(state.id);
-          updateRunningSubagentFooter(ctx.ui);
+          updateRunningSubagentFooter(ctx.ui, owner());
           return;
         }
         const result = await cancelLineageSubtreeBestEffort(snapshotRoot, {
@@ -579,7 +579,7 @@ export function registerInteractiveSupervisor(
             }
           },
         });
-        updateRunningSubagentFooter(ctx.ui);
+        updateRunningSubagentFooter(ctx.ui, owner());
         ctx.ui.notify(
           formatSubtreeCancellation(result),
           result.failed.length > 0 ||
