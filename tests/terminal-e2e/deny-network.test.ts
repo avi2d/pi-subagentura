@@ -41,6 +41,12 @@ describe("terminal E2E network guard scope", () => {
     );
   });
 
+  it("uses the local default for connect(port, connectionListener)", () => {
+    expect(deniedEvent('require("node:net").connect(443, () => {})')).toEqual(
+      expect.objectContaining({ kind: "node:net.connect", scope: "local" }),
+    );
+  });
+
   it.each(["host", "hostname"])(
     "labels remote HTTP options using %s as egress even with a request path",
     (hostKey) => {
@@ -57,11 +63,53 @@ describe("terminal E2E network guard scope", () => {
     },
   );
 
-  it("labels a UNIX socket connect as local", () => {
-    expect(
-      deniedEvent('require("node:net").connect("/tmp/subagentura.sock")'),
-    ).toEqual(
-      expect.objectContaining({ kind: "node:net.connect", scope: "local" }),
+  it.each([
+    [
+      "hostname",
+      'require("node:http").request(new URL("http://example.com/"), { hostname: "localhost", path: "/" })',
+      "local",
+    ],
+    [
+      "host",
+      'require("node:http").get("http://localhost/", { host: "example.com", path: "/" })',
+      "egress",
+    ],
+    [
+      "socketPath",
+      'require("node:http").request("http://example.com/", { socketPath: "service.sock", path: "/" })',
+      "local",
+    ],
+    [
+      "request path only",
+      'require("node:http").get("http://example.com/", { path: "/" })',
+      "egress",
+    ],
+  ])(
+    "applies HTTP URL options %s before classifying the URL host",
+    (_override, source, scope) => {
+      expect(deniedEvent(source)).toEqual(expect.objectContaining({ scope }));
+    },
+  );
+
+  it.each([
+    [
+      "absolute net socket",
+      'require("node:net").connect("/tmp/subagentura.sock")',
+      "node:net.connect",
+    ],
+    [
+      "relative net socket",
+      'require("node:net").connect("service.sock")',
+      "node:net.connect",
+    ],
+    [
+      "abstract TLS socket",
+      'require("node:tls").connect("\\u0000subagentura.sock")',
+      "node:tls.connect",
+    ],
+  ])("labels a %s path as local", (_pathType, source, kind) => {
+    expect(deniedEvent(source)).toEqual(
+      expect.objectContaining({ kind, scope: "local" }),
     );
   });
 

@@ -25,6 +25,14 @@ function scopeOfHost(host) {
   return LOOPBACK.test(String(host)) ? "local" : "egress";
 }
 
+function scopeOfOptions(options, pathIsSocket) {
+  if (!options || typeof options !== "object") return undefined;
+  if (options.socketPath != null) return "local";
+  if (pathIsSocket && options.path != null) return "local";
+  const host = options.hostname ?? options.host;
+  return host == null ? undefined : scopeOfHost(host);
+}
+
 function scopeOf(kind, args) {
   const [target, positionalHost] = args;
   const isHttpRequest =
@@ -32,14 +40,24 @@ function scopeOf(kind, args) {
     kind === "node:http.get" ||
     kind === "node:https.request" ||
     kind === "node:https.get";
+  const isIpcConnect =
+    kind === "node:net.connect" ||
+    kind === "node:net.createConnection" ||
+    kind === "node:net.Socket.connect" ||
+    kind === "node:tls.connect" ||
+    kind === "node:tls.createConnection" ||
+    kind === "node:tls.TLSSocket.connect";
+
+  if (isHttpRequest && (target instanceof URL || typeof target === "string")) {
+    const overrideScope = scopeOfOptions(args[1], false);
+    if (overrideScope) return overrideScope;
+  }
 
   if (target instanceof URL) return scopeOfHost(target.hostname);
 
   if (target && typeof target === "object") {
-    if (target.socketPath) return "local";
-    if (!isHttpRequest && target.path) return "local";
-    const host = target.hostname ?? target.host;
-    if (host != null) return scopeOfHost(host);
+    const optionsScope = scopeOfOptions(target, !isHttpRequest);
+    if (optionsScope) return optionsScope;
     if (target.url != null) return scopeOf(kind, [target.url]);
     // HTTP request options without a host use Node's loopback default. Their
     // `.path` is an HTTP request target, not a UNIX socket path.
@@ -48,8 +66,16 @@ function scopeOf(kind, args) {
   }
 
   if (typeof target === "number") {
-    return positionalHost == null ? "local" : scopeOfHost(positionalHost);
+    if (typeof positionalHost === "string") {
+      return scopeOfHost(positionalHost);
+    }
+    const optionsScope = scopeOfOptions(positionalHost, true);
+    return optionsScope ?? "local";
   }
+
+  // In the net/tls connect overloads a string first argument is an IPC path,
+  // including relative and Linux abstract socket names.
+  if (isIpcConnect && typeof target === "string") return "local";
 
   const text = String(target ?? "");
   try {
