@@ -109,14 +109,19 @@ const ONLY_INTERACTIVE_ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
  *
  * This mode decides *tool registration*, which happens during activation, so it
  * reads the signals that already exist then: the env var (programmatic and test
- * use) and raw argv (so the documented CLI flag works). `--only-interactive` is
- * still registered via `registerFlag` so `--help` lists it and Pi's flag
- * validation accepts it.
+ * use) and raw argv (so the documented CLI flag works). Pi's unknown-flag
+ * parser recognizes either the exact token or `--only-interactive=<value>`;
+ * every supplied value, including `false`, enables a registered boolean.
+ * `--only-interactive` is still registered via `registerFlag` so `--help` lists
+ * it and Pi's flag validation accepts it.
  */
 function isOnlyInteractiveMode(): boolean {
   return (
     process.env.PI_SUBAGENTURA_ONLY_INTERACTIVE === "1" ||
-    process.argv.includes("--only-interactive")
+    process.argv.some(
+      (arg) =>
+        arg === "--only-interactive" || arg.startsWith("--only-interactive="),
+    )
   );
 }
 
@@ -128,8 +133,10 @@ export default function (pi: ExtensionAPI) {
     }
     const sessionScope = registerSessionHandlers(pi);
     registerInteractiveSubagentTools(pi, sessionScope);
-    registerSubagentArtifactsCleanupTool(pi, sessionScope);
-    registerSubagentModelListTool(pi);
+    registerInProcessMaintenanceTools(pi, {
+      scope: sessionScope,
+      include: ONLY_INTERACTIVE_MAINTENANCE_TOOLS,
+    });
     registerInteractiveSupervisor(pi, sessionScope);
     return;
   }
@@ -172,7 +179,9 @@ export default function (pi: ExtensionAPI) {
     registerInProcessSubagentTools(pi, sessionScope);
     registerInProcessMaintenanceTools(pi, sessionScope);
   }
-  registerInteractiveSupervisor(pi, sessionScope);
+  if (!onlyInteractive) {
+    registerInteractiveSupervisor(pi, sessionScope);
+  }
   // ── Cancel-all-flows shortcut and command ──────────────────────
   registerCancelAllFlows(pi, sessionScope);
 }

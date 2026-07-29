@@ -1200,8 +1200,7 @@ function registerCancelSubagentTool(
 
     renderResult(result, _options, theme, _context) {
       const details = result.details as
-        | (InProcessSubagentDetails & { jobId?: string })
-        | undefined;
+        (InProcessSubagentDetails & { jobId?: string }) | undefined;
       const jobId = String(details?.jobId ?? "unknown");
       const cancelled = details?.status === "cancelled";
       const firstContent = result.content?.[0];
@@ -1601,33 +1600,5 @@ export function registerInProcessMaintenanceTools(
   const include = isScope ? undefined : scopeOrOptions.include;
   for (const name of include ?? MAINTENANCE_TOOL_NAMES) {
     MAINTENANCE_REGISTRARS[name](pi, scope);
-  }
-}
-
-export type MaintenanceToolName = (typeof MAINTENANCE_TOOL_NAMES)[number];
-
-/**
- * Maintenance tools kept in only-interactive mode: model listing (children take
- * a `model`) and artifact cleanup (interactive children write artifacts).
- * `prune_subagent_jobs` is excluded because in-process jobs cannot exist there.
- */
-export const ONLY_INTERACTIVE_MAINTENANCE_TOOLS: readonly MaintenanceToolName[] =
-  ["list_available_models", "cleanup_subagent_artifacts"];
-
-const MAINTENANCE_REGISTRARS: Record<
-  MaintenanceToolName,
-  (pi: ExtensionAPI) => void
-> = {
-  list_available_models: registerListAvailableModelsTool,
-  prune_subagent_jobs: registerPruneSubagentJobsTool,
-  cleanup_subagent_artifacts: registerCleanupArtifactsTool,
-};
-
-export function registerInProcessMaintenanceTools(
-  pi: ExtensionAPI,
-  options: { include?: readonly MaintenanceToolName[] } = {},
-): void {
-  for (const name of options.include ?? MAINTENANCE_TOOL_NAMES) {
-    MAINTENANCE_REGISTRARS[name](pi);
   }
 }

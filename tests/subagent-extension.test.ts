@@ -76,8 +76,6 @@ function mockApi(overrides: Record<string, any> = {}) {
     registerShortcut: vi.fn(),
     registerMessageRenderer: vi.fn(),
     registerFlag: vi.fn(),
-    registerCommand: vi.fn(),
-    registerShortcut: vi.fn(),
     getFlag: vi.fn().mockReturnValue(false),
     on: vi.fn(),
     ...overrides,
@@ -87,9 +85,11 @@ function mockApi(overrides: Record<string, any> = {}) {
 describe("extension registration", () => {
   let previousChild: string | undefined;
   let previousOnlyInteractive: string | undefined;
+  let previousArgv: string[];
   beforeEach(() => {
     previousChild = process.env.PI_SUBAGENTURA_CHILD;
     previousOnlyInteractive = process.env.PI_SUBAGENTURA_ONLY_INTERACTIVE;
+    previousArgv = [...process.argv];
     delete process.env.PI_SUBAGENTURA_CHILD;
     delete process.env.PI_SUBAGENTURA_ONLY_INTERACTIVE;
   });
@@ -104,6 +104,7 @@ describe("extension registration", () => {
     } else {
       process.env.PI_SUBAGENTURA_ONLY_INTERACTIVE = previousOnlyInteractive;
     }
+    process.argv.splice(0, process.argv.length, ...previousArgv);
   });
 
   it("registers the expected tools without throwing", () => {
@@ -156,18 +157,47 @@ describe("extension registration", () => {
     }
   });
 
-  it("selects only-interactive mode from the --only-interactive argv", () => {
-    const api = mockApi();
+  it("selects only-interactive mode from the exact --only-interactive argv token", () => {
     process.argv.push("--only-interactive");
+    const api = mockApi();
 
-    try {
-      registerExtension(api as any);
-    } finally {
-      process.argv.splice(process.argv.indexOf("--only-interactive"), 1);
-    }
+    registerExtension(
+      api as unknown as Parameters<typeof registerExtension>[0],
+    );
 
     expect(getRegisteredToolNames(api)).toEqual(ONLY_INTERACTIVE_TOOLS);
   });
+
+  it.each([
+    ["an arbitrary value", "--only-interactive=anything"],
+    ["false", "--only-interactive=false"],
+  ])(
+    "selects only-interactive mode when its boolean flag has %s",
+    (_label, arg) => {
+      process.argv.push(arg);
+      const api = mockApi();
+
+      registerExtension(
+        api as unknown as Parameters<typeof registerExtension>[0],
+      );
+
+      expect(getRegisteredToolNames(api)).toEqual(ONLY_INTERACTIVE_TOOLS);
+    },
+  );
+
+  it.each(["--only-interactive-extra", "--only-interactive-extra=value"])(
+    "does not mistake the longer flag %s for only-interactive",
+    (arg) => {
+      process.argv.push(arg);
+      const api = mockApi();
+
+      registerExtension(
+        api as unknown as Parameters<typeof registerExtension>[0],
+      );
+
+      expect(getRegisteredToolNames(api)).toEqual(FULL_MODE_TOOLS);
+    },
+  );
 
   /**
    * Ordering contract, documented as a test: Pi applies CLI flag values AFTER
@@ -270,6 +300,16 @@ describe("extension registration", () => {
     for (const name of ONLY_INTERACTIVE_TOOLS) {
       expect(result.systemPrompt).toContain(name);
     }
+    expect(result.systemPrompt).toContain("## Child sessions are leaf workers");
+    expect(result.systemPrompt).toContain("`PI_SUBAGENTURA_CHILD=1`");
+    expect(result.systemPrompt).toContain("no delegation tools");
+    expect(result.systemPrompt).toContain("They cannot spawn another child.");
+    expect(result.systemPrompt).not.toContain(
+      "A child can spawn its own children.",
+    );
+    expect(result.systemPrompt).not.toContain(
+      "SUBAGENTURA_MAX_ORCHESTRATION_DEPTH",
+    );
   });
 
   it("registers only protocol hooks in child mode", () => {

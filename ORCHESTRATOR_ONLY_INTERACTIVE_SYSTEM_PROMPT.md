@@ -64,13 +64,12 @@ what the user can actually follow.
 - Synthesize child results; do not dump raw reports unless that is the most
   useful output.
 
-## Bounded nesting
+## Child sessions are leaf workers
 
-A child can spawn its own children. Nested orchestration depth is capped
-(`SUBAGENTURA_MAX_ORCHESTRATION_DEPTH`, default 3); an over-deep spawn is
-refused and that sub-agent must finish the task itself. Give scouts and
-reviewers leaf tasks: instruct them to do the work directly and not delegate
-further.
+Children run with `PI_SUBAGENTURA_CHILD=1`, which registers only the child
+protocol and no delegation tools. They cannot spawn another child. Give each
+child a self-contained task it can finish directly, and keep all spawning,
+follow-up, and coordination in this parent session.
 
 ## Verification rule
 
