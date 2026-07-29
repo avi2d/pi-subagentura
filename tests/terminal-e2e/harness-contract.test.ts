@@ -1,5 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -20,6 +26,44 @@ async function nextLine(stream: NodeJS.ReadableStream): Promise<string> {
       resolvePromise(buffer.slice(0, newline));
     });
   });
+}
+
+function signalWithCompetingListener(position: "before" | "after") {
+  const harnessUrl = new URL("./harness.mjs", import.meta.url).href;
+  const script = `
+    import { existsSync } from "node:fs";
+    import { MessageChannel } from "node:worker_threads";
+    import { createHarness } from ${JSON.stringify(harnessUrl)};
+    let harness;
+    const keepAlive = new MessageChannel();
+    keepAlive.port1.on("message", () => {});
+    const otherListener = () => {
+      setImmediate(() => {
+        keepAlive.port1.close();
+        keepAlive.port2.close();
+        console.log(JSON.stringify({
+          listener: "other",
+          rootExists: existsSync(harness.root),
+        }));
+      });
+    };
+    if (${JSON.stringify(position)} === "before") {
+      process.once("SIGTERM", otherListener);
+    }
+    harness = createHarness({ scenario: "signal-ownership" });
+    if (${JSON.stringify(position)} === "after") {
+      process.once("SIGTERM", otherListener);
+    }
+    process.kill(process.pid, "SIGTERM");
+  `;
+  return JSON.parse(
+    execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, NODE_OPTIONS: "" },
+      timeout: 10_000,
+    }),
+  );
 }
 
 describe("terminal harness lifecycle", () => {
@@ -75,6 +119,55 @@ describe("terminal harness lifecycle", () => {
       }
       rmSync(diagnosticsRoot, { recursive: true, force: true });
     }
+  });
+
+  it("does not inherit hostile NODE_OPTIONS preloads into children", async () => {
+    const hostileRoot = mkdtempSync(join(tmpdir(), "hostile-node-options-"));
+    const hostilePreload = join(hostileRoot, "hostile.cjs");
+    const hostileMarker = join(hostileRoot, "loaded");
+    writeFileSync(
+      hostilePreload,
+      `require("node:fs").writeFileSync(${JSON.stringify(hostileMarker)}, "loaded");`,
+    );
+    const previousNodeOptions = process.env.NODE_OPTIONS;
+    process.env.NODE_OPTIONS = `--require=${hostilePreload}`;
+    const harness = createHarness({ scenario: "node-options" });
+    try {
+      harness.setupFiles();
+      execFileSync(process.execPath, ["--eval", ""], {
+        env: harness.env,
+        stdio: "ignore",
+        timeout: 5_000,
+      });
+
+      expect(harness.env.NODE_OPTIONS).not.toContain(hostilePreload);
+      expect(existsSync(hostileMarker)).toBe(false);
+      expect(harness.networkEvents()).toContainEqual(
+        expect.objectContaining({ kind: "armed" }),
+      );
+    } finally {
+      if (previousNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = previousNodeOptions;
+      }
+      await harness.cleanup(false);
+      rmSync(hostileRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not claim a signal with an earlier listener", () => {
+    expect(signalWithCompetingListener("before")).toEqual({
+      listener: "other",
+      rootExists: false,
+    });
+  });
+
+  it("does not claim a signal with a later listener", () => {
+    expect(signalWithCompetingListener("after")).toEqual({
+      listener: "other",
+      rootExists: false,
+    });
   });
 
   it("kills active harnesses when the test process receives SIGTERM", async () => {

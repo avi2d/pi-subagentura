@@ -61,12 +61,16 @@ function installExitCleanup() {
     ["SIGTERM", 143],
     ["SIGHUP", 129],
   ]) {
+    const ownsSignal = process.listenerCount(signal) === 0;
     process.once(signal, () => {
       cleanupActiveHarnessesSync();
-      // `process.once` removed this listener before invoking it, so a non-zero
-      // count means somebody else (vitest) also handles the signal and owns the
-      // shutdown. Exiting here would pre-empt its reporter summary.
-      if (process.listenerCount(signal) === 0) process.exit(exitCode);
+      // Ownership is established before registration so an earlier `once`
+      // listener cannot disappear before this callback and make the harness
+      // mistake the signal for its own. Re-check at delivery time so listeners
+      // registered after the harness also retain control of shutdown.
+      if (ownsSignal && process.listenerCount(signal) === 0) {
+        process.exit(exitCode);
+      }
     });
   }
 }
@@ -318,12 +322,7 @@ export class TerminalHarness {
       SUBAGENTURA_E2E_REPO: REPO,
       SUBAGENTURA_E2E_API_KEY: "subagentura-e2e-test-key",
       SUBAGENTURA_E2E_REAL_PI: resolvePi(),
-      NODE_OPTIONS: [
-        process.env.NODE_OPTIONS,
-        `--require=${join(HERE, "fixtures/deny-network.cjs")}`,
-      ]
-        .filter(Boolean)
-        .join(" "),
+      NODE_OPTIONS: `--require=${join(HERE, "fixtures/deny-network.cjs")}`,
       // Node ignores these, but tool-issued `curl`/`git`/`wget` do not, so
       // non-Node egress fails closed instead of silently succeeding.
       http_proxy: "http://127.0.0.1:1",

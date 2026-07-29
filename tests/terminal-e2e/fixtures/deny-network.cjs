@@ -21,26 +21,60 @@ const LOOPBACK =
  * suite has no reason to open either — but they are labelled so a future
  * IPC-over-socket failure cannot be misreported as "network denial was invoked".
  */
-function scopeOf(detail) {
-  if (detail && typeof detail === "object") {
-    if (detail.path) return "local";
-    if (detail.host && LOOPBACK.test(String(detail.host))) return "local";
+function scopeOfHost(host) {
+  return LOOPBACK.test(String(host)) ? "local" : "egress";
+}
+
+function scopeOf(kind, args) {
+  const [target, positionalHost] = args;
+  const isHttpRequest =
+    kind === "node:http.request" ||
+    kind === "node:http.get" ||
+    kind === "node:https.request" ||
+    kind === "node:https.get";
+
+  if (target instanceof URL) return scopeOfHost(target.hostname);
+
+  if (target && typeof target === "object") {
+    if (target.socketPath) return "local";
+    if (!isHttpRequest && target.path) return "local";
+    const host = target.hostname ?? target.host;
+    if (host != null) return scopeOfHost(host);
+    if (target.url != null) return scopeOf(kind, [target.url]);
+    // HTTP request options without a host use Node's loopback default. Their
+    // `.path` is an HTTP request target, not a UNIX socket path.
+    if (isHttpRequest) return "local";
     return "egress";
   }
-  const text = String(detail ?? "");
-  if (text.startsWith("/") || text.startsWith("./")) return "local";
+
+  if (typeof target === "number") {
+    return positionalHost == null ? "local" : scopeOfHost(positionalHost);
+  }
+
+  const text = String(target ?? "");
+  try {
+    const url = new URL(text);
+    if (url.hostname) return scopeOfHost(url.hostname);
+  } catch {
+    /* not a URL */
+  }
+  if (!isHttpRequest && (text.startsWith("/") || text.startsWith("./"))) {
+    return "local";
+  }
   return LOOPBACK.test(text) ? "local" : "egress";
 }
 
-function deny(kind, detail) {
+function deny(kind, args) {
+  let detail;
+  try {
+    detail = JSON.stringify(args);
+  } catch {
+    detail = args.map(String).join(", ");
+  }
   record({
     kind,
-    scope: scopeOf(detail),
-    detail: String(
-      (detail && typeof detail === "object"
-        ? JSON.stringify(detail)
-        : detail) || "outbound connection",
-    ),
+    scope: scopeOf(kind, args),
+    detail: detail || "outbound connection",
   });
   throw new Error(`subagentura terminal E2E forbids network access: ${kind}`);
 }
@@ -52,12 +86,12 @@ record({ kind: "armed" });
 function patchMethods(target, moduleName, names) {
   for (const name of names) {
     if (typeof target?.[name] !== "function") continue;
-    target[name] = (...args) => deny(`${moduleName}.${name}`, args[0]);
+    target[name] = (...args) => deny(`${moduleName}.${name}`, args);
   }
 }
 
 if (typeof globalThis.fetch === "function") {
-  globalThis.fetch = async (...args) => deny("fetch", args[0]);
+  globalThis.fetch = async (...args) => deny("fetch", args);
 }
 
 if (typeof globalThis.WebSocket === "function") {
@@ -65,8 +99,8 @@ if (typeof globalThis.WebSocket === "function") {
     configurable: true,
     writable: true,
     value: class DeniedWebSocket {
-      constructor(url) {
-        deny("WebSocket", url);
+      constructor(...args) {
+        deny("WebSocket", args);
       }
     },
   });
