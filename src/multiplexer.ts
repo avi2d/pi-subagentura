@@ -23,11 +23,7 @@
  *   4. Throw with a setup hint pointing at both backends.
  */
 
-import {
-  execFile,
-  execFileSync,
-  type ExecSyncOptions,
-} from "node:child_process";
+import { execFileSync, spawn, type ExecSyncOptions } from "node:child_process";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 import { ZellijMultiplexer } from "./multiplexer-zellij";
 import { assertNever } from "./artifact";
@@ -474,21 +470,27 @@ export function spawnNativeViewer(
 ): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
     const settle = (value: boolean): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       resolve(value);
     };
-    // The overlay outliving the grace window IS the success signal.
-    const timer = setTimeout(() => settle(true), graceMs);
-    timer.unref?.();
     try {
-      // No `timeout` option: the overlay is supposed to stay open until the
-      // user dismisses it, and killing it mid-read is the bug we're fixing.
-      const child = execFile(cmd, [...args], (error) => settle(!error));
-      // Never let a still-open overlay hold the parent's event loop open.
-      child.unref?.();
+      // Detachment and ignored stdio are both established before `unref`.
+      // Otherwise the long-lived popup can retain the Pi process through its
+      // child handle or inherited pipes even after this promise has resolved.
+      const child = spawn(cmd, [...args], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.once("error", () => settle(false));
+      child.once("exit", () => settle(false));
+      child.unref();
+      // Surviving the complete startup window is the success signal.
+      timer = setTimeout(() => settle(true), graceMs);
+      timer.unref();
     } catch {
       settle(false);
     }

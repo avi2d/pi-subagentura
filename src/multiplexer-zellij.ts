@@ -407,34 +407,34 @@ export class ZellijMultiplexer implements Multiplexer {
   ): Promise<PaneLiveness> {
     const target = normalizePaneId(paneId);
     if (!/^\d+$/.test(target)) return Promise.resolve("unknown");
-    const { promise, resolve } = Promise.withResolvers<PaneLiveness>();
-    try {
-      execFile(
-        "zellij",
-        [...this.sessionFlag(session), "action", "list-panes", "--json"],
-        { encoding: "utf8", timeout: 5000 },
-        (error, stdout) => {
-          if (error) {
-            resolve("unknown");
-            return;
-          }
-          try {
-            resolve(
-              parsePaneListing(stdout).some((pane) =>
-                this.paneRowMatches(pane, target),
-              )
-                ? "alive"
-                : "dead",
-            );
-          } catch {
-            resolve("unknown");
-          }
-        },
-      );
-    } catch {
-      resolve("unknown");
-    }
-    return promise;
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "zellij",
+          [...this.sessionFlag(session), "action", "list-panes", "--json"],
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            if (error) {
+              resolve("unknown");
+              return;
+            }
+            try {
+              resolve(
+                parsePaneListing(stdout).some((pane) =>
+                  this.paneRowMatches(pane, target),
+                )
+                  ? "alive"
+                  : "dead",
+              );
+            } catch {
+              resolve("unknown");
+            }
+          },
+        );
+      } catch {
+        resolve("unknown");
+      }
+    });
   }
 
   /**
@@ -540,85 +540,83 @@ export class ZellijMultiplexer implements Multiplexer {
     ref: PaneRef,
     opts: CapturePaneOptions,
   ): Promise<CapturePaneResult> {
-    const maxBytes = Number.isFinite(opts.maxBytes)
-      ? Math.max(0, Math.floor(opts.maxBytes))
-      : 0;
-    const stdoutTail = new BoundedByteTail(maxBytes);
-    const stderrTail = new BoundedByteTail(8192);
-    const { promise, resolve, reject } =
-      Promise.withResolvers<CapturePaneResult>();
-    let settled = false;
-    let forceKillTimer: NodeJS.Timeout | undefined;
-    let child: ChildProcess;
-    try {
-      child = spawn(
-        "zellij",
-        [
-          ...this.sessionFlag(ref.session),
-          "action",
-          "dump-screen",
-          "--full",
-          "--pane-id",
-          normalizePaneId(ref.paneId),
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] },
-      );
-    } catch (error) {
-      reject(error);
-      return promise;
-    }
-
-    child.stdout?.on("data", (chunk: Buffer | string) => {
-      stdoutTail.append(chunk);
-    });
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderrTail.append(chunk);
-    });
-
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
-      forceKillTimer.unref();
-      reject(new Error("[zellij] dump-screen timed out"));
-    }, 5000);
-    timeout.unref();
-
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      if (settled) return;
-      settled = true;
-      reject(error);
-    });
-    child.once("close", (code, signal) => {
-      clearTimeout(timeout);
-      clearTimeout(forceKillTimer);
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        const stderr = stderrTail.toBuffer().toString("utf8").trim();
-        const detail = stderr ? `: ${stderr}` : signal ? ` (${signal})` : "";
-        reject(new Error(`[zellij] dump-screen failed${detail}`));
+    return new Promise((resolve, reject) => {
+      const maxBytes = Number.isFinite(opts.maxBytes)
+        ? Math.max(0, Math.floor(opts.maxBytes))
+        : 0;
+      const stdoutTail = new BoundedByteTail(maxBytes);
+      const stderrTail = new BoundedByteTail(8192);
+      let settled = false;
+      let forceKillTimer: NodeJS.Timeout | undefined;
+      let child: ChildProcess;
+      try {
+        child = spawn(
+          "zellij",
+          [
+            ...this.sessionFlag(ref.session),
+            "action",
+            "dump-screen",
+            "--full",
+            "--pane-id",
+            normalizePaneId(ref.paneId),
+          ],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+      } catch (error) {
+        reject(error);
         return;
       }
 
-      const raw = stdoutTail.toBuffer();
-      let utf8Start = 0;
-      while (utf8Start < raw.length && (raw[utf8Start]! & 0xc0) === 0x80) {
-        utf8Start++;
-      }
-      const bounded = boundCaptureOutput(
-        raw.subarray(utf8Start).toString("utf8"),
-        opts,
-      );
-      resolve({
-        output: bounded.output,
-        truncated: stdoutTail.truncated || utf8Start > 0 || bounded.truncated,
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        stdoutTail.append(chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        stderrTail.append(chunk);
+      });
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill("SIGTERM");
+        forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+        forceKillTimer.unref();
+        reject(new Error("[zellij] dump-screen timed out"));
+      }, 5000);
+      timeout.unref();
+
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timeout);
+        clearTimeout(forceKillTimer);
+        if (settled) return;
+        settled = true;
+        if (code !== 0) {
+          const stderr = stderrTail.toBuffer().toString("utf8").trim();
+          const detail = stderr ? `: ${stderr}` : signal ? ` (${signal})` : "";
+          reject(new Error(`[zellij] dump-screen failed${detail}`));
+          return;
+        }
+
+        const raw = stdoutTail.toBuffer();
+        let utf8Start = 0;
+        while (utf8Start < raw.length && (raw[utf8Start]! & 0xc0) === 0x80) {
+          utf8Start++;
+        }
+        const bounded = boundCaptureOutput(
+          raw.subarray(utf8Start).toString("utf8"),
+          opts,
+        );
+        resolve({
+          output: bounded.output,
+          truncated: stdoutTail.truncated || utf8Start > 0 || bounded.truncated,
+        });
       });
     });
-
-    return promise;
   }
 
   /**

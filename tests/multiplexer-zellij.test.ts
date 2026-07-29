@@ -626,11 +626,8 @@ describe("multiplexer-zellij", () => {
   });
 
   /**
-   * The floating viewer is spawned through async `execFile` so both backends
-   * behave the same way: resolve once the overlay is up, resolve false when the
-   * backend rejects the request. Previously zellij was synchronous
-   * fire-and-forget returning `true` unconditionally, while the tmux twin
-   * blocked the event loop — same interface, opposite behaviour.
+   * The floating viewer is a detached, ignored-stdio child. A successful mock
+   * stays running through the startup grace window; rejection exits early.
    */
   function installAsyncViewerMock(
     onCall: (args: string[]) => Error | null,
@@ -638,15 +635,14 @@ describe("multiplexer-zellij", () => {
   ): void {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFile: (
-        _file: string,
-        args: string[],
-        callback: (error: Error | null, stdout: string) => void,
-      ) => {
+      spawn: (_file: string, args: string[]) => {
         calls.push(args);
-        const error = onCall(args);
-        if (callback) callback(error, "");
-        return { unref: () => {} };
+        const child = new EventEmitter();
+        Object.assign(child, { unref: vi.fn() });
+        queueMicrotask(() => {
+          if (onCall(args)) child.emit("exit", 1, null);
+        });
+        return child;
       },
       execFileSync: () => {
         throw new Error("showNativeViewer must not block the event loop");

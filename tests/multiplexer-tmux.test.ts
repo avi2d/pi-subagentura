@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { importFresh } from "./test-utils";
 
@@ -283,6 +284,10 @@ describe("multiplexer-tmux", () => {
         callback: (error: Error | null, stdout: string) => void,
       ) => {
         asyncCalls.push(args);
+        if (args[0] === "list-sessions") {
+          callback(null, "target-session\nunrelated-session\n");
+          return;
+        }
         const targetIndex = args.indexOf("-t");
         const target = targetIndex === -1 ? undefined : args[targetIndex + 1];
         callback(null, target === "target-session" ? "" : "unrelated-client\n");
@@ -309,6 +314,77 @@ describe("multiplexer-tmux", () => {
       "-F",
       "#{client_name}",
     ]);
+  });
+
+  it("returns false from successful evidence that a target session is absent", async () => {
+    const calls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        callback(null, "other-session\n");
+      },
+      execFileSync: () => "",
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().hasAttachedClientAsync("missing-session"),
+    ).resolves.toBe(false);
+    expect(calls).toEqual([["list-sessions", "-F", "#{session_name}"]]);
+  });
+
+  it("returns undefined when the session listing fails", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(new Error("server unavailable"), ""),
+      execFileSync: () => "",
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().hasAttachedClientAsync("target-session"),
+    ).resolves.toBeUndefined();
+  });
+
+  it("returns undefined when client listing fails for a valid session", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        if (args[0] === "list-sessions") {
+          callback(null, "target-session\n");
+          return;
+        }
+        callback(new Error("client probe timed out"), "");
+      },
+      execFileSync: () => "",
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().hasAttachedClientAsync("target-session"),
+    ).resolves.toBeUndefined();
   });
 
   /* ------------------------------------------------------------------ */
@@ -801,13 +877,9 @@ describe("multiplexer-tmux", () => {
   });
 
   /**
-   * `showNativeViewer` now spawns the popup through `execFile` (async, no
-   * timeout) instead of `execFileSync`. `display-popup -E` keeps the invoking
-   * tmux client alive for the popup's entire lifetime, and the popup runs
-   * `read`, so the old synchronous call froze the whole pi process until a
-   * human pressed Enter — then the 5s exec timeout SIGTERM'd the client, the
-   * popup vanished mid-read, and the UI reported failure for an overlay that
-   * had appeared.
+   * `showNativeViewer` spawns a detached, ignored-stdio child and resolves once
+   * it survives the startup grace window. Backend rejection is modeled as an
+   * early child exit.
    */
   function installAsyncViewerMock(
     onCall: (args: string[]) => Error | null,
@@ -815,15 +887,14 @@ describe("multiplexer-tmux", () => {
   ): void {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFile: (
-        _file: string,
-        args: string[],
-        callback: (error: Error | null, stdout: string) => void,
-      ) => {
+      spawn: (_file: string, args: string[]) => {
         calls.push(args);
-        const error = onCall(args);
-        if (callback) callback(error, "");
-        return { unref: () => {} };
+        const child = new EventEmitter();
+        Object.assign(child, { unref: vi.fn() });
+        queueMicrotask(() => {
+          if (onCall(args)) child.emit("exit", 1, null);
+        });
+        return child;
       },
       execFileSync: () => {
         throw new Error("showNativeViewer must not block the event loop");

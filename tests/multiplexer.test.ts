@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { importFresh } from "./test-utils";
 
@@ -235,16 +236,21 @@ describe("sanitizeViewerTitle", () => {
 });
 
 describe("spawnNativeViewer", () => {
-  it("resolves true once the overlay outlives the spawn grace window", async () => {
-    // `tmux display-popup -E` blocks its caller for the popup's entire lifetime
-    // and the popup waits on `read`, so success cannot mean "the child exited".
-    // It means "the child is still up after the grace window".
+  afterEach(() => {
+    vi.doUnmock("node:child_process");
+  });
+
+  it("resolves true only after a detached child survives the grace window", async () => {
+    const child = new EventEmitter();
+    const unref = vi.fn();
+    Object.assign(child, { unref });
     let capturedArgs: string[] | undefined;
+    let capturedOptions: unknown;
     vi.doMock("node:child_process", () => ({
-      execFile: (_file: string, args: string[]) => {
+      spawn: (_file: string, args: string[], options: unknown) => {
         capturedArgs = args;
-        // Never invoke the callback: the overlay is still open.
-        return { unref: () => {} };
+        capturedOptions = options;
+        return child;
       },
       execFileSync: () => "",
     }));
@@ -257,17 +263,17 @@ describe("spawnNativeViewer", () => {
       true,
     );
     expect(capturedArgs).toEqual(["display-popup"]);
+    expect(capturedOptions).toEqual({ detached: true, stdio: "ignore" });
+    expect(unref).toHaveBeenCalledOnce();
   });
 
-  it("resolves false when the backend rejects the request inside the grace window", async () => {
+  it("resolves false when the child exits inside the grace window", async () => {
+    const child = new EventEmitter();
+    Object.assign(child, { unref: vi.fn() });
     vi.doMock("node:child_process", () => ({
-      execFile: (
-        _file: string,
-        _args: string[],
-        callback: (error: Error | null, stdout: string) => void,
-      ) => {
-        callback(new Error("no current client"), "");
-        return { unref: () => {} };
+      spawn: () => {
+        queueMicrotask(() => child.emit("exit", 1, null));
+        return child;
       },
       execFileSync: () => "",
     }));
@@ -281,9 +287,29 @@ describe("spawnNativeViewer", () => {
     ).resolves.toBe(false);
   });
 
-  it("resolves false when the child cannot be spawned at all", async () => {
+  it("resolves false when the child emits a startup error", async () => {
+    const child = new EventEmitter();
+    Object.assign(child, { unref: vi.fn() });
     vi.doMock("node:child_process", () => ({
-      execFile: () => {
+      spawn: () => {
+        queueMicrotask(() => child.emit("error", new Error("ENOENT")));
+        return child;
+      },
+      execFileSync: () => "",
+    }));
+    const { spawnNativeViewer } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    await expect(
+      spawnNativeViewer("tmux", ["display-popup"], 1000),
+    ).resolves.toBe(false);
+  });
+
+  it("resolves false when spawn throws synchronously", async () => {
+    vi.doMock("node:child_process", () => ({
+      spawn: () => {
         throw new Error("ENOENT");
       },
       execFileSync: () => "",
@@ -296,28 +322,6 @@ describe("spawnNativeViewer", () => {
     await expect(
       spawnNativeViewer("tmux", ["display-popup"], 1000),
     ).resolves.toBe(false);
-  });
-
-  it("passes no timeout option, so the overlay is never killed mid-read", async () => {
-    // The old implementation passed `{ timeout: 5000 }`: at 5s Node SIGTERM'd
-    // the tmux client, the popup vanished while the user was reading it, and
-    // the UI then claimed native presentation was unavailable.
-    let options: unknown = "not-called";
-    vi.doMock("node:child_process", () => ({
-      execFile: (_file: string, _args: string[], maybeOptions: unknown) => {
-        options = maybeOptions;
-        return { unref: () => {} };
-      },
-      execFileSync: () => "",
-    }));
-    const { spawnNativeViewer } =
-      await importFresh<typeof import("../src/multiplexer")>(
-        "../src/multiplexer",
-      );
-
-    await spawnNativeViewer("tmux", ["display-popup"], 5);
-    // Third argument is the callback, never an options object with a timeout.
-    expect(typeof options).toBe("function");
   });
 });
 

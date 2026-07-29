@@ -358,28 +358,28 @@ export class TmuxMultiplexer implements Multiplexer {
 
   getPaneLivenessAsync(paneId: string): Promise<PaneLiveness> {
     if (!/^%\d+$/.test(paneId)) return Promise.resolve("unknown");
-    const { promise, resolve } = Promise.withResolvers<PaneLiveness>();
-    try {
-      execFile(
-        "tmux",
-        withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
-        { encoding: "utf8", timeout: 5000 },
-        (error, stdout) => {
-          if (error) {
-            resolve("unknown");
-            return;
-          }
-          try {
-            resolve(parsePaneListing(stdout).has(paneId) ? "alive" : "dead");
-          } catch {
-            resolve("unknown");
-          }
-        },
-      );
-    } catch {
-      resolve("unknown");
-    }
-    return promise;
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "tmux",
+          withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            if (error) {
+              resolve("unknown");
+              return;
+            }
+            try {
+              resolve(parsePaneListing(stdout).has(paneId) ? "alive" : "dead");
+            } catch {
+              resolve("unknown");
+            }
+          },
+        );
+      } catch {
+        resolve("unknown");
+      }
+    });
   }
 
   sendKeys(paneId: string, text: string): void {
@@ -523,31 +523,57 @@ export class TmuxMultiplexer implements Multiplexer {
    * Whether a tmux client is attached to `session` (or to the server at all,
    * when no session is given).
    *
-   * Focus is server-side state: `select-window` exits 0 with zero clients
-   * attached, so the supervisor's `f` action "succeeds" invisibly for the
-   * detached `pi-subagent-<id>` sessions the relaxed spawn path creates. This is
-   * the probe that lets the overlay say so instead of looking broken.
-   *
-   * `list-clients` prints one line per attached client and nothing at all when
-   * there are none (verified against tmux 3.7b: exit 0 with empty stdout both
-   * server-wide and with `-t <session>`). A non-zero exit means the session or
-   * the server is gone — which is also "no client is attached", not "unknown",
-   * so this never resolves `undefined`.
+   * A successful session listing first distinguishes an absent target session
+   * (`false`) from an unavailable or timed-out backend (`undefined`). Only a
+   * successful `list-clients` result can then establish attached/no-client
+   * state for an existing target.
    */
   hasAttachedClientAsync(session?: string): Promise<boolean | undefined> {
-    const target = session ? ["-t", session] : [];
     return new Promise((resolve) => {
       try {
         execFile(
           "tmux",
-          withTmuxSocket(["list-clients", ...target, "-F", "#{client_name}"]),
+          withTmuxSocket(["list-sessions", "-F", "#{session_name}"]),
           { encoding: "utf8", timeout: 5000 },
-          (error, stdout) => {
-            resolve(!error && stdout.trim().length > 0);
+          (sessionError, sessionOutput) => {
+            if (sessionError) {
+              resolve(undefined);
+              return;
+            }
+            const trimmed = sessionOutput.trim();
+            const sessions = trimmed ? trimmed.split(/\r?\n/) : [];
+            if (sessions.some((name) => name.length === 0)) {
+              resolve(undefined);
+              return;
+            }
+            if (session && !sessions.includes(session)) {
+              resolve(false);
+              return;
+            }
+
+            const target = session ? ["-t", session] : [];
+            try {
+              execFile(
+                "tmux",
+                withTmuxSocket([
+                  "list-clients",
+                  ...target,
+                  "-F",
+                  "#{client_name}",
+                ]),
+                { encoding: "utf8", timeout: 5000 },
+                (clientError, clientOutput) => {
+                  resolve(
+                    clientError ? undefined : clientOutput.trim().length > 0,
+                  );
+                },
+              );
+            } catch {
+              resolve(undefined);
+            }
           },
         );
       } catch {
-        // A synchronous spawn failure tells us nothing about attachment.
         resolve(undefined);
       }
     });
