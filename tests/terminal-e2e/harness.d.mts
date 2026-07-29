@@ -29,7 +29,10 @@ export class TerminalHarness {
   readonly parentPane: string | undefined;
   readonly version: TmuxVersion;
   readonly env: Record<string, string>;
+  readonly keep: boolean;
+  readonly started: boolean;
   setupFiles(): void;
+  assertChildCanExecNode(safePath: string): void;
   tmux(
     args: string[],
     options?: { timeout?: number; stdio?: ["ignore", "pipe", "pipe"] },
@@ -38,7 +41,11 @@ export class TerminalHarness {
   sendText(text: string): void;
   sendKey(key: string): void;
   pressEnter(): void;
+  sendPrompt(text: string): Promise<void>;
   currentScreen(pane?: string): string;
+  rawScreen(pane?: string): string;
+  renderedScreen(pane?: string): string;
+  paneScreen(paneId: string | undefined): string;
   scrollback(pane?: string): string;
   panes(): PaneInfo[];
   providerEvents(): Array<Record<string, unknown>>;
@@ -63,8 +70,10 @@ export class TerminalHarness {
   assertNoNetwork(): Promise<void>;
   diagnostics(): void;
   cleanup(failed?: boolean): Promise<void>;
+  cleanupSync(): void;
 }
 export function createHarness(
   options?: TerminalHarnessOptions,
 ): TerminalHarness;
+export function tmuxVersion(): TmuxVersion;
 export const REPO: string;

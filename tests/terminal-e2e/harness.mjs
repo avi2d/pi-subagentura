@@ -1,6 +1,13 @@
-import { execFileSync } from "node:child_process";
+// Hermeticity boundary: the guards installed here are Node-level. Pi runs with
+// `--approve`, so a tool-issued shell command (`curl`, `git fetch`, `ssh`) is
+// not intercepted by fixtures/deny-network.cjs. `_env` therefore also points
+// every proxy variable at a closed port so non-Node clients fail closed, but
+// this suite does not claim kernel-level network isolation. See
+// docs/terminal-e2e.md.
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -18,6 +25,19 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const sleep = (ms) =>
   new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+
+/**
+ * The editor key-hint line Pi paints once its raw-mode reader is attached. A
+ * half-drawn splash does not contain it, so gating `start()` on this string is
+ * a real readiness signal rather than "some banner appeared".
+ *
+ * Verified against pi v0.80.6, which is the only SDK leg that runs `test:tui`
+ * (see docs/terminal-e2e.md).
+ */
+const PI_EDITOR_READY = "ctrl+c/ctrl+d clear/exit";
+
+/** `set -g extended-keys on` does not parse before tmux 3.2. */
+const MINIMUM_TMUX = { major: 3, minor: 2 };
 
 const activeHarnesses = new Set();
 let exitCleanupInstalled = false;
@@ -43,7 +63,10 @@ function installExitCleanup() {
   ]) {
     process.once(signal, () => {
       cleanupActiveHarnessesSync();
-      process.exit(exitCode);
+      // `process.once` removed this listener before invoking it, so a non-zero
+      // count means somebody else (vitest) also handles the signal and owns the
+      // shutdown. Exiting here would pre-empt its reporter summary.
+      if (process.listenerCount(signal) === 0) process.exit(exitCode);
     });
   }
 }
@@ -52,29 +75,64 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
+/** Screen text with whitespace runs collapsed, so a line Pi soft-wrapped at the
+ *  pane width still matches a single-line expectation. */
+function normalizeScreen(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+let cachedTmuxVersion;
 function tmuxVersion() {
+  if (cachedTmuxVersion) return cachedTmuxVersion;
+  let output;
   try {
-    const output = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
-    const match = output.match(/(\d+)\.(\d+)/);
-    return {
-      text: output,
-      major: Number(match?.[1] ?? 0),
-      minor: Number(match?.[2] ?? 0),
-    };
+    output = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
   } catch (error) {
     throw new Error(`tmux is required for terminal E2E tests: ${error}`);
   }
+  const match = output.match(/(\d+)\.(\d+)/);
+  const version = {
+    text: output,
+    major: Number(match?.[1] ?? 0),
+    minor: Number(match?.[2] ?? 0),
+  };
+  if (
+    version.major < MINIMUM_TMUX.major ||
+    (version.major === MINIMUM_TMUX.major && version.minor < MINIMUM_TMUX.minor)
+  ) {
+    throw new Error(
+      `terminal E2E tests require tmux >= ${MINIMUM_TMUX.major}.${MINIMUM_TMUX.minor} ` +
+        `because the generated config sets "extended-keys on"; found ${output}`,
+    );
+  }
+  cachedTmuxVersion = version;
+  return version;
 }
 
+const MISSING_PI =
+  "terminal E2E tests require the real Pi CLI: install dependencies so " +
+  "node_modules/.bin/pi exists, put `pi` on PATH, or point " +
+  "SUBAGENTURA_E2E_REAL_PI at its absolute path";
+
+let cachedPi;
 function resolvePi() {
+  if (cachedPi) return cachedPi;
   if (process.env.SUBAGENTURA_E2E_REAL_PI) {
-    return resolve(process.env.SUBAGENTURA_E2E_REAL_PI);
+    cachedPi = resolve(process.env.SUBAGENTURA_E2E_REAL_PI);
+    return cachedPi;
   }
   const localPi = join(REPO, "node_modules", ".bin", "pi");
-  if (existsSync(localPi)) return localPi;
-  return execFileSync("sh", ["-c", "command -v pi"], {
+  if (existsSync(localPi)) {
+    cachedPi = localPi;
+    return cachedPi;
+  }
+  const found = spawnSync("/bin/sh", ["-c", "command -v pi"], {
     encoding: "utf8",
-  }).trim();
+    timeout: 5_000,
+  });
+  cachedPi = found.status === 0 ? found.stdout.trim() : "";
+  if (!cachedPi) throw new Error(MISSING_PI);
+  return cachedPi;
 }
 
 function resolveProcessGroupId(processId) {
@@ -95,7 +153,7 @@ function resolveProcessGroupId(processId) {
 }
 
 function processGroupsForRoot(root) {
-  const output = execFileSync("ps", ["-axo", "pgid=,command="], {
+  const output = execFileSync("ps", ["-axww", "-o", "pgid=,command="], {
     encoding: "utf8",
     timeout: 2_000,
   });
@@ -133,14 +191,37 @@ function signalProcessGroups(processGroupIds, signal) {
   }
 }
 
+/**
+ * `kill(-pgid, 0)` also succeeds while a group holds nothing but zombies, which
+ * a non-reaping PID 1 (docker, `act`) never collects. Treat such a group as
+ * gone so teardown does not fail a suite that actually passed.
+ */
+function processGroupHasRunningMember(processGroupId) {
+  let output;
+  try {
+    output = execFileSync("ps", ["-axww", "-o", "pgid=,stat="], {
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+  } catch {
+    return true; /* cannot prove the group is only zombies */
+  }
+  for (const line of output.split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(\S+)/);
+    if (!match || Number(match[1]) !== processGroupId) continue;
+    if (!match[2].startsWith("Z")) return true;
+  }
+  return false;
+}
+
 async function waitForProcessGroups(processGroupIds, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const live = processGroupIds.filter(processGroupIsAlive);
-    if (live.length === 0) return [];
+  let live = processGroupIds.filter(processGroupIsAlive);
+  while (live.length > 0 && Date.now() < deadline) {
     await sleep(50);
+    live = live.filter(processGroupIsAlive);
   }
-  return processGroupIds.filter(processGroupIsAlive);
+  return live.filter(processGroupHasRunningMember);
 }
 
 function findFiles(root, fileName) {
@@ -173,6 +254,7 @@ export class TerminalHarness {
     this.session = `e2e-${process.pid}-${Math.random().toString(16).slice(2)}`;
     this.parentPane = undefined;
     this.trackedPids = new Set();
+    this.echoedInput = [];
     this.started = false;
     this.serverOwned = false;
     this.version = tmuxVersion();
@@ -204,7 +286,7 @@ export class TerminalHarness {
     );
     const wrapper = join(this.wrapperBin, "pi");
     cpSync(join(HERE, "fixtures/pi-child-wrapper.sh"), wrapper);
-    execFileSync("chmod", ["700", wrapper]);
+    chmodSync(wrapper, 0o700);
     const versionConfig = ["set -g extended-keys on"];
     if (
       this.version.major > 3 ||
@@ -215,16 +297,13 @@ export class TerminalHarness {
     writeFileSync(this.tmuxConfig, `${versionConfig.join("\n")}\n`, {
       mode: 0o600,
     });
-    const originalPath = process.env.PATH ?? "/usr/bin:/bin";
-    const safePath = [
-      this.wrapperBin,
-      ...originalPath
-        .split(":")
-        .filter(
-          (part) =>
-            part && (!part.includes(".nvm") || part === dirname(resolvePi())),
-        ),
-    ].join(":");
+    // The wrapper directory is prepended, so it always wins for `pi`. Nothing
+    // else may be dropped: node_modules/.bin/pi is a `#!/usr/bin/env node`
+    // script, and filtering version-manager directories out of PATH (nvm, fnm,
+    // asdf, volta) removes the only `node` the pane can exec.
+    const safePath = [this.wrapperBin, process.env.PATH ?? "/usr/bin:/bin"]
+      .filter(Boolean)
+      .join(":");
     this._env = {
       HOME: this.home,
       PATH: safePath,
@@ -239,14 +318,49 @@ export class TerminalHarness {
       SUBAGENTURA_E2E_REPO: REPO,
       SUBAGENTURA_E2E_API_KEY: "subagentura-e2e-test-key",
       SUBAGENTURA_E2E_REAL_PI: resolvePi(),
-      NODE_OPTIONS: `--require=${join(HERE, "fixtures/deny-network.cjs")}`,
+      NODE_OPTIONS: [
+        process.env.NODE_OPTIONS,
+        `--require=${join(HERE, "fixtures/deny-network.cjs")}`,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      // Node ignores these, but tool-issued `curl`/`git`/`wget` do not, so
+      // non-Node egress fails closed instead of silently succeeding.
+      http_proxy: "http://127.0.0.1:1",
+      https_proxy: "http://127.0.0.1:1",
+      HTTP_PROXY: "http://127.0.0.1:1",
+      HTTPS_PROXY: "http://127.0.0.1:1",
+      ALL_PROXY: "http://127.0.0.1:1",
+      no_proxy: "",
+      NO_PROXY: "",
       LANG: "C.UTF-8",
       LC_ALL: "C.UTF-8",
     };
+    this.assertChildCanExecNode(safePath);
     appendFileSync(
       this.providerLog,
       `${JSON.stringify({ event: "harness", scenario: this.scenario, tmux: this.version.text })}\n`,
       { mode: 0o600 },
+    );
+  }
+
+  /**
+   * Fails fast when the child environment cannot exec `node`. Without this the
+   * pane dies instantly with `env: node: No such file or directory` and the
+   * only symptom is a 15s "real Pi did not paint its editor" timeout whose dump
+   * never mentions PATH.
+   */
+  assertChildCanExecNode(safePath) {
+    const found = spawnSync("/bin/sh", ["-c", "command -v node"], {
+      env: this._env,
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    if (found.status === 0 && found.stdout.trim()) return;
+    throw new Error(
+      'the terminal E2E child environment cannot resolve "node", so the Pi ' +
+        "pane would die before painting anything. " +
+        `PATH=${safePath}`,
     );
   }
 
@@ -311,8 +425,8 @@ export class TerminalHarness {
     ]).trim();
     this.started = true;
     await this.waitForScreen(
-      (screen) => /Pi|assistant|›|>/.test(screen),
-      "real Pi did not reach its editor",
+      (screen) => screen.includes(PI_EDITOR_READY),
+      `real Pi did not paint its editor (waiting for "${PI_EDITOR_READY}")`,
     );
     this.refreshProcesses();
     return this;
@@ -332,8 +446,65 @@ export class TerminalHarness {
     this.sendKey("Enter");
   }
 
+  /**
+   * Types a prompt, waits until Pi has echoed it into the editor, then submits.
+   * Keystrokes sent while the TUI is still initialising are discarded, and the
+   * echo wait turns that into an immediate, self-explaining failure instead of a
+   * downstream 30s gate timeout on an empty prompt.
+   *
+   * The submitted text is also recorded so `renderedScreen()` can subtract it:
+   * an assertion must be satisfied by what the fixture painted, never by the
+   * echo of what the test itself typed.
+   */
+  async sendPrompt(text) {
+    this.sendText(text);
+    const needle = normalizeScreen(text);
+    // Deliberately not waitForScreen: that subtracts already-recorded input, so
+    // re-sending an identical prompt would never observe its own echo.
+    await this.waitFor(
+      () => normalizeScreen(this.currentScreen()).includes(needle),
+      `Pi did not echo typed input: ${text.slice(0, 40)}`,
+    );
+    this.echoedInput.push(text);
+    this.pressEnter();
+  }
+
+  /** Capture with wrapped lines joined, so a long expectation that straddles
+   *  column 100 still matches. */
   currentScreen(pane = this.parentPane) {
+    return pane ? this.tmux(["capture-pane", "-p", "-J", "-t", pane]) : "";
+  }
+
+  /** Un-joined capture; keeps column fidelity for diagnostics. */
+  rawScreen(pane = this.parentPane) {
     return pane ? this.tmux(["capture-pane", "-p", "-t", pane]) : "";
+  }
+
+  /**
+   * The screen as assertions see it: wrapped lines joined, whitespace runs
+   * collapsed, and every prompt this harness submitted subtracted. Stripping the
+   * echo is what stops "renders an error" from being satisfied by the word
+   * "error" in the prompt the test typed one line earlier.
+   */
+  renderedScreen(pane = this.parentPane) {
+    let text = normalizeScreen(this.currentScreen(pane));
+    for (const echo of this.echoedInput) {
+      text = text.split(normalizeScreen(echo)).join(" ");
+    }
+    return text;
+  }
+
+  /**
+   * `renderedScreen` for a specific pane. Unlike passing `undefined` to
+   * `renderedScreen`, a missing id throws instead of silently reading the parent
+   * pane and letting a child-pane regression assert against the wrong screen.
+   */
+  paneScreen(paneId) {
+    if (!paneId)
+      throw new Error(
+        "terminal E2E paneScreen requires a pane id; the pane was not found",
+      );
+    return this.renderedScreen(paneId);
   }
 
   scrollback(pane = this.parentPane) {
@@ -449,7 +620,7 @@ export class TerminalHarness {
 
   async waitForScreen(predicate, description, timeoutMs = 15_000) {
     return this.waitFor(
-      () => predicate(this.currentScreen()),
+      () => predicate(this.renderedScreen()),
       description,
       timeoutMs,
     );
@@ -463,11 +634,48 @@ export class TerminalHarness {
     );
   }
 
+  /**
+   * Positive control first, negative assertion second.
+   *
+   * `networkEvents()` staying empty proves nothing on its own: if the
+   * `NODE_OPTIONS=--require` preload ever fails to apply, the log stays empty and
+   * every caller passes vacuously forever. So require an `armed` record from
+   * every process that actually ran the scripted provider — the provider logs its
+   * own pid, which covers the parent pane and each process-isolated child — and
+   * only then assert that nothing was denied.
+   */
   async assertNoNetwork() {
-    if (this.networkEvents().length)
+    const events = this.networkEvents();
+    const armed = new Set(
+      events
+        .filter((event) => event.kind === "armed")
+        .map((event) => event.pid),
+    );
+    if (armed.size === 0) {
       throw new Error(
-        `network denial was invoked: ${JSON.stringify(this.networkEvents())}`,
+        "the terminal E2E network guard never armed: no process recorded " +
+          `loading fixtures/deny-network.cjs in ${this.networkLog}. ` +
+          "assertNoNetwork() cannot distinguish a hermetic run from a missing " +
+          "NODE_OPTIONS preload, so this is a failure, not a pass.",
       );
+    }
+    const unguarded = [
+      ...new Set(
+        this.providerEvents()
+          .map((event) => event.pid)
+          .filter(Boolean),
+      ),
+    ].filter((pid) => !armed.has(pid));
+    if (unguarded.length > 0) {
+      throw new Error(
+        `the terminal E2E network guard is not loaded in process(es) ${unguarded.join(", ")}, ` +
+          `which ran the scripted provider (armed: ${[...armed].join(", ") || "none"})`,
+      );
+    }
+    const denials = events.filter((event) => event.kind !== "armed");
+    if (denials.length > 0) {
+      throw new Error(`network denial was invoked: ${JSON.stringify(denials)}`);
+    }
   }
 
   diagnostics() {
@@ -479,7 +687,7 @@ export class TerminalHarness {
     const writeDiagnostic = (suffix, content) => {
       writeFileSync(join(harnessDiagnosticsDir, suffix), content);
     };
-    writeDiagnostic("screen.txt", this.currentScreen());
+    writeDiagnostic("screen.txt", this.rawScreen());
     writeDiagnostic("scrollback.txt", this.scrollback());
     writeDiagnostic(
       "provider.ndjson",
@@ -518,7 +726,10 @@ export class TerminalHarness {
   }
 
   async cleanup(failed = false) {
-    if (failed || this.keep || process.env.SUBAGENTURA_E2E_DIAGNOSTICS) {
+    // SUBAGENTURA_E2E_DIAGNOSTICS only chooses *where* diagnostics land; writing
+    // a full screen + scrollback + logs dump per harness on every green run
+    // costs real time and is then discarded by an `if: failure()` upload.
+    if (failed || this.keep) {
       try {
         this.diagnostics();
       } catch {
@@ -568,4 +779,4 @@ export class TerminalHarness {
 export function createHarness(options) {
   return new TerminalHarness(options);
 }
-export { REPO };
+export { REPO, tmuxVersion };

@@ -4,16 +4,50 @@ const fs = require("node:fs");
 
 const logPath = process.env.SUBAGENTURA_E2E_NETWORK_LOG;
 
+function record(entry) {
+  if (!logPath) return;
+  fs.appendFileSync(
+    logPath,
+    `${JSON.stringify({ pid: process.pid, timestamp: 0, ...entry })}\n`,
+    { mode: 0o600 },
+  );
+}
+
+const LOOPBACK =
+  /^(?:localhost|127(?:\.\d+){3}|\[?::1\]?|0\.0\.0\.0)$|^(?:https?:\/\/)?(?:localhost|127(?:\.\d+){3}|\[::1\])(?::|\/|$)/i;
+
+/**
+ * A UNIX-socket or loopback attempt is not egress. Both are still denied — this
+ * suite has no reason to open either — but they are labelled so a future
+ * IPC-over-socket failure cannot be misreported as "network denial was invoked".
+ */
+function scopeOf(detail) {
+  if (detail && typeof detail === "object") {
+    if (detail.path) return "local";
+    if (detail.host && LOOPBACK.test(String(detail.host))) return "local";
+    return "egress";
+  }
+  const text = String(detail ?? "");
+  if (text.startsWith("/") || text.startsWith("./")) return "local";
+  return LOOPBACK.test(text) ? "local" : "egress";
+}
+
 function deny(kind, detail) {
-  const record = JSON.stringify({
-    pid: process.pid,
+  record({
     kind,
-    detail: String(detail || "outbound connection"),
-    timestamp: 0,
+    scope: scopeOf(detail),
+    detail: String(
+      (detail && typeof detail === "object"
+        ? JSON.stringify(detail)
+        : detail) || "outbound connection",
+    ),
   });
-  if (logPath) fs.appendFileSync(logPath, `${record}\n`, { mode: 0o600 });
   throw new Error(`subagentura terminal E2E forbids network access: ${kind}`);
 }
+
+// Positive control: proves to assertNoNetwork() that this preload actually
+// applied to the process under test. Without it an empty log is ambiguous.
+record({ kind: "armed" });
 
 function patchMethods(target, moduleName, names) {
   for (const name of names) {
