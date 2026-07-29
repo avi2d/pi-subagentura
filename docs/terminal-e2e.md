@@ -102,3 +102,19 @@ The guards are **Node-level**, and this is a deliberate, documented limit:
   `git fetch`, `ssh`) is **not** intercepted. The harness points every proxy
   variable at a closed port (`http_proxy=http://127.0.0.1:1`, empty `no_proxy`)
   so those clients fail closed too, but this is not kernel-level isolation.
+
+## Recording (optional, not part of CI)
+
+`tests/terminal-e2e/recording/` holds human-facing demo and WebM tooling. It is
+not exercised by `test:tui` and nothing in CI depends on it.
+
+```bash
+npm run demo:tui [scenario]     # attach to a live deterministic scenario
+npm run record:tui [scenario]   # render a scenario to WebM
+```
+
+`record:tui` additionally requires:
+
+- **wezterm** — captures the asciicast.
+- **agg** — renders the cast to GIF (`brew install agg`).
+- **ffmpeg with the `libvpx-vp9` encoder** — encodes the WebM.

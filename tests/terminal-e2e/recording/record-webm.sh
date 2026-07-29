@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 SCENARIO=${1:-interactive}
 OUTPUT=${2:-"$ROOT/terminal-e2e-recordings/${SCENARIO}.webm"}
 
@@ -25,11 +25,11 @@ mkdir -p "$(dirname -- "$OUTPUT")"
 CAPTURE_DIR=$(mktemp -d)
 GIF_FILE="$CAPTURE_DIR/render.gif"
 NORMALIZED_CAST_FILE="$CAPTURE_DIR/normalized.cast"
-trap 'rm -rf "$CAPTURE_DIR"' EXIT
+trap 'rm -rf "$CAPTURE_DIR"' EXIT INT TERM
 
 echo "Recording deterministic scenario: $SCENARIO"
 TMPDIR="$CAPTURE_DIR" wezterm record --cwd "$ROOT" -- \
-  node "$ROOT/tests/terminal-e2e/cinematic-demo.mjs" "$SCENARIO"
+  node "$ROOT/tests/terminal-e2e/recording/cinematic-demo.mjs" "$SCENARIO"
 
 CAST_FILE=$(find "$CAPTURE_DIR" -type f \
   \( -name '*.cast' -o -name '*.cast.txt' \) -print -quit)

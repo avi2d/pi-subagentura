@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { getScenario } from "./scenarios.mjs";
-import { createHarness } from "./harness.mjs";
+import { getScenario } from "../scenarios.mjs";
+import { createHarness } from "../harness.mjs";
 
 const name = process.argv[2] ?? "sync-context";
 const scenario = getScenario(name);

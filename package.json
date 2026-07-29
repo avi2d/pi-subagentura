@@ -112,8 +112,8 @@
     "hooks:install": "simple-git-hooks",
     "pack:check": "npm pack --dry-run",
     "test:tui": "vitest run --testTimeout=60000 tests/terminal-e2e/",
-    "demo:tui": "bash tests/terminal-e2e/demo.sh",
-    "record:tui": "bash tests/terminal-e2e/record-webm.sh"
+    "demo:tui": "bash tests/terminal-e2e/recording/demo.sh",
+    "record:tui": "bash tests/terminal-e2e/recording/record-webm.sh"
   },
   "simple-git-hooks": {
     "pre-commit": "npx lint-staged",
