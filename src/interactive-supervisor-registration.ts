@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
+  compareByStartedAt,
   INTERACTIVE_SUPERVISOR_SHORTCUT,
   type AsyncSupervisorItem,
   type InteractiveSupervisorItem,
@@ -12,6 +13,7 @@ import {
   cancelInteractiveDescendantByState,
   captureInteractiveSubagent,
   focusInteractiveSubagent,
+  interactiveSubagentHasAttachedClient,
   interactiveSubagentRegistry,
   showInteractiveSubagentNativeViewer,
   type InteractiveSubagentState,
@@ -20,8 +22,12 @@ import {
   cancelLineageSubtreeBestEffort,
   flattenLineageTree,
   projectLineageStore,
+  pruneTerminalLineageNodes,
   resolveLineageStorePaths,
+  type CancelSubtreeResult,
+  type LineageManifest,
   type ProjectedLineageNode,
+  type ProjectionIssue,
 } from "./interactive-lineage";
 import { getMux, type MuxName } from "./multiplexer";
 import {
@@ -48,6 +54,10 @@ const SUPERVISOR_CAPTURE_MAX_LINES = 200;
 interface SupervisorProjection {
   items: InteractiveSupervisorItem[];
   nodes: Map<string, ProjectedLineageNode>;
+  /** Raw manifests, including nodes the caps dropped — subtree cancel needs them. */
+  manifests: LineageManifest[];
+  issues: ProjectionIssue[];
+  truncated: boolean;
 }
 
 function isInteractiveStateActionable(
@@ -63,10 +73,7 @@ export function directSupervisorItems(
     .filter(
       (state) => sessionId === undefined || state.parentSessionId === sessionId,
     )
-    .sort(
-      (left, right) =>
-        left.startedAt - right.startedAt || left.id.localeCompare(right.id),
-    )
+    .sort(compareByStartedAt)
     .map((state) => ({
       kind: "interactive",
       state,
@@ -85,29 +92,21 @@ export function buildAsyncSupervisorItems(
 ): AsyncSupervisorItem[] {
   const processJobs = [...jobRegistry.values()]
     .filter((job) => inProcessJobBelongsToOwner(job, owner))
-    .sort(
-      (left, right) =>
-        left.startedAt - right.startedAt || left.id.localeCompare(right.id),
-    );
+    .sort(compareByStartedAt);
   const visibleJobs = new Map(processJobs.map((job) => [job.id, job]));
   const processItems: AsyncSupervisorItem[] = processJobs.map((job) => ({
     kind: "in-process",
     job,
     depth: inProcessSupervisorDepth(job, visibleJobs),
     actionable: job.status === "running",
-    reasons: job.status === "running" ? undefined : [job.status],
   }));
   const workflowItems: AsyncSupervisorItem[] = workflowJobsForOwner(owner)
-    .sort(
-      (left, right) =>
-        left.startedAt - right.startedAt || left.id.localeCompare(right.id),
-    )
+    .sort(compareByStartedAt)
     .map((job) => ({
       kind: "workflow",
       job,
       depth: 0,
       actionable: job.status === "running",
-      reasons: job.status === "running" ? undefined : [job.status],
     }));
   const normalizedInteractive: AsyncSupervisorItem[] = interactiveItems.map(
     (item) => ({ ...item, kind: "interactive" }),
@@ -128,20 +127,40 @@ function inProcessSupervisorDepth(
   return 1 + inProcessSupervisorDepth(parent, visibleJobs, nextVisiting);
 }
 
-function stateForNode(node: ProjectedLineageNode): InteractiveSubagentState {
+function stateForNode(
+  node: ProjectedLineageNode,
+  paneAliveById?: Map<string, boolean>,
+): InteractiveSubagentState {
   const existing = interactiveSubagentRegistry.get(node.manifest.agentId);
   if (existing) return existing;
   const manifest = node.manifest;
   const knownBackend =
     manifest.pane.backend === "tmux" || manifest.pane.backend === "zellij";
   const mux: MuxName = manifest.pane.backend === "zellij" ? "zellij" : "tmux";
-  const attach = knownBackend
-    ? getMux({ preference: mux }).buildAttachCommands({
+  // tmux's buildAttachCommands resolves the pane's window via execMuxOrThrow,
+  // which THROWS for a dead pane. It runs for every projected node, so one
+  // finished tmux agent used to make the whole projection reject and the overlay
+  // silently degrade to registry-only. Fall back to a session-less string.
+  let attach = { attachCommand: "unavailable", focusCommand: "unavailable" };
+  if (knownBackend) {
+    try {
+      attach = getMux({ preference: mux }).buildAttachCommands({
         paneId: manifest.pane.paneId,
         windowName: manifest.pane.windowName,
         session: manifest.pane.muxSession,
-      })
-    : { attachCommand: "unavailable", focusCommand: "unavailable" };
+      });
+    } catch {
+      const target = manifest.pane.windowName ?? manifest.pane.paneId;
+      attach = {
+        attachCommand: `unavailable (pane ${target} is gone)`,
+        focusCommand: `unavailable (pane ${target} is gone)`,
+      };
+    }
+  }
+  // Liveness comes from the pane probe, not from `node.state`. Deriving it from
+  // the same field the actionable gate then tests made that gate a tautology
+  // for lineage-only nodes, and mislabelled a live pane hidden for a cycle.
+  const paneAlive = paneAliveById?.get(manifest.agentId);
   return {
     id: manifest.agentId,
     name: manifest.name,
@@ -153,13 +172,30 @@ function stateForNode(node: ProjectedLineageNode): InteractiveSubagentState {
     sessionFile: manifest.childSessionFile ?? "unknown",
     cwd: manifest.cwd,
     parentSessionId: manifest.ownerSessionId,
-    startedAt: Date.parse(manifest.startedAt),
-    status: node.state === "actionable" ? "running" : "unknown",
+    startedAt: parseStartedAt(manifest.startedAt),
+    status:
+      paneAlive === undefined
+        ? node.state === "actionable"
+          ? "running"
+          : "unknown"
+        : paneAlive
+          ? "running"
+          : "unknown",
     attachCommand: attach.attachCommand,
     selectPaneCommand: attach.focusCommand,
     launchScriptFile: "unknown",
     artifactDir: manifest.artifactDir ?? "unknown",
   };
+}
+
+/**
+ * `validateLineageManifest` rejects an unparseable startedAt, but a manifest can
+ * still reach here from other sources. NaN would render as "NaNs" and make the
+ * startedAt comparators non-transitive.
+ */
+function parseStartedAt(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 async function loadSupervisorProjection(
@@ -172,20 +208,42 @@ async function loadSupervisorProjection(
     process.env.PI_CODING_AGENT_SESSION_DIR ??
     join(homedir(), ".pi", "agent", "sessions");
   const paths = await resolveLineageStorePaths(sessionRoot, rootId);
+  // Reused across the projection AND the prune sweep so no manifest is probed
+  // twice per refresh.
+  const paneAliveById = new Map<string, boolean>();
+  const isNodeStale = async (manifest: LineageManifest): Promise<boolean> => {
+    const cached = paneAliveById.get(manifest.agentId);
+    if (cached !== undefined) return !cached;
+    // A node the live registry already knows is terminal needs no subprocess.
+    const known = interactiveSubagentRegistry.get(manifest.agentId);
+    if (known?.status === "cancelled" || known?.status === "exited") {
+      paneAliveById.set(manifest.agentId, false);
+      return true;
+    }
+    if (
+      manifest.pane.backend !== "tmux" &&
+      manifest.pane.backend !== "zellij"
+    ) {
+      paneAliveById.set(manifest.agentId, false);
+      return true;
+    }
+    const alive = await getMux({
+      preference: manifest.pane.backend,
+    }).isPaneAliveAsync(manifest.pane.paneId, manifest.pane.muxSession);
+    paneAliveById.set(manifest.agentId, alive);
+    return !alive;
+  };
   const projection = await projectLineageStore(
     paths.nodesDir,
     basename(paths.treeDir),
-    async (manifest) => {
-      if (
-        manifest.pane.backend !== "tmux" &&
-        manifest.pane.backend !== "zellij"
-      ) {
-        return true;
-      }
-      return !(await getMux({
-        preference: manifest.pane.backend,
-      }).isPaneAliveAsync(manifest.pane.paneId, manifest.pane.muxSession));
-    },
+    isNodeStale,
+  );
+  // Nothing else unlinks a node manifest, so without this sweep the store grows
+  // by one file per spawn forever and the spawn gate eventually refuses every
+  // new agent. Probes are already cached above, so the sweep costs no extra
+  // subprocesses. Best effort: a failed prune is retried on the next refresh.
+  await pruneTerminalLineageNodes(paths.nodesDir, isNodeStale).catch(
+    () => undefined,
   );
   const flattened = flattenLineageTree(projection.roots);
   const seen = new Set(flattened.map((node) => node.manifest.agentId));
@@ -196,13 +254,12 @@ async function loadSupervisorProjection(
     }
   }
   const items: InteractiveSupervisorItem[] = flattened.map((node) => {
-    const state = stateForNode(node);
+    const state = stateForNode(node, paneAliveById);
     return {
       state,
       depth: node.depth,
       actionable:
         node.state === "actionable" && isInteractiveStateActionable(state),
-      reasons: node.reasons,
       origin: {
         source: "lineage",
         rootId: node.manifest.rootId,
@@ -230,7 +287,47 @@ async function loadSupervisorProjection(
   return {
     items,
     nodes: new Map(flattened.map((node) => [node.manifest.agentId, node])),
+    manifests: projection.manifests,
+    issues: projection.issues,
+    truncated: projection.truncated,
   };
+}
+
+/**
+ * Warning lines for the overlay footer.
+ *
+ * `projection.issues` and `truncated` were computed carefully and then thrown
+ * away, which is the mechanism by which a dropped node, an orphan, a cycle, or
+ * an unreadable manifest produced zero user-visible signal.
+ */
+export function supervisorStatusLines(
+  projection: SupervisorProjection | undefined,
+  refreshError: string | undefined,
+): string[] {
+  const lines: string[] = [];
+  const counts = new Map<string, number>();
+  for (const issue of projection?.issues ?? []) {
+    counts.set(issue.kind, (counts.get(issue.kind) ?? 0) + 1);
+  }
+  const hidden = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  if (hidden > 0) {
+    const detail = [...counts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([kind, count]) => `${count} ${kind === "truncated" ? "cap" : kind}`)
+      .join(", ");
+    lines.push(
+      `⚠ ${hidden} lineage node${hidden === 1 ? "" : "s"} hidden (${detail})`,
+    );
+  }
+  if (projection?.truncated) {
+    lines.push(
+      "⚠ lineage view is truncated — subtree cancellation may reach nodes not listed here",
+    );
+  }
+  if (refreshError) {
+    lines.push(`⚠ lineage refresh failing: ${refreshError}`);
+  }
+  return lines;
 }
 
 export function registerInteractiveSupervisor(
@@ -247,8 +344,12 @@ export function registerInteractiveSupervisor(
   }) => {
     const sessionId = ctx.sessionManager?.getSessionId?.();
     const activeOwner = owner();
+    let refreshError: string | undefined;
     let projection = await loadSupervisorProjection(sessionId).catch(
-      () => undefined,
+      (error: unknown) => {
+        refreshError = errorMessage(error);
+        return undefined;
+      },
     );
     await showInteractiveSupervisor(ctx.ui, {
       items: () =>
@@ -256,12 +357,19 @@ export function registerInteractiveSupervisor(
           projection?.items ?? directSupervisorItems(sessionId),
           activeOwner,
         ),
+      status: () => supervisorStatusLines(projection, refreshError),
       refresh: async () => {
-        projection = await loadSupervisorProjection(sessionId).catch(
-          () => projection,
-        );
+        // A swallowed failure used to freeze the snapshot indefinitely with no
+        // indication; the error now reaches the overlay footer.
+        try {
+          projection = await loadSupervisorProjection(sessionId);
+          refreshError = undefined;
+        } catch (error) {
+          refreshError = errorMessage(error);
+        }
       },
       focus: focusInteractiveSubagent,
+      hasAttachedClient: interactiveSubagentHasAttachedClient,
       view: async (state) => {
         const capture = await captureInteractiveSubagent(state, {
           maxBytes: SUPERVISOR_CAPTURE_MAX_BYTES,
@@ -319,18 +427,33 @@ export function registerInteractiveSupervisor(
         return item.state;
       },
       cancelSubtree: async (state) => {
+        // Snapshot the tree BEFORE the confirm blocks for human time. The 1 Hz
+        // refresh reassigns `projection` while the dialog is open, so reading it
+        // afterwards acted on a newer tree than the one the user confirmed.
+        const snapshotRoot = projection?.nodes.get(state.id);
+        const snapshotManifests = projection?.manifests ?? [];
+        const snapshotTruncated = projection?.truncated === true;
+        const descendantCount = snapshotRoot
+          ? subtreeManifestIds(snapshotRoot, snapshotManifests).size - 1
+          : 0;
+        const truncationWarning = snapshotTruncated
+          ? " The lineage view is truncated, so the tree may be larger than shown."
+          : "";
         const confirmed = await ctx.ui.confirm(
           "Cancel interactive subagent subtree?",
-          `Cancel ${state.name} and all descendants? This closes their mux panes but retains artifacts.`,
+          `Cancel ${state.name} and its ${descendantCount} descendant${descendantCount === 1 ? "" : "s"}? This closes their mux panes but retains artifacts.${truncationWarning}`,
         );
         if (!confirmed) return;
-        const root = projection?.nodes.get(state.id);
-        if (!root) {
+        if (!snapshotRoot) {
           cancelInteractiveSubagent(state.id);
           updateRunningSubagentFooter(ctx.ui);
           return;
         }
-        const result = await cancelLineageSubtreeBestEffort(root, {
+        const result = await cancelLineageSubtreeBestEffort(snapshotRoot, {
+          // The raw manifest set, so descendants past maxDepth or the node cap
+          // are cancelled instead of left running under a dead parent.
+          allManifests: snapshotManifests,
+          projectionTruncated: snapshotTruncated,
           isStale: async (node) => node.state !== "actionable",
           isTerminal: async (node) => {
             const direct = interactiveSubagentRegistry.get(
@@ -349,8 +472,12 @@ export function registerInteractiveSupervisor(
         });
         updateRunningSubagentFooter(ctx.ui);
         ctx.ui.notify(
-          `Subtree cancellation: ${result.cancelled.length} cancelled, ${result.alreadyTerminal.length} already terminal, ${result.stale.length} stale, ${result.failed.length} failed.`,
-          result.failed.length > 0 ? "warning" : "info",
+          formatSubtreeCancellation(result),
+          result.failed.length > 0 ||
+            result.projectionTruncated ||
+            result.recovered.length > 0
+            ? "warning"
+            : "info",
         );
       },
     });
@@ -368,6 +495,68 @@ export function registerInteractiveSupervisor(
       handler: async (_args, ctx) => open(ctx),
     });
   }
+}
+
+/** Agent ids in a subtree, derived from raw parent links (cycle-safe). */
+function subtreeManifestIds(
+  root: ProjectedLineageNode,
+  manifests: LineageManifest[],
+): Set<string> {
+  const childrenByParent = new Map<string, string[]>();
+  for (const manifest of manifests) {
+    if (!manifest.parentAgentId) continue;
+    const siblings = childrenByParent.get(manifest.parentAgentId) ?? [];
+    siblings.push(manifest.agentId);
+    childrenByParent.set(manifest.parentAgentId, siblings);
+  }
+  const ids = new Set<string>();
+  const stack = [root.manifest.agentId];
+  while (stack.length > 0) {
+    const agentId = stack.pop()!;
+    if (ids.has(agentId)) continue;
+    ids.add(agentId);
+    stack.push(...(childrenByParent.get(agentId) ?? []));
+  }
+  return ids;
+}
+
+/**
+ * Report skip reasons separately. "N stale" used to absorb cycles, orphans and
+ * cap truncation, telling the user the wrong thing about what was not cancelled.
+ */
+export function formatSubtreeCancellation(result: CancelSubtreeResult): string {
+  const parts = [
+    `${result.cancelled.length} cancelled`,
+    `${result.alreadyTerminal.length} already terminal`,
+  ];
+  const buckets: [string, string[]][] = [
+    ["stale", result.stale],
+    ["orphaned", result.orphan],
+    ["cyclic", result.cycle],
+    ["beyond the cap", result.truncated],
+    ["malformed", result.malformed],
+  ];
+  for (const [label, ids] of buckets) {
+    if (ids.length > 0) parts.push(`${ids.length} ${label}`);
+  }
+  parts.push(`${result.failed.length} failed`);
+  const suffixes: string[] = [];
+  if (result.recovered.length > 0) {
+    suffixes.push(
+      `${result.recovered.length} descendant${result.recovered.length === 1 ? "" : "s"} were missing from the displayed tree and were reached via the raw lineage manifests`,
+    );
+  }
+  if (result.projectionTruncated) {
+    suffixes.push(
+      "the lineage view was truncated, so treat this result as incomplete",
+    );
+  }
+  const suffix = suffixes.length > 0 ? ` ⚠ ${suffixes.join("; ")}.` : "";
+  return `Subtree cancellation: ${parts.join(", ")}.${suffix}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function cancelInProcessFromSupervisor(

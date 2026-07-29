@@ -398,10 +398,15 @@ in-flight agents. Interactive lineage can include descendants created from
 different working directories. Interactive
 children receive a minimal child runtime that can launch more interactive
 children, but does not register in-process or workflow orchestration tools.
-Recursion is bounded by default to depth 8 and 256 lineage nodes. The supervisor
-shows active, actionable work only. Cancelled, completed, malformed, orphaned,
-cyclic, and stale entries remain available through retained artifacts but are hidden
-from the overlay.
+Recursion is bounded by default to depth 8 and 256 **live** lineage nodes; the
+manifests of exited agents are pruned so a long-lived session's all-time spawn
+total never exhausts the budget. The supervisor shows active, actionable work
+only. Cancelled, completed, malformed, orphaned, cyclic, and stale entries remain
+available through retained artifacts but are hidden from the overlay. A footer
+line reports how many nodes were hidden and why, whether the view is truncated,
+and whether lineage refresh is failing, so hiding is never silent. Subtree
+cancellation walks the raw lineage manifests rather than the displayed tree, so a
+descendant past the depth or node cap is still cancelled and reported.
 
 The overlay supports these controls:
 
@@ -412,7 +417,7 @@ The overlay supports these controls:
 | `x`                    | Cancel the selected running item; workflow and in-process cancellation propagates to owned agents |
 | `v`                    | For interactive agents, capture a bounded terminal snapshot through tmux/Zellij                   |
 | `n`                    | For interactive agents, open the optional native tmux popup or Zellij floating viewer             |
-| `f`                    | For interactive agents, focus the persisted pane/window; expand first for native return controls  |
+| `f`                    | For interactive agents, focus the persisted pane/window; warns when no client is attached         |
 | `a`                    | For interactive agents, show the attach command                                                   |
 | `X`                    | For interactive agents, confirm and cancel an actionable subtree deepest-first                    |
 | `r`                    | Refresh registries, lineage, and pane liveness                                                    |

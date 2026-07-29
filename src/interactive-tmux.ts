@@ -29,7 +29,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -63,10 +62,13 @@ import {
   type CancellationSnapshotSource,
 } from "./cancellation-snapshots";
 import {
+  countLineageManifestsSync,
   DEFAULT_MAX_DEPTH,
   DEFAULT_MAX_NODES,
   hashLineageRoot,
   LINEAGE_SCHEMA_VERSION,
+  type LineageManifest,
+  pruneTerminalLineageNodesSync,
   resolveLineageStorePathsSync,
   writeLineageManifestAtomicSync,
 } from "./interactive-lineage";
@@ -277,11 +279,18 @@ export function tmuxSetupHint(): string {
   );
 }
 
+/**
+ * Sanitize a value for use as a mux window name and as a path segment.
+ *
+ * `.` is excluded on purpose: tmux treats it as the window.pane separator, so a
+ * window named `review.v2` makes `select-window -t review.v2` fail with
+ * "can't find pane: v2".
+ */
 function safeSegment(value: string): string {
   return (
     value
       .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/[^a-z0-9_-]+/g, "-")
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "subagent"
   );
@@ -413,11 +422,13 @@ export function writeLaunchScript(
     ...Object.entries(internalEnv).map(
       ([name, value]) => `export ${name}=${escape(value)}`,
     ),
-    `"${cliPath}" start`,
+    // Single-quote the helper path like every other interpolated path in this
+    // script; a double-quoted path still expands $, `` and \ inside it.
+    `${escape(cliPath)} start`,
     "on_exit() {",
     "    rc=$?",
     "    trap - EXIT",
-    `    "${cliPath}" process-exit "$rc" || true`,
+    `    ${escape(cliPath)} process-exit "$rc" || true`,
     '    tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$rc" 2>/dev/null || true',
     '    exit "$rc"',
     "}",
@@ -463,7 +474,10 @@ export function launchInteractiveSubagent(params: {
   /** Thinking/reasoning level for the child Pi process. */
   thinkingLevel?: ThinkingLevel;
 }): InteractiveSubagentState {
-  const id = randomBytes(4).toString("hex");
+  // 8 bytes, not 4: at 32 bits a birthday collision inside one tree is not
+  // remote, and the duplicate-id path only degrades gracefully — it does not
+  // recover the shadowed agent.
+  const id = randomBytes(8).toString("hex");
   const cwd = resolve(params.cwd);
   const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
   const background = params.background !== false; // default true (hidden)
@@ -499,19 +513,30 @@ export function launchInteractiveSubagent(params: {
     Number.isFinite(configuredMaxNodes) && configuredMaxNodes > 0
       ? configuredMaxNodes
       : DEFAULT_MAX_NODES;
-  const lineageStore =
-    rootId && params.parentSessionId
-      ? resolveLineageStorePathsSync(sessionRoot, rootId)
-      : undefined;
+  // The cap applies whenever a lineage root exists, even when this spawn will
+  // not persist a manifest of its own — recursion inside a tree still has to be
+  // bounded by that tree's budget.
+  const lineageStore = rootId
+    ? resolveLineageStorePathsSync(sessionRoot, rootId)
+    : undefined;
   if (lineageStore) {
-    const nodeCount = existsSync(lineageStore.nodesDir)
-      ? readdirSync(lineageStore.nodesDir).filter((entry) =>
-          entry.endsWith(".json"),
-        ).length
+    let nodeCount = existsSync(lineageStore.nodesDir)
+      ? countLineageManifestsSync(lineageStore.nodesDir)
       : 0;
     if (nodeCount >= maxNodes) {
+      // Manifests are never removed on their own, so an all-time total is not a
+      // live-node count: a session that spawned maxNodes agents over weeks —
+      // all long exited — could otherwise never spawn again. Sweep the nodes
+      // whose panes are gone and recount. The sweep costs one liveness probe
+      // per manifest, so it is paid only at the cap and only once per dead node.
+      nodeCount = pruneTerminalLineageNodesSync(
+        lineageStore.nodesDir,
+        (manifest) => !isLineagePaneAlive(manifest),
+      ).retained;
+    }
+    if (nodeCount >= maxNodes) {
       throw new Error(
-        `interactive sub-agent tree reached max nodes ${maxNodes}`,
+        `interactive sub-agent tree reached max nodes ${maxNodes} (all ${nodeCount} retained nodes are still live)`,
       );
     }
   }
@@ -782,6 +807,51 @@ export function isPaneAliveAsync(
   state: InteractiveSubagentState,
 ): Promise<boolean> {
   return getMuxForState(state).isPaneAliveAsync(state.paneId, state.muxSession);
+}
+
+/**
+ * Probe the pane recorded in a lineage manifest. An unknown backend cannot be
+ * probed, so it counts as dead — the same rule the projection already applies.
+ */
+export function isLineagePaneAlive(manifest: LineageManifest): boolean {
+  const backend = manifest.pane.backend;
+  if (backend !== "tmux" && backend !== "zellij") return false;
+  try {
+    return getMux({ preference: backend }).isPaneAlive(
+      manifest.pane.paneId,
+      manifest.pane.muxSession,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a mux client is attached to the session hosting this agent's pane.
+ *
+ * `undefined` means "cannot tell". Focus is server-side state — tmux
+ * `select-window` exits 0 with zero clients attached — so a successful focus is
+ * invisible to the user for a detached `pi-subagent-<id>` session, which is the
+ * normal case for the relaxed spawn path.
+ *
+ * The probe itself belongs to the multiplexer layer. Backends opt in by
+ * implementing the optional `hasAttachedClientAsync(session?)` method; until
+ * they do, this resolves `undefined` and the UI stays quiet.
+ */
+export async function interactiveSubagentHasAttachedClient(
+  state: InteractiveSubagentState,
+): Promise<boolean | undefined> {
+  const mux = getMuxForState(state) as Multiplexer & {
+    hasAttachedClientAsync?: (
+      session?: string,
+    ) => Promise<boolean | undefined> | boolean | undefined;
+  };
+  if (typeof mux.hasAttachedClientAsync !== "function") return undefined;
+  try {
+    return await mux.hasAttachedClientAsync(state.muxSession);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

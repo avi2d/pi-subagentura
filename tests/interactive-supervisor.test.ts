@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   InteractiveSupervisorComponent,
+  closeActiveInteractiveSupervisor,
   formatSupervisorSummary,
   showInteractiveSupervisor,
 } from "../src/interactive-supervisor-ui";
@@ -23,8 +31,11 @@ import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
 import {
   buildAsyncSupervisorItems,
   directSupervisorItems,
+  formatSubtreeCancellation,
   registerInteractiveSupervisor,
+  supervisorStatusLines,
 } from "../src/interactive-supervisor-registration";
+import type { CancelSubtreeResult } from "../src/interactive-lineage";
 import { jobRegistry, type JobState } from "../src/helpers";
 import {
   workflowJobRegistry,
@@ -111,14 +122,103 @@ function workflowJob(
   };
 }
 
+const savedLineageEnv: Record<string, string | undefined> = {};
+
+/**
+ * Register the supervisor against a real on-disk lineage store so the
+ * projection, prune sweep and cancel paths run end to end.
+ */
+async function lineageHarness(rootId: string) {
+  const sessionRoot = tempDir();
+  savedLineageEnv.PI_SUBAGENTURA_ROOT_ID = process.env.PI_SUBAGENTURA_ROOT_ID;
+  savedLineageEnv.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT =
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+  process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
+  process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
+  const paths = await resolveLineageStorePaths(sessionRoot, rootId);
+  let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+  registerInteractiveSupervisor({
+    registerCommand: (_name: string, command: { handler: any }) => {
+      commandHandler = command.handler;
+    },
+    registerShortcut: vi.fn(),
+  } as never);
+
+  return {
+    sessionRoot,
+    paths,
+    async writeNode(
+      agentId: string,
+      options: { paneId: string; parentAgentId?: string },
+    ) {
+      await writeLineageManifestAtomic(paths.nodesDir, {
+        schemaVersion: LINEAGE_SCHEMA_VERSION,
+        agentId,
+        ...(options.parentAgentId
+          ? { parentAgentId: options.parentAgentId }
+          : {}),
+        rootId,
+        rootHash: hashLineageRoot(rootId),
+        ownerSessionId: rootId,
+        name: `agent-${agentId}`,
+        taskPreview: `inspect ${agentId}`,
+        startedAt: new Date(Date.now() - 5_000).toISOString(),
+        cwd: sessionRoot,
+        pane: { backend: "tmux", paneId: options.paneId },
+        artifactDir: "unknown",
+      });
+    },
+    async writeBroken(name: string) {
+      mkdirSync(paths.nodesDir, { recursive: true });
+      writeFileSync(join(paths.nodesDir, `${name}.json`), "not json");
+    },
+    async nodeFiles(): Promise<string[]> {
+      try {
+        return readdirSync(paths.nodesDir)
+          .filter((entry) => entry.endsWith(".json"))
+          .sort();
+      } catch {
+        return [];
+      }
+    },
+    async open(drive?: (component: InteractiveSupervisorComponent) => void) {
+      const confirm = vi.fn().mockResolvedValue(true);
+      const notify = vi.fn();
+      let rendered = "";
+      const custom = vi.fn(async (factory: Function) => {
+        const component = factory(
+          { requestRender: vi.fn() },
+          undefined,
+          undefined,
+          vi.fn(),
+        ) as InteractiveSupervisorComponent;
+        rendered = component.render(200).join("\n");
+        drive?.(component);
+        return { kind: "close" };
+      });
+      await commandHandler?.("", {
+        ui: { custom, confirm, notify, setStatus: vi.fn() },
+        sessionManager: { getSessionId: () => rootId },
+      });
+      return { rendered, confirm, notify };
+    },
+  };
+}
+
 afterEach(() => {
   interactiveSubagentRegistry.clear();
   jobRegistry.clear();
   workflowJobRegistry.clear();
   __resetMuxInstances();
+  __setTmuxMultiplexer(undefined);
   vi.useRealTimers();
   if (savedTmux === undefined) delete process.env.TMUX;
   else process.env.TMUX = savedTmux;
+  for (const [name, value] of Object.entries(savedLineageEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    delete savedLineageEnv[name];
+  }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -377,7 +477,7 @@ describe("interactive supervisor", () => {
     expect(cancel).not.toHaveBeenCalled();
   });
 
-  it("shows bounded lifecycle events and artifact output in details", () => {
+  it("shows bounded lifecycle events and artifact output in details", async () => {
     const artifactDir = join(tempDir(), "artifact");
     mkdirSync(artifactDir, { recursive: true });
     writeFileSync(
@@ -403,18 +503,185 @@ describe("interactive supervisor", () => {
     interactiveSubagentRegistry.set(item.id, item);
     const component = new InteractiveSupervisorComponent({ done: vi.fn() });
 
+    // Artifact previews are read on the async refresh path, never in render().
     component.handleInput("\r");
+    expect(component.render(160).join("\n")).toContain(
+      "Recent events: loading…",
+    );
+
+    await vi.waitFor(() => {
+      component.invalidate();
+      const rendered = component.render(160).join("\n");
+      expect(rendered).toContain(
+        "Lifecycle: turn=turn-1 · completion=done · process=done",
+      );
+      expect(rendered).toContain(
+        "Recent events: turn_started → tool_activity(read) → completion(done)",
+      );
+      expect(rendered).toContain(
+        "Output preview: Completed the recursive artifact inspection.",
+      );
+    });
+  });
+
+  it("refuses to follow a symlinked artifact tail", async () => {
+    const dir = tempDir();
+    const artifactDir = join(dir, "artifact");
+    const real = join(dir, "real");
+    mkdirSync(artifactDir, { recursive: true });
+    mkdirSync(real, { recursive: true });
+    writeFileSync(join(real, "output.md"), "secret through a symlink");
+    symlinkSync(join(real, "output.md"), join(artifactDir, "output.md"));
+    const item = state("symlinked", { artifactDir });
+    interactiveSubagentRegistry.set(item.id, item);
+    const component = new InteractiveSupervisorComponent({ done: vi.fn() });
+
+    component.handleInput("\r");
+    await vi.waitFor(() => {
+      component.invalidate();
+      expect(component.render(160).join("\n")).toContain(
+        "Output preview: none yet",
+      );
+    });
+    expect(component.render(160).join("\n")).not.toContain(
+      "secret through a symlink",
+    );
+  });
+
+  it("compacts multi-line interpolated fields into single rows", async () => {
+    const item = state("multiline", {
+      name: "line\nbreaking",
+      task: "First line of the prompt\nSecond line\n\nThird line",
+      cwd: "/repo\nwith-newline",
+      artifactDir: "unknown",
+      attachCommand: "tmux attach -t a\nrm -rf /",
+    });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("\r");
+    await vi.waitFor(() => {
+      component.invalidate();
+      expect(component.render(200).join("\n")).toContain(
+        "Recent events: none yet",
+      );
+    });
+    const lines = component.render(200);
+
+    expect(lines.every((line) => !line.includes("\n"))).toBe(true);
+    expect(
+      lines.some((line) =>
+        line.includes("Task: First line of the prompt Second line Third line"),
+      ),
+    ).toBe(true);
+    expect(lines.some((line) => line.includes("cwd: /repo with-newline"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("line breaking"))).toBe(true);
+  });
+
+  it("renders warning status lines under the list", () => {
+    const item = state("warned");
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+      status: () => [
+        "⚠ 3 lineage nodes hidden (1 cap, 2 stale)",
+        "⚠ lineage refresh failing: EACCES",
+      ],
+    });
+
     const rendered = component.render(160).join("\n");
 
-    expect(rendered).toContain(
-      "Lifecycle: turn=turn-1 · completion=done · process=done",
+    expect(rendered).toContain("⚠ 3 lineage nodes hidden (1 cap, 2 stale)");
+    expect(rendered).toContain("⚠ lineage refresh failing: EACCES");
+  });
+
+  it("warns when focus succeeds but no client is attached", async () => {
+    const item = state("detached", {
+      attachCommand: "tmux attach -t pi-subagent-detached",
+    });
+    const focus = vi.fn().mockResolvedValue(undefined);
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      focus,
+      hasAttachedClient: async () => false,
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("f");
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(focus).toHaveBeenCalledWith(item);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("no client is attached"),
+      "warning",
     );
-    expect(rendered).toContain(
-      "Recent events: turn_started → tool_activity(read) → completion(done)",
+    expect(notify.mock.calls[0][0]).toContain(
+      "tmux attach -t pi-subagent-detached",
     );
-    expect(rendered).toContain(
-      "Output preview: Completed the recursive artifact inspection.",
-    );
+  });
+
+  it("stays quiet when the backend cannot report attachment", async () => {
+    const item = state("unknown-attach");
+    const focus = vi.fn().mockResolvedValue(undefined);
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      focus,
+      hasAttachedClient: async () => undefined,
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("f");
+    await vi.waitFor(() => expect(focus).toHaveBeenCalled());
+    await Promise.resolve();
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("renders a bounded elapsed marker instead of NaNs for a broken clock", () => {
+    const item = state("broken-clock", { startedAt: Number.NaN });
+
+    expect(formatSupervisorSummary(item, Date.now())).toContain(" · ? · ");
+    expect(formatSupervisorSummary(item, Date.now())).not.toContain("NaN");
+  });
+
+  it("closes every open overlay, not just the most recent one", async () => {
+    const firstDone = vi.fn();
+    const secondDone = vi.fn();
+    const openOverlay = (done: () => void) =>
+      showInteractiveSupervisor({
+        custom: async (factory: Function) => {
+          factory({ requestRender: vi.fn() }, undefined, undefined, done);
+          // Stay open until the shutdown hook closes us.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          return { kind: "close" };
+        },
+        notify: vi.fn(),
+      } as never);
+
+    const first = openOverlay(firstDone);
+    const second = openOverlay(secondDone);
+    await Promise.resolve();
+    closeActiveInteractiveSupervisor();
+    await Promise.all([first, second]);
+
+    expect(firstDone).toHaveBeenCalledWith({ kind: "close" });
+    expect(secondDone).toHaveBeenCalledWith({ kind: "close" });
   });
 
   it("shows mux-native return controls with focus details", () => {
@@ -521,7 +788,6 @@ describe("interactive supervisor", () => {
           state: stale,
           depth: 0,
           actionable: false,
-          reasons: ["stale"],
         },
       ],
     });
@@ -725,7 +991,7 @@ describe("interactive supervisor", () => {
     }
   });
 
-  it("skips artifact reads for unknown sentinel artifactDir", () => {
+  it("skips artifact reads for unknown sentinel artifactDir", async () => {
     const dir = tempDir();
     const previousCwd = process.cwd();
     process.chdir(dir);
@@ -746,10 +1012,15 @@ describe("interactive supervisor", () => {
       });
 
       component.handleInput("\r");
+      await vi.waitFor(() => {
+        component.invalidate();
+        expect(
+          component
+            .render(160)
+            .some((line) => line.includes("Recent events: none yet")),
+        ).toBe(true);
+      });
       const lines = component.render(160);
-      expect(
-        lines.some((line) => line.includes("Recent events: none yet")),
-      ).toBe(true);
       expect(lines.some((line) => line.includes("should-not-appear"))).toBe(
         false,
       );
@@ -803,6 +1074,55 @@ describe("interactive supervisor", () => {
       "<customMessageBg><dim>░   </dim></customMessageBg>",
     ]);
     expect(hideBackdrop).toHaveBeenCalledOnce();
+  });
+
+  it("reports a failing action instead of throwing out of the overlay", async () => {
+    const item = state("failing-action");
+    const notify = vi.fn();
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      notify,
+      view: vi.fn().mockRejectedValue(new Error("capture-pane exploded")),
+      items: () => [
+        { kind: "interactive", state: item, depth: 0, actionable: true },
+      ],
+    });
+
+    component.handleInput("v");
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(notify).toHaveBeenCalledWith(
+      "Unable to view: capture-pane exploded",
+      "error",
+    );
+  });
+
+  it("disposes the component and hides the backdrop when the host rejects", async () => {
+    const hideBackdrop = vi.fn();
+    let component: InteractiveSupervisorComponent | undefined;
+    const custom = vi.fn(async (factory: Function) => {
+      component = factory(
+        {
+          requestRender: vi.fn(),
+          showOverlay: () => ({ hide: hideBackdrop }),
+          terminal: { rows: 2 },
+        },
+        undefined,
+        undefined,
+        vi.fn(),
+      ) as InteractiveSupervisorComponent;
+      throw new Error("overlay host went away");
+    });
+
+    await expect(
+      showInteractiveSupervisor({ custom, notify: vi.fn() } as never),
+    ).rejects.toThrow("overlay host went away");
+
+    expect(hideBackdrop).toHaveBeenCalledOnce();
+    // Disposed: a second dispose is a no-op and the refresh timer is cleared.
+    expect(() => component?.dispose()).not.toThrow();
+    // The done handle was released, so a later shutdown does not call it.
+    expect(() => closeActiveInteractiveSupervisor()).not.toThrow();
   });
 
   it("reports a clear fallback outside Pi TUI sessions", async () => {
@@ -861,7 +1181,6 @@ describe("interactive supervisor", () => {
           state: child,
           depth: 1,
           actionable: false,
-          reasons: ["stale"],
         },
       ],
     });
@@ -908,6 +1227,243 @@ describe("interactive supervisor", () => {
       expect.stringContaining("retains artifacts"),
     );
     expect(interactiveSubagentRegistry.has(root.id)).toBe(true);
+  });
+
+  it("does not probe panes for nodes the registry already knows are terminal", async () => {
+    const harness = await lineageHarness("terminal-probe-root");
+    await harness.writeNode("finished", { paneId: "%finished" });
+    await harness.writeNode("running", { paneId: "%running" });
+    const finished = state("finished", { status: "exited" });
+    interactiveSubagentRegistry.set(finished.id, finished);
+    const isPaneAliveAsync = vi.fn().mockResolvedValue(true);
+    __setTmuxMultiplexer({
+      isPaneAliveAsync,
+      isPaneAlive: () => true,
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t x",
+        focusCommand: "tmux select-window -t x",
+      }),
+    } as never);
+
+    await harness.open();
+
+    const probedPanes = isPaneAliveAsync.mock.calls.map(([paneId]) => paneId);
+    expect(probedPanes).toContain("%running");
+    expect(probedPanes).not.toContain("%finished");
+  });
+
+  it("prunes dead lineage manifests while projecting", async () => {
+    const harness = await lineageHarness("prune-root");
+    await harness.writeNode("dead", { paneId: "%dead" });
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => false,
+      isPaneAlive: () => false,
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t x",
+        focusCommand: "tmux select-window -t x",
+      }),
+    } as never);
+
+    await harness.open();
+
+    expect(await harness.nodeFiles()).toEqual([]);
+  });
+
+  it("keeps the persisted tree when one dead pane cannot resolve attach commands", async () => {
+    const harness = await lineageHarness("poisoned-root");
+    await harness.writeNode("alive", { paneId: "%alive" });
+    await harness.writeNode("zombie", { paneId: "%zombie" });
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async (paneId: string) => paneId === "%alive",
+      isPaneAlive: () => true,
+      buildAttachCommands: ({ paneId }: { paneId: string }) => {
+        if (paneId === "%zombie") {
+          throw new Error("[tmux] display-message failed: can't find pane");
+        }
+        return {
+          attachCommand: "tmux attach -t alive",
+          focusCommand: "tmux select-window -t alive",
+        };
+      },
+    } as never);
+
+    const { rendered, notify } = await harness.open();
+
+    // A throwing attach lookup for one dead node used to reject the whole
+    // projection and silently degrade the overlay to registry-only.
+    expect(rendered).toContain("[lineage]");
+    expect(rendered).toContain("agent-alive");
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("reports hidden lineage nodes in the overlay footer", async () => {
+    const harness = await lineageHarness("footer-root");
+    await harness.writeNode("live", { paneId: "%live" });
+    await harness.writeNode("orphan", {
+      paneId: "%orphan",
+      parentAgentId: "missing-parent",
+    });
+    await harness.writeBroken("broken");
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+      isPaneAlive: () => true,
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t x",
+        focusCommand: "tmux select-window -t x",
+      }),
+    } as never);
+
+    const { rendered } = await harness.open();
+
+    expect(rendered).toMatch(/⚠ \d+ lineage nodes? hidden \(/);
+    expect(rendered).toContain("malformed");
+    expect(rendered).toContain("orphan");
+  });
+
+  it("reports a failing lineage refresh in the footer", async () => {
+    const previousRootId = process.env.PI_SUBAGENTURA_ROOT_ID;
+    const previousSessionRoot = process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+    // A session root that is a FILE makes path resolution reject.
+    const file = join(tempDir(), "not-a-directory");
+    writeFileSync(file, "");
+    process.env.PI_SUBAGENTURA_ROOT_ID = "failing-root";
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = file;
+    let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    let rendered = "";
+    registerInteractiveSupervisor({
+      registerCommand: (_name: string, command: { handler: any }) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never);
+    try {
+      await commandHandler?.("", {
+        ui: {
+          custom: async (factory: Function) => {
+            const component = factory(
+              { requestRender: vi.fn() },
+              undefined,
+              undefined,
+              vi.fn(),
+            ) as InteractiveSupervisorComponent;
+            rendered = component.render(200).join("\n");
+            return { kind: "close" };
+          },
+          confirm: vi.fn(),
+          notify: vi.fn(),
+          setStatus: vi.fn(),
+        },
+        sessionManager: { getSessionId: () => "failing-root" },
+      });
+      expect(rendered).toContain("⚠ lineage refresh failing:");
+    } finally {
+      if (previousRootId === undefined)
+        delete process.env.PI_SUBAGENTURA_ROOT_ID;
+      else process.env.PI_SUBAGENTURA_ROOT_ID = previousRootId;
+      if (previousSessionRoot === undefined)
+        delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+      else
+        process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = previousSessionRoot;
+    }
+  });
+
+  it("confirms the subtree the user saw, with its descendant count", async () => {
+    const harness = await lineageHarness("subtree-root");
+    await harness.writeNode("parent", { paneId: "%parent" });
+    await harness.writeNode("kid-a", {
+      paneId: "%kid-a",
+      parentAgentId: "parent",
+    });
+    await harness.writeNode("kid-b", {
+      paneId: "%kid-b",
+      parentAgentId: "kid-a",
+    });
+    const killed: string[] = [];
+    __setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+      isPaneAlive: () => true,
+      killPane: (paneId: string) => killed.push(paneId),
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t x",
+        focusCommand: "tmux select-window -t x",
+      }),
+    } as never);
+
+    const { confirm, notify } = await harness.open((component) => {
+      component.handleInput("X");
+    });
+
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(confirm.mock.calls[0][1]).toContain("2 descendants");
+    await vi.waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(notify.mock.calls.at(-1)?.[0]).toContain("Subtree cancellation:");
+    expect(killed.sort()).toEqual(["%kid-a", "%kid-b", "%parent"]);
+  });
+
+  it("reports subtree skip reasons in their own buckets", () => {
+    const base: CancelSubtreeResult = {
+      attempted: [],
+      cancelled: ["a"],
+      alreadyTerminal: ["b"],
+      stale: ["c"],
+      orphan: ["d"],
+      cycle: ["e"],
+      truncated: ["f"],
+      malformed: ["g"],
+      failed: [],
+      recovered: ["f"],
+      projectionTruncated: true,
+    };
+
+    const message = formatSubtreeCancellation(base);
+
+    expect(message).toContain("1 cancelled");
+    expect(message).toContain("1 already terminal");
+    expect(message).toContain("1 stale");
+    expect(message).toContain("1 orphaned");
+    expect(message).toContain("1 cyclic");
+    expect(message).toContain("1 beyond the cap");
+    expect(message).toContain("1 malformed");
+    expect(message).toContain("0 failed");
+    expect(message).toContain("missing from the displayed tree");
+    expect(message).toContain("treat this result as incomplete");
+    // Empty buckets are omitted so a clean run stays short.
+    expect(
+      formatSubtreeCancellation({
+        ...base,
+        stale: [],
+        orphan: [],
+        cycle: [],
+        truncated: [],
+        malformed: [],
+        recovered: [],
+        projectionTruncated: false,
+      }),
+    ).toBe("Subtree cancellation: 1 cancelled, 1 already terminal, 0 failed.");
+  });
+
+  it("summarizes hidden-node counts and refresh failures for the footer", () => {
+    expect(
+      supervisorStatusLines(
+        {
+          items: [],
+          nodes: new Map(),
+          manifests: [],
+          truncated: true,
+          issues: [
+            { kind: "stale", reason: "node is stale" },
+            { kind: "stale", reason: "node is stale" },
+            { kind: "truncated", reason: "node cap reached" },
+          ],
+        } as never,
+        "EACCES",
+      ),
+    ).toEqual([
+      "⚠ 3 lineage nodes hidden (2 stale, 1 cap)",
+      "⚠ lineage view is truncated — subtree cancellation may reach nodes not listed here",
+      "⚠ lineage refresh failing: EACCES",
+    ]);
+    expect(supervisorStatusLines(undefined, undefined)).toEqual([]);
   });
 
   it("renders an explicit legend without truncation at the minimum width", () => {
@@ -974,14 +1530,12 @@ describe("interactive supervisor", () => {
           job: completed,
           depth: 0,
           actionable: false,
-          reasons: ["completed"],
         },
         {
           kind: "interactive",
           state: stale,
           depth: 0,
           actionable: false,
-          reasons: ["stale"],
         },
       ],
     });

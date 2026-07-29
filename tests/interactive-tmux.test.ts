@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   existsSync,
   statSync,
@@ -34,6 +35,39 @@ function installMockExec(scenario: (file: string, args: string[]) => string) {
   // getMux would pick zellij and the mock would not intercept its calls.
   delete process.env.ZELLIJ;
   delete process.env.ZELLIJ_SESSION_NAME;
+}
+
+function lineageNodesDir(sessionRoot: string, rootId: string): string {
+  return join(
+    sessionRoot,
+    "subagentura",
+    "trees",
+    hashLineageRoot(rootId),
+    "nodes",
+  );
+}
+
+/** Write a schema-valid node manifest so the prune sweep can read it. */
+function writeLineageNode(
+  nodesDir: string,
+  agentId: string,
+  paneId: string,
+): void {
+  writeFileSync(
+    join(nodesDir, `${agentId}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      agentId,
+      rootId: "root-session",
+      rootHash: hashLineageRoot("root-session"),
+      ownerSessionId: "owner-session",
+      name: agentId,
+      taskPreview: "task",
+      startedAt: "2026-07-25T10:00:00.000Z",
+      cwd: "/repo",
+      pane: { backend: "tmux", paneId },
+    }) + "\n",
+  );
 }
 
 function makeArgs() {
@@ -250,6 +284,82 @@ describe("interactive-tmux", () => {
       }),
     ).toThrow(/reached max nodes 1/);
     expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+  });
+
+  it("prunes dead lineage nodes so an all-time spawn total cannot wedge the tree", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "4";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    for (let index = 0; index < 4; index++) {
+      writeLineageNode(nodesDir, `dead${index}`, `%dead${index}`);
+    }
+    process.env.TMUX = makeArgs().TMUX;
+    installMockExec((_file, args) => {
+      if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "display-message") {
+        // Liveness probe for a specific pane target: every recorded pane is gone.
+        const target = args[args.indexOf("-t") + 1] ?? "";
+        if (target.startsWith("%dead")) return "\n";
+        return MOCK_LOCATION;
+      }
+      if (args[0] === "show-options") return "0\n";
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    const state = mod.launchInteractiveSubagent({
+      name: "Revived",
+      task: "spawn after the tree filled up with dead nodes",
+      cwd: tmp,
+      parentSessionId: "owner-session",
+      parentCwd: tmp,
+    });
+
+    expect(state.id).toBeTruthy();
+    const remaining = readdirSync(nodesDir).filter((entry) =>
+      entry.endsWith(".json"),
+    );
+    expect(remaining).toEqual([`${state.id}.json`]);
+  });
+
+  it("still refuses a spawn when every retained lineage node is live", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "4";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    for (let index = 0; index < 4; index++) {
+      writeLineageNode(nodesDir, `live${index}`, `%live${index}`);
+    }
+    process.env.TMUX = makeArgs().TMUX;
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Too many",
+        task: "fail",
+        cwd: tmp,
+        parentSessionId: "owner-session",
+      }),
+    ).toThrow(/reached max nodes 4/);
+    expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+    expect(
+      readdirSync(nodesDir).filter((entry) => entry.endsWith(".json")),
+    ).toHaveLength(4);
   });
 
   it("launches in visible-split mode when background: false", async () => {

@@ -6,15 +6,19 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   LINEAGE_SCHEMA_VERSION,
   cancelLineageSubtreeBestEffort,
+  countLineageManifestsSync,
   hashLineageRoot,
   projectLineageStore,
   projectManifests,
+  pruneTerminalLineageNodes,
+  pruneTerminalLineageNodesSync,
   readLineageManifest,
   resolveLineageStorePaths,
   resolveLineageStorePathsSync,
   safeContainedPath,
   validateLineageManifest,
   writeLineageManifestAtomic,
+  writeLineageManifestAtomicSync,
   type LineageManifest,
 } from "../src/interactive-lineage";
 
@@ -115,6 +119,37 @@ describe("interactive lineage manifests", () => {
 
     const entries = await fs.readdir(nodesDir);
     expect(entries).toEqual(["agent-1.json"]);
+  });
+
+  it("removes the temp file when the atomic rename fails", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await fs.mkdir(nodesDir, { recursive: true });
+    // A directory at the target path makes rename() reject.
+    await fs.mkdir(path.join(nodesDir, "agent-1.json"));
+
+    await expect(
+      writeLineageManifestAtomic(nodesDir, manifest("agent-1")),
+    ).rejects.toThrow();
+
+    expect(
+      (await fs.readdir(nodesDir)).filter((entry) => entry.endsWith(".tmp")),
+    ).toEqual([]);
+  });
+
+  it("removes the temp file when the sync atomic rename fails", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await fs.mkdir(nodesDir, { recursive: true });
+    await fs.mkdir(path.join(nodesDir, "agent-1.json"));
+
+    expect(() =>
+      writeLineageManifestAtomicSync(nodesDir, manifest("agent-1")),
+    ).toThrow();
+
+    expect(
+      (await fs.readdir(nodesDir)).filter((entry) => entry.endsWith(".tmp")),
+    ).toEqual([]);
   });
 });
 
@@ -296,6 +331,154 @@ describe("interactive lineage projection", () => {
   });
 });
 
+describe("interactive lineage node cap", () => {
+  it("keeps live and recent nodes when the cap drops manifests", async () => {
+    // Ids are deliberately anti-correlated with liveness so a filename sort
+    // would keep the wrong subset.
+    const all = [
+      manifest("a01", { startedAt: "2026-07-25T10:00:01Z" }),
+      manifest("a02", { startedAt: "2026-07-25T10:00:02Z" }),
+      manifest("z98", { startedAt: "2026-07-25T10:00:58Z" }),
+      manifest("z99", { startedAt: "2026-07-25T10:00:59Z" }),
+    ];
+    const live = new Set(["z99", "a01"]);
+
+    const projection = await projectManifests(
+      all,
+      rootHash,
+      (candidate) => !live.has(candidate.agentId),
+      { maxNodes: 2 },
+    );
+
+    const retained = new Set(
+      [...projection.roots, ...projection.nonActionable].map(
+        (node) => node.manifest.agentId,
+      ),
+    );
+    expect([...retained].sort()).toEqual(["a01", "z99"]);
+    expect(projection.truncated).toBe(true);
+    expect(
+      projection.issues.filter((issue) => issue.kind === "truncated").length,
+    ).toBe(2);
+    // The raw set is still complete so cancellation can reach dropped nodes.
+    expect(projection.manifests).toHaveLength(4);
+  });
+
+  it("reads manifests newest-first so the read window follows a live tree", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await writeLineageManifestAtomic(nodesDir, manifest("aaa1"));
+    await writeLineageManifestAtomic(nodesDir, manifest("bbb2"));
+    // Make the lexicographically-first file the OLDEST on disk.
+    await fs.utimes(path.join(nodesDir, "aaa1.json"), new Date(0), new Date(0));
+
+    const projection = await projectLineageStore(
+      nodesDir,
+      rootHash,
+      () => false,
+      { maxNodes: 1 },
+    );
+
+    const retained = [...projection.roots, ...projection.nonActionable].map(
+      (node) => node.manifest.agentId,
+    );
+    expect(retained).toEqual(["bbb2"]);
+  });
+
+  it("probes staleness with bounded concurrency instead of one at a time", async () => {
+    const many = Array.from({ length: 12 }, (_, index) =>
+      manifest(`n${String(index).padStart(2, "0")}`),
+    );
+    let inFlight = 0;
+    let peakInFlight = 0;
+
+    await projectManifests(
+      many,
+      rootHash,
+      async () => {
+        inFlight++;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight--;
+        return false;
+      },
+      { concurrency: 4 },
+    );
+
+    expect(peakInFlight).toBeGreaterThan(1);
+    expect(peakInFlight).toBeLessThanOrEqual(4);
+  });
+
+  it("probes each manifest at most once per projection", async () => {
+    const probed: string[] = [];
+
+    await projectManifests(
+      [manifest("root"), manifest("child", { parentAgentId: "root" })],
+      rootHash,
+      (candidate) => {
+        probed.push(candidate.agentId);
+        return false;
+      },
+    );
+
+    expect(probed.sort()).toEqual(["child", "root"]);
+  });
+});
+
+describe("interactive lineage pruning", () => {
+  it("removes dead leaf manifests and keeps a dead parent with live children", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await writeLineageManifestAtomic(nodesDir, manifest("dead-parent"));
+    await writeLineageManifestAtomic(
+      nodesDir,
+      manifest("live-child", { parentAgentId: "dead-parent" }),
+    );
+    await writeLineageManifestAtomic(nodesDir, manifest("dead-leaf"));
+
+    const result = await pruneTerminalLineageNodes(
+      nodesDir,
+      (candidate) => candidate.agentId !== "live-child",
+    );
+
+    // Unlinking the dead parent would orphan its live child and hide it.
+    expect(result.pruned).toEqual(["dead-leaf"]);
+    expect(result.retained).toBe(2);
+    expect((await fs.readdir(nodesDir)).sort()).toEqual([
+      "dead-parent.json",
+      "live-child.json",
+    ]);
+  });
+
+  it("leaves an unreadable manifest in place for the projection to report", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await fs.mkdir(nodesDir, { recursive: true });
+    await fs.writeFile(path.join(nodesDir, "broken.json"), "not json");
+
+    const result = await pruneTerminalLineageNodes(nodesDir, () => true);
+
+    expect(result.pruned).toEqual([]);
+    expect(await fs.readdir(nodesDir)).toEqual(["broken.json"]);
+  });
+
+  it("prunes synchronously for the spawn gate", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await writeLineageManifestAtomic(nodesDir, manifest("gone"));
+    await writeLineageManifestAtomic(nodesDir, manifest("here"));
+
+    const result = pruneTerminalLineageNodesSync(
+      nodesDir,
+      (candidate) => candidate.agentId === "gone",
+    );
+
+    expect(result.pruned).toEqual(["gone"]);
+    expect(result.retained).toBe(1);
+    expect(countLineageManifestsSync(nodesDir)).toBe(1);
+  });
+});
+
 describe("interactive lineage cancellation", () => {
   it("cancels deepest-first and continues after failures", async () => {
     const projection = await projectManifests(
@@ -352,4 +535,122 @@ describe("interactive lineage cancellation", () => {
     ]);
     expect(result.cancelled).toEqual(["root"]);
   });
+
+  it("cancels descendants deeper than maxDepth and reports the truncation", async () => {
+    // A chain root → d1 … → d5 with maxDepth 2: the projection stops at d2.
+    const chain = [manifest("d0")];
+    for (let depth = 1; depth <= 5; depth++) {
+      chain.push(manifest(`d${depth}`, { parentAgentId: `d${depth - 1}` }));
+    }
+    const projection = await projectManifests(chain, rootHash, () => false, {
+      maxDepth: 2,
+    });
+    const root = projection.roots[0];
+    expect(root).toBeDefined();
+    expect(flattenAgentIds(projection.roots).sort()).toEqual([
+      "d0",
+      "d1",
+      "d2",
+    ]);
+
+    const cancelled: string[] = [];
+    const result = await cancelLineageSubtreeBestEffort(root!, {
+      allManifests: projection.manifests,
+      projectionTruncated: projection.truncated,
+      isStale: () => false,
+      isTerminal: () => false,
+      cancel: (node) => {
+        cancelled.push(node.manifest.agentId);
+      },
+    });
+
+    // Every descendant, not just the ones the depth cap left in the tree.
+    expect([...cancelled].sort()).toEqual(["d0", "d1", "d2", "d3", "d4", "d5"]);
+    expect([...result.recovered].sort()).toEqual(["d3", "d4", "d5"]);
+    expect(result.projectionTruncated).toBe(true);
+    expect(result.failed).toEqual([]);
+    // Deepest-first ordering is preserved for the recovered nodes too.
+    expect(cancelled[0]).toBe("d5");
+    expect(cancelled.at(-1)).toBe("d0");
+  });
+
+  it("cancels nodes the node cap dropped from the projection", async () => {
+    const manifests = [
+      manifest("root", { startedAt: "2026-07-25T10:00:09Z" }),
+      manifest("kept", {
+        parentAgentId: "root",
+        startedAt: "2026-07-25T10:00:08Z",
+      }),
+      manifest("dropped", {
+        parentAgentId: "root",
+        startedAt: "2026-07-25T10:00:01Z",
+      }),
+    ];
+    const projection = await projectManifests(
+      manifests,
+      rootHash,
+      () => false,
+      { maxNodes: 2 },
+    );
+    const root = projection.roots[0];
+    expect(root).toBeDefined();
+    expect(flattenAgentIds(projection.roots).sort()).toEqual(["kept", "root"]);
+
+    const cancelled: string[] = [];
+    const result = await cancelLineageSubtreeBestEffort(root!, {
+      allManifests: manifests,
+      projectionTruncated: projection.truncated,
+      isStale: () => false,
+      isTerminal: () => false,
+      cancel: (node) => {
+        cancelled.push(node.manifest.agentId);
+      },
+    });
+
+    expect(cancelled.sort()).toEqual(["dropped", "kept", "root"]);
+    expect(result.recovered).toEqual(["dropped"]);
+  });
+
+  it("reports orphan, cycle and cap skips in their own buckets", async () => {
+    const projection = await projectManifests(
+      [
+        manifest("root"),
+        manifest("orphaned", { parentAgentId: "root" }),
+        manifest("stale-child", { parentAgentId: "root" }),
+      ],
+      rootHash,
+      (candidate) => candidate.agentId === "stale-child",
+    );
+    const root = projection.roots[0]!;
+    // Force distinct non-actionable reasons onto the two children.
+    const children = root.children;
+    const orphaned = children.find(
+      (node) => node.manifest.agentId === "orphaned",
+    )!;
+    (orphaned as { reasons: string[] }).reasons = ["orphan"];
+    (orphaned as { state: string }).state = "non-actionable";
+
+    const result = await cancelLineageSubtreeBestEffort(root, {
+      isStale: () => false,
+      isTerminal: () => false,
+      cancel: () => {},
+    });
+
+    expect(result.orphan).toEqual(["orphaned"]);
+    expect(result.stale).toEqual(["stale-child"]);
+    expect(result.cancelled).toEqual(["root"]);
+    expect(result.cycle).toEqual([]);
+  });
 });
+
+function flattenAgentIds(
+  nodes: { manifest: LineageManifest; children: any[] }[],
+): string[] {
+  const ids: string[] = [];
+  const visit = (node: { manifest: LineageManifest; children: any[] }) => {
+    ids.push(node.manifest.agentId);
+    for (const child of node.children) visit(child);
+  };
+  for (const node of nodes) visit(node);
+  return ids;
+}

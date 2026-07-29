@@ -4,7 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
-import { closeSync, lstatSync, openSync, readSync, statSync } from "node:fs";
+import { promises as fs, type promises as fsTypes } from "node:fs";
 import { join } from "node:path";
 import type { JobState } from "./helpers";
 import {
@@ -24,12 +24,20 @@ const DETAIL_WORKFLOW_AGENT_COUNT = 20;
 
 export type InteractiveSupervisorAction = { kind: "close" };
 type SupervisorDone = (action: InteractiveSupervisorAction) => void;
-let activeDone: SupervisorDone | undefined;
+// A set, not a single handle: two concurrent overlays used to orphan the first
+// `done`, so shutdown could only ever close the last one.
+const activeDoneHandles = new Set<SupervisorDone>();
 
 interface SupervisorItemBase {
   depth: number;
   actionable: boolean;
-  reasons?: string[];
+}
+
+/** Bounded artifact preview for an expanded row, read off the render path. */
+export interface SupervisorArtifactDetails {
+  lifecycle: string;
+  events: string;
+  output: string;
 }
 
 export interface InteractiveSupervisorOrigin {
@@ -69,6 +77,16 @@ export interface InteractiveSupervisorOptions {
   view?: (state: InteractiveSubagentState) => void | Promise<void>;
   nativeView?: (state: InteractiveSubagentState) => void | Promise<void>;
   cancelSubtree?: (state: InteractiveSubagentState) => void | Promise<void>;
+  /**
+   * Whether a mux client is attached to the target's session. `undefined` means
+   * the backend cannot tell. Focus is server-side state, so a "successful" focus
+   * with no client attached is a silent no-op the user must be warned about.
+   */
+  hasAttachedClient?: (
+    state: InteractiveSubagentState,
+  ) => Promise<boolean | undefined> | boolean | undefined;
+  /** Warning/status lines rendered under the list (hidden nodes, refresh failures). */
+  status?: () => string[];
   refreshIntervalMs?: number;
   now?: () => number;
   items?: () => AsyncSupervisorItem[];
@@ -84,6 +102,13 @@ export class InteractiveSupervisorComponent {
   private readonly timer?: ReturnType<typeof setInterval>;
   private disposed = false;
   private refreshing = false;
+  /**
+   * Artifact previews for expanded rows, filled by the async refresh. render()
+   * must never touch the filesystem: its cache is invalidated on every refresh
+   * tick, so a sync read there ran ~10 blocking syscalls per expanded row per
+   * second on the TUI thread.
+   */
+  private artifactDetails = new Map<string, SupervisorArtifactDetails>();
 
   constructor(private readonly opts: InteractiveSupervisorOptions) {
     const refreshIntervalMs =
@@ -115,20 +140,29 @@ export class InteractiveSupervisorComponent {
         const itemKey = supervisorItemKey(item);
         const expanded = this.expanded.has(itemKey);
         const marker = selected ? "▶" : "○";
-        const unavailable = item.actionable
-          ? ""
-          : ` · unavailable (${item.reasons?.join(", ") ?? "unsafe"})`;
         lines.push(
           trunc(
             `│ ${"  ".repeat(item.depth)}${marker} ${expanded ? "▾" : "▸"} ${formatAsyncSupervisorSummary(
               item,
               this.now(),
-            )}${unavailable}`,
+            )}`,
             width,
           ),
         );
-        if (expanded) lines.push(...formatAsyncDetails(item, width));
+        if (expanded) {
+          lines.push(
+            ...formatAsyncDetails(
+              item,
+              width,
+              this.artifactDetails.get(itemKey),
+            ),
+          );
+        }
       });
+    }
+
+    for (const line of this.opts.status?.() ?? []) {
+      lines.push(trunc(`│ ${compactText(line)}`, width));
     }
 
     lines.push(trunc(`└${"─".repeat(Math.max(0, width - 2))}┘`, width));
@@ -202,15 +236,7 @@ export class InteractiveSupervisorComponent {
     }
     if (matchesKey(data, "f")) {
       const state = this.interactiveStateForAction(selectedItem, "focus");
-      if (!state) return;
-      if (!selectedItem.actionable) {
-        this.opts.notify?.(
-          unavailableActionMessage("focus", selectedItem),
-          "warning",
-        );
-        return;
-      }
-      void this.runAction("focus", state, this.opts.focus);
+      if (state) void this.focusItem(state);
       return;
     }
     if (matchesKey(data, Key.shift("x"))) {
@@ -258,18 +284,21 @@ export class InteractiveSupervisorComponent {
   }
 
   private toggle(id: string): void {
-    if (this.expanded.has(id)) this.expanded.delete(id);
-    else this.expanded.add(id);
+    const expanding = !this.expanded.has(id);
+    if (expanding) this.expanded.add(id);
+    else {
+      this.expanded.delete(id);
+      this.artifactDetails.delete(id);
+    }
+    // Repaint the row shape immediately; the artifact previews it needs are read
+    // asynchronously and land on a later tick as "loading…" resolves.
     this.changed();
+    if (expanding) void this.refresh();
   }
 
   private cancelItem(item: AsyncSupervisorItem): void {
     let cancelled = false;
     let label = "subagent";
-    if (!item.actionable) {
-      this.opts.notify?.(unavailableActionMessage("cancel", item), "warning");
-      return;
-    }
     if (item.kind === "in-process") {
       cancelled = this.opts.cancelInProcess?.(item.job) ?? false;
       label = item.job.id;
@@ -295,13 +324,6 @@ export class InteractiveSupervisorComponent {
       this.opts.notify?.(
         "Subtree cancellation is only available for interactive agents.",
         "info",
-      );
-      return;
-    }
-    if (!item.actionable) {
-      this.opts.notify?.(
-        unavailableActionMessage("cancel subtree", item),
-        "warning",
       );
       return;
     }
@@ -335,9 +357,65 @@ export class InteractiveSupervisorComponent {
       // Avoid `await undefined` — that yields a microtask and breaks the
       // no-refresh path, which previously called changed() synchronously.
       if (this.opts.refresh) await this.opts.refresh();
+      if (this.expanded.size > 0) await this.loadArtifactDetails();
     } finally {
       this.refreshing = false;
       this.changed();
+    }
+  }
+
+  /** Read the artifact previews for expanded interactive rows, off the render path. */
+  private async loadArtifactDetails(): Promise<void> {
+    const wanted = new Map<string, InteractiveSubagentState>();
+    for (const item of this.items()) {
+      const key = supervisorItemKey(item);
+      if (!this.expanded.has(key)) continue;
+      const state = interactiveState(item);
+      if (state) wanted.set(key, state);
+    }
+    for (const key of [...this.artifactDetails.keys()]) {
+      if (!wanted.has(key)) this.artifactDetails.delete(key);
+    }
+    const loaded = await Promise.all(
+      [...wanted].map(
+        async ([key, state]) =>
+          [key, await readArtifactDetails(state)] as const,
+      ),
+    );
+    for (const [key, details] of loaded) {
+      this.artifactDetails.set(key, details);
+    }
+  }
+
+  /**
+   * Focus the pane, then tell the user when the focus landed on a session no
+   * client is attached to — otherwise `f` looks like a silent no-op.
+   */
+  private async focusItem(state: InteractiveSubagentState): Promise<void> {
+    if (!this.opts.focus) {
+      this.opts.notify?.("focus is not available in this session.", "info");
+      return;
+    }
+    try {
+      await this.opts.focus(state);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.opts.notify?.(`Unable to focus: ${message}`, "error");
+      return;
+    } finally {
+      this.changed();
+    }
+    let attached: boolean | undefined;
+    try {
+      attached = await this.opts.hasAttachedClient?.(state);
+    } catch {
+      attached = undefined;
+    }
+    if (attached === false) {
+      this.opts.notify?.(
+        `Focused ${compactText(state.name)}, but no client is attached to its mux session — attach with:\n${state.attachCommand}`,
+        "warning",
+      );
     }
   }
 
@@ -423,6 +501,7 @@ export async function showInteractiveSupervisor(
   const custom = (ui as ExtensionUIContext & { custom?: Function }).custom;
   let component: InteractiveSupervisorComponent | undefined;
   let backdrop: OverlayHandle | undefined;
+  let registeredDone: SupervisorDone | undefined;
   if (typeof custom !== "function") {
     ui.notify(
       "The async subagent supervisor is only available in Pi TUI sessions. Use the status and cancellation tools in this mode.",
@@ -440,7 +519,8 @@ export async function showInteractiveSupervisor(
         _kb: unknown,
         done: SupervisorDone,
       ) => {
-        activeDone = done;
+        registeredDone = done;
+        activeDoneHandles.add(done);
         backdrop = showSupervisorBackdrop(tui, theme);
         component = new InteractiveSupervisorComponent({
           ...options,
@@ -460,14 +540,18 @@ export async function showInteractiveSupervisor(
       },
     );
   } finally {
-    activeDone = undefined;
+    if (registeredDone) activeDoneHandles.delete(registeredDone);
     component?.dispose();
     backdrop?.hide();
   }
 }
 
+/** Close every open supervisor overlay, not just the most recent one. */
 export function closeActiveInteractiveSupervisor(): void {
-  activeDone?.({ kind: "close" });
+  for (const done of [...activeDoneHandles]) {
+    activeDoneHandles.delete(done);
+    done({ kind: "close" });
+  }
 }
 
 export function formatSupervisorSummary(
@@ -475,17 +559,28 @@ export function formatSupervisorSummary(
   now: number,
 ): string {
   const icon = statusIcon(state.status);
-  const elapsed = formatElapsed(Math.max(0, now - state.startedAt));
-  const activity =
-    state.lastToolSummary ?? state.lastToolName ?? "no activity yet";
-  return `${icon} ${state.status} ${state.name} (${state.id.slice(0, 8)}) · ${state.mux} · ${elapsed} · ${activity}`;
+  const elapsed = formatElapsed(now - state.startedAt);
+  const activity = compactText(
+    state.lastToolSummary ?? state.lastToolName ?? "no activity yet",
+  );
+  return `${icon} ${state.status} ${compactText(state.name)} (${state.id.slice(0, 8)}) · ${state.mux} · ${elapsed} · ${activity}`;
 }
 
 function supervisorStates(): InteractiveSubagentState[] {
-  return [...interactiveSubagentRegistry.values()].sort(
-    (left, right) =>
-      left.startedAt - right.startedAt || left.id.localeCompare(right.id),
-  );
+  return [...interactiveSubagentRegistry.values()].sort(compareByStartedAt);
+}
+
+/** Order by start time, tolerating a non-finite startedAt so the sort stays total. */
+export function compareByStartedAt(
+  left: { startedAt: number; id: string },
+  right: { startedAt: number; id: string },
+): number {
+  const delta = finiteOrZero(left.startedAt) - finiteOrZero(right.startedAt);
+  return delta === 0 ? left.id.localeCompare(right.id) : delta;
+}
+
+function finiteOrZero(value: number): number {
+  return Number.isFinite(value) ? value : 0;
 }
 
 function supervisorItems(): AsyncSupervisorItem[] {
@@ -510,29 +605,11 @@ function interactiveState(
   return item.state;
 }
 
-function unavailableActionMessage(
-  action: string,
-  item: AsyncSupervisorItem,
-): string {
-  const label = supervisorItemLabel(item);
-  const status = supervisorItemStatus(item);
-  const reasons = item.reasons?.filter((reason) => reason !== status) ?? [];
-  const reason = reasons.length > 0 ? `; reason: ${reasons.join(", ")}` : "";
-  return `Cannot ${action} "${label}": unavailable (status: ${status}${reason}).`;
-}
-
-function supervisorItemLabel(item: AsyncSupervisorItem): string {
-  if (item.kind === "in-process") return item.job.id;
-  if (item.kind === "workflow") return item.job.name;
-  return item.state.name;
-}
-
-function supervisorItemStatus(item: AsyncSupervisorItem): string {
-  if (item.kind === "in-process") return item.job.status;
-  if (item.kind === "workflow") return item.job.status;
-  return item.state.status;
-}
-
+// Non-actionable items are filtered out of `items()` entirely (see
+// supervisorItemIsActive), so every rendered row is actionable. The former
+// "unavailable (…)" suffix, its per-action guards, and unavailableActionMessage
+// were all unreachable and have been removed rather than made reachable —
+// hiding is the intended design and the README documents it.
 function supervisorItemIsActive(item: AsyncSupervisorItem): boolean {
   if (!item.actionable) return false;
   if (item.kind === "in-process") return item.job.status === "running";
@@ -567,6 +644,7 @@ function formatAsyncSupervisorSummary(
 function formatAsyncDetails(
   item: AsyncSupervisorItem,
   width: number,
+  artifact: SupervisorArtifactDetails | undefined,
 ): string[] {
   if (item.kind === "in-process") {
     return formatInProcessDetails(item.job, width);
@@ -574,7 +652,7 @@ function formatAsyncDetails(
   if (item.kind === "workflow") {
     return formatWorkflowDetails(item.job, width);
   }
-  return formatInteractiveDetails(item, width);
+  return formatInteractiveDetails(item, width, artifact);
 }
 
 function formatInProcessDetails(job: JobState, width: number): string[] {
@@ -621,25 +699,28 @@ function formatWorkflowDetails(job: WorkflowJobState, width: number): string[] {
 function formatInteractiveDetails(
   item: InteractiveSupervisorItem,
   width: number,
+  artifact: SupervisorArtifactDetails | undefined,
 ): string[] {
   const state = item.state;
-  const artifactDetails = readArtifactDetails(state);
+  // Every interpolated value is compacted: a multi-line task prompt (the common
+  // case) would otherwise emit a literal newline inside one row and break the
+  // box drawing, since trunc bounds by length only.
   const fields = [
     `Origin: ${formatInteractiveOrigin(item)}`,
-    `Task: ${state.task}`,
-    `Model: ${state.model ?? "default"}`,
-    `Pane: ${state.mux}:${state.paneId}${state.muxSession ? ` session=${state.muxSession}` : ""}`,
-    `cwd: ${state.cwd}`,
-    `Artifact: ${state.artifactDir}`,
-    `Pi session: ${state.sessionFile}`,
-    `Lifecycle: ${artifactDetails.lifecycle}`,
-    `Recent events: ${artifactDetails.events}`,
-    `Output preview: ${artifactDetails.output}`,
+    `Task: ${compactText(state.task)}`,
+    `Model: ${compactText(state.model ?? "default")}`,
+    `Pane: ${compactText(`${state.mux}:${state.paneId}${state.muxSession ? ` session=${state.muxSession}` : ""}`)}`,
+    `cwd: ${compactText(state.cwd)}`,
+    `Artifact: ${compactText(state.artifactDir)}`,
+    `Pi session: ${compactText(state.sessionFile)}`,
+    `Lifecycle: ${artifact?.lifecycle ?? "loading…"}`,
+    `Recent events: ${artifact?.events ?? "loading…"}`,
+    `Output preview: ${artifact?.output ?? "loading…"}`,
   ];
   if (!(state.mux === "tmux" && process.env.TMUX)) {
-    fields.push(`Attach: ${state.attachCommand}`);
+    fields.push(`Attach: ${compactText(state.attachCommand)}`);
   }
-  fields.push(`Focus: ${state.selectPaneCommand}`);
+  fields.push(`Focus: ${compactText(state.selectPaneCommand)}`);
   fields.push(`Return: ${focusReturnHint(state)}`);
   return fields.map((field) => trunc(`│     ${field}`, width));
 }
@@ -650,9 +731,10 @@ function formatInteractiveOrigin(item: InteractiveSupervisorItem): string {
     origin?.source === "lineage" ? "persisted lineage" : "live registry";
   const owner =
     origin?.ownerSessionId ?? item.state.parentSessionId ?? "unknown";
-  const details = [source, `owner=${owner}`];
-  if (origin?.rootId) details.push(`root=${origin.rootId}`);
-  if (origin?.parentAgentId) details.push(`parent=${origin.parentAgentId}`);
+  const details = [source, `owner=${compactText(owner)}`];
+  if (origin?.rootId) details.push(`root=${compactText(origin.rootId)}`);
+  if (origin?.parentAgentId)
+    details.push(`parent=${compactText(origin.parentAgentId)}`);
   return details.join(" · ");
 }
 
@@ -667,11 +749,9 @@ function focusReturnHint(state: InteractiveSubagentState): string {
     : "Ctrl+p, then p (previous pane)";
 }
 
-function readArtifactDetails(state: InteractiveSubagentState): {
-  lifecycle: string;
-  events: string;
-  output: string;
-} {
+async function readArtifactDetails(
+  state: InteractiveSubagentState,
+): Promise<SupervisorArtifactDetails> {
   const lifecycle = state.lifecycle
     ? compactText(
         [
@@ -692,18 +772,18 @@ function readArtifactDetails(state: InteractiveSubagentState): {
   if (state.artifactDir === "unknown") {
     return { lifecycle, events: "none yet", output: "none yet" };
   }
-  const events = summarizeRecentEvents(
+  const [eventsTail, outputTail] = await Promise.all([
     readBoundedFileTail(
       join(state.artifactDir, "events.ndjson"),
       DETAIL_EVENTS_MAX_BYTES,
     ),
-  );
-  const output = compactText(
     readBoundedFileTail(
       join(state.artifactDir, "output.md"),
       DETAIL_OUTPUT_MAX_BYTES,
     ),
-  );
+  ]);
+  const events = summarizeRecentEvents(eventsTail);
+  const output = compactText(outputTail);
   return {
     lifecycle,
     events: events || "none yet",
@@ -711,26 +791,37 @@ function readArtifactDetails(state: InteractiveSubagentState): {
   };
 }
 
-function readBoundedFileTail(filePath: string, maxBytes: number): string {
-  let fd: number | undefined;
+async function readBoundedFileTail(
+  filePath: string,
+  maxBytes: number,
+): Promise<string> {
+  let handle: fsTypes.FileHandle | undefined;
   try {
-    if (!lstatSync(filePath).isFile()) return "";
-    const size = statSync(filePath).size;
+    // lstat, not stat: a symlink here is not a file we agreed to read.
+    if (!(await fs.lstat(filePath)).isFile()) return "";
+    handle = await fs.open(filePath, "r");
+    // Size from the open handle, so the read offset cannot refer to a
+    // different file than the one that was measured.
+    const size = (await handle.stat()).size;
     const bytes = Math.min(size, maxBytes);
+    if (bytes <= 0) return "";
     const buffer = Buffer.alloc(bytes);
-    fd = openSync(filePath, "r");
-    if (bytes > 0) readSync(fd, buffer, 0, bytes, size - bytes);
+    // Honour the short-read count: a file truncated between stat and read
+    // would otherwise leave zero padding in the buffer and silently corrupt
+    // the NDJSON parse.
+    const { bytesRead } = await handle.read(buffer, 0, bytes, size - bytes);
+    const filled = buffer.subarray(0, Math.max(0, bytesRead));
     // Drop leading UTF-8 continuation bytes so a mid-sequence cut does
     // not decode as U+FFFD.
     let start = 0;
-    while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) {
+    while (start < filled.length && (filled[start]! & 0xc0) === 0x80) {
       start++;
     }
-    return buffer.subarray(start).toString("utf8");
+    return filled.subarray(start).toString("utf8");
   } catch {
     return "";
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    await handle?.close().catch(() => {});
   }
 }
 
@@ -782,7 +873,10 @@ function statusIcon(status: string): string {
 }
 
 function formatElapsed(milliseconds: number): string {
-  const seconds = Math.floor(milliseconds / 1_000);
+  // A manifest with an unparseable startedAt reaches here as NaN, which used to
+  // render as the literal "NaNs".
+  if (!Number.isFinite(milliseconds)) return "?";
+  const seconds = Math.floor(Math.max(0, milliseconds) / 1_000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m`;

@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -306,7 +306,10 @@ describe("spawn-time state persistence", () => {
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[state.id]?.paneId).toBe(state.paneId);
     expect(loaded?.states[state.id]?.mux).toBe(state.mux);
-    expect(state.artifactDir.startsWith(cwd)).toBe(true);
+    // Path-segment containment, not a prefix match: `startsWith` would also
+    // accept an unintended sibling such as `${cwd}-other/...`.
+    expect(relative(cwd, state.artifactDir).split(sep)[0]).not.toBe("..");
+    expect(isAbsolute(relative(cwd, state.artifactDir))).toBe(false);
   });
 
   it("launchInteractiveSubagent without parentSessionId does NOT write the state file", async () => {
