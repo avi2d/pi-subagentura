@@ -587,12 +587,12 @@ describe("cancelAllFlows helper", () => {
     workflowJobRegistry.clear();
   });
 
-  it("kills running interactive agents via cancelInteractiveSubagent and preserves idle ones", async () => {
+  it("kills running and unknown interactive agents while preserving idle ones", async () => {
     const { cancelAllFlows } = await import("../src/cancel-all-flows");
 
     // Setup mock to return a state for running-1 (successful cancellation)
     vi.mocked(cancelInteractiveSubagent).mockImplementation((id: string) => {
-      if (id === "running-1") {
+      if (id === "running-1" || id === "unknown-1") {
         return { id, status: "cancelled" } as any;
       }
       return undefined;
@@ -606,6 +606,13 @@ describe("cancelAllFlows helper", () => {
       mux: "tmux",
       artifactDir: "/tmp/art1",
     } as any);
+    interactiveSubagentRegistry.set("unknown-1", {
+      id: "unknown-1",
+      status: "unknown",
+      paneId: "pane-unknown",
+      mux: "tmux",
+      artifactDir: "/tmp/art-unknown",
+    } as any);
     interactiveSubagentRegistry.set("idle-1", {
       id: "idle-1",
       status: "idle",
@@ -618,8 +625,9 @@ describe("cancelAllFlows helper", () => {
 
     // Verify cancelInteractiveSubagent was called for running agent
     expect(cancelInteractiveSubagent).toHaveBeenCalledWith("running-1");
-    // Should kill running but not idle
-    expect(result.interactiveKilled).toBe(1);
+    expect(cancelInteractiveSubagent).toHaveBeenCalledWith("unknown-1");
+    // Running and unknown can both be active; idle remains preserved.
+    expect(result.interactiveKilled).toBe(2);
     expect(result.interactivePreserved).toBe(1);
 
     // Clean up

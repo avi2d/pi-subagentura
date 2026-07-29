@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobRegistry } from "../src/helpers";
@@ -238,6 +238,100 @@ describe("session handler lifecycle callbacks", () => {
     expect(parentUi.setStatus).not.toHaveBeenCalled();
   });
 
+  it("tears down every stale descendant owner before preserving an ancestor", () => {
+    const parent = registerHandlers();
+    const child = registerHandlers();
+    const parentManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    const childManager = {
+      getSessionId: () => "child-session",
+      getEntries: () => [],
+    };
+    parent.handlers.get("session_start")![0]({ reason: "startup" }, {
+      cwd: root,
+      ui: {},
+      sessionManager: parentManager,
+    } as any);
+    child.handlers.get("session_start")![0]({ reason: "startup" }, {
+      cwd: root,
+      ui: {},
+      sessionManager: childManager,
+    } as any);
+
+    const descendantId = 4_244;
+    const descendantGeneration = 1;
+    const descendantSessionId = "descendant-session";
+    const descendantAccessor = vi.fn(() => descendantSessionId);
+    (globalThis as any).__piSubagenturaSessionContextStack.push({
+      id: descendantId,
+      generation: descendantGeneration,
+      lifecycle: "started",
+      pi: {} as any,
+      sessionManager: { getSessionId: descendantAccessor },
+    });
+
+    const workflowAbort = new AbortController();
+    workflowJobRegistry.set("descendant-workflow", {
+      id: "descendant-workflow",
+      status: "running",
+      abort: workflowAbort,
+      parentSessionOwner: {
+        id: descendantId,
+        generation: descendantGeneration,
+      },
+    } as any);
+    const jobAbort = vi.fn().mockResolvedValue(undefined);
+    jobRegistry.set("descendant-job", {
+      id: "descendant-job",
+      status: "running",
+      session: { abort: jobAbort },
+      deliveryOwner: {
+        sessionContextId: descendantId,
+        sessionContextGeneration: descendantGeneration,
+      },
+    } as any);
+    const artifactDir = join(root, "descendant-interactive");
+    mkdirSync(artifactDir, { recursive: true });
+    const descendantState: InteractiveSubagentState = {
+      id: "descendant-interactive",
+      name: "descendant",
+      task: "nested task",
+      paneId: "%descendant",
+      cwd: root,
+      artifactDir,
+      sessionFile: join(root, "descendant.jsonl"),
+      startedAt: Date.now(),
+      mux: "tmux",
+      status: "unknown",
+      parentSessionId: descendantSessionId,
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+    };
+    interactiveSubagentRegistry.set(descendantState.id, descendantState);
+    const killPane = vi.fn();
+    __setTmuxMultiplexer({
+      getPaneLiveness: () => "unknown",
+      killPane,
+    } as any);
+
+    child.handlers.get("session_shutdown")![1]({ reason: "new" }, {
+      cwd: root,
+      sessionManager: childManager,
+    } as any);
+
+    expect(descendantAccessor).toHaveBeenCalledOnce();
+    expect(workflowAbort.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has("descendant-workflow")).toBe(false);
+    expect(jobAbort).toHaveBeenCalledOnce();
+    expect(jobRegistry.has("descendant-job")).toBe(false);
+    expect(interactiveSubagentRegistry.has(descendantState.id)).toBe(false);
+    expect(killPane).toHaveBeenCalledWith("%descendant", undefined);
+    expect((globalThis as any).__piSubagenturaPiRef).toBe(parent.pi);
+  });
+
   it("snapshots owned in-process jobs before a nested shutdown aborts them", () => {
     const snapshotDir = join(root, "snapshots");
     const previousMode = process.env.SUBAGENT_CANCEL_SNAPSHOT;
@@ -332,6 +426,8 @@ describe("session handler lifecycle callbacks", () => {
     // A nested child whose shutdown hook was omitted remains structurally
     // started and its SessionManager still answers. Health probing cannot
     // distinguish this stale descendant from a live ancestor.
+    // Shutdown reads it only after the structural teardown decision, to locate
+    // descendant-owned interactive state.
     const staleAccessor = vi.fn(() => "stale-child-session");
     globalState.__piSubagenturaSessionContextStack.push({
       id: 4_242,
@@ -350,7 +446,7 @@ describe("session handler lifecycle callbacks", () => {
 
     expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
     expect(globalState.__piSubagenturaPiRef).toBeUndefined();
-    expect(staleAccessor).not.toHaveBeenCalled();
+    expect(staleAccessor).toHaveBeenCalledOnce();
     expect(globalState.__piSubagenturaSessionContextStack).toEqual([]);
   });
 

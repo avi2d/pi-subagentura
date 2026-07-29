@@ -131,40 +131,43 @@ function inProcessSupervisorDepth(
   return 1 + inProcessSupervisorDepth(parent, visibleJobs, nextVisiting);
 }
 
+function muxNameForManifest(manifest: LineageManifest): MuxName | undefined {
+  if (manifest.pane.backend === "tmux") return "tmux";
+  if (manifest.pane.backend === "zellij") return "zellij";
+  return undefined;
+}
+
 function stateForNode(
   node: ProjectedLineageNode,
   paneLivenessById?: Map<string, PaneLiveness>,
-): InteractiveSubagentState {
-  const existing = interactiveSubagentRegistry.get(node.manifest.agentId);
-  if (existing) return existing;
+): InteractiveSubagentState | undefined {
   const manifest = node.manifest;
-  const knownBackend =
-    manifest.pane.backend === "tmux" || manifest.pane.backend === "zellij";
-  const mux: MuxName = manifest.pane.backend === "zellij" ? "zellij" : "tmux";
+  const mux = muxNameForManifest(manifest);
+  if (!mux) return undefined;
+  const existing = interactiveSubagentRegistry.get(manifest.agentId);
+  if (existing) return existing;
   const paneLiveness = paneLivenessById?.get(manifest.agentId);
   // tmux's buildAttachCommands resolves the pane's window via execMuxOrThrow,
   // which THROWS for a dead pane. It runs for every projected node, so one
   // finished tmux agent used to make the whole projection reject and the overlay
   // silently degrade to registry-only. Fall back to a session-less string.
   let attach = { attachCommand: "unavailable", focusCommand: "unavailable" };
-  if (knownBackend) {
-    try {
-      attach = getMux({ preference: mux }).buildAttachCommands({
-        paneId: manifest.pane.paneId,
-        windowName: manifest.pane.windowName,
-        session: manifest.pane.muxSession,
-      });
-    } catch {
-      const target = manifest.pane.windowName ?? manifest.pane.paneId;
-      const detail =
-        paneLiveness === "dead"
-          ? `pane ${target} is gone`
-          : `pane ${target} could not be resolved`;
-      attach = {
-        attachCommand: `unavailable (${detail})`,
-        focusCommand: `unavailable (${detail})`,
-      };
-    }
+  try {
+    attach = getMux({ preference: mux }).buildAttachCommands({
+      paneId: manifest.pane.paneId,
+      windowName: manifest.pane.windowName,
+      session: manifest.pane.muxSession,
+    });
+  } catch {
+    const target = manifest.pane.windowName ?? manifest.pane.paneId;
+    const detail =
+      paneLiveness === "dead"
+        ? `pane ${target} is gone`
+        : `pane ${target} could not be resolved`;
+    attach = {
+      attachCommand: `unavailable (${detail})`,
+      focusCommand: `unavailable (${detail})`,
+    };
   }
   // Liveness comes from the pane probe, not from `node.state`. Deriving it from
   // the same field the actionable gate then tests made that gate a tautology
@@ -260,20 +263,23 @@ async function loadSupervisorProjection(
       seen.add(node.manifest.agentId);
     }
   }
-  const items: InteractiveSupervisorItem[] = flattened.map((node) => {
+  const items = flattened.flatMap((node): InteractiveSupervisorItem[] => {
     const state = stateForNode(node, paneLivenessById);
-    return {
-      state,
-      depth: node.depth,
-      actionable:
-        node.state === "actionable" && isInteractiveStateActionable(state),
-      origin: {
-        source: "lineage",
-        rootId: node.manifest.rootId,
-        ownerSessionId: node.manifest.ownerSessionId,
-        parentAgentId: node.manifest.parentAgentId,
+    if (!state) return [];
+    return [
+      {
+        state,
+        depth: node.depth,
+        actionable:
+          node.state === "actionable" && isInteractiveStateActionable(state),
+        origin: {
+          source: "lineage",
+          rootId: node.manifest.rootId,
+          ownerSessionId: node.manifest.ownerSessionId,
+          parentAgentId: node.manifest.parentAgentId,
+        },
       },
-    };
+    ];
   });
   for (const state of interactiveSubagentRegistry.values()) {
     if (sessionId !== undefined && state.parentSessionId !== sessionId)
@@ -461,7 +467,9 @@ export function registerInteractiveSupervisor(
           // are cancelled instead of left running under a dead parent.
           allManifests: snapshotManifests,
           projectionTruncated: snapshotTruncated,
-          isStale: async (node) => node.state !== "actionable",
+          isStale: async (node) =>
+            node.state !== "actionable" ||
+            muxNameForManifest(node.manifest) === undefined,
           isTerminal: async (node) => {
             const direct = interactiveSubagentRegistry.get(
               node.manifest.agentId,
@@ -472,6 +480,7 @@ export function registerInteractiveSupervisor(
           },
           cancel: async (node) => {
             const nodeState = stateForNode(node);
+            if (!nodeState) return;
             if (!cancelInteractiveSubagent(nodeState.id)) {
               cancelInteractiveDescendantByState(nodeState);
             }

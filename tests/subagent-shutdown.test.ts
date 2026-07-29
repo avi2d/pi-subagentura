@@ -199,26 +199,62 @@ describe("session_shutdown handler", () => {
     expect(globalState.__piSubagenturaPiRef).toBe(api);
   });
 
-  it("ignores a started stale descendant during top-level cleanup", () => {
+  it("tears down stale descendant-owned work while preserving an ancestor", () => {
+    setupExtension();
     const { api, shutdownHandler } = setupExtension();
     const globalState = globalThis as any;
-    const staleAccessor = vi.fn(() => "stale-descendant-session");
+    const descendantId = 9_999;
+    const descendantGeneration = 1;
+    const descendantSessionId = "stale-descendant-session";
+    const staleAccessor = vi.fn(() => descendantSessionId);
     globalState.__piSubagenturaSessionContextStack.push({
-      id: 9_999,
-      generation: 1,
+      id: descendantId,
+      generation: descendantGeneration,
       lifecycle: "started",
       pi: api,
-      sessionManager: {
-        getSessionId: staleAccessor,
-      },
+      sessionManager: { getSessionId: staleAccessor },
     });
+    const descendantState = makeState("stale-descendant", "unknown");
+    descendantState.parentSessionId = descendantSessionId;
+    interactiveTmux.interactiveSubagentRegistry.set(
+      descendantState.id,
+      descendantState,
+    );
+    const workflowAbort = new AbortController();
+    workflowJobRegistry.set("stale-descendant-workflow", {
+      id: "stale-descendant-workflow",
+      status: "running",
+      abort: workflowAbort,
+      parentSessionOwner: {
+        id: descendantId,
+        generation: descendantGeneration,
+      },
+    } as any);
+    const jobAbort = vi.fn().mockResolvedValue(undefined);
+    jobRegistry.set("stale-descendant-job", {
+      id: "stale-descendant-job",
+      status: "running",
+      session: { abort: jobAbort },
+      deliveryOwner: {
+        sessionContextId: descendantId,
+        sessionContextGeneration: descendantGeneration,
+      },
+    } as any);
     clearIntervalSpy.mockClear();
 
     shutdownHandler!({ reason: "new" }, { cwd: "/tmp" });
 
-    expect(clearIntervalSpy).toHaveBeenCalledWith(fakeHandle);
-    expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
-    expect(staleAccessor).not.toHaveBeenCalled();
+    expect(clearIntervalSpy).not.toHaveBeenCalled();
+    expect(globalState.__piSubagenturaInteractivePollerHandle).toBe(fakeHandle);
+    expect(staleAccessor).toHaveBeenCalledOnce();
+    expect(cancelByStateSpy).toHaveBeenCalledWith(descendantState);
+    expect(
+      interactiveTmux.interactiveSubagentRegistry.has(descendantState.id),
+    ).toBe(false);
+    expect(workflowAbort.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has("stale-descendant-workflow")).toBe(false);
+    expect(jobAbort).toHaveBeenCalledOnce();
+    expect(jobRegistry.has("stale-descendant-job")).toBe(false);
   });
 
   it("does not kill unrelated panes when the shutdown session id is absent", () => {

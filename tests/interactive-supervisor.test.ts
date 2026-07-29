@@ -149,7 +149,11 @@ async function lineageHarness(rootId: string) {
     paths,
     async writeNode(
       agentId: string,
-      options: { paneId: string; parentAgentId?: string },
+      options: {
+        paneId: string;
+        parentAgentId?: string;
+        backend?: string;
+      },
     ) {
       await writeLineageManifestAtomic(paths.nodesDir, {
         schemaVersion: LINEAGE_SCHEMA_VERSION,
@@ -164,7 +168,10 @@ async function lineageHarness(rootId: string) {
         taskPreview: `inspect ${agentId}`,
         startedAt: new Date(Date.now() - 5_000).toISOString(),
         cwd: sessionRoot,
-        pane: { backend: "tmux", paneId: options.paneId },
+        pane: {
+          backend: options.backend ?? "tmux",
+          paneId: options.paneId,
+        },
         artifactDir: "unknown",
       });
     },
@@ -1299,6 +1306,35 @@ describe("interactive supervisor", () => {
 
     expect(rendered).toContain("agent-unknown");
     expect(await harness.nodeFiles()).toEqual(["unknown.json"]);
+  });
+
+  it("retains unsupported backends without exposing tmux actions", async () => {
+    const harness = await lineageHarness("unsupported-root");
+    await harness.writeNode("unsupported", {
+      paneId: "remote-pane",
+      backend: "remote",
+    });
+    const getPaneLivenessAsync = vi.fn();
+    const buildAttachCommands = vi.fn();
+    const killPane = vi.fn();
+    __setTmuxMultiplexer({
+      getPaneLivenessAsync,
+      getPaneLiveness: vi.fn(),
+      buildAttachCommands,
+      killPane,
+    } as never);
+
+    const { rendered } = await harness.open((component) => {
+      component.handleInput("f");
+      component.handleInput("x");
+      component.handleInput("X");
+    });
+
+    expect(rendered).not.toContain("agent-unsupported");
+    expect(await harness.nodeFiles()).toEqual(["unsupported.json"]);
+    expect(getPaneLivenessAsync).not.toHaveBeenCalled();
+    expect(buildAttachCommands).not.toHaveBeenCalled();
+    expect(killPane).not.toHaveBeenCalled();
   });
 
   it("keeps the persisted tree when one dead pane cannot resolve attach commands", async () => {

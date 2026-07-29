@@ -483,17 +483,30 @@ export async function projectLineageStore(
   // A newest-first read window can include a live child while its older parent
   // falls outside the window. Pull missing ancestors by canonical filename so
   // cap selection can retain complete chains rather than creating cap-induced
-  // orphans. Reads remain bounded by both maxNodes and the projection byte cap.
-  const ancestorQueue = [...manifests.values()];
+  // orphans. The active-node budget may require one dead closure chain per
+  // admitted node, while depth and byte bounds still cap physical reads.
+  const ancestorQueue = [...manifests.values()].map((manifest) => ({
+    manifest,
+    depth: 0,
+  }));
   const attemptedAncestors = new Set(manifests.keys());
+  const ancestorReadLimit = effectiveBounds.maxNodes * effectiveBounds.maxDepth;
   let ancestorReads = 0;
   let ancestorCursor = 0;
   while (ancestorCursor < ancestorQueue.length) {
-    const child = ancestorQueue[ancestorCursor++]!;
+    const { manifest: child, depth } = ancestorQueue[ancestorCursor++]!;
     const parentId = child.parentAgentId;
     if (!parentId || attemptedAncestors.has(parentId)) continue;
+    if (depth >= effectiveBounds.maxDepth) {
+      issues.push({
+        kind: "truncated",
+        agentId: child.agentId,
+        reason: "ancestor depth cap reached",
+      });
+      continue;
+    }
     attemptedAncestors.add(parentId);
-    if (ancestorReads >= effectiveBounds.maxNodes) {
+    if (ancestorReads >= ancestorReadLimit) {
       issues.push({
         kind: "truncated",
         agentId: child.agentId,
@@ -528,7 +541,7 @@ export async function projectLineageStore(
         continue;
       }
       manifests.set(parent.agentId, parent);
-      ancestorQueue.push(parent);
+      ancestorQueue.push({ manifest: parent, depth: depth + 1 });
     } catch (error) {
       if (isNodeError(error, "ENOENT")) continue;
       issues.push({
@@ -742,6 +755,17 @@ export async function projectManifests(
       addReason(manifest.agentId, "malformed");
       continue;
     }
+    if (
+      manifest.pane.backend !== "tmux" &&
+      manifest.pane.backend !== "zellij"
+    ) {
+      issues.push({
+        kind: "malformed",
+        agentId: manifest.agentId,
+        reason: `unsupported pane backend ${manifest.pane.backend}`,
+      });
+      addReason(manifest.agentId, "malformed");
+    }
     candidatesById.set(manifest.agentId, manifest);
   }
 
@@ -756,6 +780,8 @@ export async function projectManifests(
     const recency = right.startedAt.localeCompare(left.startedAt);
     return recency === 0 ? left.agentId.localeCompare(right.agentId) : recency;
   });
+  let activeSelected = 0;
+  let optionalDeadSelected = 0;
   for (const manifest of capOrdered) {
     if (byId.has(manifest.agentId)) continue;
     const chain: LineageManifest[] = [];
@@ -769,7 +795,26 @@ export async function projectManifests(
         ? candidatesById.get(current.parentAgentId)
         : undefined;
     }
-    if (byId.size + chain.length > effectiveBounds.maxNodes) continue;
+    const additionalActive = chain.filter(
+      (member) => !(stale.get(member.agentId) ?? false),
+    ).length;
+    if (activeSelected + additionalActive > effectiveBounds.maxNodes) continue;
+    const endpointIsDead = stale.get(manifest.agentId) ?? false;
+    const additionalOptionalDead = endpointIsDead
+      ? chain.length - additionalActive
+      : 0;
+    if (
+      endpointIsDead &&
+      activeSelected +
+        optionalDeadSelected +
+        additionalActive +
+        additionalOptionalDead >
+        effectiveBounds.maxNodes
+    ) {
+      continue;
+    }
+    activeSelected += additionalActive;
+    if (endpointIsDead) optionalDeadSelected += additionalOptionalDead;
     for (const member of chain.reverse()) {
       byId.set(member.agentId, member);
     }

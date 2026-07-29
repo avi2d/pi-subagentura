@@ -177,16 +177,28 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
         .filter((context) => context.lifecycle === "started");
       const descendants = contextStack.slice(contextIndex + 1);
 
-      const shutdownOwner: ActiveSessionContextToken = {
-        id: sessionContext.id,
-        generation: sessionContext.generation,
-      };
-      let shutdownSessionId: string | undefined;
-      try {
-        shutdownSessionId = ctx?.sessionManager?.getSessionId?.();
-      } catch {
-        shutdownSessionId = undefined;
+      const shutdownOwners: Array<{
+        token: ActiveSessionContextToken;
+        sessionId: string | undefined;
+      }> = [];
+      for (const context of [sessionContext, ...descendants]) {
+        let sessionId: string | undefined;
+        try {
+          const manager =
+            context.sessionManager ??
+            (context.id === sessionContext.id
+              ? ctx?.sessionManager
+              : undefined);
+          sessionId = manager?.getSessionId?.();
+        } catch {
+          sessionId = undefined;
+        }
+        shutdownOwners.push({
+          token: { id: context.id, generation: context.generation },
+          sessionId,
+        });
       }
+      const shutdownSessionId = shutdownOwners[0]!.sessionId;
       sessionContext.lifecycle = "shutdown";
       advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
@@ -198,10 +210,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       setActiveSessionRefs(startedAncestors[startedAncestors.length - 1]);
       g2.__piSubagenturaParentStreaming = false;
 
-      // Context-owned workflows must be torn down even when a nested session
-      // remains active above or below this handler in the global stack.
-      cleanupWorkflowJobsForOwner(shutdownOwner);
-
       // A live ancestor may defer global teardown while this nested context
       // cleans its own state. Descendants never participate in this decision:
       // if their shutdown hook was omitted, their lifecycle is stale.
@@ -212,13 +220,59 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           event?.reason === "quit";
         // An absent session id must match nothing. `parentSessionId` is
         // legitimately undefined for states spawned without a parent session,
-        // and `undefined === undefined` would kill every unrelated pane.
-        const ownedStates =
-          shutdownSessionId === undefined
-            ? []
-            : [...interactiveSubagentRegistry.values()].filter(
-                (state) => state.parentSessionId === shutdownSessionId,
-              );
+        // and `undefined === undefined` would kill unrelated panes.
+        const ownedSessionIds = new Set(
+          shutdownOwners
+            .map((owner) => owner.sessionId)
+            .filter(
+              (sessionId): sessionId is string => sessionId !== undefined,
+            ),
+        );
+        const ownedStates = [...interactiveSubagentRegistry.values()].filter(
+          (state) =>
+            state.parentSessionId !== undefined &&
+            ownedSessionIds.has(state.parentSessionId),
+        );
+        const ownedJobs = shutdownOwners.flatMap((owner) =>
+          [...jobRegistry.entries()]
+            .filter(([, job]) => inProcessJobBelongsToOwner(job, owner.token))
+            .map(([jobId, job]) => ({
+              jobId,
+              job,
+              owner,
+              cancellation: {
+                source: "session_shutdown" as const,
+                initiator: owner.sessionId,
+                reason: `session_shutdown (${event?.reason ?? "unknown"})`,
+              },
+            })),
+        );
+
+        // Snapshot every invalidated owner's in-process job before any of
+        // those sessions is aborted.
+        for (const { job, owner, cancellation } of ownedJobs) {
+          if (job.status !== "running") continue;
+          job.cancellation = { ...cancellation, at: Date.now() };
+          job.cancellationSnapshot = snapshotInProcessSession({
+            kind: "in-process",
+            jobId: job.id,
+            session: job.session,
+            cwd: job.cwd ?? ctx?.cwd ?? process.cwd(),
+            parentSessionId: owner.sessionId,
+            model: job.modelLabel,
+            activeTool: job.liveStatus?.activeTool,
+            partialOutput: job.liveStatus?.output,
+            startedAt: job.startedAt,
+            source: "session_shutdown",
+            initiator: cancellation.initiator,
+            reason: cancellation.reason,
+          });
+        }
+
+        for (const owner of shutdownOwners) {
+          cleanupWorkflowJobsForOwner(owner.token);
+        }
+
         for (const state of ownedStates) {
           interactiveSubagentRegistry.delete(state.id);
           if (
@@ -235,36 +289,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           }
         }
 
-        const cancellation = {
-          source: "session_shutdown" as const,
-          initiator: shutdownSessionId,
-          reason: `session_shutdown (${event?.reason ?? "unknown"})`,
-        };
-        const ownedJobs = [...jobRegistry.entries()].filter(([, job]) =>
-          inProcessJobBelongsToOwner(job, shutdownOwner),
-        );
-        // Snapshot every owned job before any abort can wait for idle. The
-        // top-level path and cancelInProcessFromSupervisor both guarantee a
-        // partial-output snapshot; a nested shutdown must not lose it.
-        for (const [, job] of ownedJobs) {
-          if (job.status !== "running") continue;
-          job.cancellation = { ...cancellation, at: Date.now() };
-          job.cancellationSnapshot = snapshotInProcessSession({
-            kind: "in-process",
-            jobId: job.id,
-            session: job.session,
-            cwd: job.cwd ?? ctx?.cwd ?? process.cwd(),
-            parentSessionId: shutdownSessionId,
-            model: job.modelLabel,
-            activeTool: job.liveStatus?.activeTool,
-            partialOutput: job.liveStatus?.output,
-            startedAt: job.startedAt,
-            source: "session_shutdown",
-            initiator: cancellation.initiator,
-            reason: cancellation.reason,
-          });
-        }
-        for (const [jobId, job] of ownedJobs) {
+        for (const { jobId, job, cancellation } of ownedJobs) {
           if (job.status === "running") {
             try {
               if (job.abort) job.abort.abort(cancellation);
@@ -350,6 +375,9 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           initiator: shutdownCancellation.initiator,
           reason: shutdownCancellation.reason,
         });
+      }
+      for (const owner of shutdownOwners) {
+        cleanupWorkflowJobsForOwner(owner.token);
       }
       // Abort all running subagent sessions before clearing. Prefer the
       // controller so descendants are torn down too.

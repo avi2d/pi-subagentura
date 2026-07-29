@@ -6,7 +6,8 @@
  * - /cancel-all-flows command
  *
  * Preserves idle interactive panes (they consume no tokens).
- * Preserves done/error/cancelled jobs and workflows.
+ * Cancels running and unknown interactive panes; unknown liveness still
+ * represents potentially active work.
  */
 import {
   inProcessJobBelongsToOwner,
@@ -61,7 +62,7 @@ export async function cancelAllFlows(
     (state) => parentSessionBelongsToOwner(state.parentSessionId, owner),
   );
   for (const state of interactiveStates) {
-    if (state.status !== "running") continue;
+    if (state.status !== "running" && state.status !== "unknown") continue;
     state.cancellationSnapshot = snapshotInteractiveContext({
       kind: "interactive",
       id: state.id,
@@ -128,9 +129,9 @@ export async function cancelAllFlows(
     }
   }
 
-  // 3. Kill running interactive agents; preserve idle ones
+  // 3. Kill active interactive agents; preserve confirmed-idle ones
   for (const state of interactiveStates) {
-    if (state.status === "running") {
+    if (state.status === "running" || state.status === "unknown") {
       try {
         const cancelled = cancelInteractiveSubagent(state.id);
         if (cancelled) {

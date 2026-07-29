@@ -364,7 +364,7 @@ describe("interactive lineage node cap", () => {
     expect(projection.manifests).toHaveLength(4);
   });
 
-  it("selects complete live chains atomically under cap pressure", async () => {
+  it("budgets live nodes while retaining their dead ancestor closure", async () => {
     const live = new Set(["older-child", "newer-child"]);
     const projection = await projectManifests(
       [
@@ -388,14 +388,27 @@ describe("interactive lineage node cap", () => {
       { maxNodes: 2 },
     );
 
-    expect(projection.roots).toHaveLength(1);
-    expect(projection.roots[0]?.manifest.agentId).toBe("newer-parent");
-    expect(projection.roots[0]?.children).toHaveLength(1);
-    expect(projection.roots[0]?.children[0]?.manifest.agentId).toBe(
-      "newer-child",
-    );
-    expect(projection.roots[0]?.children[0]?.state).toBe("actionable");
-    expect(projection.roots[0]?.children[0]?.reasons).not.toContain("orphan");
+    expect(projection.roots).toHaveLength(2);
+    const retainedChildren = projection.roots.map((root) => ({
+      parent: root.manifest.agentId,
+      child: root.children[0]?.manifest.agentId,
+      state: root.children[0]?.state,
+      reasons: root.children[0]?.reasons,
+    }));
+    expect(retainedChildren).toEqual([
+      {
+        parent: "older-parent",
+        child: "older-child",
+        state: "actionable",
+        reasons: [],
+      },
+      {
+        parent: "newer-parent",
+        child: "newer-child",
+        state: "actionable",
+        reasons: [],
+      },
+    ]);
   });
 
   it("keeps a probe failure visible instead of treating it as stale", async () => {
@@ -413,6 +426,26 @@ describe("interactive lineage node cap", () => {
     expect(projection.issues).not.toContainEqual(
       expect.objectContaining({ kind: "stale" }),
     );
+  });
+
+  it("retains unsupported pane backends as explicitly non-actionable", async () => {
+    const unsupported = manifest("unsupported", {
+      pane: { backend: "remote", paneId: "remote-pane" },
+    });
+
+    const projection = await projectManifests(
+      [unsupported],
+      rootHash,
+      () => false,
+      { maxNodes: 1 },
+    );
+    expect(projection.roots).toHaveLength(1);
+    expect(projection.roots[0]?.manifest).toBe(unsupported);
+    expect(projection.roots[0]?.state).toBe("non-actionable");
+    expect(projection.nonActionable).toHaveLength(1);
+    expect(projection.nonActionable[0]?.manifest).toBe(unsupported);
+    expect(projection.nonActionable[0]?.reasons).toContain("malformed");
+    expect(projection.manifests).toEqual([unsupported]);
   });
 
   it("reads manifests newest-first so the read window follows a live tree", async () => {
@@ -436,7 +469,7 @@ describe("interactive lineage node cap", () => {
     expect(retained).toEqual(["bbb2"]);
   });
 
-  it("pulls an old stale ancestor into the cap for a retained live child", async () => {
+  it("retains stale closure without charging the active-node cap", async () => {
     const dir = await tempDir();
     const nodesDir = path.join(dir, "nodes");
     await writeLineageManifestAtomic(nodesDir, manifest("stale-parent"));
@@ -463,20 +496,30 @@ describe("interactive lineage node cap", () => {
       new Date(10_000),
       new Date(10_000),
     );
+    await writeLineageManifestAtomic(nodesDir, manifest("live-peer"));
+    await fs.utimes(
+      path.join(nodesDir, "live-peer.json"),
+      new Date(9_000),
+      new Date(9_000),
+    );
 
     const projection = await projectLineageStore(
       nodesDir,
       rootHash,
-      (candidate) => candidate.agentId !== "live-child",
+      (candidate) =>
+        candidate.agentId !== "live-child" && candidate.agentId !== "live-peer",
       { maxNodes: 2 },
     );
 
-    expect(projection.roots).toHaveLength(1);
-    expect(projection.roots[0]?.manifest.agentId).toBe("stale-parent");
-    expect(projection.roots[0]?.children[0]?.manifest.agentId).toBe(
+    const rootById = new Map(
+      projection.roots.map((root) => [root.manifest.agentId, root]),
+    );
+    expect(rootById.size).toBe(2);
+    expect(rootById.get("stale-parent")?.children[0]?.manifest.agentId).toBe(
       "live-child",
     );
-    expect(projection.roots[0]?.children[0]?.state).toBe("actionable");
+    expect(rootById.get("stale-parent")?.children[0]?.state).toBe("actionable");
+    expect(rootById.get("live-peer")?.state).toBe("actionable");
   });
 
   it("probes staleness with bounded concurrency instead of one at a time", async () => {
