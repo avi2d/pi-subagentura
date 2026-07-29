@@ -159,14 +159,23 @@ async function runTrackedWorkflowAgent(
   }
 }
 
-/** Start a workflow running in the background. Returns the job id immediately. */
+export type StartWorkflowJobOptions = Omit<
+  RunWorkflowOptions,
+  "signal" | "onProgress" | "onCancellationSnapshot"
+>;
+
+/**
+ * Start a workflow running in the background. Returns the job id immediately.
+ *
+ * `opts` may be a builder so callers that need the job id while constructing the
+ * options (e.g. to tag spawned children with their owning `workflowId`) receive it
+ * before `runWorkflow` can invoke `runAgent`.
+ */
 export function startWorkflowJob(
   name: string,
   script: string,
-  opts: Omit<
-    RunWorkflowOptions,
-    "signal" | "onProgress" | "onCancellationSnapshot"
-  >,
+  optsOrBuilder:
+    StartWorkflowJobOptions | ((workflowId: string) => StartWorkflowJobOptions),
   startedAt?: number,
   onComplete?: (job: WorkflowJobState) => boolean | void,
   owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
@@ -194,6 +203,8 @@ export function startWorkflowJob(
   }
 
   const id = `wf_${randomBytes(5).toString("hex")}`;
+  const opts =
+    typeof optsOrBuilder === "function" ? optsOrBuilder(id) : optsOrBuilder;
   const abort = new AbortController();
   const state: WorkflowJobState = {
     id,
