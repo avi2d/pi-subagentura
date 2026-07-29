@@ -366,6 +366,85 @@ test("focusPane targets the pane's own session when window names collide", async
   tmux(["kill-session", "-t", "collide-b"]);
 });
 
+test("buildAttachCommands emits window targets real tmux resolves unambiguously", async () => {
+  // Companion guard to the `focusPane` test above, for the OTHER half of the
+  // same ambiguity: the copy-paste strings we hand the user. These were
+  // session-unqualified (`select-window -t reviewer`), and real tmux answers a
+  // bare name target from whichever session it scans first while exiting 0 — so
+  // the "focus your sub-agent" command silently drove a different agent's
+  // window. Unlike the mocked suites, this executes the emitted strings.
+  const mux = new TmuxMultiplexer();
+  const windowName = "reviewer";
+  const panes: Record<string, string> = {};
+
+  for (const session of ["attach-a", "attach-b"]) {
+    tmux(["new-session", "-d", "-s", session, "-n", "home"]);
+    panes[session] = tmux([
+      "new-window",
+      "-d",
+      "-t",
+      session,
+      "-n",
+      windowName,
+      "-P",
+      "-F",
+      "#{pane_id}",
+    ]).trim();
+  }
+
+  const activeWindow = (session: string): string =>
+    tmux([
+      "display-message",
+      "-p",
+      "-t",
+      `${session}:`,
+      "#{window_name}",
+    ]).trim();
+
+  const cmds = mux.buildAttachCommands({
+    paneId: panes["attach-a"]!,
+    windowName,
+  });
+  expect(cmds.focusCommand).toContain(`'attach-a:${windowName}'`);
+  expect(cmds.attachCommand).toContain(`'attach-a:${windowName}'`);
+
+  // 1. The focusCommand, run verbatim through a shell, moves the requested
+  //    session and leaves the identically-named window in the other one alone.
+  expect(activeWindow("attach-a")).toBe("home");
+  expect(activeWindow("attach-b")).toBe("home");
+  execFileSync("/bin/sh", ["-c", cmds.focusCommand], { stdio: "ignore" });
+  expect(activeWindow("attach-a")).toBe(windowName);
+  expect(activeWindow("attach-b")).toBe("home");
+
+  // 2. The attachCommand's `attach \; select-window` chain also has to work,
+  //    and it needs a real terminal to attach to — so run it inside a tmux pane
+  //    (which owns a pty) with $TMUX unset, the situation a user pasting into a
+  //    plain shell is in. `sleep` keeps the client alive long enough to observe.
+  tmux(["select-window", "-t", "attach-a:home"]);
+  expect(activeWindow("attach-a")).toBe("home");
+  tmux([
+    "new-session",
+    "-d",
+    "-s",
+    "attach-driver",
+    `unset TMUX; ${cmds.attachCommand}; sleep 60`,
+  ]);
+
+  await waitFor(
+    () =>
+      tmux(["list-clients", "-t", "attach-a", "-F", "#{client_name}"]).trim()
+        .length > 0,
+    "the emitted attachCommand never attached a client to attach-a",
+  );
+  // The chained select-window landed on the right window, in the right session.
+  expect(activeWindow("attach-a")).toBe(windowName);
+  expect(activeWindow("attach-b")).toBe("home");
+
+  tmux(["kill-session", "-t", "attach-driver"]);
+  tmux(["kill-session", "-t", "attach-a"]);
+  tmux(["kill-session", "-t", "attach-b"]);
+});
+
 test("safeSegment window names stay selectable in real tmux", async () => {
   // `safeSegment` must exclude `.`: tmux target syntax reads `window.pane`, so
   // a window literally named `review.v2` is creatable but not selectable

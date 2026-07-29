@@ -494,21 +494,29 @@ export class TmuxMultiplexer implements Multiplexer {
     if (opts.windowName) {
       // Background mode: pane lives in a named detached window. Attach
       // command chains `attach -t <session>` with
-      // `select-window -t <windowName>` so it works from outside the
-      // session too. Inside-tmux callers get the same effect via `\;`
-      // chaining — the attach errors with "nested sessions" but the
-      // select-window still runs.
+      // `select-window -t <session>:<windowName>` so it works from outside the
+      // session too.
+      //
+      // The window target MUST carry the session qualifier. Window names are
+      // `safeSegment(name)`, so two sub-agents both called "reviewer" collide,
+      // and a bare name target resolves against whichever session tmux scans
+      // first: verified against tmux 3.7b, `select-window -t reviewer` with
+      // `reviewer` windows in both `collide-a` and `collide-b` moves
+      // `collide-b` — the most recently created session — and exits 0. That is
+      // the same silent wrong-agent focus `focusPane` was fixed for, except
+      // here it lands in a string we hand the user to paste.
+      //
+      // Note the `\;` chain is genuinely for outside-tmux use: from inside a
+      // session on the same server, tmux refuses with "sessions should be
+      // nested with care, unset $TMUX to force" and the chained select-window
+      // does NOT run either (verified 3.7b). Inside-tmux callers get
+      // `focusCommand`, which is why it is a standalone command.
       const location = getPaneLocation(opts.paneId);
       const tmux = tmuxCommandPrefix();
-      // FIXME(pr65): these two window targets are still session-unqualified, so
-      // with two sub-agents sharing a safe-segmented name they send the user to
-      // whichever session tmux scans first — the same ambiguity `focusPane` was
-      // fixed for. The fix is `${location.session}:${opts.windowName}`, but the
-      // assertions that pin these strings live in `tests/interactive-tmux.test.ts`,
-      // which is owned elsewhere; see the handoff note in the PR review reply.
+      const targetWindow = `${location.session}:${opts.windowName}`;
       return {
-        attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
-        focusCommand: `${tmux} select-window -t ${shellEscape(opts.windowName)}`,
+        attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(targetWindow)}`,
+        focusCommand: `${tmux} select-window -t ${shellEscape(targetWindow)}`,
       };
     }
     // Visible split: attach by pane id inside the parent's window.

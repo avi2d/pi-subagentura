@@ -328,8 +328,15 @@ describe("multiplexer-tmux", () => {
     expect(commands.attachCommand).toContain(
       "tmux attach -t 'pi-subagent-abc12345'",
     );
-    expect(commands.attachCommand).toContain("select-window -t 'second'");
-    expect(commands.focusCommand).toBe("tmux select-window -t 'second'");
+    // Window targets carry the session returned by display-message, so the
+    // second agent's window cannot be confused with an identically-named window
+    // in another session.
+    expect(commands.attachCommand).toContain(
+      "select-window -t 'pi-subagent-abc12345:second'",
+    );
+    expect(commands.focusCommand).toBe(
+      "tmux select-window -t 'pi-subagent-abc12345:second'",
+    );
   });
 
   it("createPane relaxed path validates pane id starts with %", async () => {
@@ -597,9 +604,12 @@ describe("multiplexer-tmux", () => {
     expect(cmds.attachCommand).toContain("tmux attach -t 'main'");
     // \; is the tmux command separator for chaining
     expect(cmds.attachCommand).toContain("\\;");
-    expect(cmds.attachCommand).toContain("select-window -t 'demo'");
+    // Session-qualified window target — `-t 'demo'` alone is ambiguous across
+    // sessions and silently selects the wrong one (see the real-binary guard in
+    // tests/tmux.integration.test.ts).
+    expect(cmds.attachCommand).toContain("select-window -t 'main:demo'");
 
-    expect(cmds.focusCommand).toBe("tmux select-window -t 'demo'");
+    expect(cmds.focusCommand).toBe("tmux select-window -t 'main:demo'");
   });
 
   /* ------------------------------------------------------------------ */
