@@ -176,7 +176,7 @@ describe("session_shutdown handler", () => {
   let tmpRoot: string;
 
   it("replaces a pre-session legacy poller on session_start", () => {
-    setupExtension({ startSession: false });
+    const first = setupExtension({ startSession: false });
     const { api } = setupExtension({ startSession: false });
     const globalState = globalThis as any;
     const legacyHandle = { unref: vi.fn() };
@@ -190,9 +190,59 @@ describe("session_shutdown handler", () => {
     expect(clearIntervalSpy).toHaveBeenCalledWith(legacyHandle);
     expect(setIntervalSpy).toHaveBeenCalledTimes(1);
     expect(fakeHandle.unref).toHaveBeenCalledTimes(1);
-    expect(globalState.__piSubagenturaSessionContextStack).toHaveLength(1);
-    expect(globalState.__piSubagenturaSessionContextStack[0].pi).toBe(api);
+    // Pre-start eviction is scoped to the starting handler's own context; the
+    // other extension's placeholder is not ours to drop.
+    const stack = globalState.__piSubagenturaSessionContextStack;
+    expect(stack).toHaveLength(2);
+    expect(stack[0].pi).toBe(first.api);
+    expect(stack.at(-1).pi).toBe(api);
     expect(globalState.__piSubagenturaPiRef).toBe(api);
+  });
+
+  it("sweeps a dead nested context so it cannot suppress top-level cleanup", () => {
+    const { api, shutdownHandler } = setupExtension();
+    const globalState = globalThis as any;
+    // A nested session that started and then crashed: the object survives in
+    // the stack but its session manager no longer answers.
+    globalState.__piSubagenturaSessionContextStack.push({
+      id: 9_999,
+      generation: 1,
+      pi: api,
+      sessionManager: {
+        getSessionId: () => {
+          throw new Error("stale session manager");
+        },
+      },
+    });
+    clearIntervalSpy.mockClear();
+
+    shutdownHandler!({ reason: "new" }, { cwd: "/tmp" });
+
+    expect(clearIntervalSpy).toHaveBeenCalledWith(fakeHandle);
+    expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
+  });
+
+  it("does not kill unrelated panes when the shutdown session id is absent", () => {
+    const { shutdownHandler } = setupExtension();
+    const globalState = globalThis as any;
+    // A live nested context keeps the handler on the nested branch.
+    globalState.__piSubagenturaSessionContextStack.push({
+      id: 9_998,
+      generation: 1,
+      pi: {} as any,
+      sessionManager: { getSessionId: () => "other-session" },
+    });
+    const orphan = makeState("no-parent", "running");
+    delete (orphan as { parentSessionId?: string }).parentSessionId;
+    interactiveTmux.interactiveSubagentRegistry.set(orphan.id, orphan);
+
+    // No sessionManager on ctx → shutdownSessionId is undefined.
+    shutdownHandler!({ reason: "new" }, { cwd: "/tmp" });
+
+    expect(cancelByStateSpy).not.toHaveBeenCalled();
+    expect(interactiveTmux.interactiveSubagentRegistry.has(orphan.id)).toBe(
+      true,
+    );
   });
 
   it("clearIntervals the poller in session_shutdown", () => {

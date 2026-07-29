@@ -50,15 +50,44 @@ function ensureInteractivePoller(globalState: any): void {
   globalState.__piSubagenturaInteractivePollerHandle = handle;
 }
 
+/**
+ * Whether a registered context still belongs to a session that can answer for
+ * itself. A started-then-crashed child keeps its `sessionManager` object but the
+ * host tears the session down, so `getSessionId` throws or stops answering — the
+ * same signal the poller already uses to decide widget ownership.
+ */
+function isSessionContextLive(context: SessionContextRef): boolean {
+  if (context.sessionManager === undefined) return false;
+  try {
+    return typeof context.sessionManager.getSessionId?.() === "string";
+  } catch {
+    return false;
+  }
+}
+
+/** A context that started and then died. Never-started ones are not "dead". */
+function isDeadSessionContext(context: SessionContextRef): boolean {
+  return context.sessionManager !== undefined && !isSessionContextLive(context);
+}
+
 // Older releases could start a poller during extension preload, before project
 // package overrides selected the live runtime. Replace that orphan on session_start.
-function discardPreSessionPollerState(globalState: any): void {
+function discardPreSessionPollerState(
+  globalState: any,
+  sessionContext: SessionContextRef,
+): void {
   const contexts = [...getSessionContextStack()];
   const hasStartedContext = contexts.some(
     (context) => context.sessionManager !== undefined,
   );
   for (const context of contexts) {
-    if (context.sessionManager === undefined) {
+    // Only THIS handler's own pre-start placeholder may be evicted for a
+    // missing sessionManager — another session's placeholder is not ours to
+    // drop. Contexts that started and then died are swept regardless: left in
+    // the stack they would suppress the owning session's shutdown cleanup.
+    const ownPreStart =
+      context.id === sessionContext.id && context.sessionManager === undefined;
+    if (ownPreStart || isDeadSessionContext(context)) {
       removeSessionContext(context.id);
     }
   }
@@ -101,7 +130,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       id: sessionContext.id,
       generation: sessionContext.generation,
     };
-    discardPreSessionPollerState(g2);
+    discardPreSessionPollerState(g2, sessionContext);
     cleanupWorkflowJobsForOwner(previousOwner);
     removeSessionContext(sessionContext.id);
     sessionContext.generation++;
@@ -155,7 +184,6 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       );
       if (contextIndex < 0) return;
 
-      const wasTop = contextIndex === contextStack.length - 1;
       const shutdownOwner: ActiveSessionContextToken = {
         id: sessionContext.id,
         generation: sessionContext.generation,
@@ -168,21 +196,37 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       }
       advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
-      setActiveSessionRefs(contextStack[contextStack.length - 1]);
+      // Hand the active refs to the newest context that can still answer for
+      // itself; a crashed one must not become the live session's stand-in.
+      setActiveSessionRefs(
+        [...contextStack].reverse().find(isSessionContextLive),
+      );
       g2.__piSubagenturaParentStreaming = false;
 
       // Context-owned workflows must be torn down even when a nested session
       // remains active above or below this handler in the global stack.
       cleanupWorkflowJobsForOwner(shutdownOwner);
 
-      if (!wasTop || contextStack.length > 0) {
+      // Only a context that can still answer for itself may defer the
+      // top-level teardown. A nested context that crashed (or a host that
+      // never emits session_shutdown for it) would otherwise sit in the stack
+      // forever and permanently suppress poller teardown, snapshots, and pane
+      // kills for the session that is actually shutting down. This context was
+      // already spliced out above, so anything left here belongs to a sibling.
+      if (contextStack.some(isSessionContextLive)) {
         const preserveInteractivePanes =
           event?.reason === "reload" ||
           event?.reason === "resume" ||
           event?.reason === "quit";
-        const ownedStates = [...interactiveSubagentRegistry.values()].filter(
-          (state) => state.parentSessionId === shutdownSessionId,
-        );
+        // An absent session id must match nothing. `parentSessionId` is
+        // legitimately undefined for states spawned without a parent session,
+        // and `undefined === undefined` would kill every unrelated pane.
+        const ownedStates =
+          shutdownSessionId === undefined
+            ? []
+            : [...interactiveSubagentRegistry.values()].filter(
+                (state) => state.parentSessionId === shutdownSessionId,
+              );
         for (const state of ownedStates) {
           interactiveSubagentRegistry.delete(state.id);
           if (
@@ -202,10 +246,32 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           initiator: shutdownSessionId,
           reason: `session_shutdown (${event?.reason ?? "unknown"})`,
         };
-        for (const [jobId, job] of jobRegistry.entries()) {
-          if (!inProcessJobBelongsToOwner(job, shutdownOwner)) continue;
+        const ownedJobs = [...jobRegistry.entries()].filter(([, job]) =>
+          inProcessJobBelongsToOwner(job, shutdownOwner),
+        );
+        // Snapshot every owned job before any abort can wait for idle. The
+        // top-level path and cancelInProcessFromSupervisor both guarantee a
+        // partial-output snapshot; a nested shutdown must not lose it.
+        for (const [, job] of ownedJobs) {
+          if (job.status !== "running") continue;
+          job.cancellation = { ...cancellation, at: Date.now() };
+          job.cancellationSnapshot = snapshotInProcessSession({
+            kind: "in-process",
+            jobId: job.id,
+            session: job.session,
+            cwd: job.cwd ?? ctx?.cwd ?? process.cwd(),
+            parentSessionId: shutdownSessionId,
+            model: job.modelLabel,
+            activeTool: job.liveStatus?.activeTool,
+            partialOutput: job.liveStatus?.output,
+            startedAt: job.startedAt,
+            source: "session_shutdown",
+            initiator: cancellation.initiator,
+            reason: cancellation.reason,
+          });
+        }
+        for (const [jobId, job] of ownedJobs) {
           if (job.status === "running") {
-            job.cancellation = { ...cancellation, at: Date.now() };
             try {
               if (job.abort) job.abort.abort(cancellation);
               else void job.session.abort().catch(() => {});

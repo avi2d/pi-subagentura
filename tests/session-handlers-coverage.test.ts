@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobRegistry } from "../src/helpers";
@@ -203,6 +203,149 @@ describe("session handler lifecycle callbacks", () => {
 
     updateRunningSubagentFooter(parentUi as any);
     expect(parentUi.setStatus).not.toHaveBeenCalled();
+  });
+
+  it("snapshots owned in-process jobs before a nested shutdown aborts them", () => {
+    const snapshotDir = join(root, "snapshots");
+    const previousMode = process.env.SUBAGENT_CANCEL_SNAPSHOT;
+    const previousDir = process.env.SUBAGENT_CANCEL_SNAPSHOT_DIR;
+    process.env.SUBAGENT_CANCEL_SNAPSHOT = "full";
+    process.env.SUBAGENT_CANCEL_SNAPSHOT_DIR = snapshotDir;
+    try {
+      const parent = registerHandlers();
+      const child = registerHandlers();
+      const parentManager = {
+        getSessionId: () => "parent-session",
+        getEntries: () => [],
+      };
+      const childManager = {
+        getSessionId: () => "child-session",
+        getEntries: () => [],
+      };
+      parent.handlers.get("session_start")![0]({ reason: "startup" }, {
+        cwd: root,
+        ui: {},
+        sessionManager: parentManager,
+      } as any);
+      child.handlers.get("session_start")![0]({ reason: "startup" }, {
+        cwd: root,
+        ui: {},
+        sessionManager: childManager,
+      } as any);
+      const abort = new AbortController();
+      const childJob = {
+        id: "nested-job",
+        status: "running",
+        abort,
+        cwd: root,
+        startedAt: Date.now(),
+        liveStatus: {
+          turn: 2,
+          output: "half-written analysis",
+          activeTool: { name: "read", args: { path: "src/main.ts" } },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 2,
+          },
+        },
+        session: { abort: vi.fn(), sessionId: "child-session" },
+        promise: new Promise<never>(() => {}),
+        deliveryOwner: {
+          pi: {} as never,
+          sessionContextId: child.sessionContext.id,
+          sessionContextGeneration: child.sessionContext.generation,
+        },
+      } as any;
+      jobRegistry.set(childJob.id, childJob);
+
+      child.handlers.get("session_shutdown")![1]({ reason: "agent_settled" }, {
+        cwd: root,
+        sessionManager: childManager,
+      } as any);
+
+      expect(abort.signal.aborted).toBe(true);
+      expect(jobRegistry.has(childJob.id)).toBe(false);
+      expect(childJob.cancellation?.source).toBe("session_shutdown");
+      expect(childJob.cancellationSnapshot?.status).toBe("written");
+      const written = readFileSync(childJob.cancellationSnapshot.path, "utf8");
+      expect(written).toContain("half-written analysis");
+    } finally {
+      if (previousMode === undefined)
+        delete process.env.SUBAGENT_CANCEL_SNAPSHOT;
+      else process.env.SUBAGENT_CANCEL_SNAPSHOT = previousMode;
+      if (previousDir === undefined)
+        delete process.env.SUBAGENT_CANCEL_SNAPSHOT_DIR;
+      else process.env.SUBAGENT_CANCEL_SNAPSHOT_DIR = previousDir;
+    }
+  });
+
+  it("runs top-level cleanup even when a crashed nested context lingers", () => {
+    const parent = registerHandlers();
+    const parentManager = {
+      getSessionId: () => "parent-session",
+      getEntries: () => [],
+    };
+    parent.handlers.get("session_start")![0]({ reason: "startup" }, {
+      cwd: root,
+      ui: {},
+      sessionManager: parentManager,
+    } as any);
+    const globalState = globalThis as any;
+    expect(globalState.__piSubagenturaInteractivePollerHandle).toBeDefined();
+    // A nested child that started and then died: still in the stack, but its
+    // session manager no longer answers.
+    globalState.__piSubagenturaSessionContextStack.push({
+      id: 4_242,
+      generation: 1,
+      pi: {} as any,
+      sessionManager: {
+        getSessionId: () => {
+          throw new Error("stale session manager");
+        },
+      },
+    });
+
+    parent.handlers.get("session_shutdown")![1]({ reason: "new" }, {
+      cwd: root,
+      sessionManager: parentManager,
+    } as any);
+
+    expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
+    expect(globalState.__piSubagenturaPiRef).toBeUndefined();
+  });
+
+  it("sweeps dead contexts on session_start", () => {
+    const parent = registerHandlers();
+    const globalState = globalThis as any;
+    globalState.__piSubagenturaSessionContextStack.push({
+      id: 4_243,
+      generation: 1,
+      pi: {} as any,
+      sessionManager: {
+        getSessionId: () => {
+          throw new Error("stale session manager");
+        },
+      },
+    });
+
+    parent.handlers.get("session_start")![0]({ reason: "startup" }, {
+      cwd: root,
+      ui: {},
+      sessionManager: {
+        getSessionId: () => "parent-session",
+        getEntries: () => [],
+      },
+    } as any);
+
+    expect(
+      globalState.__piSubagenturaSessionContextStack.map(
+        (entry: { id: number }) => entry.id,
+      ),
+    ).toEqual([parent.sessionContext.id]);
   });
 
   it("polls every live owner from the single global interval", async () => {
