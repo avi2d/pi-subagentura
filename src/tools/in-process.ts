@@ -79,7 +79,7 @@ type InProcessSubagentDetails =
   | { status: "cancelled" | "not_found"; jobId?: string };
 
 function updateRunningFooter(ctx: RunningFooterContext): void {
-  updateRunningSubagentFooter(ctx.ui);
+  updateRunningSubagentFooter(ctx.ui, getActiveSessionContextToken());
 }
 
 const ZERO_USAGE: Usage = {
