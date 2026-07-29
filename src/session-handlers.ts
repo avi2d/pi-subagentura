@@ -58,23 +58,113 @@ function discardPreSessionPollerState(
   sessionContext: SessionContextRef,
 ): void {
   const contexts = [...getSessionContextStack()];
-  const hasStartedContext = contexts.some(
-    (context) => context.lifecycle === "started",
-  );
   const ownIndex = contexts.findIndex(
     (context) => context.id === sessionContext.id,
   );
-  for (const [index, context] of contexts.entries()) {
-    // A started context after this ancestor belongs to an older nested
-    // lifecycle whose shutdown was omitted. Stack position, not a
-    // SessionManager accessor, is the reliable ownership signal.
-    const staleDescendant =
-      ownIndex >= 0 && index > ownIndex && context.lifecycle === "started";
-    if (staleDescendant) {
-      context.lifecycle = "shutdown";
-      advanceSessionContextGeneration(context.id);
-      removeSessionContext(context.id);
+  const staleDescendants =
+    ownIndex < 0
+      ? []
+      : contexts
+          .slice(ownIndex + 1)
+          .filter((context) => context.lifecycle === "started");
+  const staleIds = new Set(staleDescendants.map((context) => context.id));
+  const hasStartedContext = contexts.some(
+    (context) => context.lifecycle === "started" && !staleIds.has(context.id),
+  );
+  const staleOwners: Array<{
+    token: ActiveSessionContextToken;
+    sessionId: string | undefined;
+  }> = [];
+  for (const context of staleDescendants) {
+    let sessionId: string | undefined;
+    try {
+      sessionId = context.sessionManager?.getSessionId?.();
+    } catch {
+      sessionId = undefined;
     }
+    staleOwners.push({
+      token: { id: context.id, generation: context.generation },
+      sessionId,
+    });
+  }
+
+  const ownedJobs = staleOwners.flatMap((owner) =>
+    [...jobRegistry.entries()]
+      .filter(([, job]) => inProcessJobBelongsToOwner(job, owner.token))
+      .map(([jobId, job]) => ({
+        jobId,
+        job,
+        owner,
+        cancellation: {
+          source: "session_shutdown" as const,
+          initiator: owner.sessionId,
+          reason: "session_start removed a stale descendant context",
+        },
+      })),
+  );
+  for (const { job, owner, cancellation } of ownedJobs) {
+    if (job.status !== "running") continue;
+    job.cancellation = { ...cancellation, at: Date.now() };
+    job.cancellationSnapshot = snapshotInProcessSession({
+      kind: "in-process",
+      jobId: job.id,
+      session: job.session,
+      cwd: job.cwd ?? process.cwd(),
+      parentSessionId: owner.sessionId,
+      model: job.modelLabel,
+      activeTool: job.liveStatus?.activeTool,
+      partialOutput: job.liveStatus?.output,
+      startedAt: job.startedAt,
+      source: "session_shutdown",
+      initiator: cancellation.initiator,
+      reason: cancellation.reason,
+    });
+  }
+  for (const owner of staleOwners) {
+    cleanupWorkflowJobsForOwner(owner.token);
+  }
+
+  const staleSessionIds = new Set(
+    staleOwners
+      .map((owner) => owner.sessionId)
+      .filter((sessionId): sessionId is string => sessionId !== undefined),
+  );
+  for (const state of [...interactiveSubagentRegistry.values()]) {
+    if (
+      state.parentSessionId === undefined ||
+      !staleSessionIds.has(state.parentSessionId)
+    ) {
+      continue;
+    }
+    interactiveSubagentRegistry.delete(state.id);
+    if (
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown"
+    ) {
+      try {
+        cancelInteractiveSubagentByState(state);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+  for (const { jobId, job, cancellation } of ownedJobs) {
+    if (job.status === "running") {
+      try {
+        if (job.abort) job.abort.abort(cancellation);
+        else void job.session.abort().catch(() => {});
+      } catch {
+        /* session may already be disposed */
+      }
+    }
+    jobRegistry.delete(jobId);
+  }
+
+  for (const context of staleDescendants) {
+    context.lifecycle = "shutdown";
+    advanceSessionContextGeneration(context.id);
+    removeSessionContext(context.id);
   }
   const handle = globalState.__piSubagenturaInteractivePollerHandle;
   if (hasStartedContext || !handle) return;

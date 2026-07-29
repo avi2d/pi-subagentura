@@ -450,7 +450,7 @@ describe("session handler lifecycle callbacks", () => {
     expect(globalState.__piSubagenturaSessionContextStack).toEqual([]);
   });
 
-  it("sweeps structurally stale descendants on session_start without health probing", () => {
+  it("tears down stale descendant ownership on session_start", () => {
     const parent = registerHandlers();
     const globalState = globalThis as any;
     const staleAccessor = vi.fn(() => "stale-child-session");
@@ -463,6 +463,47 @@ describe("session handler lifecycle callbacks", () => {
         getSessionId: staleAccessor,
       },
     });
+    const workflowAbort = new AbortController();
+    workflowJobRegistry.set("startup-stale-workflow", {
+      id: "startup-stale-workflow",
+      status: "running",
+      abort: workflowAbort,
+      parentSessionOwner: { id: 4_243, generation: 1 },
+    } as any);
+    const jobAbort = vi.fn().mockResolvedValue(undefined);
+    jobRegistry.set("startup-stale-job", {
+      id: "startup-stale-job",
+      status: "running",
+      session: { abort: jobAbort },
+      deliveryOwner: {
+        sessionContextId: 4_243,
+        sessionContextGeneration: 1,
+      },
+    } as any);
+    const artifactDir = join(root, "startup-stale-interactive");
+    mkdirSync(artifactDir, { recursive: true });
+    const staleState: InteractiveSubagentState = {
+      id: "startup-stale-interactive",
+      name: "startup stale",
+      task: "stale task",
+      paneId: "%startup-stale",
+      cwd: root,
+      artifactDir,
+      sessionFile: join(root, "startup-stale.jsonl"),
+      startedAt: Date.now(),
+      mux: "tmux",
+      status: "unknown",
+      parentSessionId: "stale-child-session",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+    };
+    interactiveSubagentRegistry.set(staleState.id, staleState);
+    const killPane = vi.fn();
+    __setTmuxMultiplexer({
+      getPaneLiveness: () => "unknown",
+      killPane,
+    } as any);
 
     parent.handlers.get("session_start")![0]({ reason: "startup" }, {
       cwd: root,
@@ -478,7 +519,14 @@ describe("session handler lifecycle callbacks", () => {
         (entry: { id: number }) => entry.id,
       ),
     ).toEqual([parent.sessionContext.id]);
-    expect(staleAccessor).not.toHaveBeenCalled();
+    expect(staleAccessor).toHaveBeenCalledOnce();
+    expect(workflowAbort.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has("startup-stale-workflow")).toBe(false);
+    expect(jobAbort).toHaveBeenCalledOnce();
+    expect(jobRegistry.has("startup-stale-job")).toBe(false);
+    expect(interactiveSubagentRegistry.has(staleState.id)).toBe(false);
+    expect(killPane).toHaveBeenCalledWith("%startup-stale", undefined);
+    expect(globalState.__piSubagenturaInteractivePollerHandle).toBeDefined();
   });
 
   it("polls every live owner from the single global interval", async () => {
