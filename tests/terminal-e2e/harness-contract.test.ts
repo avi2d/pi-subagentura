@@ -99,7 +99,7 @@ describe("terminal harness lifecycle", () => {
       });
       child.kill("SIGTERM");
       const result = await exited;
-      const processes = execFileSync("ps", ["-axo", "command="], {
+      const processes = execFileSync("ps", ["-axww", "-o", "command="], {
         encoding: "utf8",
       });
 
@@ -114,6 +114,9 @@ describe("terminal harness lifecycle", () => {
     } finally {
       if (child.exitCode === null) child.kill("SIGKILL");
     }
-    expect(stderr).toBe("");
+    // Assert the absence of the thing under test, not an empty stream: the child
+    // is `node --eval`, so one ExperimentalWarning on a Node minor bump would
+    // otherwise fail a test about signal handling.
+    expect(stderr).not.toMatch(/emergency cleanup failed|teardown incomplete/);
   }, 30_000);
 });

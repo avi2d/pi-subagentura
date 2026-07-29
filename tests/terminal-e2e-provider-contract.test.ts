@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,7 +13,7 @@ import {
   streamTextForTest,
   streamThinkingForTest,
   waitForGate,
-} from "./fixtures/mock-provider";
+} from "./terminal-e2e/fixtures/mock-provider";
 
 const model = { provider: E2E_PROVIDER, id: E2E_MODEL, api: E2E_API } as any;
 let gateDir: string;
@@ -159,7 +159,13 @@ describe("scripted terminal provider contract", () => {
       context({ role: "user", content: "[E2E:CHILD_SYNC_CONTEXT]" }),
       { signal: controller.signal },
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Poll for the gate-wait state instead of sleeping: this tree has no fixed
+    // sleeps and adding one here would make the test time-dependent.
+    await vi.waitFor(() =>
+      expect(
+        getMockProviderState().get("[E2E:CHILD_SYNC_CONTEXT]")?.stage,
+      ).toBe("gated"),
+    );
     controller.abort();
     const result = await events(stream);
     expect(result.map((event) => event.type)).toEqual(["start", "error"]);

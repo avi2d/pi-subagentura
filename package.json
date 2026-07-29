@@ -111,7 +111,7 @@
     "format:check": "prettier --check .",
     "hooks:install": "simple-git-hooks",
     "pack:check": "npm pack --dry-run",
-    "test:tui": "vitest run --testTimeout=60000 tests/terminal-e2e/provider-contract.test.ts tests/terminal-e2e/network-guard.test.ts tests/terminal-e2e/harness-contract.test.ts tests/terminal-e2e/terminal.test.ts",
+    "test:tui": "vitest run --testTimeout=60000 tests/terminal-e2e/",
     "demo:tui": "bash tests/terminal-e2e/demo.sh",
     "record:tui": "bash tests/terminal-e2e/record-webm.sh"
   },

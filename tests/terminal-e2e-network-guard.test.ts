@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
+// Needs neither tmux nor Pi, so it lives in the normal unit suite and runs on
+// every `npm test` rather than only under `test:tui`.
 const guard = fileURLToPath(
-  new URL("./fixtures/deny-network.cjs", import.meta.url),
+  new URL("./terminal-e2e/fixtures/deny-network.cjs", import.meta.url),
 );
 const temporaryRoots: string[] = [];
 
@@ -51,33 +53,58 @@ afterEach(() => {
   }
 });
 
+function runGuarded(source: string) {
+  const root = mkdtempSync(join(tmpdir(), "subagentura-network-guard-"));
+  const log = join(root, "network.ndjson");
+  temporaryRoots.push(root);
+
+  const result = spawnSync(
+    process.execPath,
+    ["--require", guard, "--eval", source],
+    {
+      encoding: "utf8",
+      timeout: 2_000,
+      env: { ...process.env, SUBAGENTURA_E2E_NETWORK_LOG: log },
+    },
+  );
+  const records = existsSync(log)
+    ? readFileSync(log, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    : [];
+  return { result, records };
+}
+
 describe("terminal E2E network guard", () => {
   it.each(escapePaths)("denies $name before transport", ({ source, kind }) => {
-    const root = mkdtempSync(join(tmpdir(), "subagentura-network-guard-"));
-    const log = join(root, "network.ndjson");
-    temporaryRoots.push(root);
-
-    const result = spawnSync(
-      process.execPath,
-      ["--require", guard, "--eval", source],
-      {
-        encoding: "utf8",
-        timeout: 2_000,
-        env: { ...process.env, SUBAGENTURA_E2E_NETWORK_LOG: log },
-      },
-    );
-    const records = existsSync(log)
-      ? readFileSync(log, "utf8")
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line))
-      : [];
+    const { result, records } = runGuarded(source);
 
     expect(result.error).toBeUndefined();
     expect(result.status).not.toBe(0);
     expect(records).toEqual(
       expect.arrayContaining([expect.objectContaining({ kind })]),
+    );
+  });
+
+  it("records that it armed, so an empty log cannot pass vacuously", () => {
+    const { records } = runGuarded("process.exit(0)");
+
+    expect(records).toEqual([
+      expect.objectContaining({ kind: "armed", pid: expect.any(Number) }),
+    ]);
+  });
+
+  it("labels a UNIX socket attempt local so it cannot read as egress", () => {
+    const { records } = runGuarded(
+      'require("node:net").connect("/tmp/subagentura-e2e-absent.sock")',
+    );
+
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "node:net.connect", scope: "local" }),
+      ]),
     );
   });
 });
