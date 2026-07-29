@@ -31,10 +31,9 @@ import {
 } from "./helpers";
 import { registerWorkflowTool } from "./workflow";
 import {
+  ONLY_INTERACTIVE_MAINTENANCE_TOOLS,
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
-  registerSubagentArtifactsCleanupTool,
-  registerSubagentModelListTool,
 } from "./tools/in-process";
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
@@ -84,6 +83,43 @@ const ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
   "utf8",
 ).trim();
 
+/**
+ * Reduced orchestration guidance for only-interactive mode: the full prompt
+ * instructs the model to use in-process and script-orchestration tools that are
+ * not registered in that mode.
+ */
+const ONLY_INTERACTIVE_ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
+  new URL("../ORCHESTRATOR_ONLY_INTERACTIVE_SYSTEM_PROMPT.md", import.meta.url),
+  "utf8",
+).trim();
+
+/**
+ * Detects only-interactive mode from load-time signals — deliberately NOT from
+ * `pi.getFlag("only-interactive")`.
+ *
+ * `getFlag` is unusable during activation: Pi must load extensions first to
+ * learn which flags exist, and applies CLI flag values only afterwards
+ * (`resourceLoader.reload()` runs every extension factory before
+ * `applyExtensionFlagValues()` in @earendil-works/pi-coding-agent's
+ * `core/agent-session-services.js`). Until that point `getFlag` returns the
+ * default `registerFlag` seeded — i.e. `false` — so a flag read here always
+ * loses. Flags are only readable lazily, from inside an event handler; see the
+ * `before_agent_start` handler below, which is why `--orchestrator` can use
+ * `getFlag`.
+ *
+ * This mode decides *tool registration*, which happens during activation, so it
+ * reads the signals that already exist then: the env var (programmatic and test
+ * use) and raw argv (so the documented CLI flag works). `--only-interactive` is
+ * still registered via `registerFlag` so `--help` lists it and Pi's flag
+ * validation accepts it.
+ */
+function isOnlyInteractiveMode(): boolean {
+  return (
+    process.env.PI_SUBAGENTURA_ONLY_INTERACTIVE === "1" ||
+    process.argv.includes("--only-interactive")
+  );
+}
+
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENTURA_CHILD === "1") {
     registerChildProtocol(pi);
@@ -108,23 +144,29 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
   pi.registerFlag("only-interactive", {
-    description: "Enable only interactive sub-agent tools",
+    description:
+      "Register only attachable interactive sub-agent tools, model listing, and artifact cleanup",
     type: "boolean",
     default: false,
   });
-  const onlyInteractive = pi.getFlag("only-interactive") === true;
+  const onlyInteractive = isOnlyInteractiveMode();
   pi.on("before_agent_start", (event) => {
     if (pi.getFlag("orchestrator") !== true) return;
+    const prompt = onlyInteractive
+      ? ONLY_INTERACTIVE_ORCHESTRATOR_SYSTEM_PROMPT
+      : ORCHESTRATOR_SYSTEM_PROMPT;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${ORCHESTRATOR_SYSTEM_PROMPT}`,
+      systemPrompt: `${event.systemPrompt}\n\n${prompt}`,
     };
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-const sessionScope = registerSessionHandlers(pi);
+  const sessionScope = registerSessionHandlers(pi);
   registerInteractiveSubagentTools(pi, sessionScope);
   if (onlyInteractive) {
-    registerSubagentArtifactsCleanupTool(pi, sessionScope);
-    registerSubagentModelListTool(pi);
+    registerInProcessMaintenanceTools(pi, {
+      scope: sessionScope,
+      include: ONLY_INTERACTIVE_MAINTENANCE_TOOLS,
+    });
   } else {
     registerWorkflowTool(pi, sessionScope);
     registerInProcessSubagentTools(pi, sessionScope);
