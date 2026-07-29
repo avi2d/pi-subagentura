@@ -39,7 +39,10 @@ import {
 import { InteractiveParams } from "../schemas";
 import { updateRunningSubagentFooter } from "../artifact-poller";
 
-const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
+const SUBAGENT_ID_INVALID_CHAR_RE = /[^a-f0-9]/;
+function isValidSubagentId(id: string): boolean {
+  return id.length === 16 && !SUBAGENT_ID_INVALID_CHAR_RE.test(id);
+}
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
 const FOLLOWUP_COMPLETION_REMINDER =
@@ -51,13 +54,13 @@ function formatFollowupPreview(message: string): string {
 }
 
 export function findArtifactById(id: string): SubagentArtifact | null {
-  // Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
-  // chars. Validate the id before joining it into a path so that an
+  // Sub-agent ids are randomBytes(8).toString("hex") at spawn time, i.e. 16
+  // lowercase hex chars. Validate the id before joining it into a path so that an
   // LLM-supplied id like "../../../etc" can't escape the artifact root
   // (path.join normalises "..", so a malicious id would otherwise resolve
   // to a sibling directory and get exfiltrated to the parent LLM via
   // read_subagent_artifact).
-  if (!SUBAGENT_ID_RE.test(id)) return null;
+  if (!isValidSubagentId(id)) return null;
 
   const root =
     process.env.PI_CODING_AGENT_SESSION_DIR ??
@@ -402,12 +405,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     async execute(_toolCallId, params): Promise<any> {
       // Validate the id shape first for a precise error.
-      if (!SUBAGENT_ID_RE.test(params.id)) {
+      if (!isValidSubagentId(params.id)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },
@@ -569,12 +572,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     async execute(_toolCallId, params): Promise<any> {
       // Validate the id shape FIRST so a malformed id gets a precise error
       // instead of being collapsed into the generic "not found" message.
-      if (!SUBAGENT_ID_RE.test(params.id)) {
+      if (!isValidSubagentId(params.id)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },

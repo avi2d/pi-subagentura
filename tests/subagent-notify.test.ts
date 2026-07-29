@@ -1568,24 +1568,29 @@ describe("read_subagent_artifact (invalid id)", () => {
     cleanGlobals();
   });
 
-  it("returns status:invalid_id with a precise message for a malformed id", async () => {
+  it.each([
+    "not-a-hex-id",
+    "deadbeefcafebabe\n",
+    "deadbeefcafebabe\r\n",
+    "deadbeefcafebabe\u2028",
+    "deadbeefcafebabe\u2029",
+  ])("returns invalid_id with a precise message for %j", async (id) => {
     const toolDef = setupReadArtifactTool();
     expect(toolDef).toBeDefined();
 
     const result = await toolDef.execute(
       "call-malformed",
-      { id: "not-a-hex-id" },
+      { id },
       undefined,
       undefined,
       {} as any,
     );
 
     expect(result.isError).toBe(true);
-    expect(result.details.status).toBe("invalid_id");
-    expect(result.details.id).toBe("not-a-hex-id");
+    expect(result.details).toMatchObject({ id, status: "invalid_id" });
     const text = result.content[0].text;
     expect(text).toContain("Invalid sub-agent id");
-    expect(text).toContain("not-a-hex-id");
+    expect(text).toContain(JSON.stringify(id).slice(1, -1));
   });
 });
 
@@ -1649,7 +1654,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(sub-agent exited without writing output.md — last event: done @ <ts>)' when output.md is missing and the agent finished", async () => {
-    const id = "ab12cd34";
+    const id = "ab12cd3400000001";
     const parent = tmp();
     try {
       const { state } = makeArtifactWithDone(id, parent);
@@ -1679,7 +1684,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports a protocol-v2 completion as exited when output.md is missing", async () => {
-    const id = "ab12cd38";
+    const id = "ab12cd3800000002";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent, false);
@@ -1715,7 +1720,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports a protocol-v2 process exit as exited when output.md is missing", async () => {
-    const id = "ab12cd39";
+    const id = "ab12cd3900000003";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent, false);
@@ -1753,7 +1758,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(<N> events, last: <type> @ <ts> — output.md not written yet)' when output.md is missing and the agent is still running", async () => {
-    const id = "ab12cd35";
+    const id = "ab12cd3500000004";
     const parent = tmp();
     try {
       const dir = join(parent, id);
@@ -1805,7 +1810,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(empty — 0 chars)' when output.md exists but is empty", async () => {
-    const id = "ab12cd36";
+    const id = "ab12cd3600000005";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1832,7 +1837,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '<N> chars' when output.md has content", async () => {
-    const id = "ab12cd37";
+    const id = "ab12cd3700000006";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1859,7 +1864,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reads protocol-v2 history by Pi turnId and lists the turn mapping", async () => {
-    const id = "ab12cd38";
+    const id = "ab12cd3800000007";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1910,7 +1915,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("rejects ambiguous legacy turn and protocol-v2 turnId selectors", async () => {
-    const id = "ab12cd39";
+    const id = "ab12cd3900000008";
     const parent = tmp();
     try {
       const { state } = makeArtifactWithDone(id, parent);

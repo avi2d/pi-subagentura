@@ -55,7 +55,7 @@ function getToolDef(
 
 function runningState(overrides: Record<string, any> = {}) {
   return {
-    id: "abc12345",
+    id: "abc12345def67890",
     name: "Test",
     paneId: "%99",
     status: "running",
@@ -86,24 +86,24 @@ describe("send_interactive_subagent_message", () => {
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-1", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "now do step 2",
     });
 
-    expect(mockGet).toHaveBeenCalledWith("abc12345");
+    expect(mockGet).toHaveBeenCalledWith("abc12345def67890");
     expect(mockSendCommandToPane).toHaveBeenCalledWith(
       expect.objectContaining({ paneId: "%99" }),
       expect.stringMatching(/^now do step 2 \[MANDATORY COMPLETION PROTOCOL/),
     );
     expect(result.isError).toBeFalsy();
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       paneId: "%99",
       messageLength: "now do step 2".length,
       status: "sent",
     });
     expect(result.content[0].text).toContain(
-      "Sent follow-up to interactive sub-agent abc12345",
+      "Sent follow-up to interactive sub-agent abc12345def67890",
     );
     expect(result.content[0].text).toContain("pane %99");
     expect(result.content[0].text).toContain("Message sent:\nnow do step 2");
@@ -115,7 +115,7 @@ describe("send_interactive_subagent_message", () => {
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     await toolDef.execute("call-reminder", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "inspect the second case",
     });
 
@@ -133,7 +133,7 @@ describe("send_interactive_subagent_message", () => {
     const message = "a".repeat(600);
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-long", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -156,7 +156,7 @@ describe("send_interactive_subagent_message", () => {
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-1b", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "follow-up after turn 1",
     });
 
@@ -170,17 +170,23 @@ describe("send_interactive_subagent_message", () => {
     expect(result.details.status).toBe("sent");
   });
 
-  it("rejects malformed ids with a precise error", async () => {
+  it.each([
+    "not-hex",
+    "deadbeefcafebabe\n",
+    "deadbeefcafebabe\r\n",
+    "deadbeefcafebabe\u2028",
+    "deadbeefcafebabe\u2029",
+  ])("rejects malformed id %j with a precise error", async (id) => {
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-2", {
-      id: "not-hex",
+      id,
       message: "hi",
     });
 
     expect(mockGet).not.toHaveBeenCalled();
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
-    expect(result.details.status).toBe("invalid_id");
+    expect(result.details).toMatchObject({ id, status: "invalid_id" });
     expect(result.content[0].text).toMatch(/Invalid sub-agent id/);
   });
 
@@ -191,7 +197,7 @@ describe("send_interactive_subagent_message", () => {
       // reject it before any registry / tmux work happens.
       const toolDef = getToolDef(api, "send_interactive_subagent_message");
       const result = await toolDef.execute("call-empty", {
-        id: "abc12345",
+        id: "abc12345def67890",
         message,
       });
 
@@ -210,7 +216,7 @@ describe("send_interactive_subagent_message", () => {
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const message = "x".repeat(64 * 1024 + 1);
     const result = await toolDef.execute("call-huge", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -218,7 +224,7 @@ describe("send_interactive_subagent_message", () => {
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       status: "message_too_large",
       messageLength: 64 * 1024 + 1,
       maxBytes: 64 * 1024,
@@ -235,7 +241,7 @@ describe("send_interactive_subagent_message", () => {
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const message = "x".repeat(64 * 1024);
     const result = await toolDef.execute("call-boundary", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -251,7 +257,7 @@ describe("send_interactive_subagent_message", () => {
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-3", {
-      id: "deadbeef",
+      id: "deadbeefcafebabe",
       message: "hi",
     });
 
@@ -267,7 +273,7 @@ describe("send_interactive_subagent_message", () => {
 
       const toolDef = getToolDef(api, "send_interactive_subagent_message");
       const result = await toolDef.execute("call-4", {
-        id: "abc12345",
+        id: "abc12345def67890",
         message: "hi",
       });
 
@@ -286,13 +292,13 @@ describe("send_interactive_subagent_message", () => {
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-5", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "hi",
     });
 
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       paneId: "%99",
       status: "send_failed",
     });
