@@ -55,6 +55,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux
 
+      # zellij is not in apt, so pull the prebuilt musl binary from the release
+      # the backend is verified against. Without a real zellij on PATH the whole
+      # zellij suite is mocked, which is exactly how a `dump-screen` argv that
+      # zellij rejects outright shipped with CI green.
+      - name: Install zellij
+        env:
+          ZELLIJ_VERSION: v0.44.3
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zellij.tar.gz \
+            "https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz"
+          sudo tar -xzf /tmp/zellij.tar.gz -C /usr/local/bin zellij
+          sudo chmod +x /usr/local/bin/zellij
+          zellij --version
+
       - name: Type check
         run: npm run typecheck
       - name: Run unit tests
@@ -66,6 +81,11 @@ jobs:
         run: npm run test:tmux
         env:
           PI_SUBAGENTURA_TMUX_SOCKET: pi-subagentura-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          TERM: xterm-256color
+
+      - name: Run zellij integration tests
+        run: npm run test:zellij
+        env:
           TERM: xterm-256color
 
       - name: Format check
