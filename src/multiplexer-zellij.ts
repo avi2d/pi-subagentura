@@ -487,6 +487,52 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   /**
+   * Whether a client is attached to `session`.
+   *
+   * Deliberately resolves `undefined` — "cannot determine" — for any session
+   * that is still alive. zellij's `list-sessions` reports creation age and an
+   * `EXITED` marker but says nothing about attachment: a background session
+   * nobody has ever attached to prints exactly the same line as an attached one
+   * (verified against 0.44.3 — `zellij attach --create-background <n>` then
+   * `list-sessions --no-formatting` yields `<n> [Created 1s ago]`, with no
+   * marker to test). Guessing here would make the supervisor warn "not attached"
+   * at random, which is worse than staying quiet, so the consumer's
+   * feature-detection path is left to no-op on this backend.
+   *
+   * A session that is gone or `EXITED` is the one case we can answer: it
+   * definitively has no attached client, so that resolves `false`.
+   */
+  hasAttachedClientAsync(session?: string): Promise<boolean | undefined> {
+    if (!session) return Promise.resolve(undefined);
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "zellij",
+          ["list-sessions", "--no-formatting"],
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            if (error) {
+              resolve(undefined);
+              return;
+            }
+            const line = stdout
+              .split("\n")
+              .find((row) => row.trim().startsWith(`${session} `));
+            // Absent or explicitly exited ⇒ certainly unattached.
+            if (!line || line.includes("EXITED")) {
+              resolve(false);
+              return;
+            }
+            resolve(undefined);
+          },
+        );
+      } catch {
+        resolve(undefined);
+      }
+    });
+  }
+
+  /**
    * Open the bounded supervisor content in a floating zellij pane.
    *
    * Kept behaviourally identical to the tmux twin: spawn asynchronously, resolve

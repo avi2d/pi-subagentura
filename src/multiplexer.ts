@@ -236,6 +236,13 @@ export interface Multiplexer {
   showNativeViewer(title: string, content: string): Promise<boolean>;
 
   /**
+   * Whether at least one client is currently attached to the session hosting
+   * this backend's panes. `undefined` = cannot determine.
+   * MUST NOT throw; resolve undefined on backend errors.
+   */
+  hasAttachedClientAsync?(session?: string): Promise<boolean | undefined>;
+
+  /**
    * Build the user-facing commands to attach to (or focus) the child's pane.
    *
    * Two forms are returned because the UX differs based on whether the user
