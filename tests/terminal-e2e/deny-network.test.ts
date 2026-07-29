@@ -47,6 +47,26 @@ describe("terminal E2E network guard scope", () => {
     );
   });
 
+  it.each([
+    [
+      "third-argument host options",
+      'require("node:tls").connect(443, "localhost", { host: "example.com" })',
+      "egress",
+    ],
+    [
+      "third-argument hostname options",
+      'require("node:tls").connect(443, "example.com", { hostname: "localhost" })',
+      "local",
+    ],
+    [
+      "numeric-string port",
+      'require("node:net").connect("443", "example.com")',
+      "egress",
+    ],
+  ])("normalizes connect overload %s", (_overload, source, scope) => {
+    expect(deniedEvent(source)).toEqual(expect.objectContaining({ scope }));
+  });
+
   it.each(["host", "hostname"])(
     "labels remote HTTP options using %s as egress even with a request path",
     (hostKey) => {
@@ -65,13 +85,18 @@ describe("terminal E2E network guard scope", () => {
 
   it.each([
     [
-      "hostname",
+      "explicit hostname",
       'require("node:http").request(new URL("http://example.com/"), { hostname: "localhost", path: "/" })',
       "local",
     ],
     [
-      "host",
-      'require("node:http").get("http://localhost/", { host: "example.com", path: "/" })',
+      "URL hostname before explicit host",
+      'require("node:http").get("http://localhost/", { host: "example.com" })',
+      "local",
+    ],
+    [
+      "reverse URL hostname before explicit host",
+      'require("node:http").get("http://example.com/", { host: "localhost" })',
       "egress",
     ],
     [
@@ -84,12 +109,9 @@ describe("terminal E2E network guard scope", () => {
       'require("node:http").get("http://example.com/", { path: "/" })',
       "egress",
     ],
-  ])(
-    "applies HTTP URL options %s before classifying the URL host",
-    (_override, source, scope) => {
-      expect(deniedEvent(source)).toEqual(expect.objectContaining({ scope }));
-    },
-  );
+  ])("normalizes HTTP options %s", (_case, source, scope) => {
+    expect(deniedEvent(source)).toEqual(expect.objectContaining({ scope }));
+  });
 
   it.each([
     [

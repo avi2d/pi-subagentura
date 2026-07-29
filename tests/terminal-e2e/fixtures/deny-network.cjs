@@ -25,69 +25,125 @@ function scopeOfHost(host) {
   return LOOPBACK.test(String(host)) ? "local" : "egress";
 }
 
-function scopeOfOptions(options, pathIsSocket) {
-  if (!options || typeof options !== "object") return undefined;
-  if (options.socketPath != null) return "local";
-  if (pathIsSocket && options.path != null) return "local";
-  const host = options.hostname ?? options.host;
-  return host == null ? undefined : scopeOfHost(host);
+const HTTP_METHODS = new Set([
+  "node:http.request",
+  "node:http.get",
+  "node:https.request",
+  "node:https.get",
+]);
+
+const IPC_CONNECT_METHODS = new Set([
+  "node:net.connect",
+  "node:net.createConnection",
+  "node:net.Socket.connect",
+  "node:tls.connect",
+  "node:tls.createConnection",
+  "node:tls.TLSSocket.connect",
+]);
+
+function optionsFromUrl(value) {
+  let url = value;
+  if (typeof value === "string") {
+    try {
+      url = new URL(value);
+    } catch {
+      return { host: value };
+    }
+  }
+  return { hostname: url.hostname };
 }
 
-function scopeOf(kind, args) {
-  const [target, positionalHost] = args;
-  const isHttpRequest =
-    kind === "node:http.request" ||
-    kind === "node:http.get" ||
-    kind === "node:https.request" ||
-    kind === "node:https.get";
-  const isIpcConnect =
-    kind === "node:net.connect" ||
-    kind === "node:net.createConnection" ||
-    kind === "node:net.Socket.connect" ||
-    kind === "node:tls.connect" ||
-    kind === "node:tls.createConnection" ||
-    kind === "node:tls.TLSSocket.connect";
+function normalizeHttpTarget(args) {
+  const input = args[0];
+  const baseOptions =
+    input instanceof URL || typeof input === "string"
+      ? optionsFromUrl(input)
+      : input && typeof input === "object"
+        ? input
+        : {};
+  const overrides =
+    args[1] && typeof args[1] === "object" ? args[1] : undefined;
+  const options = overrides ? { ...baseOptions, ...overrides } : baseOptions;
+  return {
+    socket: options.socketPath != null,
+    host: options.hostname ?? options.host,
+    defaultLocal: true,
+  };
+}
 
-  if (isHttpRequest && (target instanceof URL || typeof target === "string")) {
-    const overrideScope = scopeOfOptions(args[1], false);
-    if (overrideScope) return overrideScope;
-  }
-
-  if (target instanceof URL) return scopeOfHost(target.hostname);
-
-  if (target && typeof target === "object") {
-    const optionsScope = scopeOfOptions(target, !isHttpRequest);
-    if (optionsScope) return optionsScope;
-    if (target.url != null) return scopeOf(kind, [target.url]);
-    // HTTP request options without a host use Node's loopback default. Their
-    // `.path` is an HTTP request target, not a UNIX socket path.
-    if (isHttpRequest) return "local";
-    return "egress";
-  }
-
-  if (typeof target === "number") {
-    if (typeof positionalHost === "string") {
-      return scopeOfHost(positionalHost);
+function normalizeConnectTarget(args) {
+  const input = args[0];
+  const options = {};
+  for (const argument of args) {
+    if (argument && typeof argument === "object") {
+      Object.assign(options, argument);
     }
-    const optionsScope = scopeOfOptions(positionalHost, true);
-    return optionsScope ?? "local";
   }
 
-  // In the net/tls connect overloads a string first argument is an IPC path,
-  // including relative and Linux abstract socket names.
-  if (isIpcConnect && typeof target === "string") return "local";
+  if (input && typeof input === "object") {
+    return {
+      socket: options.socketPath != null || options.path != null,
+      host: options.hostname ?? options.host,
+      defaultLocal: true,
+    };
+  }
 
-  const text = String(target ?? "");
+  const isPort =
+    typeof input === "number" ||
+    (typeof input === "string" && /^\d+$/.test(input));
+  if (!isPort && typeof input === "string") {
+    return { socket: true, host: undefined, defaultLocal: true };
+  }
+
+  const positionalHost = typeof args[1] === "string" ? args[1] : undefined;
+  return {
+    socket: options.socketPath != null || options.path != null,
+    host: options.hostname ?? options.host ?? positionalHost,
+    defaultLocal: true,
+  };
+}
+
+function normalizeGenericTarget(args) {
+  const input = args[0];
+  if (input instanceof URL) {
+    return { socket: false, host: input.hostname, defaultLocal: false };
+  }
+  if (input && typeof input === "object") {
+    if (input.url != null) return normalizeGenericTarget([input.url]);
+    return {
+      socket: input.socketPath != null || input.path != null,
+      host: input.hostname ?? input.host,
+      defaultLocal: false,
+    };
+  }
+  if (typeof input === "number") {
+    const host = typeof args[1] === "string" ? args[1] : undefined;
+    return { socket: false, host, defaultLocal: host == null };
+  }
+
+  const text = String(input ?? "");
   try {
     const url = new URL(text);
-    if (url.hostname) return scopeOfHost(url.hostname);
+    if (url.hostname) {
+      return { socket: false, host: url.hostname, defaultLocal: false };
+    }
   } catch {
     /* not a URL */
   }
-  if (!isHttpRequest && (text.startsWith("/") || text.startsWith("./"))) {
+  const socket = text.startsWith("/") || text.startsWith("./");
+  return { socket, host: socket ? undefined : text, defaultLocal: false };
+}
+
+function scopeOf(kind, args) {
+  const target = HTTP_METHODS.has(kind)
+    ? normalizeHttpTarget(args)
+    : IPC_CONNECT_METHODS.has(kind)
+      ? normalizeConnectTarget(args)
+      : normalizeGenericTarget(args);
+  if (target.socket || (target.host == null && target.defaultLocal)) {
     return "local";
   }
-  return LOOPBACK.test(text) ? "local" : "egress";
+  return target.host == null ? "egress" : scopeOfHost(target.host);
 }
 
 function deny(kind, args) {
