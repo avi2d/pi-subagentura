@@ -1,42 +1,37 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createHarness, type TerminalHarness } from "./harness.mjs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { gateForMarker } from "./fixtures/mock-provider";
+import {
+  createHarness,
+  tmuxVersion,
+  type TerminalHarness,
+} from "./harness.mjs";
 import { getScenario } from "./scenarios.mjs";
 
 const timeout = 60_000;
-const harnesses: TerminalHarness[] = [];
-const failedHarnesses = new Set<TerminalHarness>();
 let harness: TerminalHarness;
+
+/**
+ * `C-M-a` needs `extended-keys-format csi-u`, which tmux only understands from
+ * 3.5. ubuntu-latest ships 3.4, so the shortcut test is *reported as skipped*
+ * there rather than silently not executing inside a passing test body.
+ */
+const tmux = tmuxVersion();
+const supportsExtendedKeyShortcut =
+  tmux.major > 3 || (tmux.major === 3 && tmux.minor >= 5);
 
 beforeEach(() => {
   harness = createHarness({ scenario: "terminal" });
-  harnesses.push(harness);
 });
 
-afterEach((context) => {
-  const failed = context.task.result?.state === "fail";
-  if (!failed) return;
-  failedHarnesses.add(harness);
-  try {
-    harness.diagnostics();
-  } catch (error) {
-    console.error(`terminal E2E diagnostics failed: ${error}`);
-  }
-});
-
-afterAll(async () => {
-  const results = await Promise.allSettled(
-    harnesses.map((candidate) =>
-      candidate.cleanup(failedHarnesses.has(candidate)),
-    ),
-  );
-  const errors = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
-  );
-  if (errors.length > 0)
-    throw new AggregateError(errors, "suite teardown failed");
+// Every harness owns a tmux server, a real Pi process, retained child panes and a
+// temp tree. Tearing them down here instead of in one afterAll keeps later tests
+// off the load created by earlier ones and keeps teardown out of a single hook
+// whose blocking, serialized work has no parallelism to gain.
+afterEach(async (context) => {
+  await harness.cleanup(context.task.result?.state === "fail");
 }, timeout);
 
 function hasStage(
@@ -53,8 +48,7 @@ async function startScenario(name: string): Promise<void> {
   const scenario = getScenario(name);
   harness.scenario = name;
   await harness.start();
-  harness.sendText(scenario.prompt);
-  harness.pressEnter();
+  await harness.sendPrompt(scenario.prompt);
 }
 
 async function waitForParentSettled(marker: string): Promise<void> {
@@ -69,8 +63,7 @@ async function waitForParentSettled(marker: string): Promise<void> {
 }
 
 async function sendMarker(marker: string): Promise<void> {
-  harness.sendText(`${marker} Continue the deterministic fixture.`);
-  harness.pressEnter();
+  await harness.sendPrompt(`${marker} Continue the deterministic fixture.`);
   await waitForParentSettled(marker);
 }
 
@@ -86,16 +79,22 @@ async function runGatedScenario(name: string): Promise<void> {
     (events) => hasStage(events, scenario.child!, "gated"),
     `${name} child gate`,
   );
-  expect(harness.currentScreen()).toContain(toolName);
+  // The provider log is written by the child before the parent TUI repaints, so
+  // the tool call needs its own wait rather than a synchronous read.
+  await harness.waitForScreen(
+    (screen) => screen.includes(toolName),
+    `${name} tool call rendered`,
+  );
   harness.release(scenario.gate!);
   await harness.waitForProvider(
     (events) => hasStage(events, scenario.child!, "complete"),
     `${name} child completion`,
   );
   await waitForParentSettled(scenario.marker);
-  const screen = harness.currentScreen();
-  expect(screen).toContain(`Parent settled for ${scenario.marker}`);
-  expect(screen).toMatch(new RegExp(scenario.expected, "i"));
+  await harness.waitForScreen(
+    (screen) => screen.includes(scenario.expected),
+    `${name} rendered ${scenario.expected}`,
+  );
   await harness.assertNoNetwork();
 }
 
@@ -109,8 +108,7 @@ function childPane() {
 }
 
 async function openSupervisor(): Promise<void> {
-  harness.sendText("/subagents");
-  harness.pressEnter();
+  await harness.sendPrompt("/subagents");
   await harness.waitForScreen(
     (screen) => screen.includes("Async Subagents"),
     "supervisor overlay",
@@ -146,7 +144,11 @@ describe("real Pi terminal E2E", () => {
     "starts a real Pi editor in the isolated PTY",
     async () => {
       await harness.start();
-      expect(harness.currentScreen()).toMatch(/›|>|Pi|pi/i);
+      // start() gates on the editor key hints, so assert the things it does not:
+      // the scripted model is selected and both extensions loaded.
+      const screen = harness.renderedScreen();
+      expect(screen).toContain("mock • medium");
+      expect(screen).toContain("mock-provider.ts, subagent.ts");
       expect(harness.panes()).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ session: expect.stringMatching(/^e2e-/) }),
@@ -209,10 +211,18 @@ describe("real Pi terminal E2E", () => {
         "async child gate",
       );
       await waitForParentSettled(scenario.marker);
-      expect(harness.currentScreen()).toMatch(/started|working|subagent/i);
+      await harness.waitForScreen(
+        (screen) => screen.includes(scenario.expected),
+        "async start notice",
+      );
 
       await sendMarker("[E2E:ASYNC_STATUS]");
-      expect(harness.currentScreen()).toMatch(/running|status|Parent settled/i);
+      // The job-id suffix distinguishes the status *tool call* from the
+      // "Use get_subagent_status to check progress." hint painted earlier.
+      await harness.waitForScreen(
+        (screen) => /get_subagent_status [a-f0-9]{16}/.test(screen),
+        "status tool call rendered",
+      );
       const parentCallsBeforeRelease = harness
         .providerEvents()
         .filter((event) => event.marker === scenario.marker).length;
@@ -223,7 +233,7 @@ describe("real Pi terminal E2E", () => {
         "async completion",
       );
       await harness.waitForScreen(
-        (screen) => /completion|completed|sub-agent/i.test(screen),
+        (screen) => /✅ Job [a-f0-9]{16} done/.test(screen),
         "async completion notification",
       );
       expect(
@@ -233,7 +243,10 @@ describe("real Pi terminal E2E", () => {
       ).toHaveLength(parentCallsBeforeRelease);
 
       await sendMarker("[E2E:ASYNC_RESULT]");
-      expect(harness.currentScreen()).toMatch(/result|Parent settled/i);
+      await harness.waitForScreen(
+        (screen) => /get_subagent_result [a-f0-9]{16}/.test(screen),
+        "result tool call rendered",
+      );
       await harness.assertNoNetwork();
     },
     timeout,
@@ -243,7 +256,10 @@ describe("real Pi terminal E2E", () => {
     "renders an in-process workflow phase and completion",
     async () => {
       await runGatedScenario("workflow");
-      expect(harness.currentScreen()).toMatch(/Workflow|phase|done/i);
+      await harness.waitForScreen(
+        (screen) => screen.includes("Child result for [E2E:CHILD_WORKFLOW]."),
+        "in-process workflow child result rendered",
+      );
     },
     timeout,
   );
@@ -258,7 +274,15 @@ describe("real Pi terminal E2E", () => {
         "background workflow child gate",
       );
       await waitForParentSettled(scenario.marker);
+      await harness.waitForScreen(
+        (screen) => screen.includes(scenario.expected),
+        "background workflow start notice",
+      );
       await sendMarker("[E2E:WORKFLOW_STATUS]");
+      await harness.waitForScreen(
+        (screen) => screen.includes('Workflow "e2e-workflow" [running]'),
+        "workflow status result rendered",
+      );
 
       harness.release(scenario.gate!);
       await harness.waitForProvider(
@@ -280,6 +304,10 @@ describe("real Pi terminal E2E", () => {
         "background workflow settled screen",
       );
       await sendMarker("[E2E:WORKFLOW_RESULT]");
+      await harness.waitForScreen(
+        (screen) => screen.includes("Child result for [E2E:CHILD_WORKFLOW]."),
+        "workflow result returned the child output",
+      );
       await harness.assertNoNetwork();
     },
     timeout,
@@ -291,11 +319,13 @@ describe("real Pi terminal E2E", () => {
       await runGatedScenario("process-workflow");
       const pane = childPane();
       expect(pane).toBeDefined();
-      expect(
-        harness
-          .currentScreen(pane?.id)
-          .includes("Child result for [E2E:CHILD_WORKFLOW_PROCESS]"),
-      ).toBe(true);
+      await harness.waitFor(
+        () =>
+          harness
+            .paneScreen(pane?.id)
+            .includes("Child result for [E2E:CHILD_WORKFLOW_PROCESS]."),
+        "process workflow child pane result",
+      );
       expect(
         harness.panes().some((candidate) => candidate.id === pane?.id),
       ).toBe(true);
@@ -331,7 +361,15 @@ describe("real Pi terminal E2E", () => {
         "partial workflow successful child",
       );
       await waitForParentSettled(scenario.marker);
-      expect(harness.currentScreen()).toMatch(/Workflow|error|partial/i);
+      await harness.waitForScreen(
+        (screen) => screen.includes(scenario.expected),
+        "partial workflow error summary rendered",
+      );
+      await harness.waitForScreen(
+        (screen) =>
+          screen.includes("Child result for [E2E:CHILD_WORKFLOW_OK]."),
+        "partial workflow retained successful output",
+      );
       await harness.assertNoNetwork();
     },
     timeout,
@@ -357,9 +395,7 @@ describe("real Pi terminal E2E", () => {
       );
       await harness.waitFor(
         () =>
-          harness
-            .currentScreen(pane?.id)
-            .includes("Interactive child complete"),
+          harness.paneScreen(pane?.id).includes("Interactive child complete"),
         "interactive child idle pane",
       );
       await harness.waitForScreen(
@@ -373,16 +409,15 @@ describe("real Pi terminal E2E", () => {
         .filter((event) => event.type === "completion");
       expect(firstCompletions).toHaveLength(1);
 
-      harness.sendText(
+      await harness.sendPrompt(
         "[E2E:INTERACTIVE_FOLLOWUP_PARENT] Send the deterministic follow-up.",
       );
-      harness.pressEnter();
       await harness.waitForProvider(
         (events) =>
           hasStage(events, "[E2E:CHILD_INTERACTIVE_FOLLOWUP]", "gated"),
         "interactive follow-up gate",
       );
-      harness.release("release-interactive-followup");
+      harness.release(gateForMarker("[E2E:CHILD_INTERACTIVE_FOLLOWUP]"));
       await harness.waitForProvider(
         (events) =>
           hasStage(events, "[E2E:CHILD_INTERACTIVE_FOLLOWUP]", "complete"),
@@ -390,9 +425,7 @@ describe("real Pi terminal E2E", () => {
       );
       await harness.waitFor(
         () =>
-          harness
-            .currentScreen(pane?.id)
-            .includes("[E2E:INTERACTIVE_OUTPUT_2]"),
+          harness.paneScreen(pane?.id).includes("[E2E:INTERACTIVE_OUTPUT_2]"),
         "interactive follow-up pane output",
       );
 
@@ -458,7 +491,10 @@ describe("real Pi terminal E2E", () => {
       expect(output?.bytes).toBe(0);
       expect(existsSync(resolve(String(output?.path)))).toBe(true);
       await harness.waitFor(
-        () => /error|failed/i.test(harness.currentScreen(pane?.id)),
+        () =>
+          harness
+            .paneScreen(pane?.id)
+            .includes("Error: scripted provider error"),
         "interactive child error screen",
         20_000,
       );
@@ -483,10 +519,9 @@ describe("real Pi terminal E2E", () => {
       const pane = childPane();
       expect(pane).toBeDefined();
 
-      harness.sendText(
+      await harness.sendPrompt(
         "[E2E:INTERACTIVE_CANCEL_PARENT] Cancel the interactive fixture.",
       );
-      harness.pressEnter();
       await waitForParentSettled("[E2E:INTERACTIVE_CANCEL_PARENT]");
       await harness.waitFor(
         () => !harness.panes().some((candidate) => candidate.id === pane?.id),
@@ -519,24 +554,14 @@ describe("real Pi terminal E2E", () => {
       await waitForParentSettled(scenario.marker);
 
       await openSupervisor();
-      expect(harness.currentScreen()).toMatch(/\[in-process\].*running/i);
+      await harness.waitForScreen(
+        (screen) => /▶ [▸▾] \[in-process\] → running/.test(screen),
+        "in-process row listed as running",
+      );
       await closeSupervisor();
 
-      if (
-        harness.version.major > 3 ||
-        (harness.version.major === 3 && harness.version.minor >= 5)
-      ) {
-        harness.sendKey("C-M-a");
-        await harness.waitForScreen(
-          (screen) => screen.includes("Async Subagents"),
-          "supervisor shortcut overlay",
-        );
-        await closeSupervisor();
-      }
-
       const workflow = getScenario("background-workflow");
-      harness.sendText(workflow.prompt);
-      harness.pressEnter();
+      await harness.sendPrompt(workflow.prompt);
       await harness.waitForProvider(
         (events) => hasStage(events, workflow.child!, "gated"),
         "supervisor workflow gate",
@@ -544,7 +569,10 @@ describe("real Pi terminal E2E", () => {
       await waitForParentSettled(workflow.marker);
 
       await openSupervisor();
-      expect(harness.currentScreen()).toMatch(/\[workflow\].*running/i);
+      await harness.waitForScreen(
+        (screen) => /\[workflow\] → running e2e-workflow/.test(screen),
+        "workflow row listed as running",
+      );
       harness.sendKey("Enter");
       await harness.waitForScreen(
         (screen) => screen.includes("Model: subagentura-e2e/mock"),
@@ -559,6 +587,13 @@ describe("real Pi terminal E2E", () => {
         "expanded workflow details after navigation",
       );
       harness.sendKey("k");
+      // `x` cancels whatever row is selected. Assert the selection moved back to
+      // the in-process child so a future change to list ordering reports a
+      // mismatch here instead of cancelling the wrong job and timing out below.
+      await harness.waitForScreen(
+        (screen) => /▶ [▸▾] \[in-process\]/.test(screen),
+        "in-process row reselected before cancellation",
+      );
       harness.sendKey("x");
       await harness.waitForProvider(
         (events) =>
@@ -571,6 +606,28 @@ describe("real Pi terminal E2E", () => {
         "supervisor cancellation",
       );
       await closeSupervisor("Escape");
+      await harness.assertNoNetwork();
+    },
+    timeout,
+  );
+
+  it.skipIf(!supportsExtendedKeyShortcut)(
+    "opens the supervisor through the C-M-a shortcut (tmux >= 3.5)",
+    async () => {
+      const scenario = getScenario("async-isolated");
+      await startScenario("async-isolated");
+      await harness.waitForProvider(
+        (events) => hasStage(events, scenario.child!, "gated"),
+        "supervisor shortcut fixture gate",
+      );
+      await waitForParentSettled(scenario.marker);
+
+      harness.sendKey("C-M-a");
+      await harness.waitForScreen(
+        (screen) => screen.includes("Async Subagents"),
+        "supervisor shortcut overlay",
+      );
+      await closeSupervisor();
       await harness.assertNoNetwork();
     },
     timeout,
@@ -608,12 +665,18 @@ describe("real Pi terminal E2E", () => {
   it(
     "renders a provider error as a terminal screen state",
     async () => {
+      const scenario = getScenario("error");
       await startScenario("error");
       await harness.waitForProvider(
         (events) => hasStage(events, "[E2E:ERROR]", "failed"),
         "provider error",
       );
-      expect(harness.currentScreen()).toMatch(/error|failed|❌/i);
+      // The prompt itself contains "provider error", so match the fixture's own
+      // message, which the user never typed.
+      await harness.waitForScreen(
+        (screen) => screen.includes(scenario.expected),
+        "provider error rendered",
+      );
       await harness.assertNoNetwork();
     },
     timeout,

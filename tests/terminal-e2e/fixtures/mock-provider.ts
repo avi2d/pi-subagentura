@@ -72,6 +72,41 @@ function resultId(context: Context, toolName: string, pattern: RegExp): string {
   return id;
 }
 
+const INTERACTIVE_ID = /^[a-f0-9]{16}$/;
+const INTERACTIVE_LAUNCH = /^Interactive sub-agent ([a-f0-9]{16}) started \(/;
+
+function interactiveResultId(context: Context): string {
+  for (let index = context.messages.length - 1; index >= 0; index -= 1) {
+    const current = context.messages[index];
+    if (
+      current.role !== "toolResult" ||
+      current.toolName !== "subagent_interactive"
+    ) {
+      continue;
+    }
+
+    const details = current.details;
+    if (details && typeof details === "object" && "id" in details) {
+      const id = details.id;
+      if (typeof id === "string" && INTERACTIVE_ID.test(id)) return id;
+    }
+
+    const launchText = current.content.find((part) => part.type === "text");
+    const fallback =
+      launchText?.type === "text"
+        ? launchText.text.match(INTERACTIVE_LAUNCH)?.[1]
+        : undefined;
+    if (fallback) return fallback;
+
+    throw new Error(
+      "mock provider could not find a valid subagent_interactive id in its latest result",
+    );
+  }
+  throw new Error(
+    "mock provider could not find result for subagent_interactive",
+  );
+}
+
 function message(
   content: AssistantMessage["content"],
   stopReason: AssistantMessage["stopReason"] = "stop",
@@ -152,6 +187,34 @@ const GATES = new Map<string, string>([
 
 function gateFor(marker: string): string | undefined {
   return GATES.get(marker);
+}
+
+/**
+ * The gate a child marker waits on. Tests must release gates through this rather
+ * than hardcoding the name: a rename would otherwise surface as a silent 30s
+ * timeout instead of an error naming the marker.
+ */
+export function gateForMarker(marker: string): string {
+  const gate = GATES.get(marker);
+  if (!gate)
+    throw new Error(`no scripted terminal E2E gate is defined for ${marker}`);
+  return gate;
+}
+
+/** `ARTIFACT_DIR` is injected by the interactive sub-agent runner. Falling back
+ *  to the CWD would silently write the fixture artifact somewhere the test never
+ *  looks, so demand it instead. */
+function artifactDir(): string {
+  const directory = process.env.ARTIFACT_DIR;
+  if (!directory)
+    throw new Error(
+      "mock provider requires ARTIFACT_DIR for the interactive fixture",
+    );
+  return directory;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 class AbortError extends Error {
@@ -431,7 +494,7 @@ async function runRequest(
         `e2e-interactive-write-${interactiveTurn}`,
         "write",
         {
-          path: join(process.env.ARTIFACT_DIR ?? ".", "output.md"),
+          path: join(artifactDir(), "output.md"),
           content:
             `interactive child artifact turn ${interactiveTurn} ` +
             `[E2E:INTERACTIVE_OUTPUT_${interactiveTurn}]\n`,
@@ -453,7 +516,7 @@ async function runRequest(
       state.toolCallId?.includes("write")
     ) {
       const call = toolCall(`e2e-interactive-done-${interactiveTurn}`, "bash", {
-        command: `node ${join(process.env.ARTIFACT_DIR ?? ".", "cli.mjs")} done 0`,
+        command: `node ${shellQuote(join(artifactDir(), "cli.mjs"))} done 0`,
       });
       const final = message([call], "toolUse");
       states.set(marker, {
@@ -583,7 +646,7 @@ function parentTool(marker: string, context: Context): ToolCall {
       "e2e-interactive-followup-parent-1",
       "send_interactive_subagent_message",
       {
-        id: resultId(context, "subagent_interactive", /\b[a-f0-9]{8}\b/),
+        id: interactiveResultId(context),
         message:
           "[E2E:CHILD_INTERACTIVE_FOLLOWUP] Complete the follow-up fixture.",
       },
@@ -594,7 +657,7 @@ function parentTool(marker: string, context: Context): ToolCall {
       "e2e-interactive-cancel-parent-1",
       "cancel_interactive_subagent",
       {
-        jobId: resultId(context, "subagent_interactive", /\b[a-f0-9]{8}\b/),
+        jobId: interactiveResultId(context),
       },
     );
   }

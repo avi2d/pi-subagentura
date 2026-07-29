@@ -1,10 +1,19 @@
+/**
+ * `expected` is a substring the FIXTURE paints and the user never types. It is
+ * matched with `includes`, not as a regular expression, so scenario markers like
+ * `[E2E:...]` stay literal instead of turning into character classes.
+ *
+ * Never set it to a word that also appears in `prompt`: Pi echoes the submitted
+ * prompt into the transcript, so such an expectation is satisfied the instant
+ * the input lands and can never fail.
+ */
 export const scenarios = {
   smoke: {
     name: "smoke",
     marker: "[E2E:SMOKE]",
     gate: null,
     prompt: "[E2E:SMOKE] Show the deterministic idle fixture.",
-    expected: "Pi",
+    expected: "Parent settled for [E2E:SMOKE].",
   },
   "sync-context": {
     name: "sync-context",
@@ -13,7 +22,7 @@ export const scenarios = {
     prompt:
       "[E2E:SYNC_CONTEXT] PARENT_CONTEXT_SENTINEL Run the inherited-context fixture.",
     child: "[E2E:CHILD_SYNC_CONTEXT]",
-    expected: "Parent settled",
+    expected: "subagent_with_context [E2E:CHILD_SYNC_CONTEXT]",
   },
   "sync-isolated": {
     name: "sync-isolated",
@@ -22,7 +31,7 @@ export const scenarios = {
     prompt:
       "[E2E:SYNC_ISOLATED] PARENT_CONTEXT_SENTINEL Run the isolated fixture.",
     child: "[E2E:CHILD_SYNC_ISOLATED]",
-    expected: "Parent settled",
+    expected: "subagent_isolated [E2E:CHILD_SYNC_ISOLATED]",
   },
   "async-isolated": {
     name: "async-isolated",
@@ -30,7 +39,7 @@ export const scenarios = {
     gate: "release-async-isolated",
     prompt: "[E2E:ASYNC_ISOLATED] Start the async isolated fixture.",
     child: "[E2E:CHILD_ASYNC_ISOLATED]",
-    expected: "Sub-agent started",
+    expected: "Sub-agent started — job",
   },
   workflow: {
     name: "workflow",
@@ -38,7 +47,7 @@ export const scenarios = {
     gate: "release-workflow",
     prompt: "[E2E:WORKFLOW_SYNC] Run the in-process workflow fixture.",
     child: "[E2E:CHILD_WORKFLOW]",
-    expected: "Workflow",
+    expected: 'Workflow "e2e-workflow" complete',
   },
   "background-workflow": {
     name: "background-workflow",
@@ -46,7 +55,7 @@ export const scenarios = {
     gate: "release-workflow",
     prompt: "[E2E:WORKFLOW_ASYNC] Start the background workflow fixture.",
     child: "[E2E:CHILD_WORKFLOW]",
-    expected: "Workflow",
+    expected: 'Workflow "e2e-workflow" started in background',
   },
   "process-workflow": {
     name: "process-workflow",
@@ -54,7 +63,7 @@ export const scenarios = {
     gate: "release-workflow-process",
     prompt: "[E2E:WORKFLOW_PROCESS] Run the process workflow fixture.",
     child: "[E2E:CHILD_WORKFLOW_PROCESS]",
-    expected: "Workflow",
+    expected: 'Workflow "e2e-workflow" complete',
   },
   "workflow-partial": {
     name: "workflow-partial",
@@ -62,7 +71,7 @@ export const scenarios = {
     gate: "release-workflow",
     prompt: "[E2E:WORKFLOW_PARTIAL] Run the partial failure fixture.",
     child: "[E2E:CHILD_WORKFLOW_OK]",
-    expected: "Workflow",
+    expected: 'Workflow "e2e-partial" completed with errors',
   },
   interactive: {
     name: "interactive",
@@ -79,7 +88,7 @@ export const scenarios = {
     prompt:
       "[E2E:INTERACTIVE_ERROR_PARENT] Start the failing interactive fixture.",
     child: "[E2E:CHILD_PROVIDER_ERROR]",
-    expected: "error",
+    expected: "Parent settled for [E2E:INTERACTIVE_ERROR_PARENT].",
   },
   cancel: {
     name: "cancel",
@@ -87,14 +96,14 @@ export const scenarios = {
     gate: "release-cancel",
     prompt: "[E2E:CANCEL] Run the cancellation fixture.",
     child: "[E2E:CHILD_CANCEL]",
-    expected: "Sub-agent",
+    expected: "Parent settled for [E2E:CANCEL].",
   },
   error: {
     name: "error",
     marker: "[E2E:ERROR]",
     gate: null,
     prompt: "[E2E:ERROR] Run the provider error fixture.",
-    expected: "Failed",
+    expected: "Error: scripted provider error",
   },
 };
 

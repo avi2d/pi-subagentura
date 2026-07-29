@@ -195,6 +195,123 @@ describe("scripted terminal provider contract", () => {
     ).toContain("CHILD_SYNC_ISOLATED");
   });
 
+  it("routes async and workflow lookups with their typed result ids", async () => {
+    const config = createMockProviderConfig();
+    const jobId = "0123456789abcdef";
+    const workflowId = "wf_0123456789";
+    const routes = [
+      {
+        marker: "[E2E:ASYNC_STATUS]",
+        resultTool: "subagent_isolated",
+        details: { jobId },
+        callName: "get_subagent_status",
+        argument: "jobId",
+        value: jobId,
+      },
+      {
+        marker: "[E2E:ASYNC_RESULT]",
+        resultTool: "subagent_isolated",
+        details: { jobId },
+        callName: "get_subagent_result",
+        argument: "jobId",
+        value: jobId,
+      },
+      {
+        marker: "[E2E:WORKFLOW_STATUS]",
+        resultTool: "workflow",
+        details: { workflowId },
+        callName: "get_workflow_status",
+        argument: "workflowId",
+        value: workflowId,
+      },
+      {
+        marker: "[E2E:WORKFLOW_RESULT]",
+        resultTool: "workflow",
+        details: { workflowId },
+        callName: "get_workflow_result",
+        argument: "workflowId",
+        value: workflowId,
+      },
+    ] as const;
+
+    for (const route of routes) {
+      const result = await events(
+        config.streamSimple(
+          model,
+          context(
+            {
+              role: "toolResult",
+              toolCallId: `result-${route.marker}`,
+              toolName: route.resultTool,
+              content: [{ type: "text", text: "Lookup result ready." }],
+              details: route.details,
+              isError: false,
+              timestamp: 0,
+            },
+            { role: "user", content: route.marker },
+          ),
+        ),
+      );
+      const call = result.find(
+        (event) => event.type === "toolcall_end",
+      ).toolCall;
+      expect(call.name).toBe(route.callName);
+      expect(call.arguments[route.argument]).toBe(route.value);
+    }
+  });
+
+  it("routes interactive follow-up and cancel to the launched id", async () => {
+    const config = createMockProviderConfig();
+    const interactiveId = "1234567890abcdef";
+    const competingOwnership = {
+      parentSessionId: "019faf8a-0000-4000-8000-000000000000",
+      sessionId: "deadbeef-1111-4111-8111-111111111111",
+    };
+    const request = async (
+      marker:
+        "[E2E:INTERACTIVE_FOLLOWUP_PARENT]" | "[E2E:INTERACTIVE_CANCEL_PARENT]",
+      details: Record<string, unknown>,
+    ) => {
+      const result = await events(
+        config.streamSimple(
+          model,
+          context(
+            {
+              role: "toolResult",
+              toolCallId: "e2e-interactive-parent-1",
+              toolName: "subagent_interactive",
+              content: [
+                {
+                  type: "text",
+                  text: `Interactive sub-agent ${interactiveId} started (visible split) in tmux pane %42.`,
+                },
+              ],
+              details,
+              isError: false,
+              timestamp: 0,
+            },
+            { role: "user", content: marker },
+          ),
+        ),
+      );
+      return result.find((event) => event.type === "toolcall_end").toolCall;
+    };
+
+    const followUp = await request("[E2E:INTERACTIVE_FOLLOWUP_PARENT]", {
+      ...competingOwnership,
+      id: interactiveId,
+    });
+    expect(followUp.name).toBe("send_interactive_subagent_message");
+    expect(followUp.arguments.id).toBe(interactiveId);
+
+    const cancel = await request("[E2E:INTERACTIVE_CANCEL_PARENT]", {
+      ...competingOwnership,
+      id: interactiveId,
+    });
+    expect(cancel.name).toBe("cancel_interactive_subagent");
+    expect(cancel.arguments.jobId).toBe(interactiveId);
+  });
+
   it("fails with one terminal error for an explicit scripted error", async () => {
     const config = createMockProviderConfig() as any;
     const result = await events(
