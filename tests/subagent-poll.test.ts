@@ -421,7 +421,9 @@ describe("pollArtifactChanges", () => {
       id: "steady-workflow",
       name: "steady-flow",
       status: "running",
-      startedAt: 5_000,
+      // Both polls land inside the same coarse elapsed bucket, so every row
+      // stays byte-identical and the memoized paint is skipped.
+      startedAt: 20_000,
       promise: Promise.resolve({}) as any,
       abort: new AbortController(),
       snapshot: {
@@ -458,8 +460,187 @@ describe("pollArtifactChanges", () => {
     );
     expect(workflowFooterCalls).toHaveLength(1);
     expect((activityCalls[0][1] as string[])[0]).toBe(
-      "▶ steady-agent: reading src/main.ts",
+      "▶ steady-agent: reading src/main.ts (10s ago)",
     );
+    expect((workflowWidgetCalls[0][1] as string[])[0]).toContain("0s");
+  });
+
+  it("repaints the widget once a coarse elapsed bucket boundary is crossed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const ui = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const item = makeState();
+    item.state.name = "ticking-agent";
+    item.state.lastToolSummary = "reading src/main.ts";
+    item.state.lastActivityAt = 10_000;
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    (globalThis as any).__piSubagenturaUi = ui;
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any);
+    // Still inside the 10s bucket — no repaint.
+    vi.setSystemTime(29_000);
+    await mod.pollArtifactChanges({} as any);
+    // Crosses into the 20s bucket — one repaint with the advanced clock.
+    vi.setSystemTime(31_000);
+    await mod.pollArtifactChanges({} as any);
+
+    const activityCalls = ui.setWidget.mock.calls.filter(
+      ([key]) => key === "subagentura-activity",
+    );
+    expect(activityCalls).toHaveLength(2);
+    expect((activityCalls[0][1] as string[])[0]).toBe(
+      "▶ ticking-agent: reading src/main.ts (10s ago)",
+    );
+    expect((activityCalls[1][1] as string[])[0]).toBe(
+      "▶ ticking-agent: reading src/main.ts (20s ago)",
+    );
+  });
+
+  it("coalesces overlapping polls for the same owner", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const item = makeState();
+    item.state.parentSessionId = "session-same";
+    item.state.cwd = join(item.artifactDir, "..");
+    const art = artifactPath(item.state.cwd, item.id);
+    appendCompletionEvent(art, {
+      turnId: `turn-${item.id}`,
+      outcome: "done",
+      source: "agent_settled",
+    });
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    const owner = { id: 601, generation: 1 };
+    const sendMessage = vi.fn();
+    registerSessionContext({
+      ...owner,
+      pi: { sendMessage } as any,
+      ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } as any,
+      sessionManager: {
+        getSessionId: () => "session-same",
+        getEntries: () => [],
+      },
+    });
+    let releaseLiveness!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseLiveness = resolve;
+    });
+    const isPaneAliveAsync = vi.fn(async () => {
+      await blocked;
+      return true;
+    });
+    multiplexer.__setTmuxMultiplexer({ isPaneAliveAsync } as any);
+
+    const first = mod.pollArtifactChanges({} as any, owner);
+    await Promise.resolve();
+    const second = mod.pollArtifactChanges({} as any, owner);
+
+    // The second tick joins the in-flight poll instead of starting a second
+    // pass that would race on the shared eventByteCursor / delivery queue.
+    expect(isPaneAliveAsync).toHaveBeenCalledTimes(1);
+    releaseLiveness();
+    await Promise.all([first, second]);
+
+    expect(isPaneAliveAsync).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(item.state.pendingDeliveries ?? []).toHaveLength(1);
+
+    // Once the in-flight poll settles the key is released, so a later tick runs.
+    await mod.pollArtifactChanges({} as any, owner);
+    expect(isPaneAliveAsync).toHaveBeenCalledTimes(2);
+    // The completion cursor already advanced, so the second pass adds no new
+    // delivery intent for the same turn.
+    expect(item.state.pendingDeliveries ?? []).toHaveLength(1);
+  });
+
+  it("records a liveness probe failure and treats the pane as dead", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-subagentura-poll-debug-"));
+    process.env.SUBAGENT_DEBUG_LOG_DIR = dir;
+    try {
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const multiplexer = await import("../src/multiplexer");
+      const item = makeState();
+      item.state.cwd = join(item.artifactDir, "..");
+      const art = artifactPath(item.state.cwd, item.id);
+      appendEvent(art, { ts: 1, type: "done", status: "done" } as any);
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+      installDeliverySpies();
+      multiplexer.__setTmuxMultiplexer({
+        isPaneAliveAsync: async () => {
+          throw new Error("mux socket gone");
+        },
+      } as any);
+
+      await mod.pollArtifactChanges({} as any);
+
+      // A throwing probe is a dead pane, not a crashed poll tick.
+      expect(item.state.status).toBe("exited");
+      const logged = readFileSync(
+        join(dir, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`),
+        "utf8",
+      );
+      expect(logged).toContain('"event":"poller_liveness_error"');
+      expect(logged).toContain("mux socket gone");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("truncates overflowing activity and workflow widget rows", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const { workflowJobRegistry } = await import("../src/workflow");
+    const ui = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
+    for (let index = 0; index < 12; index++) {
+      const item = makeState();
+      item.state.name = `agent-${index}`;
+      mod.interactiveSubagentRegistry.set(item.id, item.state);
+    }
+    for (let index = 0; index < 7; index++) {
+      workflowJobRegistry.set(`wf-${index}`, {
+        id: `wf-${index}`,
+        name: `flow-${index}`,
+        status: "running",
+        startedAt: Date.now(),
+        promise: Promise.resolve({}) as any,
+        abort: new AbortController(),
+        snapshot: {
+          agentsSpawned: 1,
+          errorCount: 0,
+          tokensSpent: 0,
+          phases: [],
+          runningCount: 1,
+        },
+      } as any);
+    }
+    (globalThis as any).__piSubagenturaUi = ui;
+    multiplexer.__setTmuxMultiplexer({
+      isPaneAliveAsync: async () => true,
+    } as any);
+
+    await mod.pollArtifactChanges({} as any);
+
+    const rowsFor = (key: string): string[] =>
+      ui.setWidget.mock.calls.filter(([name]) => name === key).at(-1)?.[1] ??
+      [];
+    const activityRows = rowsFor("subagentura-activity");
+    expect(activityRows).toHaveLength(11);
+    expect(activityRows.at(-1)).toBe("… and 2 more");
+    const workflowRows = rowsFor("subagentura-workflow-activity");
+    expect(workflowRows).toHaveLength(6);
+    expect(workflowRows.at(-1)).toBe("… and 2 more workflows");
   });
 
   it("abandons mutation when its owner is removed during liveness", async () => {

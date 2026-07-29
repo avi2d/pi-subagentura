@@ -37,7 +37,7 @@ import {
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
 import { debugLog, jobRegistry } from "./helpers";
-import { formatActivityRow } from "./rendering";
+import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -156,6 +156,7 @@ function updateWidgetRows(
 function projectActivityWidgetRows(
   ui: ExtensionUIContext | undefined,
   owner: ActiveSessionContextToken | undefined,
+  now: number,
 ): string[] {
   if (!ui) return [];
   const contexts = getSessionContextStack();
@@ -164,7 +165,7 @@ function projectActivityWidgetRows(
       (state.status === "running" || state.status === "idle") &&
       stateBelongsToUi(state, ui, owner, contexts),
   );
-  return states.map(formatActivityRow);
+  return states.map((state) => formatActivityRow(state, now));
 }
 
 function stateBelongsToUi(
@@ -406,7 +407,9 @@ async function runPollArtifactChanges(
         });
       }
     }
-    const widgetRows = projectActivityWidgetRows(ui, owner);
+    // One clock for both widgets so their coarse elapsed buckets stay aligned.
+    const now = Date.now();
+    const widgetRows = projectActivityWidgetRows(ui, owner, now);
     flushDeliveries(interactivePi, ui, owner);
     for (const state of states) {
       if (interactiveSubagentRegistry.get(state.id) !== state) continue;
@@ -442,7 +445,7 @@ async function runPollArtifactChanges(
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);
-        const workflowRows = formatWorkflowWidgetRows(owner);
+        const workflowRows = formatWorkflowWidgetRows(owner, now);
         const workflowStatus =
           wfCount > 0
             ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
@@ -463,7 +466,10 @@ async function runPollArtifactChanges(
   }
 }
 
-function formatWorkflowWidgetRows(owner?: ActiveSessionContextToken): string[] {
+function formatWorkflowWidgetRows(
+  owner: ActiveSessionContextToken | undefined,
+  now: number,
+): string[] {
   const rows: string[] = [];
   for (const st of workflowJobRegistry.values()) {
     if (!workflowJobBelongsToOwner(st, owner)) continue;
@@ -474,6 +480,7 @@ function formatWorkflowWidgetRows(owner?: ActiveSessionContextToken): string[] {
       `${s.runningCount ?? 0} running`,
       `${s.tokensSpent} output tokens`,
       ...(s.usage ? [formatWorkflowUsage(s.usage)] : []),
+      formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
     const last = s.lastMessage ? ` — ${s.lastMessage}` : "";
@@ -485,6 +492,16 @@ function formatWorkflowWidgetRows(owner?: ActiveSessionContextToken): string[] {
     rows.push(`… and ${extra} more workflow${extra === 1 ? "" : "s"}`);
   }
   return rows;
+}
+
+/** Coarse elapsed clock; see ACTIVITY_ELAPSED_BUCKET_MS for why it is bucketed. */
+function formatWorkflowElapsed(milliseconds: number): string {
+  const bucketed = coarseElapsedMs(milliseconds);
+  const seconds = Math.floor(bucketed / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 // ── Session-log parsing state ─────────────────────────────────────────
