@@ -23,7 +23,11 @@
  *   4. Throw with a setup hint pointing at both backends.
  */
 
-import { execFileSync, type ExecSyncOptions } from "node:child_process";
+import {
+  execFile,
+  execFileSync,
+  type ExecSyncOptions,
+} from "node:child_process";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 import { ZellijMultiplexer } from "./multiplexer-zellij";
 import { assertNever } from "./artifact";
@@ -38,11 +42,62 @@ export interface PaneRef {
   readonly session?: string;
 }
 
-/** Optional transport features supported by a multiplexer backend. */
+/**
+ * Optional transport features supported by a multiplexer backend.
+ *
+ * `structuredFocus` — `focusPane(ref)` can reach the referenced pane from a
+ *   `PaneRef` alone, without asking the user to paste a command.
+ * `boundedCapture` — `capturePane(ref, opts)` returns the pane's text, bounded
+ *   by `maxLines`/`maxBytes`.
+ * `nativeOverlay` — `showNativeViewer(title, content)` has a backend-native
+ *   surface to render into. Note this describes the BACKEND, not the current
+ *   process: both backends additionally require the parent process to be inside
+ *   a session and return `false` from `showNativeViewer` when it is not.
+ */
 export interface MultiplexerCapabilities {
   readonly structuredFocus: boolean;
   readonly boundedCapture: boolean;
   readonly nativeOverlay: boolean;
+}
+
+/**
+ * Verified capability matrix, keyed by backend name.
+ *
+ * Single source of truth: both backends expose the matching entry as their
+ * `capabilities` field, and UI code that wants to gate an action can read the
+ * entry directly from a `MuxName` (e.g. `InteractiveSubagentState.mux`) without
+ * resolving a backend instance or paying an availability probe.
+ *
+ * Every flag below is asserted against the real `tmux` / `zellij` binaries in
+ * `tests/tmux.integration.test.ts` and `tests/zellij.integration.test.ts` —
+ * flipping one to `true` without a passing real-binary assertion is how the
+ * broken zellij `dump-screen` argv shipped green.
+ */
+export const MUX_CAPABILITIES: Readonly<
+  Record<MuxName, MultiplexerCapabilities>
+> = {
+  tmux: {
+    // `select-window -t <pane_id>`: pane ids are server-global.
+    structuredFocus: true,
+    // `capture-pane -p -S -<lines>` reaches scrollback.
+    boundedCapture: true,
+    // `display-popup -E`.
+    nativeOverlay: true,
+  },
+  zellij: {
+    // `action focus-pane-id` / `action go-to-tab-name`, both `--session` scoped.
+    structuredFocus: true,
+    // `action dump-screen --full`. Verified against zellij 0.44.3 — this was
+    // `false` in practice until the bogus `/dev/stdout` positional was dropped.
+    boundedCapture: true,
+    // `action new-pane --floating`.
+    nativeOverlay: true,
+  },
+} as const;
+
+/** Read the verified capability set for a backend name. */
+export function muxCapabilities(name: MuxName): MultiplexerCapabilities {
+  return MUX_CAPABILITIES[name];
 }
 
 /** Bounds applied by backend-neutral pane capture. */
@@ -307,10 +362,14 @@ export function __resetMuxInstances(): void {
  * Test whether a binary is on PATH. Used by both backends' `isAvailable`.
  * Cheap (one sh -c exec); safe to call repeatedly. The 5s timeout guards
  * against a hung PATH (e.g., NFS hang) blocking the agent's startup probe.
+ *
+ * Deliberately NOT a login shell (`-lc`): sourcing the user's profile on every
+ * availability probe is slow, has side effects, and can even change the PATH
+ * the probe reports relative to the PATH we actually spawn children with.
  */
 export function commandExists(command: string): boolean {
   try {
-    execFileSync("/bin/sh", ["-lc", `command -v ${shellEscape(command)}`], {
+    execFileSync("/bin/sh", ["-c", `command -v ${shellEscape(command)}`], {
       stdio: "ignore",
       timeout: 5000,
     });
@@ -318,6 +377,111 @@ export function commandExists(command: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Sanitize a free-form name into a safe window/tab/session segment.
+ *
+ * Shared by both backends so a sub-agent's display name maps to exactly one
+ * segment everywhere. `.` is excluded on purpose: tmux target syntax reads
+ * `window.pane`, so a window literally named `review.v2` can be created but
+ * never selected again — `tmux select-window -t review.v2` fails with
+ * `can't find pane: v2`, permanently breaking focus and the copy-paste attach
+ * strings for that sub-agent. Agent names are model/task-derived, so dots are
+ * not hypothetical.
+ */
+export function safeSegment(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"
+  );
+}
+
+/** Maximum length of a native-viewer overlay title. */
+export const MAX_VIEWER_TITLE_LENGTH = 120;
+
+/**
+ * Sanitize an untrusted sub-agent name for use as a native-overlay title.
+ *
+ * The sub-agent name is attacker-reachable: it is unvalidated in the tool
+ * schema and defaults to text lifted from the task prompt, so a prompt
+ * injection can choose it. It then lands in `tmux display-popup -T <title>` —
+ * and a popup title is a tmux FORMAT, not a string. Formats run shell commands
+ * via `#(...)` jobs, so `#(curl … | sh)` as a title is remote code execution
+ * the moment a human opens the native viewer for that row. `shellEscape` does
+ * not help: tmux evaluates the format itself, after argv parsing.
+ *
+ * Therefore:
+ *   - `#` is removed — it is the only format introducer (`#(cmd)` executes,
+ *     `#{...}` expands), so removing it neutralizes both.
+ *   - control characters (CR/LF/ESC/BEL/NUL) are collapsed to spaces so a
+ *     title cannot forge line boundaries or drive the parent's terminal.
+ *   - leading `-` is removed: zellij's clap-based CLI parses `--name -rf` as a
+ *     flag and rejects the whole command (`Found argument '-r' …`).
+ */
+export function sanitizeViewerTitle(title: string): string {
+  const cleaned = title
+    .replace(/#/g, "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^-+/, "")
+    .trim();
+  return (cleaned || "subagent").slice(0, MAX_VIEWER_TITLE_LENGTH);
+}
+
+/**
+ * Grace window used to tell "the overlay is up" apart from "the backend
+ * rejected our argv". Short enough to be imperceptible when a human presses
+ * `n` in the overlay, long enough for a clap/tmux usage error to surface.
+ */
+export const NATIVE_VIEWER_SPAWN_GRACE_MS = 250;
+
+/**
+ * Spawn a native overlay without blocking the caller for the overlay's
+ * lifetime.
+ *
+ * `tmux display-popup -E` keeps the invoking client alive until the popup
+ * closes, so running it through `execFileSync` froze the entire pi process —
+ * no input, no rendering, no poller tick — until a human pressed Enter or the
+ * exec timeout SIGTERM'd the client out from under the popup and we then
+ * reported failure for an overlay that had demonstrably appeared.
+ *
+ * Instead: spawn asynchronously with no timeout, and resolve `true` once the
+ * child has survived `graceMs` (i.e. the overlay is up and waiting for the
+ * user). A backend that rejects the request — `no current client`, a clap
+ * usage error, a missing binary — exits non-zero well inside the grace window,
+ * so genuine failures still resolve `false`.
+ */
+export function spawnNativeViewer(
+  cmd: string,
+  args: readonly string[],
+  graceMs: number = NATIVE_VIEWER_SPAWN_GRACE_MS,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    // The overlay outliving the grace window IS the success signal.
+    const timer = setTimeout(() => settle(true), graceMs);
+    timer.unref?.();
+    try {
+      // No `timeout` option: the overlay is supposed to stay open until the
+      // user dismisses it, and killing it mid-read is the bug we're fixing.
+      const child = execFile(cmd, [...args], (error) => settle(!error));
+      // Never let a still-open overlay hold the parent's event loop open.
+      child.unref?.();
+    } catch {
+      settle(false);
+    }
+  });
 }
 
 /** POSIX-style single-quote escape. Safe for paths, names, and command args. */

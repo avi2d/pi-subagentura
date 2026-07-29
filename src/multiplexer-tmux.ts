@@ -34,7 +34,11 @@ import {
   commandExists,
   execMuxOrThrow,
   MAX_CAPTURE_READ_BYTES,
+  MUX_CAPABILITIES,
+  safeSegment,
+  sanitizeViewerTitle,
   shellEscape,
+  spawnNativeViewer,
 } from "./multiplexer";
 
 /**
@@ -87,26 +91,9 @@ function getPaneLocation(paneId: string): {
   return { session, window, pane };
 }
 
-/** Sanitize a free-form name into a tmux-safe segment. tmux names allow most
- * chars but reject `:`, `.`, and whitespace; we collapse everything else to
- * a single dash to keep the resulting window/session names copy-pasteable. */
-function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
-  );
-}
-
 export class TmuxMultiplexer implements Multiplexer {
   readonly name = "tmux" as const;
-  readonly capabilities = {
-    structuredFocus: true,
-    boundedCapture: true,
-    nativeOverlay: true,
-  } as const;
+  readonly capabilities = MUX_CAPABILITIES.tmux;
 
   /** Shared detached session used when the parent is outside tmux. */
   private detachedSessionName?: string;
@@ -368,7 +355,10 @@ export class TmuxMultiplexer implements Multiplexer {
       "tmux",
       "send-keys",
       "tmux",
-      withTmuxSocket(["send-keys", "-t", paneId, "-l", text]),
+      // `--` terminates flag parsing: agent follow-up text is user/model
+      // controlled and text starting with `-` would otherwise be read as a
+      // send-keys flag (`command send-keys: unknown flag -n`, exit 1).
+      withTmuxSocket(["send-keys", "-t", paneId, "-l", "--", text]),
       {
         encoding: "utf8",
         timeout: 5000,
@@ -400,11 +390,33 @@ export class TmuxMultiplexer implements Multiplexer {
     }
   }
 
+  /**
+   * Focus the pane, addressed by its tmux pane id.
+   *
+   * Pane ids (`%N`) are tmux-server-global, so a single target resolves the
+   * pane, its window AND its session unambiguously. The previous
+   * `select-window -t <windowName>` was none of those things: window names come
+   * from `safeSegment(name)`, so two sub-agents both called "reviewer" collide,
+   * and an unqualified name target resolves against whichever session tmux
+   * scans first — verified to focus the WRONG session's window while returning
+   * exit 0, i.e. reporting success for focusing a different agent.
+   *
+   * `select-window` is required even for a visible split (`select-pane` alone
+   * does not change the active window), and `select-pane` is required to land
+   * on the right pane within that window — so both run, chained in one tmux
+   * invocation via a literal `;` argument.
+   */
   focusPane(ref: PaneRef): Promise<void> {
     return new Promise((resolve, reject) => {
-      const args = ref.windowName
-        ? withTmuxSocket(["select-window", "-t", ref.windowName])
-        : withTmuxSocket(["select-pane", "-t", ref.paneId]);
+      const args = withTmuxSocket([
+        "select-window",
+        "-t",
+        ref.paneId,
+        ";",
+        "select-pane",
+        "-t",
+        ref.paneId,
+      ]);
       execFile("tmux", args, { timeout: 5000 }, (error) => {
         if (error) reject(error);
         else resolve();
@@ -444,27 +456,35 @@ export class TmuxMultiplexer implements Multiplexer {
     });
   }
 
-  async showNativeViewer(title: string, content: string): Promise<boolean> {
-    if (!process.env.TMUX) return false;
+  /**
+   * Open the bounded supervisor content in a tmux popup.
+   *
+   * `title` is the sub-agent's display name, which is attacker-reachable, and
+   * `display-popup -T` evaluates its argument as a tmux FORMAT — `#(...)` in a
+   * format spawns a shell job. `sanitizeViewerTitle` strips the `#` introducer;
+   * see its doc comment. `shellEscape` cannot substitute for it, because tmux
+   * evaluates the format after argv parsing.
+   *
+   * The popup itself runs `read`, i.e. it lives until the user dismisses it,
+   * and `-E` keeps the invoking tmux client alive for that whole time. So this
+   * must never be spawned synchronously — `spawnNativeViewer` returns as soon
+   * as the popup is up and leaves it running.
+   */
+  showNativeViewer(title: string, content: string): Promise<boolean> {
+    if (!process.env.TMUX) return Promise.resolve(false);
     const command = `printf '%s\\n' ${shellEscape(content)}; printf '\\nPress Enter to close'; read _`;
-    try {
-      execFileSync(
-        "tmux",
-        withTmuxSocket([
-          "display-popup",
-          "-E",
-          "-T",
-          title.slice(0, 120),
-          "sh",
-          "-lc",
-          command,
-        ]),
-        { stdio: "ignore", timeout: 5000 },
-      );
-      return true;
-    } catch {
-      return false;
-    }
+    return spawnNativeViewer(
+      "tmux",
+      withTmuxSocket([
+        "display-popup",
+        "-E",
+        "-T",
+        sanitizeViewerTitle(title),
+        "sh",
+        "-lc",
+        command,
+      ]),
+    );
   }
 
   buildAttachCommands(opts: { paneId: string; windowName?: string }): {
@@ -480,6 +500,12 @@ export class TmuxMultiplexer implements Multiplexer {
       // select-window still runs.
       const location = getPaneLocation(opts.paneId);
       const tmux = tmuxCommandPrefix();
+      // FIXME(pr65): these two window targets are still session-unqualified, so
+      // with two sub-agents sharing a safe-segmented name they send the user to
+      // whichever session tmux scans first — the same ambiguity `focusPane` was
+      // fixed for. The fix is `${location.session}:${opts.windowName}`, but the
+      // assertions that pin these strings live in `tests/interactive-tmux.test.ts`,
+      // which is owned elsewhere; see the handoff note in the PR review reply.
       return {
         attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
         focusCommand: `${tmux} select-window -t ${shellEscape(opts.windowName)}`,

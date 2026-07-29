@@ -39,19 +39,12 @@ import {
   commandExists,
   execMuxOrThrow,
   MAX_CAPTURE_READ_BYTES,
+  MUX_CAPABILITIES,
+  safeSegment,
+  sanitizeViewerTitle,
   shellEscape,
+  spawnNativeViewer,
 } from "./multiplexer";
-
-/** Sanitize a free-form name into a safe segment for zellij tab/session names. */
-function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
-  );
-}
 
 /**
  * Normalize a zellij pane id to the bare-integer string form used by
@@ -65,11 +58,7 @@ function normalizePaneId(raw: string): string {
 
 export class ZellijMultiplexer implements Multiplexer {
   readonly name = "zellij" as const;
-  readonly capabilities = {
-    structuredFocus: true,
-    boundedCapture: true,
-    nativeOverlay: true,
-  } as const;
+  readonly capabilities = MUX_CAPABILITIES.zellij;
 
   /**
    * True iff `zellij` is on PATH. Binary-only — symmetric with
@@ -166,15 +155,7 @@ export class ZellijMultiplexer implements Multiplexer {
       let previousTabPosition: number | undefined;
       if (isInZellij) {
         try {
-          const currentTabInfo = execFileSync(
-            "zellij",
-            [...sessionFlag, "action", "current-tab-info"],
-            { encoding: "utf8", timeout: 3000 },
-          );
-          const positionMatch = currentTabInfo.match(/^position:\s*(\d+)/m);
-          if (positionMatch) {
-            previousTabPosition = parseInt(positionMatch[1], 10);
-          }
+          previousTabPosition = this.currentTabPosition(sessionFlag);
         } catch {
           // Best effort — if we can't get the current tab, we'll still
           // create the new tab, just won't restore focus.
@@ -226,21 +207,54 @@ export class ZellijMultiplexer implements Multiplexer {
       );
     }
 
-    const panesAfter = this.listPanes(session);
-    const beforeIds = new Set(panesBefore.map((p) => String(p.id)));
-    // Ignore plugin panes (the tab-bar / status-bar plugins zellij spawns) —
-    // only a real terminal pane can host the child shell.
-    const newPanes = panesAfter.filter(
-      (p) => !beforeIds.has(String(p.id)) && !p.is_plugin,
+    // Ignore plugin panes (the tab-bar / status-bar / link plugins zellij
+    // spawns) on BOTH sides of the diff — only a real terminal pane can host
+    // the child shell, and plugin ids live in a separate namespace that shares
+    // integers with terminal ids (see `paneRowMatches`). Keeping plugin ids in
+    // `beforeIds` would mask a genuinely new terminal pane whose integer
+    // happens to match an existing plugin pane.
+    const terminalsAfter = this.listPanes(session).filter((p) => !p.is_plugin);
+    const beforeIds = new Set(
+      panesBefore.filter((p) => !p.is_plugin).map((p) => String(p.id)),
     );
-    const chosen =
-      newPanes[0] ?? panesAfter.find((p) => !p.is_plugin) ?? panesAfter[0];
+    const newPanes = terminalsAfter.filter((p) => !beforeIds.has(String(p.id)));
+    const chosen = newPanes[0] ?? terminalsAfter[0];
     const paneId = chosen ? normalizePaneId(String(chosen.id)) : "";
     if (!paneId) {
       throw new Error("Failed to determine pane ID after creating pane");
     }
 
     return { paneId, windowName, session: session || undefined };
+  }
+
+  /**
+   * Read the focused tab's position so `createPane` can restore focus after
+   * `new-tab` steals it.
+   *
+   * `action current-tab-info --json` (verified present in zellij 0.44.3) emits a
+   * full `TabInfo` object with a numeric `position`; the default text form emits
+   * `name: … / id: … / position: N`. We prefer JSON and keep the text regex as a
+   * fallback for zellij builds without `--json`.
+   *
+   * Returns `undefined` when there is no focused tab to restore — notably when a
+   * floating/plugin pane holds focus, where zellij answers
+   * `No active tab found for current client` on stdout with exit 0 rather than
+   * failing, so a parse miss (not an exception) is the signal.
+   */
+  private currentTabPosition(sessionFlag: string[]): number | undefined {
+    const output = execFileSync(
+      "zellij",
+      [...sessionFlag, "action", "current-tab-info", "--json"],
+      { encoding: "utf8", timeout: 3000 },
+    );
+    try {
+      const parsed = JSON.parse(output) as { position?: unknown };
+      if (typeof parsed.position === "number") return parsed.position;
+    } catch {
+      // Not JSON (older zellij, or the "no active tab" text response).
+    }
+    const positionMatch = output.match(/^position:\s*(\d+)/m);
+    return positionMatch ? parseInt(positionMatch[1], 10) : undefined;
   }
 
   /** Run `list-panes --json` against a session, returning [] on any failure. */
@@ -261,15 +275,35 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   /**
+   * Match a `list-panes --json` row against a pane id we hold.
+   *
+   * Plugin panes MUST be excluded, not merely deprioritized: zellij numbers
+   * `terminal_N` and `plugin_N` in SEPARATE namespaces, and `normalizePaneId`
+   * strips the prefix, so the two collapse onto the same integer. Verified
+   * against zellij 0.44.3 — a fresh session lists a `zellij:link` plugin pane
+   * with `id: 0` alongside the shell's terminal pane, also `id: 0`. Matching on
+   * the bare integer therefore reported a closed sub-agent pane as still alive
+   * (the plugin pane kept answering for it), which would make the artifact
+   * poller believe a finished child was running forever. Our pane is always a
+   * terminal pane: `createPane` only ever selects `!is_plugin`.
+   */
+  private paneRowMatches(
+    pane: { id?: unknown; is_plugin?: boolean; exited?: boolean },
+    target: string,
+  ): boolean {
+    return (
+      !pane.is_plugin && String(pane.id) === target && pane.exited !== true
+    );
+  }
+
+  /**
    * Probe whether the pane is still alive. Runs `list-panes --json` and
    * checks whether the pane ID appears AND has not exited. Returns false on
    * any error (dead pane, backend down, malformed id).
    */
   isPaneAlive(paneId: string, session?: string): boolean {
     const target = normalizePaneId(paneId);
-    return this.listPanes(session).some(
-      (p) => String(p.id) === target && p.exited !== true,
-    );
+    return this.listPanes(session).some((p) => this.paneRowMatches(p, target));
   }
 
   isPaneAliveAsync(paneId: string, session?: string): Promise<boolean> {
@@ -290,8 +324,11 @@ export class ZellijMultiplexer implements Multiplexer {
               const panes = Array.isArray(parsed) ? parsed : [];
               resolve(
                 panes.some(
-                  (pane: { id?: unknown; exited?: boolean }) =>
-                    String(pane.id) === target && pane.exited !== true,
+                  (pane: {
+                    id?: unknown;
+                    is_plugin?: boolean;
+                    exited?: boolean;
+                  }) => this.paneRowMatches(pane, target),
                 ),
               );
             } catch {
@@ -322,6 +359,10 @@ export class ZellijMultiplexer implements Multiplexer {
         "write-chars",
         "--pane-id",
         normalizePaneId(paneId),
+        // `--` terminates flag parsing. Follow-up text is user/model controlled;
+        // starting it with `-` otherwise fails the whole command (zellij's own
+        // error even suggests the fix: "use `-- -n`").
+        "--",
         text,
       ],
       { encoding: "utf8", timeout: 5000 },
@@ -342,6 +383,9 @@ export class ZellijMultiplexer implements Multiplexer {
         "write",
         "--pane-id",
         normalizePaneId(paneId),
+        // Symmetric with sendKeys; `13` needs no protection itself, but the
+        // terminator keeps the two write paths shaped identically.
+        "--",
         "13",
       ],
       { encoding: "utf8", timeout: 5000 },
@@ -391,6 +435,26 @@ export class ZellijMultiplexer implements Multiplexer {
     });
   }
 
+  /**
+   * Capture bounded pane output via `action dump-screen`.
+   *
+   * argv contract (verified against zellij 0.44.3 — `zellij action dump-screen
+   * --help` is `dump-screen [OPTIONS]`, no positional):
+   *   - STDOUT is the DEFAULT sink. There used to be a `/dev/stdout` positional
+   *     here, which clap rejected client-side with
+   *     `error: Found argument '/dev/stdout' which wasn't expected` (exit 2) —
+   *     the command never reached a session, so BOTH overlay actions that read
+   *     pane output (`v` snapshot, `n` native viewer) failed for every zellij
+   *     sub-agent. Write-to-file is `--path <PATH>`, which we do not want.
+   *   - `--full` includes scrollback. Without it zellij dumps only the current
+   *     viewport, whereas tmux's `capture-pane -S -<lines>` reaches scrollback.
+   *
+   * Remaining backend difference: tmux applies the line bound server-side
+   * (`-S -<lines>`), zellij has no equivalent flag, so we ask for everything and
+   * let `boundCaptureOutput` apply `maxLines`/`maxBytes` client-side. Same
+   * result for the caller; zellij just transfers more bytes over the socket,
+   * capped by `MAX_CAPTURE_READ_BYTES`.
+   */
   capturePane(
     ref: PaneRef,
     opts: CapturePaneOptions,
@@ -402,9 +466,9 @@ export class ZellijMultiplexer implements Multiplexer {
           ...this.sessionFlag(ref.session),
           "action",
           "dump-screen",
+          "--full",
           "--pane-id",
           normalizePaneId(ref.paneId),
-          "/dev/stdout",
         ],
         {
           encoding: "utf8",
@@ -422,30 +486,36 @@ export class ZellijMultiplexer implements Multiplexer {
     });
   }
 
-  async showNativeViewer(title: string, content: string): Promise<boolean> {
-    if (!process.env.ZELLIJ) return false;
+  /**
+   * Open the bounded supervisor content in a floating zellij pane.
+   *
+   * Kept behaviourally identical to the tmux twin: spawn asynchronously, resolve
+   * `true` once the overlay survives the spawn grace window, resolve `false`
+   * when zellij rejects the request. Previously this was a synchronous
+   * fire-and-forget that returned `true` unconditionally while the tmux twin
+   * blocked the event loop — same interface, opposite behaviour.
+   *
+   * `--name` is not a format context in zellij (verified: a `#(...)` pane name
+   * executes nothing), but it is still untrusted text in an argv slot: a name
+   * beginning with `-` makes zellij's clap parser reject the whole command
+   * (`Found argument '-r' which wasn't expected`). `sanitizeViewerTitle` handles
+   * that along with the tmux format hazard, so both backends sanitize alike.
+   */
+  showNativeViewer(title: string, content: string): Promise<boolean> {
+    if (!process.env.ZELLIJ) return Promise.resolve(false);
     const command = `printf '%s\\n' ${shellEscape(content)}; printf '\\nPress Enter to close'; read _`;
-    try {
-      execFileSync(
-        "zellij",
-        [
-          ...this.sessionFlag(process.env.ZELLIJ_SESSION_NAME),
-          "action",
-          "new-pane",
-          "--floating",
-          "--name",
-          title.slice(0, 120),
-          "--",
-          "sh",
-          "-lc",
-          command,
-        ],
-        { stdio: "ignore", timeout: 5000 },
-      );
-      return true;
-    } catch {
-      return false;
-    }
+    return spawnNativeViewer("zellij", [
+      ...this.sessionFlag(process.env.ZELLIJ_SESSION_NAME),
+      "action",
+      "new-pane",
+      "--floating",
+      "--name",
+      sanitizeViewerTitle(title),
+      "--",
+      "sh",
+      "-lc",
+      command,
+    ]);
   }
 
   /**
@@ -485,7 +555,7 @@ export class ZellijMultiplexer implements Multiplexer {
     // positional argument. No `\;` chaining — that's tmux-only syntax.
     return {
       attachCommand: `zellij attach ${escapedSession}`,
-      focusCommand: `zellij action focus-pane-id ${normalizePaneId(opts.paneId)}`,
+      focusCommand: `zellij action focus-pane-id ${shellEscape(normalizePaneId(opts.paneId))}`,
     };
   }
 }

