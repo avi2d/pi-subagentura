@@ -421,6 +421,7 @@ export function registerWorkflowTool(
       "Orchestrate decomposable multi-agent work with trusted raw JavaScript workflows.",
     promptGuidelines: [
       "Use workflows only for decomposable multi-agent work; handle simple or sequential tasks directly.",
+      "Omit async for the default background behavior; use async: false only when synchronous execution is required.",
       "Pass raw JavaScript with no markdown fences. Include a top-level pure-literal `export const meta = { name, description, phases? }`.",
       "Do not use TypeScript, imports, require, fs, or other Node APIs. Date.now(), Math.random(), and argless new Date() are unavailable.",
       "Available globals are agent, parallel, pipeline, workflow, phase, log, args, immutable cwd, budget, console, guarded Date, and guarded Math.",
