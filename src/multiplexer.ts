@@ -382,8 +382,11 @@ export function commandExists(command: string): boolean {
 /**
  * Sanitize a free-form name into a safe window/tab/session segment.
  *
- * Shared by both backends so a sub-agent's display name maps to exactly one
- * segment everywhere. `.` is excluded on purpose: tmux target syntax reads
+ * Shared by both backends AND by the orchestrator in `interactive-tmux.ts`,
+ * which reuses it for the artifact/session path segments, so a sub-agent's
+ * display name maps to exactly one segment everywhere — a second, drifting copy
+ * of this logic is how a window name and its artifact directory came apart.
+ * `.` is excluded on purpose: tmux target syntax reads
  * `window.pane`, so a window literally named `review.v2` can be created but
  * never selected again — `tmux select-window -t review.v2` fails with
  * `can't find pane: v2`, permanently breaking focus and the copy-paste attach

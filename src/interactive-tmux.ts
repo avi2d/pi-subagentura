@@ -55,6 +55,7 @@ import {
   type MuxName,
   type Multiplexer,
   type PaneRef,
+  safeSegment,
 } from "./multiplexer";
 import {
   snapshotInteractiveContext,
@@ -276,23 +277,6 @@ export function tmuxSetupHint(): string {
     "Start pi inside tmux or zellij, for example:\n" +
     "  tmux new -A -s pi 'pi'\n" +
     "  zellij --session pi  (or just start pi inside an existing zellij session)"
-  );
-}
-
-/**
- * Sanitize a value for use as a mux window name and as a path segment.
- *
- * `.` is excluded on purpose: tmux treats it as the window.pane separator, so a
- * window named `review.v2` makes `select-window -t review.v2` fail with
- * "can't find pane: v2".
- */
-function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
   );
 }
 
