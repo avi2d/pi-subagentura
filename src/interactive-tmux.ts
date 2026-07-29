@@ -84,6 +84,11 @@ import {
   writeLineageManifestAtomicSync,
 } from "./interactive-lineage";
 import {
+  advanceInteractiveStateActor,
+  createInteractiveStateActor,
+  type InteractiveStateActor,
+} from "./interactive-state-xstate";
+import {
   initialInteractiveMachineState,
   projectInteractiveStatus,
   transitionInteractiveMachine,
@@ -320,9 +325,9 @@ export function removeInteractiveSubagentState(
   return removed;
 }
 
-const interactiveMachineStates = new WeakMap<
+const interactiveStateActors = new WeakMap<
   InteractiveSubagentState,
-  InteractiveMachineState
+  InteractiveStateActor
 >();
 
 function paneLivenessFromCompatibilityStatus(
@@ -389,41 +394,49 @@ export function initializeInteractiveStateMachine(
     lifecycle: lifecycleForCompatibilityInitialization(state),
     pane,
   });
-  interactiveMachineStates.set(state, machine);
+  interactiveStateActors.set(state, createInteractiveStateActor(machine));
   state.lifecycle = { ...machine.lifecycle };
   state.status = projectInteractiveStatus(machine);
   return machine;
 }
 
+function getInteractiveStateActor(
+  state: InteractiveSubagentState,
+): InteractiveStateActor {
+  const existing = interactiveStateActors.get(state);
+  if (existing) return existing;
+  initializeInteractiveStateMachine(state);
+  const initialized = interactiveStateActors.get(state);
+  if (!initialized) {
+    throw new Error("interactive state actor initialization failed");
+  }
+  return initialized;
+}
+
 export function getInteractiveMachineState(
   state: InteractiveSubagentState,
 ): InteractiveMachineState {
-  return (
-    interactiveMachineStates.get(state) ??
-    initializeInteractiveStateMachine(state)
-  );
+  return getInteractiveStateActor(state).getSnapshot().context.state;
 }
 
 export function advanceInteractiveState(
   state: InteractiveSubagentState,
   event: InteractiveMachineEvent,
 ): InteractiveMachineTransition {
-  const transition = transitionInteractiveMachine(
-    getInteractiveMachineState(state),
-    event,
-  );
-  if (
-    event.type === "pane_observed" &&
-    transition.state.pane.kind === "dead" &&
-    state.parentSessionId
-  ) {
-    updateInteractiveState(state.cwd, state.id, (entry) => {
-      entry.paneDeathConfirmed = true;
-    });
-  }
+  const actor = getInteractiveStateActor(state);
+  const transition = advanceInteractiveStateActor(actor, event, (candidate) => {
+    if (
+      event.type === "pane_observed" &&
+      candidate.state.pane.kind === "dead" &&
+      state.parentSessionId
+    ) {
+      updateInteractiveState(state.cwd, state.id, (entry) => {
+        entry.paneDeathConfirmed = true;
+      });
+    }
+  });
   switch (transition.kind) {
     case "applied": {
-      interactiveMachineStates.set(state, transition.state);
       state.lifecycle = { ...transition.state.lifecycle };
       state.status = projectInteractiveStatus(transition.state);
       const exitCode =
