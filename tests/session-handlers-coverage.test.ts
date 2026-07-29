@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobRegistry } from "../src/helpers";
-import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import {
+  interactiveSubagentRegistry,
+  type InteractiveSubagentState,
+} from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
 import { updateRunningSubagentFooter } from "../src/artifact-poller";
 import { workflowJobRegistry } from "../src/workflow-jobs";
@@ -188,6 +191,34 @@ describe("session handler lifecycle callbacks", () => {
     );
     parentUi.setStatus.mockClear();
 
+    const parentState: InteractiveSubagentState = {
+      id: "parent-interactive",
+      name: "parent-interactive",
+      task: "parent task",
+      paneId: "%parent",
+      cwd: root,
+      artifactDir: join(root, "parent-interactive"),
+      sessionFile: join(root, "parent-interactive.jsonl"),
+      startedAt: Date.now(),
+      mux: "tmux",
+      status: "exited",
+      parentSessionId: "parent-session",
+      attachCommand: "",
+      selectPaneCommand: "",
+      launchScriptFile: "",
+    };
+    const childState: InteractiveSubagentState = {
+      ...parentState,
+      id: "child-interactive",
+      name: "child-interactive",
+      paneId: "%child",
+      artifactDir: join(root, "child-interactive"),
+      sessionFile: join(root, "child-interactive.jsonl"),
+      parentSessionId: "child-session",
+    };
+    interactiveSubagentRegistry.set(parentState.id, parentState);
+    interactiveSubagentRegistry.set(childState.id, childState);
+
     child.handlers.get("session_shutdown")![1](
       { reason: "agent_settled" },
       childCtx as any,
@@ -196,6 +227,8 @@ describe("session handler lifecycle callbacks", () => {
     expect(childWorkflow.abort.signal.aborted).toBe(true);
     expect(workflowJobRegistry.has(childWorkflow.id)).toBe(false);
     expect(workflowJobRegistry.get(parentWorkflow.id)).toBe(parentWorkflow);
+    expect(interactiveSubagentRegistry.get(parentState.id)).toBe(parentState);
+    expect(interactiveSubagentRegistry.has(childState.id)).toBe(false);
     expect((globalThis as any).__piSubagenturaPiRef).toBe(parent.pi);
     expect((globalThis as any).__piSubagenturaSessionManager).toBe(
       parentSessionManager,
@@ -283,7 +316,7 @@ describe("session handler lifecycle callbacks", () => {
     }
   });
 
-  it("runs top-level cleanup even when a crashed nested context lingers", () => {
+  it("runs top-level cleanup when a descendant omitted its shutdown", () => {
     const parent = registerHandlers();
     const parentManager = {
       getSessionId: () => "parent-session",
@@ -296,16 +329,17 @@ describe("session handler lifecycle callbacks", () => {
     } as any);
     const globalState = globalThis as any;
     expect(globalState.__piSubagenturaInteractivePollerHandle).toBeDefined();
-    // A nested child that started and then died: still in the stack, but its
-    // session manager no longer answers.
+    // A nested child whose shutdown hook was omitted remains structurally
+    // started and its SessionManager still answers. Health probing cannot
+    // distinguish this stale descendant from a live ancestor.
+    const staleAccessor = vi.fn(() => "stale-child-session");
     globalState.__piSubagenturaSessionContextStack.push({
       id: 4_242,
       generation: 1,
+      lifecycle: "started",
       pi: {} as any,
       sessionManager: {
-        getSessionId: () => {
-          throw new Error("stale session manager");
-        },
+        getSessionId: staleAccessor,
       },
     });
 
@@ -316,19 +350,21 @@ describe("session handler lifecycle callbacks", () => {
 
     expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
     expect(globalState.__piSubagenturaPiRef).toBeUndefined();
+    expect(staleAccessor).not.toHaveBeenCalled();
+    expect(globalState.__piSubagenturaSessionContextStack).toEqual([]);
   });
 
-  it("sweeps dead contexts on session_start", () => {
+  it("sweeps structurally stale descendants on session_start without health probing", () => {
     const parent = registerHandlers();
     const globalState = globalThis as any;
+    const staleAccessor = vi.fn(() => "stale-child-session");
     globalState.__piSubagenturaSessionContextStack.push({
       id: 4_243,
       generation: 1,
+      lifecycle: "started",
       pi: {} as any,
       sessionManager: {
-        getSessionId: () => {
-          throw new Error("stale session manager");
-        },
+        getSessionId: staleAccessor,
       },
     });
 
@@ -346,6 +382,7 @@ describe("session handler lifecycle callbacks", () => {
         (entry: { id: number }) => entry.id,
       ),
     ).toEqual([parent.sessionContext.id]);
+    expect(staleAccessor).not.toHaveBeenCalled();
   });
 
   it("polls every live owner from the single global interval", async () => {
@@ -387,7 +424,7 @@ describe("session handler lifecycle callbacks", () => {
     interactiveSubagentRegistry.set(parentState.id, parentState);
     interactiveSubagentRegistry.set(childState.id, childState);
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await vi.advanceTimersByTimeAsync(5000);

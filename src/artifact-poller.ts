@@ -31,7 +31,7 @@ import {
   deriveInteractiveSubagentStatusFromLifecycle,
   foldInteractiveLifecycle,
   interactiveSubagentRegistry,
-  isPaneAliveAsync,
+  getInteractivePaneLivenessAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
@@ -82,7 +82,10 @@ function getRunningSubagentCount(): number {
     (job) => job.status === "running",
   ).length;
   const interactiveCount = [...interactiveSubagentRegistry.values()].filter(
-    (state) => state.status === "running" || state.status === "idle",
+    (state) =>
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
   ).length;
   return inProcessCount + interactiveCount;
 }
@@ -162,7 +165,9 @@ function projectActivityWidgetRows(
   const contexts = getSessionContextStack();
   const states = [...interactiveSubagentRegistry.values()].filter(
     (state) =>
-      (state.status === "running" || state.status === "idle") &&
+      (state.status === "running" ||
+        state.status === "idle" ||
+        state.status === "unknown") &&
       stateBelongsToUi(state, ui, owner, contexts),
   );
   return states.map((state) => formatActivityRow(state, now));
@@ -268,13 +273,13 @@ async function runPollArtifactChanges(
     const liveness = await Promise.all(
       states.map(async (state) => {
         try {
-          return [state, await isPaneAliveAsync(state)] as const;
+          return [state, await getInteractivePaneLivenessAsync(state)] as const;
         } catch (err) {
           debugLog("error", "poller_liveness_error", {
             stateId: state.id,
             error: err instanceof Error ? err.message : String(err),
           });
-          return [state, false] as const;
+          return [state, "unknown"] as const;
         }
       }),
     );
@@ -290,7 +295,7 @@ async function runPollArtifactChanges(
     const ui =
       ownerContext?.ui ??
       (g2.__piSubagenturaUi as ExtensionUIContext | undefined);
-    for (const [state, paneAlive] of liveness) {
+    for (const [state, paneLiveness] of liveness) {
       if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
       // the artifact log: a later done/error event must still reach the parent.
@@ -382,7 +387,7 @@ async function runPollArtifactChanges(
       state.eventByteCursor = nextCursor;
       const next = deriveInteractiveSubagentStatusFromLifecycle(
         lifecycle,
-        paneAlive,
+        paneLiveness,
       );
       if (next !== state.status) state.status = next;
       if (next === "exited") {
@@ -414,9 +419,7 @@ async function runPollArtifactChanges(
     for (const state of states) {
       if (interactiveSubagentRegistry.get(state.id) !== state) continue;
       const terminal =
-        state.status === "cancelled" ||
-        state.status === "exited" ||
-        state.status === "unknown";
+        state.status === "cancelled" || state.status === "exited";
       if (terminal) destroySessionParser(state);
       if (
         terminal &&

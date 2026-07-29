@@ -29,7 +29,7 @@ import {
   type ProjectedLineageNode,
   type ProjectionIssue,
 } from "./interactive-lineage";
-import { getMux, type MuxName } from "./multiplexer";
+import { getMux, type MuxName, type PaneLiveness } from "./multiplexer";
 import {
   abortJobTree,
   inProcessJobBelongsToOwner,
@@ -63,7 +63,11 @@ interface SupervisorProjection {
 function isInteractiveStateActionable(
   state: InteractiveSubagentState,
 ): boolean {
-  return state.status === "running" || state.status === "idle";
+  return (
+    state.status === "running" ||
+    state.status === "idle" ||
+    state.status === "unknown"
+  );
 }
 
 export function directSupervisorItems(
@@ -129,7 +133,7 @@ function inProcessSupervisorDepth(
 
 function stateForNode(
   node: ProjectedLineageNode,
-  paneAliveById?: Map<string, boolean>,
+  paneLivenessById?: Map<string, PaneLiveness>,
 ): InteractiveSubagentState {
   const existing = interactiveSubagentRegistry.get(node.manifest.agentId);
   if (existing) return existing;
@@ -137,6 +141,7 @@ function stateForNode(
   const knownBackend =
     manifest.pane.backend === "tmux" || manifest.pane.backend === "zellij";
   const mux: MuxName = manifest.pane.backend === "zellij" ? "zellij" : "tmux";
+  const paneLiveness = paneLivenessById?.get(manifest.agentId);
   // tmux's buildAttachCommands resolves the pane's window via execMuxOrThrow,
   // which THROWS for a dead pane. It runs for every projected node, so one
   // finished tmux agent used to make the whole projection reject and the overlay
@@ -151,16 +156,19 @@ function stateForNode(
       });
     } catch {
       const target = manifest.pane.windowName ?? manifest.pane.paneId;
+      const detail =
+        paneLiveness === "dead"
+          ? `pane ${target} is gone`
+          : `pane ${target} could not be resolved`;
       attach = {
-        attachCommand: `unavailable (pane ${target} is gone)`,
-        focusCommand: `unavailable (pane ${target} is gone)`,
+        attachCommand: `unavailable (${detail})`,
+        focusCommand: `unavailable (${detail})`,
       };
     }
   }
   // Liveness comes from the pane probe, not from `node.state`. Deriving it from
   // the same field the actionable gate then tests made that gate a tautology
   // for lineage-only nodes, and mislabelled a live pane hidden for a cycle.
-  const paneAlive = paneAliveById?.get(manifest.agentId);
   return {
     id: manifest.agentId,
     name: manifest.name,
@@ -174,11 +182,11 @@ function stateForNode(
     parentSessionId: manifest.ownerSessionId,
     startedAt: parseStartedAt(manifest.startedAt),
     status:
-      paneAlive === undefined
+      paneLiveness === undefined
         ? node.state === "actionable"
           ? "running"
           : "unknown"
-        : paneAlive
+        : paneLiveness === "alive"
           ? "running"
           : "unknown",
     attachCommand: attach.attachCommand,
@@ -210,28 +218,33 @@ async function loadSupervisorProjection(
   const paths = await resolveLineageStorePaths(sessionRoot, rootId);
   // Reused across the projection AND the prune sweep so no manifest is probed
   // twice per refresh.
-  const paneAliveById = new Map<string, boolean>();
+  const paneLivenessById = new Map<string, PaneLiveness>();
   const isNodeStale = async (manifest: LineageManifest): Promise<boolean> => {
-    const cached = paneAliveById.get(manifest.agentId);
-    if (cached !== undefined) return !cached;
+    const cached = paneLivenessById.get(manifest.agentId);
+    if (cached !== undefined) return cached === "dead";
     // A node the live registry already knows is terminal needs no subprocess.
     const known = interactiveSubagentRegistry.get(manifest.agentId);
     if (known?.status === "cancelled" || known?.status === "exited") {
-      paneAliveById.set(manifest.agentId, false);
+      paneLivenessById.set(manifest.agentId, "dead");
       return true;
     }
     if (
       manifest.pane.backend !== "tmux" &&
       manifest.pane.backend !== "zellij"
     ) {
-      paneAliveById.set(manifest.agentId, false);
-      return true;
+      paneLivenessById.set(manifest.agentId, "unknown");
+      return false;
     }
-    const alive = await getMux({
-      preference: manifest.pane.backend,
-    }).isPaneAliveAsync(manifest.pane.paneId, manifest.pane.muxSession);
-    paneAliveById.set(manifest.agentId, alive);
-    return !alive;
+    let paneLiveness: PaneLiveness;
+    try {
+      paneLiveness = await getMux({
+        preference: manifest.pane.backend,
+      }).getPaneLivenessAsync(manifest.pane.paneId, manifest.pane.muxSession);
+    } catch {
+      paneLiveness = "unknown";
+    }
+    paneLivenessById.set(manifest.agentId, paneLiveness);
+    return paneLiveness === "dead";
   };
   const projection = await projectLineageStore(
     paths.nodesDir,
@@ -254,7 +267,7 @@ async function loadSupervisorProjection(
     }
   }
   const items: InteractiveSupervisorItem[] = flattened.map((node) => {
-    const state = stateForNode(node, paneAliveById);
+    const state = stateForNode(node, paneLivenessById);
     return {
       state,
       depth: node.depth,

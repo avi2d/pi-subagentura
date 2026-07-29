@@ -17,6 +17,10 @@ import {
   MAX_IN_PROCESS_DELIVERY_BYTES,
   MAX_IN_PROCESS_DELIVERY_RECORDS,
 } from "../src/notifications";
+import {
+  getSessionContextStack,
+  setActiveSessionRefs,
+} from "../src/session-context";
 
 // ── Hoisted mock: startSubagentJob must be mocked before any imports ──────
 const { mockStartSubagentJob } = vi.hoisted(() => ({
@@ -189,6 +193,8 @@ function cleanGlobals() {
   (globalThis as any).__piSubagenturaPiRef = undefined;
   (globalThis as any).__piSubagenturaUi = undefined;
   (globalThis as any).__piSubagenturaParentStreaming = false;
+  getSessionContextStack().length = 0;
+  setActiveSessionRefs(undefined);
   jobRegistry.clear();
 }
 
@@ -230,6 +236,8 @@ describe("notifyOnComplete", () => {
     };
 
     registerExtension(_api as any);
+    const sessionContext = getSessionContextStack().at(-1);
+    if (sessionContext) sessionContext.lifecycle = "started";
     (globalThis as any).__piSubagenturaUi = { notify: _api.notify };
 
     const isolatedDef = _api.registerTool.mock.calls.find(

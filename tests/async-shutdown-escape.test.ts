@@ -153,8 +153,11 @@ describe("async spawn shutdown handoff", () => {
       mockStartSubagentJob.mockReturnValue(gate.promise);
       const tools = setupTools();
       const parentPi = { on: vi.fn(), sendMessage: vi.fn() } as any;
-      registerSessionHandlers(parentPi);
       const ctx = fakeCtx(toolName === "subagent_with_context");
+      const parentContext = registerSessionHandlers(parentPi);
+      parentContext.lifecycle = "started";
+      parentContext.ui = ctx.ui;
+      parentContext.sessionManager = ctx.sessionManager;
 
       const spawn = tools[toolName].execute(
         "call",
@@ -166,7 +169,10 @@ describe("async spawn shutdown handoff", () => {
       await Promise.resolve();
 
       const childPi = { on: vi.fn(), sendMessage: vi.fn() } as any;
-      registerSessionHandlers(childPi);
+      const childContext = registerSessionHandlers(childPi);
+      childContext.lifecycle = "started";
+      childContext.ui = ctx.ui;
+      childContext.sessionManager = ctx.sessionManager;
 
       const start = vi.fn();
       const disposeBeforeStart = vi.fn();

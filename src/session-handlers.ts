@@ -38,6 +38,7 @@ function ensureInteractivePoller(globalState: any): void {
   if (globalState.__piSubagenturaInteractivePollerHandle) return;
   const handle = setInterval(() => {
     for (const context of [...getSessionContextStack()]) {
+      if (context.lifecycle !== "started") continue;
       void pollArtifactChanges(context.pi, {
         id: context.id,
         generation: context.generation,
@@ -50,26 +51,6 @@ function ensureInteractivePoller(globalState: any): void {
   globalState.__piSubagenturaInteractivePollerHandle = handle;
 }
 
-/**
- * Whether a registered context still belongs to a session that can answer for
- * itself. A started-then-crashed child keeps its `sessionManager` object but the
- * host tears the session down, so `getSessionId` throws or stops answering — the
- * same signal the poller already uses to decide widget ownership.
- */
-function isSessionContextLive(context: SessionContextRef): boolean {
-  if (context.sessionManager === undefined) return false;
-  try {
-    return typeof context.sessionManager.getSessionId?.() === "string";
-  } catch {
-    return false;
-  }
-}
-
-/** A context that started and then died. Never-started ones are not "dead". */
-function isDeadSessionContext(context: SessionContextRef): boolean {
-  return context.sessionManager !== undefined && !isSessionContextLive(context);
-}
-
 // Older releases could start a poller during extension preload, before project
 // package overrides selected the live runtime. Replace that orphan on session_start.
 function discardPreSessionPollerState(
@@ -78,16 +59,20 @@ function discardPreSessionPollerState(
 ): void {
   const contexts = [...getSessionContextStack()];
   const hasStartedContext = contexts.some(
-    (context) => context.sessionManager !== undefined,
+    (context) => context.lifecycle === "started",
   );
-  for (const context of contexts) {
-    // Only THIS handler's own pre-start placeholder may be evicted for a
-    // missing sessionManager — another session's placeholder is not ours to
-    // drop. Contexts that started and then died are swept regardless: left in
-    // the stack they would suppress the owning session's shutdown cleanup.
-    const ownPreStart =
-      context.id === sessionContext.id && context.sessionManager === undefined;
-    if (ownPreStart || isDeadSessionContext(context)) {
+  const ownIndex = contexts.findIndex(
+    (context) => context.id === sessionContext.id,
+  );
+  for (const [index, context] of contexts.entries()) {
+    // A started context after this ancestor belongs to an older nested
+    // lifecycle whose shutdown was omitted. Stack position, not a
+    // SessionManager accessor, is the reliable ownership signal.
+    const staleDescendant =
+      ownIndex >= 0 && index > ownIndex && context.lifecycle === "started";
+    if (staleDescendant) {
+      context.lifecycle = "shutdown";
+      advanceSessionContextGeneration(context.id);
       removeSessionContext(context.id);
     }
   }
@@ -132,8 +117,8 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
     };
     discardPreSessionPollerState(g2, sessionContext);
     cleanupWorkflowJobsForOwner(previousOwner);
-    removeSessionContext(sessionContext.id);
     sessionContext.generation++;
+    sessionContext.lifecycle = "started";
     sessionContext.ui = ctx.ui;
     sessionContext.sessionManager = ctx.sessionManager;
     registerSessionContext(sessionContext);
@@ -184,6 +169,14 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       );
       if (contextIndex < 0) return;
 
+      // Only started ancestors registered before this context may keep the
+      // shared poller and registries alive. Descendants are structurally owned
+      // by this context; a missed nested shutdown must not outlive its parent.
+      const startedAncestors = contextStack
+        .slice(0, contextIndex)
+        .filter((context) => context.lifecycle === "started");
+      const descendants = contextStack.slice(contextIndex + 1);
+
       const shutdownOwner: ActiveSessionContextToken = {
         id: sessionContext.id,
         generation: sessionContext.generation,
@@ -194,26 +187,25 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       } catch {
         shutdownSessionId = undefined;
       }
+      sessionContext.lifecycle = "shutdown";
       advanceSessionContextGeneration(sessionContext.id);
       removeSessionContext(sessionContext.id);
-      // Hand the active refs to the newest context that can still answer for
-      // itself; a crashed one must not become the live session's stand-in.
-      setActiveSessionRefs(
-        [...contextStack].reverse().find(isSessionContextLive),
-      );
+      for (const descendant of descendants) {
+        descendant.lifecycle = "shutdown";
+        advanceSessionContextGeneration(descendant.id);
+        removeSessionContext(descendant.id);
+      }
+      setActiveSessionRefs(startedAncestors[startedAncestors.length - 1]);
       g2.__piSubagenturaParentStreaming = false;
 
       // Context-owned workflows must be torn down even when a nested session
       // remains active above or below this handler in the global stack.
       cleanupWorkflowJobsForOwner(shutdownOwner);
 
-      // Only a context that can still answer for itself may defer the
-      // top-level teardown. A nested context that crashed (or a host that
-      // never emits session_shutdown for it) would otherwise sit in the stack
-      // forever and permanently suppress poller teardown, snapshots, and pane
-      // kills for the session that is actually shutting down. This context was
-      // already spliced out above, so anything left here belongs to a sibling.
-      if (contextStack.some(isSessionContextLive)) {
+      // A live ancestor may defer global teardown while this nested context
+      // cleans its own state. Descendants never participate in this decision:
+      // if their shutdown hook was omitted, their lifecycle is stale.
+      if (startedAncestors.length > 0) {
         const preserveInteractivePanes =
           event?.reason === "reload" ||
           event?.reason === "resume" ||

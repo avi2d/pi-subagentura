@@ -26,7 +26,7 @@ function owner(id: number, generation: number): ActiveSessionContextToken {
 }
 
 function context(id: number, generation: number): SessionContextRef {
-  return { id, generation, pi: {} as any };
+  return { id, generation, lifecycle: "started", pi: {} as never };
 }
 
 function makeJob(

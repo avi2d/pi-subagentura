@@ -62,16 +62,22 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
   const sessionContext = getSessionContextStack().at(-1);
   if (sessionContext) {
     sessionContext.ui = ui;
+    sessionContext.lifecycle = "started";
     sessionContext.sessionManager = harness.sessionManager;
   }
   (globalThis as any).__piSubagenturaUi = ui;
   const pi = (globalThis as any).__piSubagenturaPiRef;
   const sendMessage = vi.fn(pi.sendMessage.bind(pi));
   pi.sendMessage = sendMessage;
+  __setTmuxMultiplexer({
+    getPaneLiveness: () => "alive",
+    getPaneLivenessAsync: async () => "alive",
+  } as any);
   const art = artifactPath(repoRoot, "session-harness");
   const state: any = {
     id: "session-harness",
     paneId: "none",
+    mux: "tmux",
     cwd: repoRoot,
     artifactDir: art.dir,
     eventsFile: art.statusFile,
@@ -371,6 +377,11 @@ describe("Pi session delivery integration", () => {
   it("batches a triggering burst despite a stale streaming flag", async () => {
     const harness = await createPiSessionHarness(repoRoot);
     harnesses.push(harness);
+    const sessionContext = getSessionContextStack().at(-1);
+    if (sessionContext) {
+      sessionContext.lifecycle = "started";
+      sessionContext.sessionManager = harness.sessionManager;
+    }
     (globalThis as any).__piSubagenturaParentStreaming = true;
     const result: any = {
       isError: false,
@@ -430,8 +441,8 @@ describe("Pi session delivery integration", () => {
     };
     interactiveSubagentRegistry.set(state.id, state);
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
-      isPaneAlive: () => true,
+      getPaneLivenessAsync: async () => "alive",
+      getPaneLiveness: () => "alive",
     } as any);
     writeOutput(art, "immutable artifact result");
     appendCompletionEvent(art, {

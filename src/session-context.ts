@@ -8,16 +8,26 @@ const SESSION_CONTEXT_ID_COUNTER_KEY = "__piSubagenturaSessionContextIdCounter";
 export const ACTIVE_SESSION_CONTEXT_ID_KEY =
   "__piSubagenturaActiveSessionContextId";
 
+export type SessionContextLifecycle = "registered" | "started" | "shutdown";
+
 export interface SessionContextRef {
   id: number;
   generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
+  lifecycle: SessionContextLifecycle;
   sessionManager?: {
     getEntries?: () => unknown[];
     getSessionId?: () => string;
   };
 }
+
+export type SessionContextRegistration = Omit<
+  SessionContextRef,
+  "lifecycle"
+> & {
+  lifecycle?: SessionContextLifecycle;
+};
 
 declare global {
   // eslint-disable-next-line no-var
@@ -52,20 +62,30 @@ export function createSessionContextRef(pi: ExtensionAPI): SessionContextRef {
   return {
     id: nextSessionContextId(),
     generation: 0,
+    lifecycle: "registered",
     pi,
   };
 }
 
-export function registerSessionContext(context: SessionContextRef): void {
+export function registerSessionContext(
+  context: SessionContextRegistration,
+): void {
+  // Existing external registrations represent active contexts; the extension's
+  // own pre-start placeholder passes "registered" explicitly.
+  context.lifecycle ??= "started";
+  const registeredContext = context as SessionContextRef;
   const stack = getSessionContextStack();
 
-  // Keep the stack deduplicated when registerSessionHandlers is re-bound after
-  // restore/reload cycles in tests and host startup paths.
-  const existingIndex = stack.findIndex((entry) => entry.id === context.id);
+  // Re-registration advances the existing lifecycle in place. Moving a
+  // context would destroy the ancestor-before-descendant stack invariant.
+  const existingIndex = stack.findIndex(
+    (entry) => entry.id === registeredContext.id,
+  );
   if (existingIndex >= 0) {
-    stack.splice(existingIndex, 1);
+    stack[existingIndex] = registeredContext;
+    return;
   }
-  stack.push(context);
+  stack.push(registeredContext);
 }
 
 export function removeSessionContext(
@@ -138,7 +158,10 @@ export function resolveLiveSessionContext(
   const context = getSessionContextStack().find(
     (entry) => entry.id === token.id,
   );
-  return context?.generation === token.generation ? context : undefined;
+  return context?.generation === token.generation &&
+    context.lifecycle === "started"
+    ? context
+    : undefined;
 }
 
 /** Whether a captured context still belongs to the same live lifecycle. */

@@ -588,7 +588,10 @@ function supervisorItems(): AsyncSupervisorItem[] {
     kind: "interactive",
     state,
     depth: 0,
-    actionable: state.status === "running" || state.status === "idle",
+    actionable:
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
   }));
 }
 
@@ -614,7 +617,11 @@ function supervisorItemIsActive(item: AsyncSupervisorItem): boolean {
   if (!item.actionable) return false;
   if (item.kind === "in-process") return item.job.status === "running";
   if (item.kind === "workflow") return item.job.status === "running";
-  return item.state.status === "running" || item.state.status === "idle";
+  return (
+    item.state.status === "running" ||
+    item.state.status === "idle" ||
+    item.state.status === "unknown"
+  );
 }
 
 function formatAsyncSupervisorSummary(

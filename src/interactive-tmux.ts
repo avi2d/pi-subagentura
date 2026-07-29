@@ -54,6 +54,7 @@ import {
   NoMultiplexerAvailableError,
   type MuxName,
   type Multiplexer,
+  type PaneLiveness,
   type PaneRef,
   safeSegment,
 } from "./multiplexer";
@@ -504,23 +505,21 @@ export function launchInteractiveSubagent(params: {
     ? resolveLineageStorePathsSync(sessionRoot, rootId)
     : undefined;
   if (lineageStore) {
-    let nodeCount = existsSync(lineageStore.nodesDir)
+    let activeCount = existsSync(lineageStore.nodesDir)
       ? countLineageManifestsSync(lineageStore.nodesDir)
       : 0;
-    if (nodeCount >= maxNodes) {
-      // Manifests are never removed on their own, so an all-time total is not a
-      // live-node count: a session that spawned maxNodes agents over weeks —
-      // all long exited — could otherwise never spawn again. Sweep the nodes
-      // whose panes are gone and recount. The sweep costs one liveness probe
-      // per manifest, so it is paid only at the cap and only once per dead node.
-      nodeCount = pruneTerminalLineageNodesSync(
+    if (activeCount >= maxNodes) {
+      // Physical manifests include confirmed-dead ancestors retained to keep
+      // child lineage connected. Probe only at the cap, then admit by the
+      // active/non-dead count; unknown panes conservatively consume capacity.
+      activeCount = pruneTerminalLineageNodesSync(
         lineageStore.nodesDir,
-        (manifest) => !isLineagePaneAlive(manifest),
-      ).retained;
+        (manifest) => getLineagePaneLiveness(manifest) === "dead",
+      ).active;
     }
-    if (nodeCount >= maxNodes) {
+    if (activeCount >= maxNodes) {
       throw new Error(
-        `interactive sub-agent tree reached max nodes ${maxNodes} (all ${nodeCount} retained nodes are still live)`,
+        `interactive sub-agent tree reached max nodes ${maxNodes} (${activeCount} nodes are active or have unknown liveness)`,
       );
     }
   }
@@ -778,35 +777,48 @@ export function showInteractiveSubagentNativeViewer(
   return getMuxForState(state).showNativeViewer(state.name, content);
 }
 
-/**
- * Probe whether a pane is still alive, using the mux that created it.
- * Mux-agnostic — replaces `isTmuxPaneAlive(paneId)`.
- */
+/** Probe pane liveness using the mux that created it. */
+export function getInteractivePaneLiveness(
+  state: InteractiveSubagentState,
+): PaneLiveness {
+  return getMuxForState(state).getPaneLiveness(state.paneId, state.muxSession);
+}
+
+/** Preserve active state unless the backend explicitly confirms pane death. */
 export function isPaneAlive(state: InteractiveSubagentState): boolean {
-  return getMuxForState(state).isPaneAlive(state.paneId, state.muxSession);
+  return getInteractivePaneLiveness(state) !== "dead";
 }
 
 /** Probe pane liveness without blocking the parent event loop. */
-export function isPaneAliveAsync(
+export function getInteractivePaneLivenessAsync(
   state: InteractiveSubagentState,
-): Promise<boolean> {
-  return getMuxForState(state).isPaneAliveAsync(state.paneId, state.muxSession);
+): Promise<PaneLiveness> {
+  return getMuxForState(state).getPaneLivenessAsync(
+    state.paneId,
+    state.muxSession,
+  );
 }
 
-/**
- * Probe the pane recorded in a lineage manifest. An unknown backend cannot be
- * probed, so it counts as dead — the same rule the projection already applies.
- */
-export function isLineagePaneAlive(manifest: LineageManifest): boolean {
+/** Preserve active state unless the async backend explicitly confirms death. */
+export async function isPaneAliveAsync(
+  state: InteractiveSubagentState,
+): Promise<boolean> {
+  return (await getInteractivePaneLivenessAsync(state)) !== "dead";
+}
+
+/** Probe the pane recorded in a lineage manifest. */
+export function getLineagePaneLiveness(
+  manifest: LineageManifest,
+): PaneLiveness {
   const backend = manifest.pane.backend;
-  if (backend !== "tmux" && backend !== "zellij") return false;
+  if (backend !== "tmux" && backend !== "zellij") return "unknown";
   try {
-    return getMux({ preference: backend }).isPaneAlive(
+    return getMux({ preference: backend }).getPaneLiveness(
       manifest.pane.paneId,
       manifest.pane.muxSession,
     );
   } catch {
-    return false;
+    return "unknown";
   }
 }
 
@@ -874,7 +886,7 @@ export function buildAttachCommandsForState(
  * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
  */
 export function isTmuxPaneAlive(paneId: string): boolean {
-  return new TmuxMultiplexer().isPaneAlive(paneId);
+  return new TmuxMultiplexer().getPaneLiveness(paneId) === "alive";
 }
 
 /**
@@ -921,7 +933,7 @@ export function cancelInteractiveSubagent(
 
   // 3. Kill the pane via the backend that created it. The wrapper's EXIT trap fires and records the event.
   const mux = getMuxForState(state);
-  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
     mux.killPane(state.paneId, state.muxSession);
   }
   return state;
@@ -998,7 +1010,7 @@ export function cancelInteractiveDescendantByState(
   appendCancellation(state, false);
   state.status = "cancelled";
   const mux = getMuxForState(state);
-  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
     mux.killPane(state.paneId, state.muxSession);
   }
   return state;
@@ -1052,7 +1064,7 @@ export function cancelInteractiveSubagentByState(
 
   // 2. Kill the pane if alive (best-effort; wrapped to keep the shutdown loop alive)
   const mux = getMuxForState(state);
-  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
     try {
       mux.killPane(state.paneId, state.muxSession);
     } catch {
@@ -1163,22 +1175,30 @@ export function foldInteractiveLifecycle(
 
 export function deriveInteractiveSubagentStatusFromLifecycle(
   lifecycle: PersistedLifecycleFold,
-  paneAlive: boolean,
+  paneState: boolean | PaneLiveness,
 ): InteractiveSubagentStatus {
+  const paneLiveness: PaneLiveness =
+    typeof paneState === "boolean" ? (paneState ? "alive" : "dead") : paneState;
   if (lifecycle.parentCancelled) return "cancelled";
   if (lifecycle.processStatus) {
     return lifecycle.processStatus === "cancelled" ? "cancelled" : "exited";
   }
   if (lifecycle.completionOutcome) {
     if (lifecycle.completionOutcome === "cancelled") return "cancelled";
-    return paneAlive ? "idle" : "exited";
+    if (paneLiveness === "alive") return "idle";
+    return paneLiveness === "dead" ? "exited" : "unknown";
   }
   if (lifecycle.legacyTerminal) {
     if (lifecycle.legacyTerminal === "cancelled") return "cancelled";
     if (lifecycle.legacyTerminal === "error") return "exited";
-    return paneAlive ? "idle" : "exited";
+    if (paneLiveness === "alive") return "idle";
+    return paneLiveness === "dead" ? "exited" : "unknown";
   }
-  return paneAlive ? "running" : "unknown";
+  if (paneLiveness === "alive") return "running";
+  if (paneLiveness === "unknown") return "unknown";
+  // Keep the legacy boolean helper's no-event result stable; tri-state
+  // consumers can distinguish confirmed death and transition to exited.
+  return typeof paneState === "boolean" ? "unknown" : "exited";
 }
 
 /**
@@ -1198,21 +1218,18 @@ export function deriveInteractiveSubagentStatusFromLifecycle(
  */
 export function pruneDeadInteractiveSubagents(): void {
   for (const state of interactiveSubagentRegistry.values()) {
-    if (state.status !== "running" && state.status !== "idle") continue;
-    const paneAlive = isPaneAlive(state);
-    let next = deriveInteractiveSubagentStatusFromLifecycle(
-      state.lifecycle ?? {},
-      paneAlive,
-    );
-    // Session-file fallback: if the pane is gone and no event was recorded, the child died.
-    // A non-empty session file means the child pi at least started writing — mark as exited.
     if (
-      next === "unknown" &&
-      state.sessionFile &&
-      existsSync(state.sessionFile)
+      state.status !== "running" &&
+      state.status !== "idle" &&
+      state.status !== "unknown"
     ) {
-      next = "exited";
+      continue;
     }
+    const paneLiveness = getInteractivePaneLiveness(state);
+    const next = deriveInteractiveSubagentStatusFromLifecycle(
+      state.lifecycle ?? {},
+      paneLiveness,
+    );
     if (next === state.status) continue;
     state.status = next;
     const exitCode =

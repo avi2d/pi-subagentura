@@ -134,10 +134,10 @@ describe("pollArtifactChanges", () => {
       releaseLiveness = resolve;
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => {
+      getPaneLivenessAsync: async () => {
         livenessStarted = true;
         await blockedLiveness;
-        return true;
+        return "alive";
       },
     } as any);
 
@@ -202,8 +202,8 @@ describe("pollArtifactChanges", () => {
       sendMessage: wrongSendMessage,
     };
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
     } as any);
     await mod.pollArtifactChanges(
       { sendMessage: wrongSendMessage } as any,
@@ -252,8 +252,10 @@ describe("pollArtifactChanges", () => {
       releaseA = resolve;
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: (paneId: string) =>
-        paneId === "%a" ? blockedA.then(() => true) : Promise.resolve(true),
+      getPaneLivenessAsync: (paneId: string) =>
+        paneId === "%a"
+          ? blockedA.then(() => "alive" as const)
+          : Promise.resolve("alive" as const),
     } as any);
 
     const pollA = mod.pollArtifactChanges({} as any, ownerA);
@@ -295,7 +297,7 @@ describe("pollArtifactChanges", () => {
       sessionManager: { getSessionId: () => "session-b" },
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any, ownerA);
@@ -347,7 +349,7 @@ describe("pollArtifactChanges", () => {
       sessionManager: { getSessionId: () => "session-b" },
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any, ownerA);
@@ -386,7 +388,7 @@ describe("pollArtifactChanges", () => {
     });
     (globalThis as any).__piSubagenturaUi = ui;
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any);
@@ -436,7 +438,7 @@ describe("pollArtifactChanges", () => {
     });
     (globalThis as any).__piSubagenturaUi = ui;
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any);
@@ -483,7 +485,7 @@ describe("pollArtifactChanges", () => {
     mod.interactiveSubagentRegistry.set(item.id, item.state);
     (globalThis as any).__piSubagenturaUi = ui;
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any);
@@ -535,11 +537,11 @@ describe("pollArtifactChanges", () => {
     const blocked = new Promise<void>((resolve) => {
       releaseLiveness = resolve;
     });
-    const isPaneAliveAsync = vi.fn(async () => {
+    const getPaneLivenessAsync = vi.fn(async () => {
       await blocked;
-      return true;
+      return "alive";
     });
-    multiplexer.__setTmuxMultiplexer({ isPaneAliveAsync } as any);
+    multiplexer.__setTmuxMultiplexer({ getPaneLivenessAsync } as any);
 
     const first = mod.pollArtifactChanges({} as any, owner);
     await Promise.resolve();
@@ -547,54 +549,41 @@ describe("pollArtifactChanges", () => {
 
     // The second tick joins the in-flight poll instead of starting a second
     // pass that would race on the shared eventByteCursor / delivery queue.
-    expect(isPaneAliveAsync).toHaveBeenCalledTimes(1);
+    expect(getPaneLivenessAsync).toHaveBeenCalledTimes(1);
     releaseLiveness();
     await Promise.all([first, second]);
 
-    expect(isPaneAliveAsync).toHaveBeenCalledTimes(1);
+    expect(getPaneLivenessAsync).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(item.state.pendingDeliveries ?? []).toHaveLength(1);
 
     // Once the in-flight poll settles the key is released, so a later tick runs.
     await mod.pollArtifactChanges({} as any, owner);
-    expect(isPaneAliveAsync).toHaveBeenCalledTimes(2);
+    expect(getPaneLivenessAsync).toHaveBeenCalledTimes(2);
     // The completion cursor already advanced, so the second pass adds no new
     // delivery intent for the same turn.
     expect(item.state.pendingDeliveries ?? []).toHaveLength(1);
   });
 
-  it("records a liveness probe failure and treats the pane as dead", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-subagentura-poll-debug-"));
-    process.env.SUBAGENT_DEBUG_LOG_DIR = dir;
-    try {
-      const mod =
-        await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      const multiplexer = await import("../src/multiplexer");
-      const item = makeState();
-      item.state.cwd = join(item.artifactDir, "..");
-      const art = artifactPath(item.state.cwd, item.id);
-      appendEvent(art, { ts: 1, type: "done", status: "done" } as any);
-      mod.interactiveSubagentRegistry.set(item.id, item.state);
-      installDeliverySpies();
-      multiplexer.__setTmuxMultiplexer({
-        isPaneAliveAsync: async () => {
-          throw new Error("mux socket gone");
-        },
-      } as any);
+  it("keeps an unknown pane active and continues artifact polling", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const multiplexer = await import("../src/multiplexer");
+    const item = makeState();
+    item.state.cwd = join(item.artifactDir, "..");
+    const art = artifactPath(item.state.cwd, item.id);
+    appendEvent(art, { ts: 1, type: "done", status: "done" });
+    mod.interactiveSubagentRegistry.set(item.id, item.state);
+    installDeliverySpies();
+    multiplexer.__setTmuxMultiplexer({
+      getPaneLivenessAsync: async () => "unknown",
+    } as never);
 
-      await mod.pollArtifactChanges({} as any);
+    await mod.pollArtifactChanges({} as never);
 
-      // A throwing probe is a dead pane, not a crashed poll tick.
-      expect(item.state.status).toBe("exited");
-      const logged = readFileSync(
-        join(dir, `debug-${new Date().toISOString().slice(0, 10)}.jsonl`),
-        "utf8",
-      );
-      expect(logged).toContain('"event":"poller_liveness_error"');
-      expect(logged).toContain("mux socket gone");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    expect(item.state.status).toBe("unknown");
+    expect(mod.interactiveSubagentRegistry.get(item.id)).toBe(item.state);
+    expect(item.state.eventByteCursor).toBeGreaterThan(0);
   });
 
   it("truncates overflowing activity and workflow widget rows", async () => {
@@ -627,7 +616,7 @@ describe("pollArtifactChanges", () => {
     }
     (globalThis as any).__piSubagenturaUi = ui;
     multiplexer.__setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     await mod.pollArtifactChanges({} as any);
@@ -699,17 +688,17 @@ describe("pollArtifactChanges", () => {
     const multiplexer = await import("../src/multiplexer");
     const { state, artifactDir } = makeState();
     mkdirSync(artifactDir, { recursive: true });
-    let resolveProbe!: (alive: boolean) => void;
+    let resolveProbe!: (liveness: "alive") => void;
     let probeStarted = false;
     let settled = false;
-    const probe = new Promise<boolean>((resolve) => {
+    const probe = new Promise<"alive">((resolve) => {
       resolveProbe = resolve;
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => {
+      getPaneLiveness: () => {
         throw new Error("sync liveness probe must not run");
       },
-      isPaneAliveAsync: () => {
+      getPaneLivenessAsync: () => {
         probeStarted = true;
         return probe;
       },
@@ -731,7 +720,7 @@ describe("pollArtifactChanges", () => {
     });
     expect(timerRan).toBe(true);
     expect(settled).toBe(false);
-    resolveProbe(true);
+    resolveProbe("alive");
     await polling;
     expect(settled).toBe(true);
     multiplexer.__setTmuxMultiplexer(undefined);
@@ -749,22 +738,22 @@ describe("pollArtifactChanges", () => {
       status: "done",
       exitCode: 0,
     });
-    let resolveProbe!: (alive: boolean) => void;
-    const probe = new Promise<boolean>((resolve) => {
+    let resolveProbe!: (liveness: "alive") => void;
+    const probe = new Promise<"alive">((resolve) => {
       resolveProbe = resolve;
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => {
+      getPaneLiveness: () => {
         throw new Error("sync liveness probe must not run");
       },
-      isPaneAliveAsync: () => probe,
+      getPaneLivenessAsync: () => probe,
     } as any);
     mod.interactiveSubagentRegistry.set(state.id, state);
     const sendMessage = vi.fn();
     const polling = mod.pollArtifactChanges({ sendMessage } as any);
     await Promise.resolve();
     mod.interactiveSubagentRegistry.clear();
-    resolveProbe(true);
+    resolveProbe("alive");
     await polling;
     expect(state.eventByteCursor).toBeUndefined();
     expect(sendMessage).not.toHaveBeenCalled();
@@ -778,15 +767,15 @@ describe("pollArtifactChanges", () => {
     const { state, artifactDir } = makeState();
     mkdirSync(artifactDir, { recursive: true });
     let probeCalls = 0;
-    let resolveProbe!: (alive: boolean) => void;
-    const probe = new Promise<boolean>((resolve) => {
+    let resolveProbe!: (liveness: "alive") => void;
+    const probe = new Promise<"alive">((resolve) => {
       resolveProbe = resolve;
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => {
+      getPaneLiveness: () => {
         throw new Error("sync liveness probe must not run");
       },
-      isPaneAliveAsync: () => {
+      getPaneLivenessAsync: () => {
         probeCalls++;
         return probe;
       },
@@ -796,7 +785,7 @@ describe("pollArtifactChanges", () => {
     const second = mod.pollArtifactChanges({ sendMessage: vi.fn() } as any);
     await Promise.resolve();
     expect(probeCalls).toBe(1);
-    resolveProbe(true);
+    resolveProbe("alive");
     await Promise.all([first, second]);
     multiplexer.__setTmuxMultiplexer(undefined);
   });
@@ -903,7 +892,7 @@ describe("pollArtifactChanges", () => {
       parentSessionId: "pi",
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => true,
+      getPaneLiveness: () => "alive",
       killPane: () => {
         completionsAtKill = readFileSync(
           join(artifactDir, "events.ndjson"),
@@ -957,7 +946,7 @@ describe("pollArtifactChanges", () => {
       source: "explicit",
     });
     multiplexer.__setTmuxMultiplexer({
-      isPaneAlive: () => true,
+      getPaneLiveness: () => "alive",
       killPane: vi.fn(),
     } as any);
     interactive.interactiveSubagentRegistry.set(state.id, state);
@@ -1101,19 +1090,16 @@ describe("pollArtifactChanges", () => {
 
   it("marks the sub-agent as idle when a done event is seen and the pane is still alive (follow-up support)", async () => {
     // The child is between turns, REPL is open, ready for the next prompt.
-    // Force the pane to look alive by mocking tmux display-message to succeed.
+    // Return a successful pane listing containing the tracked pane.
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("#99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
       execFile: (
         _file: string,
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout?: string) => void,
-      ) => callback(null, "#99"),
+      ) => callback(null, "%99\n"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1130,18 +1116,16 @@ describe("pollArtifactChanges", () => {
   });
 
   it("marks the sub-agent as exited when a done event is seen but the pane is gone", async () => {
-    // Default tmux mock: display-message throws → isTmuxPaneAlive → false → exited.
+    // A successful listing without the pane is confirmed dead.
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: () => {
-        throw new Error("can't find pane: %99");
-      },
+      execFileSync: () => "",
       execFile: (
         _file: string,
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout?: string) => void,
-      ) => callback(new Error("can't find pane: %99")),
+      ) => callback(null, ""),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1186,15 +1170,12 @@ describe("pollArtifactChanges", () => {
     vi.resetModules();
     let paneProbeCount = 0;
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") {
-          paneProbeCount++;
-          if (paneProbeCount === 1) {
-            throw new Error("pane not ready yet");
-          }
-          return Buffer.from("#99");
+      execFileSync: () => {
+        paneProbeCount++;
+        if (paneProbeCount === 1) {
+          throw new Error("pane not ready yet");
         }
-        return "";
+        return Buffer.from("%99\n");
       },
       execFile: (
         _file: string,
@@ -1205,7 +1186,7 @@ describe("pollArtifactChanges", () => {
         paneProbeCount++;
         callback(
           paneProbeCount === 1 ? new Error("pane not ready yet") : null,
-          "#99",
+          "%99\n",
         );
       },
     }));
@@ -1232,10 +1213,13 @@ describe("pollArtifactChanges", () => {
     // it so a second `done` event (from a follow-up turn) re-fires the pointer notification.
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("#99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "%99\n"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1314,8 +1298,8 @@ describe("pollArtifactChanges", () => {
       });
       mod.interactiveSubagentRegistry.set(state.id, state);
       multiplexer.__setTmuxMultiplexer({
-        isPaneAlive: () => true,
-        isPaneAliveAsync: async () => true,
+        getPaneLiveness: () => "alive",
+        getPaneLivenessAsync: async () => "alive",
       } as any);
       const art = artifactPath(join(artifactDir, ".."), state.id);
       const raw =
@@ -1490,10 +1474,13 @@ describe("pollArtifactChanges", () => {
     it("dispatches pointer-only envelopes for legacy follow-up completions", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1552,10 +1539,13 @@ describe("pollArtifactChanges", () => {
     it("does not snapshot mutable output.md for legacy completions", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1590,10 +1580,13 @@ describe("pollArtifactChanges", () => {
     it("does not snapshot legacy output when notifyOnComplete is unset", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1616,10 +1609,13 @@ describe("pollArtifactChanges", () => {
     it("never creates legacy snapshots while mutable output changes", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
+        execFile: (
+          _file: string,
+          _args: string[],
+          _options: object,
+          callback: (error: Error | null, stdout?: string) => void,
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1668,29 +1664,17 @@ describe("pollArtifactChanges", () => {
   // still live and DO contribute to the active count.
   describe("footer/widget (Bug B)", () => {
     it("AC-B1: counts running + idle as 'active'; excludes exited from both footer and widget", async () => {
-      // Mock display-message to branch on paneId:
-      //   running-pane and idle-pane → alive (return success)
-      //   exited-pane              → dead (throw)
+      // One successful listing serves every probe: two panes are present and
+      // the third is conclusively absent.
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") {
-            const paneId = args[3];
-            if (paneId === "%exited-pane") throw new Error("pane dead");
-            return Buffer.from("#99");
-          }
-          return "";
-        },
+        execFileSync: () => Buffer.from("%90\n%91\n"),
         execFile: (
           _file: string,
-          args: string[],
+          _args: string[],
           _options: object,
           callback: (error: Error | null, stdout?: string) => void,
-        ) =>
-          callback(
-            args[3] === "%exited-pane" ? new Error("pane dead") : null,
-            "#99",
-          ),
+        ) => callback(null, "%90\n%91\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1698,14 +1682,14 @@ describe("pollArtifactChanges", () => {
       // Running sub-agent: no events in artifact; pane alive.
       const running = makeState().state;
       running.id = "running-1";
-      running.paneId = "%running-pane";
+      running.paneId = "%90";
       mod.interactiveSubagentRegistry.set(running.id, running);
 
       // Idle sub-agent: done event, pane alive. artifactDir must be set so the
       // poller reads from the same dir where we write the events.
       const idle = makeState().state;
       idle.id = "idle-1";
-      idle.paneId = "%idle-pane";
+      idle.paneId = "%91";
       idle.lastDeliveredEventTs = 2;
       idle.artifactDir = join(idle.artifactDir, "..", idle.id);
       mod.interactiveSubagentRegistry.set(idle.id, idle);
@@ -1721,7 +1705,7 @@ describe("pollArtifactChanges", () => {
       // Exited sub-agent: done event, pane dead.
       const exited = makeState().state;
       exited.id = "exited-1";
-      exited.paneId = "%exited-pane";
+      exited.paneId = "%92";
       exited.lastDeliveredEventTs = 2;
       exited.artifactDir = join(exited.artifactDir, "..", exited.id);
       mod.interactiveSubagentRegistry.set(exited.id, exited);
@@ -1765,23 +1749,20 @@ describe("pollArtifactChanges", () => {
     it("AC-B1b: rehydrates a completed live pane as idle and ready", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
         execFile: (
           _file: string,
           _args: string[],
           _options: object,
           callback: (error: Error | null, stdout?: string) => void,
-        ) => callback(null, "#99"),
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
       const multiplexer = await import("../src/multiplexer");
       multiplexer.__setTmuxMultiplexer({
-        isPaneAlive: () => true,
-        isPaneAliveAsync: async () => true,
+        getPaneLiveness: () => "alive",
+        getPaneLivenessAsync: async () => "alive",
       } as any);
       const cwd = makeTmp();
       const id = "rehydrated-idle";
@@ -1840,16 +1821,13 @@ describe("pollArtifactChanges", () => {
     it("AC-B2: clears footer and widget when all sub-agents are exited", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "-lc") return Buffer.from("");
-          throw new Error("pane dead");
-        },
+        execFileSync: () => "",
         execFile: (
           _file: string,
           _args: string[],
           _options: object,
           callback: (error: Error | null, stdout?: string) => void,
-        ) => callback(new Error("pane dead")),
+        ) => callback(null, ""),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -1895,16 +1873,13 @@ describe("pollArtifactChanges", () => {
     it("AC-B3: combines interactive and in-process footer counts", async () => {
       vi.resetModules();
       vi.doMock("node:child_process", () => ({
-        execFileSync: (_file: string, args: string[]) => {
-          if (args[0] === "display-message") return Buffer.from("#99");
-          return "";
-        },
+        execFileSync: () => Buffer.from("%99\n"),
         execFile: (
           _file: string,
           _args: string[],
           _options: object,
           callback: (error: Error | null, stdout?: string) => void,
-        ) => callback(null, "#99"),
+        ) => callback(null, "%99\n"),
       }));
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -2012,9 +1987,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   it("keeps terminal state until the custom-message receipt is visible", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: () => {
-        throw new Error("can't find pane: %99");
-      },
+      execFileSync: () => "",
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, ""),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -2037,9 +2016,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   it("reconciles same-session inject receipt before terminal cleanup", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: () => {
-        throw new Error("can't find pane: %99");
-      },
+      execFileSync: () => "",
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, ""),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -2065,16 +2048,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   it("keeps the state.json entry after delivering a done event when the pane is alive", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("#99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
       execFile: (
         _file: string,
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout?: string) => void,
-      ) => callback(null, "#99"),
+      ) => callback(null, "%99\n"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -2094,16 +2074,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   it("keeps a live pane idle after a v2 error completion", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("#99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
       execFile: (
         _file: string,
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout?: string) => void,
-      ) => callback(null, "#99"),
+      ) => callback(null, "%99\n"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -2132,10 +2109,13 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
   it("removes state after process_exited even if pane liveness reports true", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("#99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout?: string) => void,
+      ) => callback(null, "%99\n"),
     }));
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");

@@ -103,7 +103,7 @@ describe("recursive interactive children", () => {
     mkdirSync(artifactDir, { recursive: true });
     const killPane = vi.fn();
     __setTmuxMultiplexer({
-      isPaneAlive: vi.fn(() => true),
+      getPaneLiveness: vi.fn(() => "alive"),
       killPane,
     } as never);
     const state: InteractiveSubagentState = {

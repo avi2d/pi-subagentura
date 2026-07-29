@@ -947,8 +947,8 @@ describe("interactive supervisor", () => {
     });
     interactiveSubagentRegistry.set(exited.id, exited);
     __setTmuxMultiplexer({
-      isPaneAliveAsync: vi.fn().mockResolvedValue(true),
-      isPaneAlive: vi.fn().mockReturnValue(false),
+      getPaneLivenessAsync: vi.fn().mockResolvedValue("alive"),
+      getPaneLiveness: vi.fn().mockReturnValue("dead"),
     } as never);
     process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
     process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
@@ -1235,10 +1235,10 @@ describe("interactive supervisor", () => {
     await harness.writeNode("running", { paneId: "%running" });
     const finished = state("finished", { status: "exited" });
     interactiveSubagentRegistry.set(finished.id, finished);
-    const isPaneAliveAsync = vi.fn().mockResolvedValue(true);
+    const getPaneLivenessAsync = vi.fn().mockResolvedValue("alive");
     __setTmuxMultiplexer({
-      isPaneAliveAsync,
-      isPaneAlive: () => true,
+      getPaneLivenessAsync,
+      getPaneLiveness: () => "alive",
       buildAttachCommands: () => ({
         attachCommand: "tmux attach -t x",
         focusCommand: "tmux select-window -t x",
@@ -1247,7 +1247,9 @@ describe("interactive supervisor", () => {
 
     await harness.open();
 
-    const probedPanes = isPaneAliveAsync.mock.calls.map(([paneId]) => paneId);
+    const probedPanes = getPaneLivenessAsync.mock.calls.map(
+      ([paneId]) => paneId,
+    );
     expect(probedPanes).toContain("%running");
     expect(probedPanes).not.toContain("%finished");
   });
@@ -1256,8 +1258,8 @@ describe("interactive supervisor", () => {
     const harness = await lineageHarness("prune-root");
     await harness.writeNode("dead", { paneId: "%dead" });
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async () => false,
-      isPaneAlive: () => false,
+      getPaneLivenessAsync: async () => "dead",
+      getPaneLiveness: () => "dead",
       buildAttachCommands: () => ({
         attachCommand: "tmux attach -t x",
         focusCommand: "tmux select-window -t x",
@@ -1269,13 +1271,32 @@ describe("interactive supervisor", () => {
     expect(await harness.nodeFiles()).toEqual([]);
   });
 
+  it("keeps unknown lineage panes visible and retained", async () => {
+    const harness = await lineageHarness("unknown-root");
+    await harness.writeNode("unknown", { paneId: "%unknown" });
+    __setTmuxMultiplexer({
+      getPaneLivenessAsync: async () => "unknown",
+      getPaneLiveness: () => "unknown",
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t x",
+        focusCommand: "tmux select-window -t x",
+      }),
+    } as never);
+
+    const { rendered } = await harness.open();
+
+    expect(rendered).toContain("agent-unknown");
+    expect(await harness.nodeFiles()).toEqual(["unknown.json"]);
+  });
+
   it("keeps the persisted tree when one dead pane cannot resolve attach commands", async () => {
     const harness = await lineageHarness("poisoned-root");
     await harness.writeNode("alive", { paneId: "%alive" });
     await harness.writeNode("zombie", { paneId: "%zombie" });
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async (paneId: string) => paneId === "%alive",
-      isPaneAlive: () => true,
+      getPaneLivenessAsync: async (paneId: string) =>
+        paneId === "%alive" ? "alive" : "dead",
+      getPaneLiveness: () => "alive",
       buildAttachCommands: ({ paneId }: { paneId: string }) => {
         if (paneId === "%zombie") {
           throw new Error("[tmux] display-message failed: can't find pane");
@@ -1305,8 +1326,8 @@ describe("interactive supervisor", () => {
     });
     await harness.writeBroken("broken");
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
-      isPaneAlive: () => true,
+      getPaneLivenessAsync: async () => "alive",
+      getPaneLiveness: () => "alive",
       buildAttachCommands: () => ({
         attachCommand: "tmux attach -t x",
         focusCommand: "tmux select-window -t x",
@@ -1380,8 +1401,8 @@ describe("interactive supervisor", () => {
     });
     const killed: string[] = [];
     __setTmuxMultiplexer({
-      isPaneAliveAsync: async () => true,
-      isPaneAlive: () => true,
+      getPaneLivenessAsync: async () => "alive",
+      getPaneLiveness: () => "alive",
       killPane: (paneId: string) => killed.push(paneId),
       buildAttachCommands: () => ({
         attachCommand: "tmux attach -t x",

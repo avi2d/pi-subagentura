@@ -115,6 +115,14 @@ export interface LineageProjection {
   manifests: LineageManifest[];
 }
 
+export interface LineagePruneResult {
+  pruned: string[];
+  /** Physical manifests left on disk, including dead retained ancestors. */
+  retained: number;
+  /** Manifests not confirmed dead; this is the spawn-admission count. */
+  active: number;
+}
+
 /**
  * Why a node was skipped. `stale` used to absorb orphan/cycle/truncated too,
  * which reported "N stale" for what was really a cycle or the depth cap.
@@ -472,6 +480,65 @@ export async function projectLineageStore(
       });
     }
   }
+  // A newest-first read window can include a live child while its older parent
+  // falls outside the window. Pull missing ancestors by canonical filename so
+  // cap selection can retain complete chains rather than creating cap-induced
+  // orphans. Reads remain bounded by both maxNodes and the projection byte cap.
+  const ancestorQueue = [...manifests.values()];
+  const attemptedAncestors = new Set(manifests.keys());
+  let ancestorReads = 0;
+  let ancestorCursor = 0;
+  while (ancestorCursor < ancestorQueue.length) {
+    const child = ancestorQueue[ancestorCursor++]!;
+    const parentId = child.parentAgentId;
+    if (!parentId || attemptedAncestors.has(parentId)) continue;
+    attemptedAncestors.add(parentId);
+    if (ancestorReads >= effectiveBounds.maxNodes) {
+      issues.push({
+        kind: "truncated",
+        agentId: child.agentId,
+        reason: "ancestor read cap reached",
+      });
+      break;
+    }
+    ancestorReads++;
+    const parentPath = nodeManifestPath(nodesDir, parentId);
+    try {
+      const data = await readBoundedFile(
+        parentPath,
+        effectiveBounds.maxManifestBytes,
+      );
+      consumedBytes += Buffer.byteLength(data);
+      if (consumedBytes > effectiveBounds.maxProjectionBytes) {
+        issues.push({
+          kind: "truncated",
+          path: parentPath,
+          reason: "projection byte cap reached",
+        });
+        break;
+      }
+      const parent = validateLineageManifest(JSON.parse(data), effectiveBounds);
+      if (parent.agentId !== parentId || parent.rootHash !== rootHash) {
+        issues.push({
+          kind: "malformed",
+          agentId: parentId,
+          path: parentPath,
+          reason: "ancestor manifest identity mismatch",
+        });
+        continue;
+      }
+      manifests.set(parent.agentId, parent);
+      ancestorQueue.push(parent);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) continue;
+      issues.push({
+        kind: "malformed",
+        agentId: parentId,
+        path: parentPath,
+        reason: errorMessage(error),
+      });
+    }
+  }
   return await projectManifests(
     [...manifests.values()],
     rootHash,
@@ -499,16 +566,14 @@ export async function pruneTerminalLineageNodes(
   nodesDir: string,
   isNodeStale: (manifest: LineageManifest) => boolean | Promise<boolean>,
   bounds: Partial<LineageBounds> & { concurrency?: number } = {},
-): Promise<{ pruned: string[]; retained: number }> {
+): Promise<LineagePruneResult> {
   const effectiveBounds = lineageBounds(bounds);
   const entries: { path: string; manifest: LineageManifest }[] = [];
-  for (const manifestPath of await listManifestPaths(
-    nodesDir,
-    effectiveBounds,
-    {
-      limit: Number.POSITIVE_INFINITY,
-    },
-  )) {
+  const manifestPaths = await listManifestPaths(nodesDir, effectiveBounds, {
+    limit: Number.POSITIVE_INFINITY,
+  });
+  let missing = 0;
+  for (const manifestPath of manifestPaths) {
     try {
       const manifest = validateLineageManifest(
         JSON.parse(
@@ -517,7 +582,11 @@ export async function pruneTerminalLineageNodes(
         effectiveBounds,
       );
       entries.push({ path: manifestPath, manifest });
-    } catch {
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        missing++;
+        continue;
+      }
       /* An unreadable manifest is left alone; the projection reports it. */
     }
   }
@@ -543,7 +612,15 @@ export async function pruneTerminalLineageNodes(
       /* Best effort: a manifest we cannot remove is retried next sweep. */
     }
   }
-  return { pruned, retained: entries.length - pruned.length };
+  const unreadable = manifestPaths.length - missing - entries.length;
+  const active =
+    unreadable +
+    entries.filter((entry) => !stale.get(entry.manifest.agentId)).length;
+  return {
+    pruned,
+    retained: manifestPaths.length - missing - pruned.length,
+    active,
+  };
 }
 
 /** Count node manifests without reading them. Used by the sync spawn gate. */
@@ -561,15 +638,16 @@ export function pruneTerminalLineageNodesSync(
   nodesDir: string,
   isNodeStale: (manifest: LineageManifest) => boolean,
   bounds: Partial<LineageBounds> = {},
-): { pruned: string[]; retained: number } {
+): LineagePruneResult {
   const effectiveBounds = lineageBounds(bounds);
   const entries: { path: string; manifest: LineageManifest }[] = [];
   let names: string[];
   try {
     names = readdirSync(nodesDir).filter((entry) => entry.endsWith(".json"));
   } catch {
-    return { pruned: [], retained: 0 };
+    return { pruned: [], retained: 0, active: 0 };
   }
+  let missing = 0;
   for (const name of names) {
     const manifestPath = path.join(nodesDir, name);
     try {
@@ -582,10 +660,17 @@ export function pruneTerminalLineageNodesSync(
           effectiveBounds,
         ),
       });
-    } catch {
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        missing++;
+        continue;
+      }
       /* An unreadable manifest is left alone; the projection reports it. */
     }
   }
+  const stale = new Map(
+    entries.map((entry) => [entry.path, isNodeStale(entry.manifest)]),
+  );
   const parents = new Set(
     entries
       .map((entry) => entry.manifest.parentAgentId)
@@ -595,7 +680,7 @@ export function pruneTerminalLineageNodesSync(
   for (const entry of entries) {
     const agentId = entry.manifest.agentId;
     if (parents.has(agentId)) continue;
-    if (!isNodeStale(entry.manifest)) continue;
+    if (!stale.get(entry.path)) continue;
     try {
       rmSync(entry.path, { force: true });
       pruned.push(agentId);
@@ -603,7 +688,14 @@ export function pruneTerminalLineageNodesSync(
       /* Best effort: a manifest we cannot remove is retried next sweep. */
     }
   }
-  return { pruned, retained: names.length - pruned.length };
+  const unreadable = names.length - missing - entries.length;
+  const active =
+    unreadable + entries.filter((entry) => !stale.get(entry.path)).length;
+  return {
+    pruned,
+    retained: names.length - missing - pruned.length,
+    active,
+  };
 }
 
 export async function projectManifests(
@@ -639,26 +731,9 @@ export async function projectManifests(
     options.concurrency,
   );
 
-  // Cap selection is liveness-first, then newest-first. Dropping a LIVE node
-  // makes a running agent invisible in the overlay and unreachable by subtree
-  // cancellation, so live nodes must never be the ones sacrificed.
-  const capOrdered = [...candidates].sort((left, right) => {
-    const leftStale = stale.get(left.agentId) ?? false;
-    const rightStale = stale.get(right.agentId) ?? false;
-    if (leftStale !== rightStale) return leftStale ? 1 : -1;
-    const recency = right.startedAt.localeCompare(left.startedAt);
-    return recency === 0 ? left.agentId.localeCompare(right.agentId) : recency;
-  });
-  for (const manifest of capOrdered) {
-    if (byId.size >= effectiveBounds.maxNodes) {
-      issues.push({
-        kind: "truncated",
-        agentId: manifest.agentId,
-        reason: "node cap reached",
-      });
-      continue;
-    }
-    if (byId.has(manifest.agentId)) {
+  const candidatesById = new Map<string, LineageManifest>();
+  for (const manifest of candidates) {
+    if (candidatesById.has(manifest.agentId)) {
       issues.push({
         kind: "malformed",
         agentId: manifest.agentId,
@@ -667,7 +742,45 @@ export async function projectManifests(
       addReason(manifest.agentId, "malformed");
       continue;
     }
-    byId.set(manifest.agentId, manifest);
+    candidatesById.set(manifest.agentId, manifest);
+  }
+
+  // Select complete parent chains. A live child without its retained ancestor
+  // would be rendered as a non-actionable orphan, so a chain either fits as a
+  // unit or is omitted. Non-dead endpoints are considered before dead-only
+  // candidates, then deterministic recency decides cap pressure.
+  const capOrdered = [...candidatesById.values()].sort((left, right) => {
+    const leftStale = stale.get(left.agentId) ?? false;
+    const rightStale = stale.get(right.agentId) ?? false;
+    if (leftStale !== rightStale) return leftStale ? 1 : -1;
+    const recency = right.startedAt.localeCompare(left.startedAt);
+    return recency === 0 ? left.agentId.localeCompare(right.agentId) : recency;
+  });
+  for (const manifest of capOrdered) {
+    if (byId.has(manifest.agentId)) continue;
+    const chain: LineageManifest[] = [];
+    const visited = new Set<string>();
+    let current: LineageManifest | undefined = manifest;
+    while (current && !byId.has(current.agentId)) {
+      if (visited.has(current.agentId)) break;
+      visited.add(current.agentId);
+      chain.push(current);
+      current = current.parentAgentId
+        ? candidatesById.get(current.parentAgentId)
+        : undefined;
+    }
+    if (byId.size + chain.length > effectiveBounds.maxNodes) continue;
+    for (const member of chain.reverse()) {
+      byId.set(member.agentId, member);
+    }
+  }
+  for (const manifest of candidatesById.values()) {
+    if (byId.has(manifest.agentId)) continue;
+    issues.push({
+      kind: "truncated",
+      agentId: manifest.agentId,
+      reason: "node cap reached",
+    });
   }
 
   for (const manifest of byId.values()) {
@@ -957,9 +1070,9 @@ async function staleFlagsFor(
         try {
           stale.set(manifest.agentId, Boolean(await isNodeStale(manifest)));
         } catch {
-          // A probe that throws cannot prove liveness; treat it as stale so the
-          // node is hidden rather than offered as an actionable target.
-          stale.set(manifest.agentId, true);
+          // Failure cannot confirm death. Keep the node visible and retained
+          // until a later probe returns an explicit dead result.
+          stale.set(manifest.agentId, false);
         }
       }
     }),

@@ -132,8 +132,8 @@ describe("session_shutdown handler", () => {
     jobRegistry.clear();
     workflowJobRegistry.clear();
     __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     // Stub the global timers. setInterval returns a fake handle with a
@@ -190,8 +190,8 @@ describe("session_shutdown handler", () => {
     expect(clearIntervalSpy).toHaveBeenCalledWith(legacyHandle);
     expect(setIntervalSpy).toHaveBeenCalledTimes(1);
     expect(fakeHandle.unref).toHaveBeenCalledTimes(1);
-    // Pre-start eviction is scoped to the starting handler's own context; the
-    // other extension's placeholder is not ours to drop.
+    // Starting advances this handler's placeholder in place; the other
+    // extension's registered placeholder keeps its original stack position.
     const stack = globalState.__piSubagenturaSessionContextStack;
     expect(stack).toHaveLength(2);
     expect(stack[0].pi).toBe(first.api);
@@ -199,19 +199,17 @@ describe("session_shutdown handler", () => {
     expect(globalState.__piSubagenturaPiRef).toBe(api);
   });
 
-  it("sweeps a dead nested context so it cannot suppress top-level cleanup", () => {
+  it("ignores a started stale descendant during top-level cleanup", () => {
     const { api, shutdownHandler } = setupExtension();
     const globalState = globalThis as any;
-    // A nested session that started and then crashed: the object survives in
-    // the stack but its session manager no longer answers.
+    const staleAccessor = vi.fn(() => "stale-descendant-session");
     globalState.__piSubagenturaSessionContextStack.push({
       id: 9_999,
       generation: 1,
+      lifecycle: "started",
       pi: api,
       sessionManager: {
-        getSessionId: () => {
-          throw new Error("stale session manager");
-        },
+        getSessionId: staleAccessor,
       },
     });
     clearIntervalSpy.mockClear();
@@ -220,18 +218,18 @@ describe("session_shutdown handler", () => {
 
     expect(clearIntervalSpy).toHaveBeenCalledWith(fakeHandle);
     expect(globalState.__piSubagenturaInteractivePollerHandle).toBeUndefined();
+    expect(staleAccessor).not.toHaveBeenCalled();
   });
 
   it("does not kill unrelated panes when the shutdown session id is absent", () => {
+    setupExtension();
     const { shutdownHandler } = setupExtension();
     const globalState = globalThis as any;
-    // A live nested context keeps the handler on the nested branch.
-    globalState.__piSubagenturaSessionContextStack.push({
-      id: 9_998,
-      generation: 1,
-      pi: {} as any,
-      sessionManager: { getSessionId: () => "other-session" },
-    });
+    expect(
+      globalState.__piSubagenturaSessionContextStack.map(
+        (context: { lifecycle: string }) => context.lifecycle,
+      ),
+    ).toEqual(["started", "started"]);
     const orphan = makeState("no-parent", "running");
     delete (orphan as { parentSessionId?: string }).parentSessionId;
     interactiveTmux.interactiveSubagentRegistry.set(orphan.id, orphan);
@@ -458,8 +456,8 @@ describe("session_shutdown handler", () => {
 
     interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
     __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
     } as any);
 
     const ui = {

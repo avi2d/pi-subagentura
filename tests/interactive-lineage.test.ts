@@ -364,6 +364,57 @@ describe("interactive lineage node cap", () => {
     expect(projection.manifests).toHaveLength(4);
   });
 
+  it("selects complete live chains atomically under cap pressure", async () => {
+    const live = new Set(["older-child", "newer-child"]);
+    const projection = await projectManifests(
+      [
+        manifest("older-parent", {
+          startedAt: "2026-07-25T10:00:01Z",
+        }),
+        manifest("older-child", {
+          parentAgentId: "older-parent",
+          startedAt: "2026-07-25T10:00:50Z",
+        }),
+        manifest("newer-parent", {
+          startedAt: "2026-07-25T10:00:02Z",
+        }),
+        manifest("newer-child", {
+          parentAgentId: "newer-parent",
+          startedAt: "2026-07-25T10:00:59Z",
+        }),
+      ],
+      rootHash,
+      (candidate) => !live.has(candidate.agentId),
+      { maxNodes: 2 },
+    );
+
+    expect(projection.roots).toHaveLength(1);
+    expect(projection.roots[0]?.manifest.agentId).toBe("newer-parent");
+    expect(projection.roots[0]?.children).toHaveLength(1);
+    expect(projection.roots[0]?.children[0]?.manifest.agentId).toBe(
+      "newer-child",
+    );
+    expect(projection.roots[0]?.children[0]?.state).toBe("actionable");
+    expect(projection.roots[0]?.children[0]?.reasons).not.toContain("orphan");
+  });
+
+  it("keeps a probe failure visible instead of treating it as stale", async () => {
+    const projection = await projectManifests(
+      [manifest("unknown-pane")],
+      rootHash,
+      () => {
+        throw new Error("mux unavailable");
+      },
+      { maxNodes: 1 },
+    );
+
+    expect(projection.roots[0]?.manifest.agentId).toBe("unknown-pane");
+    expect(projection.roots[0]?.state).toBe("actionable");
+    expect(projection.issues).not.toContainEqual(
+      expect.objectContaining({ kind: "stale" }),
+    );
+  });
+
   it("reads manifests newest-first so the read window follows a live tree", async () => {
     const dir = await tempDir();
     const nodesDir = path.join(dir, "nodes");
@@ -383,6 +434,49 @@ describe("interactive lineage node cap", () => {
       (node) => node.manifest.agentId,
     );
     expect(retained).toEqual(["bbb2"]);
+  });
+
+  it("pulls an old stale ancestor into the cap for a retained live child", async () => {
+    const dir = await tempDir();
+    const nodesDir = path.join(dir, "nodes");
+    await writeLineageManifestAtomic(nodesDir, manifest("stale-parent"));
+    await fs.utimes(
+      path.join(nodesDir, "stale-parent.json"),
+      new Date(0),
+      new Date(0),
+    );
+    for (let index = 0; index < 4; index++) {
+      const id = `dead-filler-${index}`;
+      await writeLineageManifestAtomic(nodesDir, manifest(id));
+      const time = new Date((index + 1) * 1000);
+      await fs.utimes(path.join(nodesDir, `${id}.json`), time, time);
+    }
+    await writeLineageManifestAtomic(
+      nodesDir,
+      manifest("live-child", {
+        parentAgentId: "stale-parent",
+        startedAt: "2026-07-25T10:00:59Z",
+      }),
+    );
+    await fs.utimes(
+      path.join(nodesDir, "live-child.json"),
+      new Date(10_000),
+      new Date(10_000),
+    );
+
+    const projection = await projectLineageStore(
+      nodesDir,
+      rootHash,
+      (candidate) => candidate.agentId !== "live-child",
+      { maxNodes: 2 },
+    );
+
+    expect(projection.roots).toHaveLength(1);
+    expect(projection.roots[0]?.manifest.agentId).toBe("stale-parent");
+    expect(projection.roots[0]?.children[0]?.manifest.agentId).toBe(
+      "live-child",
+    );
+    expect(projection.roots[0]?.children[0]?.state).toBe("actionable");
   });
 
   it("probes staleness with bounded concurrency instead of one at a time", async () => {
@@ -444,6 +538,7 @@ describe("interactive lineage pruning", () => {
     // Unlinking the dead parent would orphan its live child and hide it.
     expect(result.pruned).toEqual(["dead-leaf"]);
     expect(result.retained).toBe(2);
+    expect(result.active).toBe(1);
     expect((await fs.readdir(nodesDir)).sort()).toEqual([
       "dead-parent.json",
       "live-child.json",
@@ -459,6 +554,7 @@ describe("interactive lineage pruning", () => {
     const result = await pruneTerminalLineageNodes(nodesDir, () => true);
 
     expect(result.pruned).toEqual([]);
+    expect(result.active).toBe(1);
     expect(await fs.readdir(nodesDir)).toEqual(["broken.json"]);
   });
 
@@ -475,6 +571,7 @@ describe("interactive lineage pruning", () => {
 
     expect(result.pruned).toEqual(["gone"]);
     expect(result.retained).toBe(1);
+    expect(result.active).toBe(1);
     expect(countLineageManifestsSync(nodesDir)).toBe(1);
   });
 });
