@@ -552,6 +552,8 @@ npm run record:tui -- workflow "$PWD/terminal-e2e-recordings/workflow.webm"
 
 The command requires `wezterm`, `agg`, and an `ffmpeg` build with `libvpx-vp9`. It keeps intermediate cast/GIF files temporary and writes only the final WebM. Direct cast recording and replay remain available:
 
+The recording path uses `cinematic-demo.mjs`: it types the prompt character by character, displays high-contrast step captions, pauses at deterministic provider stages, opens and expands the supervisor, then closes and detaches automatically. The normal `demo:tui` command remains manually controlled.
+
 ```bash
 wezterm record --cwd "$PWD" -- bash ./tests/terminal-e2e/demo.sh interactive
 wezterm replay <generated-cast-file>
@@ -584,6 +586,7 @@ tests/terminal-e2e/
   network-guard.test.ts
   harness-contract.test.ts
   terminal.test.ts
+  cinematic-demo.mjs
   demo.mjs
   demo.sh
   record-webm.sh
