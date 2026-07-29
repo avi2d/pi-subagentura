@@ -49,21 +49,76 @@ describe("terminal E2E network guard scope", () => {
 
   it.each([
     [
-      "third-argument host options",
+      "TLS third-argument host overrides the positional host",
       'require("node:tls").connect(443, "localhost", { host: "example.com" })',
       "egress",
     ],
     [
-      "third-argument hostname options",
+      "TLS hostname does not override the positional host",
       'require("node:tls").connect(443, "example.com", { hostname: "localhost" })',
-      "local",
+      "egress",
     ],
     [
-      "numeric-string port",
+      "TLS options can clear a positional IPC path",
+      'require("node:tls").connect("service.sock", { path: "", host: "example.com" })',
+      "egress",
+    ],
+    [
+      "TLS socketPath does not select IPC",
+      'require("node:tls").connect({ port: 443, host: "example.com", socketPath: "service.sock" })',
+      "egress",
+    ],
+    [
+      "net numeric-string port keeps its positional host",
       'require("node:net").connect("443", "example.com")',
       "egress",
     ],
-  ])("normalizes connect overload %s", (_overload, source, scope) => {
+    [
+      "TLS numeric-string port keeps its positional host",
+      'require("node:tls").connect("443", "example.com")',
+      "egress",
+    ],
+    [
+      "net ignores a later options object",
+      'require("node:net").connect(443, "localhost", { host: "example.com" })',
+      "local",
+    ],
+    [
+      "net uses its first options object directly",
+      'require("node:net").connect({ port: 443, host: "localhost" }, { host: "example.com" })',
+      "local",
+    ],
+    [
+      "net ignores hostname in its options object",
+      'require("node:net").connect({ port: 443, hostname: "example.com" })',
+      "local",
+    ],
+    [
+      "net ignores socketPath in its options object",
+      'require("node:net").connect({ port: 443, host: "example.com", socketPath: "service.sock" })',
+      "egress",
+    ],
+    [
+      "net truthy path selects IPC before host",
+      'require("node:net").connect({ path: "service.sock", host: "example.com" })',
+      "local",
+    ],
+    [
+      "TLS ignores hostname in its options object",
+      'require("node:tls").connect({ port: 443, hostname: "example.com" })',
+      "local",
+    ],
+    [
+      "TLS merges only its first positional options object",
+      'require("node:tls").connect(443, { host: "localhost" }, { host: "example.com" })',
+      "local",
+    ],
+    [
+      "TLS existing socket is a custom preconnected transport",
+      'require("node:tls").connect({ socket: {} })',
+      "egress",
+    ],
+  ])("mirrors Node normalization: %s", (_case, source, scope) => {
     expect(deniedEvent(source)).toEqual(expect.objectContaining({ scope }));
   });
 

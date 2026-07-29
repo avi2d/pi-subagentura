@@ -32,13 +32,16 @@ const HTTP_METHODS = new Set([
   "node:https.get",
 ]);
 
-const IPC_CONNECT_METHODS = new Set([
+const NET_CONNECT_METHODS = new Set([
   "node:net.connect",
   "node:net.createConnection",
   "node:net.Socket.connect",
+  "node:tls.TLSSocket.connect",
+]);
+
+const TLS_CONNECT_METHODS = new Set([
   "node:tls.connect",
   "node:tls.createConnection",
-  "node:tls.TLSSocket.connect",
 ]);
 
 function optionsFromUrl(value) {
@@ -50,100 +53,115 @@ function optionsFromUrl(value) {
       return { host: value };
     }
   }
-  return { hostname: url.hostname };
+  const hostname = url.hostname.startsWith("[")
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
+  const options = {
+    ...url,
+    protocol: url.protocol,
+    hostname,
+    path: `${url.pathname || ""}${url.search || ""}`,
+    href: url.href,
+  };
+  if (url.port !== "") options.port = Number(url.port);
+  return options;
 }
 
-function normalizeHttpTarget(args) {
+function normalizeHttpOptions(args) {
   const input = args[0];
-  const baseOptions =
-    input instanceof URL || typeof input === "string"
-      ? optionsFromUrl(input)
-      : input && typeof input === "object"
-        ? input
-        : {};
-  const overrides =
-    args[1] && typeof args[1] === "object" ? args[1] : undefined;
-  const options = overrides ? { ...baseOptions, ...overrides } : baseOptions;
+  if (input instanceof URL || typeof input === "string") {
+    const derived = optionsFromUrl(input);
+    const explicit =
+      args[1] && typeof args[1] === "object" ? args[1] : undefined;
+    return explicit ? { ...derived, ...explicit } : derived;
+  }
+  return input && typeof input === "object" ? input : {};
+}
+
+function normalizeNetOptions(args) {
+  const input = args[0];
+  if (input && typeof input === "object") return input;
+  if (typeof input === "string" && !(Number(input) >= 0)) {
+    return { path: input };
+  }
+  const options = { port: input };
+  if (typeof args[1] === "string") options.host = args[1];
+  return options;
+}
+
+function normalizeTlsOptions(args) {
+  const options = { ...normalizeNetOptions(args) };
+  const explicit =
+    args[1] && typeof args[1] === "object"
+      ? args[1]
+      : args[2] && typeof args[2] === "object"
+        ? args[2]
+        : undefined;
+  return explicit ? Object.assign(options, explicit) : options;
+}
+
+function transportFromHttp(args) {
+  const options = normalizeHttpOptions(args);
+  if (options.socketPath) return { type: "ipc" };
   return {
-    socket: options.socketPath != null,
-    host: options.hostname ?? options.host,
-    defaultLocal: true,
+    type: "host",
+    host: options.hostname || options.host || "localhost",
   };
 }
 
-function normalizeConnectTarget(args) {
-  const input = args[0];
-  const options = {};
-  for (const argument of args) {
-    if (argument && typeof argument === "object") {
-      Object.assign(options, argument);
-    }
-  }
-
-  if (input && typeof input === "object") {
-    return {
-      socket: options.socketPath != null || options.path != null,
-      host: options.hostname ?? options.host,
-      defaultLocal: true,
-    };
-  }
-
-  const isPort =
-    typeof input === "number" ||
-    (typeof input === "string" && /^\d+$/.test(input));
-  if (!isPort && typeof input === "string") {
-    return { socket: true, host: undefined, defaultLocal: true };
-  }
-
-  const positionalHost = typeof args[1] === "string" ? args[1] : undefined;
-  return {
-    socket: options.socketPath != null || options.path != null,
-    host: options.hostname ?? options.host ?? positionalHost,
-    defaultLocal: true,
-  };
+function transportFromNet(args) {
+  const options = normalizeNetOptions(args);
+  if (options.path) return { type: "ipc" };
+  return { type: "host", host: options.host || "localhost" };
 }
 
-function normalizeGenericTarget(args) {
+function transportFromTls(args) {
+  const options = normalizeTlsOptions(args);
+  if (options.socket) return { type: "custom" };
+  if (options.path) return { type: "ipc" };
+  return { type: "host", host: options.host || "localhost" };
+}
+
+function transportFromGeneric(args) {
   const input = args[0];
-  if (input instanceof URL) {
-    return { socket: false, host: input.hostname, defaultLocal: false };
-  }
+  if (input instanceof URL) return { type: "host", host: input.hostname };
   if (input && typeof input === "object") {
-    if (input.url != null) return normalizeGenericTarget([input.url]);
+    if (input.url != null) return transportFromGeneric([input.url]);
+    if (input.socketPath || input.path) return { type: "ipc" };
     return {
-      socket: input.socketPath != null || input.path != null,
-      host: input.hostname ?? input.host,
-      defaultLocal: false,
+      type: "host",
+      host: input.hostname ?? input.host ?? "outbound connection",
     };
   }
   if (typeof input === "number") {
-    const host = typeof args[1] === "string" ? args[1] : undefined;
-    return { socket: false, host, defaultLocal: host == null };
+    return {
+      type: "host",
+      host: typeof args[1] === "string" ? args[1] : "localhost",
+    };
   }
 
   const text = String(input ?? "");
   try {
     const url = new URL(text);
-    if (url.hostname) {
-      return { socket: false, host: url.hostname, defaultLocal: false };
-    }
+    if (url.hostname) return { type: "host", host: url.hostname };
   } catch {
     /* not a URL */
   }
-  const socket = text.startsWith("/") || text.startsWith("./");
-  return { socket, host: socket ? undefined : text, defaultLocal: false };
+  if (text.startsWith("/") || text.startsWith("./")) return { type: "ipc" };
+  return { type: "host", host: text };
 }
 
 function scopeOf(kind, args) {
-  const target = HTTP_METHODS.has(kind)
-    ? normalizeHttpTarget(args)
-    : IPC_CONNECT_METHODS.has(kind)
-      ? normalizeConnectTarget(args)
-      : normalizeGenericTarget(args);
-  if (target.socket || (target.host == null && target.defaultLocal)) {
-    return "local";
-  }
-  return target.host == null ? "egress" : scopeOfHost(target.host);
+  const transport = HTTP_METHODS.has(kind)
+    ? transportFromHttp(args)
+    : NET_CONNECT_METHODS.has(kind)
+      ? transportFromNet(args)
+      : TLS_CONNECT_METHODS.has(kind)
+        ? transportFromTls(args)
+        : transportFromGeneric(args);
+  if (transport.type === "ipc") return "local";
+  if (transport.type === "custom") return "egress";
+  return scopeOfHost(transport.host);
 }
 
 function deny(kind, args) {
