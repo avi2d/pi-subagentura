@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { importFresh } from "./test-utils";
 
@@ -18,6 +20,48 @@ function installMockExec(scenario: (file: string, args: string[]) => string) {
   vi.doMock("node:child_process", () => ({
     execFileSync: (_file: string, args: string[]) =>
       scenario("zellij", args as string[]),
+    execFile: (
+      _file: string,
+      args: string[],
+      _options: object,
+      callback: (error: Error | null, stdout: string) => void,
+    ) => {
+      try {
+        callback(null, scenario("zellij", args));
+      } catch (error) {
+        callback(error as Error, "");
+      }
+    },
+  }));
+}
+
+function installMockSpawn(
+  scenario: (
+    args: string[],
+    stdout: PassThrough,
+    stderr: PassThrough,
+    close: (code: number | null, signal?: NodeJS.Signals | null) => void,
+  ) => void,
+): void {
+  vi.resetModules();
+  vi.doMock("node:child_process", () => ({
+    execFileSync: () => "",
+    spawn: (_file: string, args: string[]) => {
+      const child = new EventEmitter();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, {
+        stdout,
+        stderr,
+        kill: vi.fn(() => true),
+      });
+      queueMicrotask(() =>
+        scenario(args, stdout, stderr, (code, signal = null) => {
+          child.emit("close", code, signal);
+        }),
+      );
+      return child;
+    },
   }));
 }
 
@@ -144,7 +188,7 @@ describe("multiplexer-zellij", () => {
     // `new-pane`'s `terminal_<n>` stdout counter is NOT the same number as the
     // `id` field in `list-panes` (verified on zellij 0.44.3), so createPane
     // recovers the canonical id from a before/after list-panes diff — the same
-    // number every other op (isPaneAlive/sendKeys/killPane) compares against.
+    // number every other op (liveness/sendKeys/killPane) compares against.
     process.env.ZELLIJ = "0";
     process.env.ZELLIJ_SESSION_NAME = "main";
     const calls: string[][] = [];
@@ -272,55 +316,76 @@ describe("multiplexer-zellij", () => {
   });
 
   /* ------------------------------------------------------------------ */
-  /*  isPaneAlive                                                        */
+  /*  getPaneLiveness                                                   */
   /* ------------------------------------------------------------------ */
 
-  it("isPaneAlive returns true when pane exists in list", async () => {
-    process.env.ZELLIJ = "0";
-    installMockExec((_f, args) => {
-      if (args.includes("list-panes") && args.includes("--json")) {
+  it("returns alive when a successful pane listing contains the pane", async () => {
+    installMockExec((_file, args) => {
+      if (args.includes("list-panes")) {
         return JSON.stringify([{ id: 1 }, { id: 42 }, { id: 3 }]);
       }
       return "";
     });
-
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
-    const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("42")).toBe(true);
+    expect(new ZellijMultiplexer().getPaneLiveness("42")).toBe("alive");
   });
 
-  it("isPaneAlive returns false when pane does not exist in list", async () => {
-    process.env.ZELLIJ = "0";
-    installMockExec((_f, args) => {
-      if (args.includes("list-panes") && args.includes("--json")) {
+  it("returns dead when a successful pane listing omits the pane", async () => {
+    installMockExec((_file, args) => {
+      if (args.includes("list-panes")) {
         return JSON.stringify([{ id: 1 }, { id: 2 }]);
       }
       return "";
     });
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+    expect(new ZellijMultiplexer().getPaneLiveness("99")).toBe("dead");
+  });
 
+  it("returns unknown when sync or async pane listing fails", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        throw new Error("server unavailable");
+      },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(new Error("server unavailable"), ""),
+    }));
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("99")).toBe(false);
+    expect(mux.getPaneLiveness("42")).toBe("unknown");
+    await expect(mux.getPaneLivenessAsync("42")).resolves.toBe("unknown");
   });
 
-  it("isPaneAlive returns false on exec error", async () => {
-    process.env.ZELLIJ = "0";
-    installMockExec(() => {
-      throw new Error("no such pane");
-    });
-
+  it("returns unknown for malformed pane-listing output", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => "{}",
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(null, JSON.stringify([{ is_plugin: false }])),
+    }));
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("42")).toBe(false);
+    expect(mux.getPaneLiveness("42")).toBe("unknown");
+    await expect(mux.getPaneLivenessAsync("42")).resolves.toBe("unknown");
   });
 
-  it("isPaneAliveAsync uses execFile rather than execFileSync", async () => {
+  it("getPaneLivenessAsync lists panes without using execFileSync", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
       execFileSync: () => {
@@ -336,9 +401,9 @@ describe("multiplexer-zellij", () => {
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
-    await expect(new ZellijMultiplexer().isPaneAliveAsync("42")).resolves.toBe(
-      true,
-    );
+    await expect(
+      new ZellijMultiplexer().getPaneLivenessAsync("42"),
+    ).resolves.toBe("alive");
   });
 
   /* ------------------------------------------------------------------ */
@@ -721,19 +786,11 @@ describe("multiplexer-zellij", () => {
 
   it("capturePane dumps a session-scoped pane and bounds output by lines and bytes", async () => {
     const calls: string[][] = [];
-    vi.resetModules();
-    vi.doMock("node:child_process", () => ({
-      execFile: (
-        _file: string,
-        args: string[],
-        _options: object,
-        callback: (error: Error | null, stdout: string) => void,
-      ) => {
-        calls.push(args);
-        callback(null, "one\ntwo\nthree\nfour");
-      },
-      execFileSync: () => "",
-    }));
+    installMockSpawn((args, stdout, _stderr, close) => {
+      calls.push(args);
+      stdout.end("one\ntwo\nthree\nfour");
+      close(0);
+    });
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
@@ -764,8 +821,83 @@ describe("multiplexer-zellij", () => {
     expect(result).toEqual({ output: "ee\nfour", truncated: true });
   });
 
+  it("streams more than 1 MiB into a caller-bounded UTF-8 tail", async () => {
+    installMockSpawn((_args, stdout, _stderr, close) => {
+      stdout.write(Buffer.alloc(1024 * 1024 + 17, "x"));
+      stdout.end("αβtail");
+      close(0);
+    });
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    await expect(
+      new ZellijMultiplexer().capturePane(
+        { paneId: "42", session: "main" },
+        { maxLines: 20, maxBytes: 7 },
+      ),
+    ).resolves.toEqual({ output: "βtail", truncated: true });
+  });
+
+  it("propagates a non-zero dump-screen exit with bounded stderr", async () => {
+    installMockSpawn((_args, _stdout, stderr, close) => {
+      stderr.end("permission denied");
+      close(2);
+    });
+    const { ZellijMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-zellij")
+    >("../src/multiplexer-zellij");
+
+    await expect(
+      new ZellijMultiplexer().capturePane(
+        { paneId: "42", session: "main" },
+        { maxLines: 20, maxBytes: 100 },
+      ),
+    ).rejects.toThrow(/dump-screen failed: permission denied/);
+  });
+
+  it("terminates and then force-kills a timed-out dump-screen process", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new EventEmitter();
+      const kill = vi.fn((signal: NodeJS.Signals) => {
+        if (signal === "SIGKILL") child.emit("close", null, signal);
+        return true;
+      });
+      Object.assign(child, {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill,
+      });
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({
+        execFileSync: () => "",
+        spawn: () => child,
+      }));
+      const { ZellijMultiplexer } = await importFresh<
+        typeof import("../src/multiplexer-zellij")
+      >("../src/multiplexer-zellij");
+      const capture = new ZellijMultiplexer().capturePane(
+        { paneId: "42", session: "main" },
+        { maxLines: 20, maxBytes: 100 },
+      );
+
+      const rejection = expect(capture).rejects.toThrow(
+        /dump-screen timed out/,
+      );
+      await vi.advanceTimersByTimeAsync(5000);
+      await rejection;
+      expect(kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(kill).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   /* ------------------------------------------------------------------ */
-  /*  session threading + isPaneAlive exited-guard / normalization       */
+  /*  session threading + exited-guard / normalization                   */
   /* ------------------------------------------------------------------ */
 
   it("ops target the supplied session via --session and normalize prefixed ids", async () => {
@@ -783,7 +915,7 @@ describe("multiplexer-zellij", () => {
     const mux = new ZellijMultiplexer();
     const sess = "pi-subagent-xyz";
 
-    expect(mux.isPaneAlive("terminal_42", sess)).toBe(true);
+    expect(mux.getPaneLiveness("terminal_42", sess)).toBe("alive");
     mux.sendKeys("terminal_42", "echo hi", sess);
     mux.sendEnter("terminal_42", sess);
     mux.killPane("terminal_42", sess);
@@ -798,9 +930,9 @@ describe("multiplexer-zellij", () => {
     expect(writeChars).not.toContain("terminal_42");
   });
 
-  it("isPaneAlive returns false for a pane reported as exited", async () => {
+  it("returns dead for a pane reported as exited", async () => {
     // `--close-on-exit` is not always set, so a finished pane can linger in
-    // list-panes with exited:true. Presence alone must not mean 'alive'.
+    // list-panes with exited:true. Presence alone must not mean `alive`.
     process.env.ZELLIJ = "0";
     installMockExec((_f, args) => {
       if (args.includes("list-panes")) {
@@ -813,14 +945,14 @@ describe("multiplexer-zellij", () => {
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("42")).toBe(false);
+    expect(mux.getPaneLiveness("42")).toBe("dead");
   });
 
   /* ------------------------------------------------------------------ */
   /*  plugin_<n> prefix normalization                                    */
   /* ------------------------------------------------------------------ */
 
-  it("isPaneAlive normalizes plugin_<n> prefix (symmetric with terminal_<n>)", async () => {
+  it("normalizes plugin_<n> prefix symmetrically with terminal_<n>", async () => {
     process.env.ZELLIJ = "0";
     installMockExec((_f, args) => {
       if (args.includes("list-panes")) {
@@ -835,12 +967,12 @@ describe("multiplexer-zellij", () => {
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
     // plugin_42 should normalize to bare integer 42 for list-panes lookup
-    expect(mux.isPaneAlive("plugin_42")).toBe(true);
-    // Non-existent pane should still return false
-    expect(mux.isPaneAlive("plugin_99")).toBe(false);
+    expect(mux.getPaneLiveness("plugin_42")).toBe("alive");
+    // Non-existent pane is absent from a successful listing.
+    expect(mux.getPaneLiveness("plugin_99")).toBe("dead");
   });
 
-  it("isPaneAlive ignores plugin rows that share our terminal pane's integer id", async () => {
+  it("ignores plugin rows that share our terminal pane's integer id", async () => {
     // zellij numbers `terminal_N` and `plugin_N` in SEPARATE namespaces, and
     // `normalizePaneId` strips the prefix, collapsing both onto one integer.
     // Verified against zellij 0.44.3: a fresh session lists a `zellij:link`
@@ -865,11 +997,11 @@ describe("multiplexer-zellij", () => {
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("0")).toBe(false);
-    await expect(mux.isPaneAliveAsync("0")).resolves.toBe(false);
+    expect(mux.getPaneLiveness("0")).toBe("dead");
+    await expect(mux.getPaneLivenessAsync("0")).resolves.toBe("dead");
   });
 
-  it("isPaneAlive still reports true when the terminal row is present alongside a colliding plugin row", async () => {
+  it("reports alive when a terminal row accompanies a colliding plugin row", async () => {
     process.env.ZELLIJ = "0";
     installMockExec((_f, args) => {
       if (args.includes("list-panes")) {
@@ -885,7 +1017,7 @@ describe("multiplexer-zellij", () => {
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
     const mux = new ZellijMultiplexer();
-    expect(mux.isPaneAlive("0")).toBe(true);
+    expect(mux.getPaneLiveness("0")).toBe("alive");
   });
 
   it("createPane diffs terminal panes only, so a colliding plugin id cannot mask the new pane", async () => {

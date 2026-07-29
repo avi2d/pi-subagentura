@@ -9,7 +9,7 @@
  * `id` field, and every `--pane-id` flag accepts the bare integer too. To keep
  * one canonical form everywhere we normalize to the bare integer string the
  * moment a pane id enters our hands (`normalizePaneId`). This is what makes the
- * visible-split path's liveness probe work — without it `isPaneAlive` would
+ * visible-split path's liveness probe work — without it `getPaneLiveness` would
  * compare `"terminal_5"` against `"5"` and always report dead.
  *
  * Session targeting: zellij addresses every `action` at a specific session via
@@ -27,18 +27,19 @@
  *      targets it via `--session <name>`.
  */
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type {
   CapturePaneOptions,
   CapturePaneResult,
   Multiplexer,
+  PaneLiveness,
   PaneRef,
 } from "./multiplexer";
 import {
   boundCaptureOutput,
   commandExists,
   execMuxOrThrow,
-  MAX_CAPTURE_READ_BYTES,
   MUX_CAPABILITIES,
   safeSegment,
   sanitizeViewerTitle,
@@ -50,10 +51,97 @@ import {
  * Normalize a zellij pane id to the bare-integer string form used by
  * `list-panes --json` (`id`) and accepted by every `--pane-id` flag.
  * `new-pane` emits `terminal_5` / `plugin_2`; strip that prefix so the id
- * round-trips through `isPaneAlive` / `sendKeys` / `killPane`.
+ * round-trips through `getPaneLiveness` / `sendKeys` / `killPane`.
  */
 function normalizePaneId(raw: string): string {
   return raw.trim().replace(/^(?:terminal_|plugin_)/, "");
+}
+
+interface ZellijPaneRow {
+  readonly id: number | string;
+  readonly is_plugin?: boolean;
+  readonly exited?: boolean;
+}
+
+function parsePaneListing(output: string): ZellijPaneRow[] {
+  const parsed: unknown = JSON.parse(output);
+  if (!Array.isArray(parsed)) {
+    throw new Error("Malformed zellij pane listing");
+  }
+  for (const row of parsed) {
+    if (row === null || typeof row !== "object") {
+      throw new Error("Malformed zellij pane listing row");
+    }
+    const pane = row as Record<string, unknown>;
+    const validId =
+      (typeof pane.id === "number" &&
+        Number.isInteger(pane.id) &&
+        pane.id >= 0) ||
+      (typeof pane.id === "string" && /^\d+$/.test(pane.id));
+    if (
+      !validId ||
+      (pane.is_plugin !== undefined && typeof pane.is_plugin !== "boolean") ||
+      (pane.exited !== undefined && typeof pane.exited !== "boolean")
+    ) {
+      throw new Error("Malformed zellij pane listing row");
+    }
+  }
+  return parsed as ZellijPaneRow[];
+}
+
+class BoundedByteTail {
+  readonly #storage: Buffer;
+  #start = 0;
+  #length = 0;
+  truncated = false;
+
+  constructor(capacity: number) {
+    this.#storage = Buffer.allocUnsafe(capacity);
+  }
+
+  append(chunk: Buffer | string): void {
+    const input = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const capacity = this.#storage.length;
+    if (input.length === 0) return;
+    if (capacity === 0) {
+      this.truncated = true;
+      return;
+    }
+    if (input.length >= capacity) {
+      this.truncated ||= this.#length > 0 || input.length > capacity;
+      input.copy(this.#storage, 0, input.length - capacity);
+      this.#start = 0;
+      this.#length = capacity;
+      return;
+    }
+    const overflow = Math.max(0, this.#length + input.length - capacity);
+    if (overflow > 0) {
+      this.#start = (this.#start + overflow) % capacity;
+      this.#length -= overflow;
+      this.truncated = true;
+    }
+    const writeAt = (this.#start + this.#length) % capacity;
+    const firstLength = Math.min(input.length, capacity - writeAt);
+    input.copy(this.#storage, writeAt, 0, firstLength);
+    if (firstLength < input.length) {
+      input.copy(this.#storage, 0, firstLength);
+    }
+    this.#length += input.length;
+  }
+
+  toBuffer(): Buffer {
+    if (this.#length === 0) return Buffer.alloc(0);
+    if (this.#start + this.#length <= this.#storage.length) {
+      return Buffer.from(
+        this.#storage.subarray(this.#start, this.#start + this.#length),
+      );
+    }
+    const first = this.#storage.subarray(this.#start);
+    return Buffer.concat([
+      first,
+      this.#storage.subarray(0, this.#length - first.length),
+    ]);
+  }
 }
 
 export class ZellijMultiplexer implements Multiplexer {
@@ -258,17 +346,14 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   /** Run `list-panes --json` against a session, returning [] on any failure. */
-  private listPanes(
-    session?: string,
-  ): Array<{ id: unknown; is_plugin?: boolean; exited?: boolean }> {
+  private listPanes(session?: string): ZellijPaneRow[] {
     try {
       const output = execFileSync(
         "zellij",
         [...this.sessionFlag(session), "action", "list-panes", "--json"],
         { encoding: "utf8", timeout: 5000 },
       );
-      const parsed = JSON.parse(output);
-      return Array.isArray(parsed) ? parsed : [];
+      return parsePaneListing(output);
     } catch {
       return [];
     }
@@ -287,61 +372,69 @@ export class ZellijMultiplexer implements Multiplexer {
    * poller believe a finished child was running forever. Our pane is always a
    * terminal pane: `createPane` only ever selects `!is_plugin`.
    */
-  private paneRowMatches(
-    pane: { id?: unknown; is_plugin?: boolean; exited?: boolean },
-    target: string,
-  ): boolean {
+  private paneRowMatches(pane: ZellijPaneRow, target: string): boolean {
     return (
       !pane.is_plugin && String(pane.id) === target && pane.exited !== true
     );
   }
 
   /**
-   * Probe whether the pane is still alive. Runs `list-panes --json` and
-   * checks whether the pane ID appears AND has not exited. Returns false on
-   * any error (dead pane, backend down, malformed id).
+   * Probe pane liveness from a complete backend pane listing. Backend and parse
+   * failures are `unknown`, distinct from a successful listing without the pane.
    */
-  isPaneAlive(paneId: string, session?: string): boolean {
+  getPaneLiveness(paneId: string, session?: string): PaneLiveness {
     const target = normalizePaneId(paneId);
-    return this.listPanes(session).some((p) => this.paneRowMatches(p, target));
+    if (!/^\d+$/.test(target)) return "unknown";
+    try {
+      const output = execFileSync(
+        "zellij",
+        [...this.sessionFlag(session), "action", "list-panes", "--json"],
+        { encoding: "utf8", timeout: 5000 },
+      );
+      return parsePaneListing(output).some((pane) =>
+        this.paneRowMatches(pane, target),
+      )
+        ? "alive"
+        : "dead";
+    } catch {
+      return "unknown";
+    }
   }
 
-  isPaneAliveAsync(paneId: string, session?: string): Promise<boolean> {
+  getPaneLivenessAsync(
+    paneId: string,
+    session?: string,
+  ): Promise<PaneLiveness> {
     const target = normalizePaneId(paneId);
-    return new Promise((resolve) => {
-      try {
-        execFile(
-          "zellij",
-          [...this.sessionFlag(session), "action", "list-panes", "--json"],
-          { encoding: "utf8", timeout: 5000 },
-          (error, stdout) => {
-            if (error) {
-              resolve(false);
-              return;
-            }
-            try {
-              const parsed = JSON.parse(stdout);
-              const panes = Array.isArray(parsed) ? parsed : [];
-              resolve(
-                panes.some(
-                  (pane: {
-                    id?: unknown;
-                    is_plugin?: boolean;
-                    exited?: boolean;
-                  }) => this.paneRowMatches(pane, target),
-                ),
-              );
-            } catch {
-              // Malformed backend output is a failed liveness probe.
-              resolve(false);
-            }
-          },
-        );
-      } catch {
-        // A synchronous child-process setup failure is also a failed probe.
-        resolve(false);
-      }
-    });
+    if (!/^\d+$/.test(target)) return Promise.resolve("unknown");
+    const { promise, resolve } = Promise.withResolvers<PaneLiveness>();
+    try {
+      execFile(
+        "zellij",
+        [...this.sessionFlag(session), "action", "list-panes", "--json"],
+        { encoding: "utf8", timeout: 5000 },
+        (error, stdout) => {
+          if (error) {
+            resolve("unknown");
+            return;
+          }
+          try {
+            resolve(
+              parsePaneListing(stdout).some((pane) =>
+                this.paneRowMatches(pane, target),
+              )
+                ? "alive"
+                : "dead",
+            );
+          } catch {
+            resolve("unknown");
+          }
+        },
+      );
+    } catch {
+      resolve("unknown");
+    }
+    return promise;
   }
 
   /**
@@ -436,31 +529,29 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   /**
-   * Capture bounded pane output via `action dump-screen`.
+   * Capture bounded pane output via streaming `action dump-screen --full`.
    *
-   * argv contract (verified against zellij 0.44.3 — `zellij action dump-screen
-   * --help` is `dump-screen [OPTIONS]`, no positional):
-   *   - STDOUT is the DEFAULT sink. There used to be a `/dev/stdout` positional
-   *     here, which clap rejected client-side with
-   *     `error: Found argument '/dev/stdout' which wasn't expected` (exit 2) —
-   *     the command never reached a session, so BOTH overlay actions that read
-   *     pane output (`v` snapshot, `n` native viewer) failed for every zellij
-   *     sub-agent. Write-to-file is `--path <PATH>`, which we do not want.
-   *   - `--full` includes scrollback. Without it zellij dumps only the current
-   *     viewport, whereas tmux's `capture-pane -S -<lines>` reaches scrollback.
-   *
-   * Remaining backend difference: tmux applies the line bound server-side
-   * (`-S -<lines>`), zellij has no equivalent flag, so we ask for everything and
-   * let `boundCaptureOutput` apply `maxLines`/`maxBytes` client-side. Same
-   * result for the caller; zellij just transfers more bytes over the socket,
-   * capped by `MAX_CAPTURE_READ_BYTES`.
+   * Zellij has no server-side line bound, so stdout is consumed as raw bytes
+   * into a tail ring sized from `maxBytes`. The full dump is never accumulated,
+   * and UTF-8 decoding happens only after the process closes and a leading
+   * partial code point has been skipped.
    */
   capturePane(
     ref: PaneRef,
     opts: CapturePaneOptions,
   ): Promise<CapturePaneResult> {
-    return new Promise((resolve, reject) => {
-      execFile(
+    const maxBytes = Number.isFinite(opts.maxBytes)
+      ? Math.max(0, Math.floor(opts.maxBytes))
+      : 0;
+    const stdoutTail = new BoundedByteTail(maxBytes);
+    const stderrTail = new BoundedByteTail(8192);
+    const { promise, resolve, reject } =
+      Promise.withResolvers<CapturePaneResult>();
+    let settled = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    let child: ChildProcess;
+    try {
+      child = spawn(
         "zellij",
         [
           ...this.sessionFlag(ref.session),
@@ -470,20 +561,64 @@ export class ZellijMultiplexer implements Multiplexer {
           "--pane-id",
           normalizePaneId(ref.paneId),
         ],
-        {
-          encoding: "utf8",
-          maxBuffer: MAX_CAPTURE_READ_BYTES,
-          timeout: 5000,
-        },
-        (error, stdout) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve(boundCaptureOutput(stdout, opts));
-        },
+        { stdio: ["ignore", "pipe", "pipe"] },
       );
+    } catch (error) {
+      reject(error);
+      return promise;
+    }
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdoutTail.append(chunk);
     });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderrTail.append(chunk);
+    });
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+      forceKillTimer.unref();
+      reject(new Error("[zellij] dump-screen timed out"));
+    }, 5000);
+    timeout.unref();
+
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(forceKillTimer);
+      if (settled) return;
+      settled = true;
+      if (code !== 0) {
+        const stderr = stderrTail.toBuffer().toString("utf8").trim();
+        const detail = stderr ? `: ${stderr}` : signal ? ` (${signal})` : "";
+        reject(new Error(`[zellij] dump-screen failed${detail}`));
+        return;
+      }
+
+      const raw = stdoutTail.toBuffer();
+      let utf8Start = 0;
+      while (utf8Start < raw.length && (raw[utf8Start]! & 0xc0) === 0x80) {
+        utf8Start++;
+      }
+      const bounded = boundCaptureOutput(
+        raw.subarray(utf8Start).toString("utf8"),
+        opts,
+      );
+      resolve({
+        output: bounded.output,
+        truncated: stdoutTail.truncated || utf8Start > 0 || bounded.truncated,
+      });
+    });
+
+    return promise;
   }
 
   /**

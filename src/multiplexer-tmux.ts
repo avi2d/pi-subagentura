@@ -27,6 +27,7 @@ import type {
   CapturePaneOptions,
   CapturePaneResult,
   Multiplexer,
+  PaneLiveness,
   PaneRef,
 } from "./multiplexer";
 import {
@@ -66,8 +67,8 @@ function settleTmuxSocketPaneForTests(): void {
 
 /**
  * Extract the session name, window index, and pane index of a tmux pane
- * via `display-message`. Throws if the pane is dead or the id is malformed —
- * callers that want a liveness probe should use `isPaneAlive` instead.
+ * via `display-message`. Throws if the pane is dead or the response is
+ * malformed.
  */
 function getPaneLocation(paneId: string): {
   session: string;
@@ -87,8 +88,22 @@ function getPaneLocation(paneId: string): {
     ]),
     { encoding: "utf8", timeout: 5000 },
   ).trim();
-  const [session, window, pane] = output.split("\t");
+  const fields = output.split("\t");
+  if (fields.length !== 3 || fields.some((field) => field.length === 0)) {
+    throw new Error(`Malformed tmux pane location: ${output || "(empty)"}`);
+  }
+  const [session, window, pane] = fields as [string, string, string];
   return { session, window, pane };
+}
+
+function parsePaneListing(output: string): ReadonlySet<string> {
+  const trimmed = output.trim();
+  if (!trimmed) return new Set();
+  const paneIds = trimmed.split(/\r?\n/);
+  if (paneIds.some((paneId) => !/^%\d+$/.test(paneId))) {
+    throw new Error("Malformed tmux pane listing");
+  }
+  return new Set(paneIds);
 }
 
 export class TmuxMultiplexer implements Multiplexer {
@@ -151,7 +166,7 @@ export class TmuxMultiplexer implements Multiplexer {
     parentPane?: string;
     windowName?: string;
     id?: string; // sub-agent id (8 hex); used for the relaxed-path unique session name
-  }): { paneId: string; windowName?: string } {
+  }): { paneId: string; windowName?: string; session: string } {
     if (!commandExists("tmux")) {
       throw new Error(
         "tmux is not available. Install tmux or set PATH to include it.",
@@ -163,7 +178,7 @@ export class TmuxMultiplexer implements Multiplexer {
     // usage organized without changing the in-session behavior below.
     if (!process.env.TMUX) {
       let isFirstPane = this.detachedSessionName === undefined;
-      let sessionName =
+      const sessionName =
         this.detachedSessionName ??
         `pi-subagent-${opts.id ?? safeSegment(opts.name)}`;
       if (!isFirstPane && !this.hasSession(sessionName)) {
@@ -210,7 +225,7 @@ export class TmuxMultiplexer implements Multiplexer {
             ]),
             { encoding: "utf8", timeout: 10000 },
           ).trim();
-      if (!paneId.startsWith("%")) {
+      if (!/^%\d+$/.test(paneId)) {
         throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
       }
       this.detachedSessionName = sessionName;
@@ -236,7 +251,7 @@ export class TmuxMultiplexer implements Multiplexer {
         }
       }
       settleTmuxSocketPaneForTests();
-      return { paneId, windowName };
+      return { paneId, windowName, session: sessionName };
     }
 
     // Standard path: parent is in tmux.
@@ -292,8 +307,17 @@ export class TmuxMultiplexer implements Multiplexer {
         },
       ).trim();
     }
-    if (!paneId.startsWith("%")) {
+    if (!/^%\d+$/.test(paneId)) {
       throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
+    }
+    let session: string;
+    try {
+      session = getPaneLocation(paneId).session;
+    } catch (error) {
+      this.killPane(paneId);
+      throw new Error(`Failed to determine session for tmux pane ${paneId}`, {
+        cause: error,
+      });
     }
     if (!opts.background) {
       // Pane title is cosmetic and the new window already shows `name`.
@@ -311,43 +335,51 @@ export class TmuxMultiplexer implements Multiplexer {
       }
     }
     settleTmuxSocketPaneForTests();
-    return { paneId, windowName };
+    return { paneId, windowName, session };
   }
 
-  isPaneAlive(paneId: string): boolean {
+  getPaneLiveness(paneId: string): PaneLiveness {
+    if (!/^%\d+$/.test(paneId)) return "unknown";
     try {
       const output = execFileSync(
         "tmux",
-        withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
+        withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
         {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
           timeout: 5000,
         },
       );
-      // tmux 3.6 can exit 0 with blank output for a stale pane target.
-      return output.trim().length > 0;
+      return parsePaneListing(output).has(paneId) ? "alive" : "dead";
     } catch {
-      return false;
+      return "unknown";
     }
   }
 
-  isPaneAliveAsync(paneId: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      try {
-        execFile(
-          "tmux",
-          withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
-          { encoding: "utf8", timeout: 5000 },
-          (error, stdout) => {
-            resolve(!error && stdout.trim().length > 0);
-          },
-        );
-      } catch {
-        // A synchronous child-process setup failure is also a dead pane.
-        resolve(false);
-      }
-    });
+  getPaneLivenessAsync(paneId: string): Promise<PaneLiveness> {
+    if (!/^%\d+$/.test(paneId)) return Promise.resolve("unknown");
+    const { promise, resolve } = Promise.withResolvers<PaneLiveness>();
+    try {
+      execFile(
+        "tmux",
+        withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
+        { encoding: "utf8", timeout: 5000 },
+        (error, stdout) => {
+          if (error) {
+            resolve("unknown");
+            return;
+          }
+          try {
+            resolve(parsePaneListing(stdout).has(paneId) ? "alive" : "dead");
+          } catch {
+            resolve("unknown");
+          }
+        },
+      );
+    } catch {
+      resolve("unknown");
+    }
+    return promise;
   }
 
   sendKeys(paneId: string, text: string): void {

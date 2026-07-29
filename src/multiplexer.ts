@@ -34,6 +34,8 @@ import { assertNever } from "./artifact";
 
 /** Names of the supported multiplexer backends. Kept narrow on purpose. */
 export type MuxName = "tmux" | "zellij";
+/** Result of a backend pane-listing liveness probe. */
+export type PaneLiveness = "alive" | "dead" | "unknown";
 
 /** Backend-neutral structured reference to a durable mux pane. */
 export interface PaneRef {
@@ -153,7 +155,7 @@ export interface Multiplexer {
    *                           and generate their own (zellij requires unique
    *                           tab names per session).
    * @returns paneId           String id usable in subsequent `sendKeys` /
-   *                           `isPaneAlive` / `killPane` calls. The string
+   *                           `getPaneLiveness` / `killPane` calls. The string
    *                           format is backend-specific (tmux uses `%N`,
    *                           zellij uses `terminal_N` or just an integer
    *                           stringified).
@@ -162,6 +164,8 @@ export interface Multiplexer {
    *                           for background mode, undefined for visible
    *                           split mode (the pane lives in the same window
    *                           as the parent).
+   * @returns session          The actual session containing the created pane,
+   *                           used to scope later attachment probes.
    */
   createPane(opts: {
     name: string;
@@ -174,22 +178,19 @@ export interface Multiplexer {
   }): { paneId: string; windowName?: string; session?: string };
 
   /**
-   * Probe whether the pane is still alive (the backend still knows about
-   * it). MUST NOT throw — return false on any failure (dead pane, backend
-   * down, pane id malformed). Used by the artifact poller on every tick.
+   * Probe whether the pane is still known to the backend.
+   *
+   * A successful pane listing returns `alive` when the pane is present and
+   * `dead` when it is absent. Command, setup, timeout, and parse failures return
+   * `unknown`; callers must not mistake an unavailable backend for a dead pane.
    *
    * @param session  The session returned by `createPane`. zellij needs it to
-   *                 target the right server; tmux ignores it (pane ids are
-   *                 server-global).
+   *                 target the right server; tmux pane ids are server-global.
    */
-  isPaneAlive(paneId: string, session?: string): boolean;
+  getPaneLiveness(paneId: string, session?: string): PaneLiveness;
 
-  /**
-   * Asynchronously probe pane liveness without blocking the parent event loop.
-   * Used by the recurring artifact poller; implementations must resolve false
-   * on backend errors rather than throwing.
-   */
-  isPaneAliveAsync(paneId: string, session?: string): Promise<boolean>;
+  /** Asynchronously perform the same tri-state pane-listing probe. */
+  getPaneLivenessAsync(paneId: string, session?: string): Promise<PaneLiveness>;
 
   /**
    * Send literal text to the pane's shell input buffer, character-by-character.
@@ -552,7 +553,7 @@ export function execMuxOrThrow(
   }
 }
 
-/** Upper bound for `execFile` maxBuffer on pane-capture subprocesses. */
+/** Upper bound for tmux's `execFile` pane-capture buffer. */
 export const MAX_CAPTURE_READ_BYTES = 1024 * 1024;
 
 /**

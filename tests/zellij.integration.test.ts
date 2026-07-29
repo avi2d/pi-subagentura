@@ -108,7 +108,7 @@ async function spawnPane(mux: ZellijMultiplexer, name: string) {
   const pane = created!;
   if (pane.session) sessions.push(pane.session);
   await waitFor(
-    () => mux.isPaneAlive(pane.paneId, pane.session),
+    () => mux.getPaneLiveness(pane.paneId, pane.session) === "alive",
     `pane ${pane.paneId} never reported alive in ${pane.session}`,
   );
   return pane;
@@ -159,15 +159,15 @@ describe.skipIf(!hasZellij)("zellij backend against the real binary", () => {
     expect(pane.windowName).toBe("create-child");
     // Normalized to the bare integer form `list-panes --json` reports.
     expect(pane.paneId).toMatch(/^\d+$/);
-    expect(mux.isPaneAlive(pane.paneId, pane.session)).toBe(true);
-    await expect(mux.isPaneAliveAsync(pane.paneId, pane.session)).resolves.toBe(
-      true,
-    );
+    expect(mux.getPaneLiveness(pane.paneId, pane.session)).toBe("alive");
+    await expect(
+      mux.getPaneLivenessAsync(pane.paneId, pane.session),
+    ).resolves.toBe("alive");
   });
 
-  it("isPaneAlive reports false for an id the session never had", async () => {
+  it("reports dead for an id the session never had", async () => {
     const pane = await spawnPane(mux, "Liveness child");
-    expect(mux.isPaneAlive("99999", pane.session)).toBe(false);
+    expect(mux.getPaneLiveness("99999", pane.session)).toBe("dead");
   });
 
   it("capturePane reads real pane output via dump-screen", async () => {
@@ -223,7 +223,7 @@ describe.skipIf(!hasZellij)("zellij backend against the real binary", () => {
     // `dump-screen --pane-id 99999` with exit 0 and no output, so a capture of
     // a pane that does not exist is indistinguishable from a capture of an
     // empty pane. Callers cannot use a capture failure as a liveness signal —
-    // that is what `isPaneAlive` is for.
+    // that is what `getPaneLiveness` is for.
     const pane = await spawnPane(mux, "Missing pane child");
     const result = await mux.capturePane(
       { paneId: "99999", session: pane.session },
@@ -285,18 +285,18 @@ describe.skipIf(!hasZellij)("zellij backend against the real binary", () => {
     // fresh session has BOTH a `zellij:link` plugin pane with id 0 and a shell
     // terminal pane with id 0. Matching liveness on the bare integer therefore
     // kept reporting a closed sub-agent pane as alive — the artifact poller
-    // would never see the child finish. `isPaneAlive` must ignore plugin rows.
+    // would never see the child finish. Liveness must ignore plugin rows.
     const pane = await spawnPane(mux, "Kill child");
-    expect(mux.isPaneAlive(pane.paneId, pane.session)).toBe(true);
+    expect(mux.getPaneLiveness(pane.paneId, pane.session)).toBe("alive");
 
     mux.killPane(pane.paneId, pane.session);
     await waitFor(
-      () => !mux.isPaneAlive(pane.paneId, pane.session),
+      () => mux.getPaneLiveness(pane.paneId, pane.session) === "dead",
       "pane never reported dead after killPane",
     );
-    await expect(mux.isPaneAliveAsync(pane.paneId, pane.session)).resolves.toBe(
-      false,
-    );
+    await expect(
+      mux.getPaneLivenessAsync(pane.paneId, pane.session),
+    ).resolves.toBe("dead");
     expect(() => mux.killPane(pane.paneId, pane.session)).not.toThrow();
   });
 

@@ -87,8 +87,7 @@ describe("multiplexer-tmux", () => {
     installMockExec((args) => {
       calls.push(args);
       if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
-      // createPane doesn't call display-message; buildsAttachCommands does.
-      // sendKeys / sendEnter / isPaneAlive are not called here.
+      if (args[0] === "display-message") return MOCK_LOCATION;
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -102,6 +101,7 @@ describe("multiplexer-tmux", () => {
 
     expect(result.paneId).toBe(MOCK_PANE_ID);
     expect(result.windowName).toBe("demo");
+    expect(result.session).toBe("main");
 
     const nw = calls.find((a) => a[0] === "new-window");
     expect(nw).toBeDefined();
@@ -124,6 +124,7 @@ describe("multiplexer-tmux", () => {
     installMockExec((args) => {
       calls.push(args);
       if (args[0] === "new-window") return "%99\n";
+      if (args[0] === "display-message") return MOCK_LOCATION;
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
@@ -138,6 +139,7 @@ describe("multiplexer-tmux", () => {
 
     expect(result.paneId).toBe("%99");
     expect(result.windowName).toBe("my-custom-name");
+    expect(result.session).toBe("main");
 
     const nw = calls.find((a) => a[0] === "new-window");
     expect(nw).toContain("my-custom-name");
@@ -174,6 +176,7 @@ describe("multiplexer-tmux", () => {
     installMockExec((args) => {
       calls.push(args);
       if (args[0] === "split-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "display-message") return MOCK_LOCATION;
       if (args[0] === "select-pane") return "";
       return "";
     });
@@ -190,6 +193,7 @@ describe("multiplexer-tmux", () => {
     expect(result.paneId).toBe(MOCK_PANE_ID);
     // Visible split has no windowName (same window as parent)
     expect(result.windowName).toBeUndefined();
+    expect(result.session).toBe("main");
 
     const sw = calls.find((a) => a[0] === "split-window");
     expect(sw).toBeDefined();
@@ -218,6 +222,7 @@ describe("multiplexer-tmux", () => {
     installMockExec((args) => {
       calls.push(args);
       if (args[0] === "split-window") return "%88\n";
+      if (args[0] === "display-message") return MOCK_LOCATION;
       if (args[0] === "select-pane") return "";
       return "";
     });
@@ -234,6 +239,76 @@ describe("multiplexer-tmux", () => {
     const sw = calls.find((a) => a[0] === "split-window");
     expect(sw).toContain("-t");
     expect(sw).toContain("%9");
+  });
+
+  it("cleans up a created pane when its session cannot be derived", async () => {
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const calls: string[][] = [];
+    installMockExec((args) => {
+      calls.push(args);
+      if (isCommandProbe(args)) return "";
+      if (args[0] === "new-window") return "%42\n";
+      if (args[0] === "display-message") throw new Error("server disappeared");
+      return "";
+    });
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+
+    expect(() =>
+      new TmuxMultiplexer().createPane({
+        name: "Demo",
+        cwd: "/tmp",
+        background: true,
+      }),
+    ).toThrow(/Failed to determine session/);
+    expect(calls).toContainEqual(["kill-pane", "-t", "%42"]);
+  });
+
+  it("targets the created session when probing attached clients", async () => {
+    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+    const asyncCalls: string[][] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (_file: string, args: string[]) => {
+        if (isCommandProbe(args)) return "";
+        if (args[0] === "new-window") return "%42\n";
+        if (args[0] === "display-message") return "target-session\t1\t0\n";
+        return "";
+      },
+      execFile: (
+        _file: string,
+        args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => {
+        asyncCalls.push(args);
+        const targetIndex = args.indexOf("-t");
+        const target = targetIndex === -1 ? undefined : args[targetIndex + 1];
+        callback(null, target === "target-session" ? "" : "unrelated-client\n");
+      },
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    const mux = new TmuxMultiplexer();
+    const created = mux.createPane({
+      name: "Demo",
+      cwd: "/tmp",
+      background: true,
+    });
+
+    expect(created.session).toBe("target-session");
+    await expect(mux.hasAttachedClientAsync(created.session)).resolves.toBe(
+      false,
+    );
+    expect(asyncCalls).toContainEqual([
+      "list-clients",
+      "-t",
+      "target-session",
+      "-F",
+      "#{client_name}",
+    ]);
   });
 
   /* ------------------------------------------------------------------ */
@@ -264,6 +339,7 @@ describe("multiplexer-tmux", () => {
     expect(result.paneId).toBe(MOCK_PANE_ID);
     // Relaxed path always defines windowName (renamed from default "0")
     expect(result.windowName).toBe("demo");
+    expect(result.session).toBe("pi-subagent-abc12345");
 
     const ns = calls.find((a) => a[0] === "new-session");
     expect(ns).toBeDefined();
@@ -315,6 +391,8 @@ describe("multiplexer-tmux", () => {
 
     expect(first.windowName).toBe("first");
     expect(second.windowName).toBe("second");
+    expect(first.session).toBe("pi-subagent-abc12345");
+    expect(second.session).toBe("pi-subagent-abc12345");
     expect(calls.filter((args) => args[0] === "new-session")).toHaveLength(1);
     const newWindow = calls.find((args) => args[0] === "new-window");
     expect(newWindow).toBeDefined();
@@ -380,34 +458,72 @@ describe("multiplexer-tmux", () => {
   });
 
   /* ------------------------------------------------------------------ */
-  /*  isPaneAlive                                                        */
+  /*  getPaneLiveness                                                   */
   /* ------------------------------------------------------------------ */
 
-  it("isPaneAlive returns true when display-message succeeds", async () => {
-    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+  it("returns alive when a successful pane listing contains the pane", async () => {
     installMockExec((args) => {
-      if (args[0] === "display-message") return "%42\n";
+      if (args[0] === "list-panes") return "%1\n%42\n";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-tmux")
     >("../src/multiplexer-tmux");
-    expect(new TmuxMultiplexer().isPaneAlive("%42")).toBe(true);
+    expect(new TmuxMultiplexer().getPaneLiveness("%42")).toBe("alive");
   });
 
-  it("isPaneAlive returns false when display-message throws", async () => {
-    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+  it("returns dead when a successful pane listing omits the pane", async () => {
     installMockExec((args) => {
-      if (args[0] === "display-message") throw new Error("no such pane");
+      if (args[0] === "list-panes") return "%1\n%2\n";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-tmux")
     >("../src/multiplexer-tmux");
-    expect(new TmuxMultiplexer().isPaneAlive("%99")).toBe(false);
+    expect(new TmuxMultiplexer().getPaneLiveness("%99")).toBe("dead");
   });
 
-  it("isPaneAliveAsync uses execFile rather than execFileSync", async () => {
+  it("returns unknown when sync or async pane listing fails", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        throw new Error("server unavailable");
+      },
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(new Error("server unavailable"), ""),
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    const mux = new TmuxMultiplexer();
+    expect(mux.getPaneLiveness("%99")).toBe("unknown");
+    await expect(mux.getPaneLivenessAsync("%99")).resolves.toBe("unknown");
+  });
+
+  it("returns unknown for malformed pane-listing output", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => "not-a-pane\n",
+      execFile: (
+        _file: string,
+        _args: string[],
+        _options: object,
+        callback: (error: Error | null, stdout: string) => void,
+      ) => callback(null, "not-a-pane\n"),
+    }));
+    const { TmuxMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-tmux")
+    >("../src/multiplexer-tmux");
+    const mux = new TmuxMultiplexer();
+    expect(mux.getPaneLiveness("%42")).toBe("unknown");
+    await expect(mux.getPaneLivenessAsync("%42")).resolves.toBe("unknown");
+  });
+
+  it("getPaneLivenessAsync lists panes without using execFileSync", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
       execFileSync: () => {
@@ -418,17 +534,17 @@ describe("multiplexer-tmux", () => {
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout: string) => void,
-      ) => callback(null, "%42\n"),
+      ) => callback(null, "%1\n%42\n"),
     }));
     const { TmuxMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-tmux")
     >("../src/multiplexer-tmux");
-    await expect(new TmuxMultiplexer().isPaneAliveAsync("%42")).resolves.toBe(
-      true,
-    );
+    await expect(
+      new TmuxMultiplexer().getPaneLivenessAsync("%42"),
+    ).resolves.toBe("alive");
   });
 
-  it("treats successful blank probes as dead panes", async () => {
+  it("treats a successful blank listing as dead", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
       execFileSync: () => "\n",
@@ -444,29 +560,28 @@ describe("multiplexer-tmux", () => {
     >("../src/multiplexer-tmux");
     const mux = new TmuxMultiplexer();
 
-    expect(mux.isPaneAlive("%missing")).toBe(false);
-    await expect(mux.isPaneAliveAsync("%missing")).resolves.toBe(false);
+    expect(mux.getPaneLiveness("%99")).toBe("dead");
+    await expect(mux.getPaneLivenessAsync("%99")).resolves.toBe("dead");
   });
 
-  it("isPaneAlive uses correct tmux args: display-message -p -t paneId #{pane_id}", async () => {
-    process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
+  it("lists all panes with stable pane-id output", async () => {
     const calls: string[][] = [];
     installMockExec((args) => {
       calls.push(args);
-      if (args[0] === "display-message") return "%42\n";
+      if (args[0] === "list-panes") return "%42\n";
       return "";
     });
     const { TmuxMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-tmux")
     >("../src/multiplexer-tmux");
-    new TmuxMultiplexer().isPaneAlive("%42");
+    new TmuxMultiplexer().getPaneLiveness("%42");
 
-    const dm = calls.find((a) => a[0] === "display-message");
-    expect(dm).toBeDefined();
-    expect(dm).toContain("-p");
-    expect(dm).toContain("-t");
-    expect(dm).toContain("%42");
-    expect(dm).toContain("#{pane_id}");
+    expect(calls.find((args) => args[0] === "list-panes")).toEqual([
+      "list-panes",
+      "-a",
+      "-F",
+      "#{pane_id}",
+    ]);
   });
 
   /* ------------------------------------------------------------------ */
