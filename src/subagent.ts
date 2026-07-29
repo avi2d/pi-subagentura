@@ -31,7 +31,6 @@ import {
 } from "./helpers";
 import { registerWorkflowTool } from "./workflow";
 import {
-  registerInteractiveChildMaintenanceTools,
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
   registerSubagentArtifactsCleanupTool,
@@ -93,7 +92,8 @@ export default function (pi: ExtensionAPI) {
     }
     registerSessionHandlers(pi);
     registerInteractiveSubagentTools(pi);
-    registerInteractiveChildMaintenanceTools(pi);
+    registerSubagentArtifactsCleanupTool(pi);
+    registerSubagentModelListTool(pi);
     registerInteractiveSupervisor(pi);
     return;
   }
