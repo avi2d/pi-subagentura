@@ -11,6 +11,7 @@ Reference docs for the pi-subagentura project.
 | ---------------------------------------------------------- | ----------------------------------------------------------------------- |
 | [bun.md](./bun.md)                                         | JavaScript runtime and package manager conventions                      |
 | [publish.md](./publish.md)                                 | npm release process via OIDC trusted publisher                          |
+| [terminal-e2e.md](./terminal-e2e.md)                       | Terminal E2E harness: how to run it, determinism rules, recording tools |
 | [workflows.md](./workflows.md)                             | Workflow scripts shipped in the repo (consensus pipelines + converters) |
 | [interactive-tmux-review.md](./interactive-tmux-review.md) | Code review of `src/interactive-tmux.ts` via GLM-5.2                    |
 
