@@ -23,7 +23,12 @@ import {
   projectLineageStore,
   resolveLineageStorePaths,
 } from "../src/interactive-lineage";
-import { __resetMuxInstances } from "../src/multiplexer";
+import {
+  __resetMuxInstances,
+  MUX_CAPABILITIES,
+  safeSegment,
+} from "../src/multiplexer";
+import { TmuxMultiplexer } from "../src/multiplexer-tmux";
 
 const socket =
   process.env.PI_SUBAGENTURA_TMUX_SOCKET ??
@@ -299,6 +304,117 @@ test("cancel writes the cancellation marker and kills the tmux pane", async () =
 
   expect(cancelled?.status).toBe("cancelled");
   expect(existsSync(join(state.artifactDir, ".cancelled"))).toBe(true);
+});
+
+test("focusPane targets the pane's own session when window names collide", async () => {
+  // Regression guard for a silent wrong-agent focus. `focusPane` used to build
+  // `select-window -t <windowName>` with no session qualifier, dropping the
+  // populated `PaneRef.session`. Window names are `safeSegment(name)`, so two
+  // sub-agents both called "reviewer" collide trivially — and real tmux answers
+  // an unqualified name target from whichever session it scans first, exiting 0.
+  // The result was "focus succeeded" while a different agent got focused.
+  const mux = new TmuxMultiplexer();
+  const windowName = "reviewer";
+  const panes: Record<string, string> = {};
+
+  for (const session of ["collide-a", "collide-b"]) {
+    // Window 0 is `home` and stays active; window 1 is the colliding name.
+    tmux(["new-session", "-d", "-s", session, "-n", "home"]);
+    panes[session] = tmux([
+      "new-window",
+      "-d",
+      "-t",
+      session,
+      "-n",
+      windowName,
+      "-P",
+      "-F",
+      "#{pane_id}",
+    ]).trim();
+    expect(panes[session]).toMatch(/^%/);
+  }
+
+  const activeWindow = (session: string): string =>
+    tmux([
+      "display-message",
+      "-p",
+      "-t",
+      `${session}:`,
+      "#{window_name}",
+    ]).trim();
+
+  expect(activeWindow("collide-a")).toBe("home");
+  expect(activeWindow("collide-b")).toBe("home");
+
+  // Focus the pane in `collide-a` specifically. This direction is what makes
+  // the test a real guard: verified against tmux 3.7b, an unqualified
+  // `select-window -t reviewer` on this server resolves to `collide-b` (the
+  // most recently created session), so the pre-fix implementation moved
+  // `collide-b` and left `collide-a` alone — while still exiting 0.
+  await mux.focusPane({
+    paneId: panes["collide-a"]!,
+    windowName,
+    session: "collide-a",
+  });
+
+  // The requested session moved...
+  expect(activeWindow("collide-a")).toBe(windowName);
+  // ...and the identically-named window in the OTHER session did not.
+  expect(activeWindow("collide-b")).toBe("home");
+
+  tmux(["kill-session", "-t", "collide-a"]);
+  tmux(["kill-session", "-t", "collide-b"]);
+});
+
+test("safeSegment window names stay selectable in real tmux", async () => {
+  // `safeSegment` must exclude `.`: tmux target syntax reads `window.pane`, so
+  // a window literally named `review.v2` is creatable but not selectable
+  // (`can't find pane: v2`), which permanently breaks focus for any sub-agent
+  // whose model-chosen name contains a dot.
+  const segment = safeSegment("Review.v2 Agent");
+  expect(segment).toBe("review-v2-agent");
+  expect(segment).not.toContain(".");
+
+  tmux(["new-session", "-d", "-s", "dotted", "-n", "home"]);
+  const paneId = tmux([
+    "new-window",
+    "-d",
+    "-t",
+    "dotted",
+    "-n",
+    segment,
+    "-P",
+    "-F",
+    "#{pane_id}",
+  ]).trim();
+
+  // Both the structured focus path and the copy-paste `select-window` form
+  // must resolve this name.
+  expect(() =>
+    tmux(["select-window", "-t", `dotted:${segment}`]),
+  ).not.toThrow();
+  await new TmuxMultiplexer().focusPane({
+    paneId,
+    windowName: segment,
+    session: "dotted",
+  });
+  expect(
+    tmux(["display-message", "-p", "-t", paneId, "#{window_active}"]).trim(),
+  ).toBe("1");
+
+  tmux(["kill-session", "-t", "dotted"]);
+});
+
+test("declared tmux capabilities match what the binary actually does", async () => {
+  // M7: the capability record used to be unread, unverified metadata. Each flag
+  // below is exercised for real by the focus/capture tests in this file.
+  const mux = new TmuxMultiplexer();
+  expect(mux.capabilities).toEqual(MUX_CAPABILITIES.tmux);
+  expect(mux.isAvailable()).toBe(true);
+  // nativeOverlay describes the backend, but the overlay still needs the parent
+  // process to be inside tmux — these tests deliberately run outside one.
+  expect(mux.capabilities.nativeOverlay).toBe(true);
+  await expect(mux.showNativeViewer("Agent", "content")).resolves.toBe(false);
 });
 
 test("launches and projects a recursive child hierarchy across cwd values", async () => {
