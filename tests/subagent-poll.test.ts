@@ -863,7 +863,7 @@ describe("pollArtifactChanges", () => {
     rmSync(logDir, { recursive: true, force: true });
   });
 
-  it("acknowledges parent cancellation before killing the pane without injecting it", async () => {
+  it("acknowledges cancellation before killing a pane with unknown liveness", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const interactive = await import("../src/interactive-tmux");
@@ -892,7 +892,7 @@ describe("pollArtifactChanges", () => {
       parentSessionId: "pi",
     });
     multiplexer.__setTmuxMultiplexer({
-      getPaneLiveness: () => "alive",
+      getPaneLiveness: () => "unknown",
       killPane: () => {
         completionsAtKill = readFileSync(
           join(artifactDir, "events.ndjson"),

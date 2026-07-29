@@ -223,7 +223,9 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
           interactiveSubagentRegistry.delete(state.id);
           if (
             !preserveInteractivePanes &&
-            (state.status === "running" || state.status === "idle")
+            (state.status === "running" ||
+              state.status === "idle" ||
+              state.status === "unknown")
           ) {
             try {
               cancelInteractiveSubagentByState(state);
@@ -291,7 +293,11 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       // kill their panes; reload/resume/quit leave them for rehydration.
       const runningStates: InteractiveSubagentState[] = [];
       for (const state of interactiveSubagentRegistry.values()) {
-        if (state.status === "running" || state.status === "idle") {
+        if (
+          state.status === "running" ||
+          state.status === "idle" ||
+          state.status === "unknown"
+        ) {
           runningStates.push(state);
         }
       }

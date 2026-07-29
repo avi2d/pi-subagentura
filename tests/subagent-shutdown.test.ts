@@ -259,10 +259,11 @@ describe("session_shutdown handler", () => {
   });
 
   it.each(["new", "fork"])(
-    "kills running and idle panes for non-preserving reason %s",
+    "kills running, idle, and unknown panes for non-preserving reason %s",
     (reason) => {
       const running = makeState("run-1", "running");
       const idle = makeState("idle-1", "idle");
+      const unknown = makeState("unknown-1", "unknown");
 
       const cancelled = makeState("canc-1", "cancelled");
 
@@ -270,6 +271,7 @@ describe("session_shutdown handler", () => {
 
       interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
       interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
+      interactiveTmux.interactiveSubagentRegistry.set(unknown.id, unknown);
 
       interactiveTmux.interactiveSubagentRegistry.set(cancelled.id, cancelled);
 
@@ -285,22 +287,25 @@ describe("session_shutdown handler", () => {
 
       // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
 
-      expect(cancelByStateSpy).toHaveBeenCalledTimes(2);
+      expect(cancelByStateSpy).toHaveBeenCalledTimes(3);
 
       expect(cancelByStateSpy).toHaveBeenCalledWith(running);
       expect(cancelByStateSpy).toHaveBeenCalledWith(idle);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(unknown);
 
       expect(cancelSpy).not.toHaveBeenCalled();
     },
   );
 
   it.each(["reload", "resume", "quit"])(
-    "preserves running and idle panes for reason %s",
+    "preserves running, idle, and unknown panes for reason %s",
     (reason) => {
       const running = makeState("run-1", "running");
       const idle = makeState("idle-1", "idle");
+      const unknown = makeState("unknown-1", "unknown");
       interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
       interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
+      interactiveTmux.interactiveSubagentRegistry.set(unknown.id, unknown);
 
       const { shutdownHandler } = setupExtension();
       shutdownHandler!({ reason });

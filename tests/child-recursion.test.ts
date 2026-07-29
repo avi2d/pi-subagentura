@@ -98,12 +98,12 @@ describe("recursive interactive children", () => {
     );
   });
 
-  it("leaves descendant cancellation delivery for the owning Pi session", () => {
+  it("leaves descendant delivery to its owner and kills on unknown liveness", () => {
     const artifactDir = join(tempDir(), "artifact");
     mkdirSync(artifactDir, { recursive: true });
     const killPane = vi.fn();
     __setTmuxMultiplexer({
-      getPaneLiveness: vi.fn(() => "alive"),
+      getPaneLiveness: vi.fn(() => "unknown"),
       killPane,
     } as never);
     const state: InteractiveSubagentState = {

@@ -222,12 +222,6 @@ async function loadSupervisorProjection(
   const isNodeStale = async (manifest: LineageManifest): Promise<boolean> => {
     const cached = paneLivenessById.get(manifest.agentId);
     if (cached !== undefined) return cached === "dead";
-    // A node the live registry already knows is terminal needs no subprocess.
-    const known = interactiveSubagentRegistry.get(manifest.agentId);
-    if (known?.status === "cancelled" || known?.status === "exited") {
-      paneLivenessById.set(manifest.agentId, "dead");
-      return true;
-    }
     if (
       manifest.pane.backend !== "tmux" &&
       manifest.pane.backend !== "zellij"

@@ -916,7 +916,7 @@ describe("interactive supervisor", () => {
     expect(notify).not.toHaveBeenCalled();
   });
 
-  it("hides exited projected registry children", async () => {
+  it("hides exited registry children without treating an alive pane as stale", async () => {
     const sessionRoot = tempDir();
     const rootId = "projected-root";
     const artifactDir = join(sessionRoot, "artifact");
@@ -945,9 +945,10 @@ describe("interactive supervisor", () => {
       pane: { backend: "tmux", paneId: exited.paneId },
       artifactDir,
     });
+    const getPaneLivenessAsync = vi.fn().mockResolvedValue("alive");
     interactiveSubagentRegistry.set(exited.id, exited);
     __setTmuxMultiplexer({
-      getPaneLivenessAsync: vi.fn().mockResolvedValue("alive"),
+      getPaneLivenessAsync,
       getPaneLiveness: vi.fn().mockReturnValue("dead"),
     } as never);
     process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
@@ -980,6 +981,11 @@ describe("interactive supervisor", () => {
 
       expect.soft(rendered).not.toContain(exited.name);
       expect(exited.status).toBe("exited");
+      expect(getPaneLivenessAsync).toHaveBeenCalledWith(
+        exited.paneId,
+        undefined,
+      );
+      expect(readdirSync(paths.nodesDir)).toContain(`${exited.id}.json`);
     } finally {
       if (previousRootId === undefined)
         delete process.env.PI_SUBAGENTURA_ROOT_ID;
@@ -1229,13 +1235,17 @@ describe("interactive supervisor", () => {
     expect(interactiveSubagentRegistry.has(root.id)).toBe(true);
   });
 
-  it("does not probe panes for nodes the registry already knows are terminal", async () => {
+  it("probes terminal registry nodes and prunes only confirmed-dead panes", async () => {
     const harness = await lineageHarness("terminal-probe-root");
-    await harness.writeNode("finished", { paneId: "%finished" });
-    await harness.writeNode("running", { paneId: "%running" });
-    const finished = state("finished", { status: "exited" });
-    interactiveSubagentRegistry.set(finished.id, finished);
-    const getPaneLivenessAsync = vi.fn().mockResolvedValue("alive");
+    await harness.writeNode("alive", { paneId: "%alive" });
+    await harness.writeNode("unknown", { paneId: "%unknown" });
+    await harness.writeNode("dead", { paneId: "%dead" });
+    for (const id of ["alive", "unknown", "dead"]) {
+      interactiveSubagentRegistry.set(id, state(id, { status: "exited" }));
+    }
+    const getPaneLivenessAsync = vi.fn(async (paneId: string) =>
+      paneId === "%dead" ? "dead" : paneId === "%unknown" ? "unknown" : "alive",
+    );
     __setTmuxMultiplexer({
       getPaneLivenessAsync,
       getPaneLiveness: () => "alive",
@@ -1250,8 +1260,10 @@ describe("interactive supervisor", () => {
     const probedPanes = getPaneLivenessAsync.mock.calls.map(
       ([paneId]) => paneId,
     );
-    expect(probedPanes).toContain("%running");
-    expect(probedPanes).not.toContain("%finished");
+    expect(probedPanes).toEqual(
+      expect.arrayContaining(["%alive", "%unknown", "%dead"]),
+    );
+    expect(await harness.nodeFiles()).toEqual(["alive.json", "unknown.json"]);
   });
 
   it("prunes dead lineage manifests while projecting", async () => {

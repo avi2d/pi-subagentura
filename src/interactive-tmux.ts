@@ -933,7 +933,7 @@ export function cancelInteractiveSubagent(
 
   // 3. Kill the pane via the backend that created it. The wrapper's EXIT trap fires and records the event.
   const mux = getMuxForState(state);
-  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
     mux.killPane(state.paneId, state.muxSession);
   }
   return state;
@@ -1010,7 +1010,7 @@ export function cancelInteractiveDescendantByState(
   appendCancellation(state, false);
   state.status = "cancelled";
   const mux = getMuxForState(state);
-  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
     mux.killPane(state.paneId, state.muxSession);
   }
   return state;
@@ -1062,9 +1062,10 @@ export function cancelInteractiveSubagentByState(
   }
   appendCancellation(state);
 
-  // 2. Kill the pane if alive (best-effort; wrapped to keep the shutdown loop alive)
+  // Explicit cancellation is destructive by request: unless absence is
+  // confirmed, attempt the kill even when the listing probe is unavailable.
   const mux = getMuxForState(state);
-  if (mux.getPaneLiveness(state.paneId, state.muxSession) === "alive") {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
     try {
       mux.killPane(state.paneId, state.muxSession);
     } catch {
