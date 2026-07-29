@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.2.0] - 2026-07-31
 
+### Added
+
+- Only-interactive mode: `pi --only-interactive` (or `PI_SUBAGENTURA_ONLY_INTERACTIVE=1`) registers only the six attachable child-session tools plus `list_available_models` and `cleanup_subagent_artifacts`, dropping the in-process and workflow tools and their slash commands. Session handlers, the artifact poller, rehydration, `/cancel-all-flows`, and `ctrl+alt+x` stay active.
+- `ORCHESTRATOR_ONLY_INTERACTIVE_SYSTEM_PROMPT.md`: `--orchestrator` injects this reduced prompt in only-interactive mode so the parent is never told to call a tool that mode omits.
+
 ### Fixed
 
 - Concurrent parent sessions now keep in-process jobs, interactive sub-agents, delivery queues, streaming state, supervisor actions, and shutdown cleanup isolated by exact session generation.
+
+## [3.1.0] - 2026-07-26
 
 ### Added
 

@@ -55,15 +55,50 @@ pi --orchestrator
 workflow. `/workflows` runs saved workflows, and `/workflow-tree` shows live
 phases, agents, and cancellation controls.
 
-Attach-only mode keeps the full interactive session toolchain but skips in-process
-and workflow sub-agents. Start Pi with:
+## Only-interactive mode
 
 ```text
 pi --only-interactive
 ```
 
-Use this when you want only attachable child-session tools while preserving
-poller/rehydration and interactive artifact controls.
+Only-interactive mode registers a reduced surface: the six attachable
+child-session tools plus model listing and artifact cleanup. Session handlers,
+the artifact poller, and rehydration stay active, so children survive reload and
+resume. Use it when you want child Pi sessions you can watch and attach to, and
+none of the in-process or workflow machinery.
+
+The mode is chosen when the extension loads — before Pi applies flag values — so
+pass `--only-interactive` on the command line or set
+`PI_SUBAGENTURA_ONLY_INTERACTIVE=1` in the environment. Combined with
+`--orchestrator` it injects `ORCHESTRATOR_ONLY_INTERACTIVE_SYSTEM_PROMPT.md`, a
+reduced prompt that mentions only the tools this mode registers.
+
+### Registered in only-interactive mode
+
+| Tool                                | Purpose                                                        |
+| ----------------------------------- | -------------------------------------------------------------- |
+| `subagent_interactive`              | Launch an attachable Pi session in tmux/Zellij                 |
+| `get_interactive_subagent_status`   | Inspect attachable child sessions                              |
+| `send_interactive_subagent_message` | Send a follow-up while preserving child context                |
+| `cancel_interactive_subagent`       | Kill an attachable child pane                                  |
+| `list_subagent_artifacts`           | List durable interactive-agent artifacts                       |
+| `read_subagent_artifact`            | Read lifecycle events and output snapshots                     |
+| `cleanup_subagent_artifacts`        | Remove expired artifact directories and stale registry entries |
+| `list_available_models`             | List configured model identifiers                              |
+
+The `/cancel-all-flows` command and its `ctrl+alt+x` shortcut stay available.
+
+### Not registered in only-interactive mode
+
+Thirteen tools are dropped: `workflow`, `save_workflow`, `list_workflows`,
+`delete_workflow`, `get_workflow_status`, `get_workflow_result`,
+`cancel_workflow`, `subagent_with_context`, `subagent_isolated`,
+`get_subagent_status`, `get_subagent_result`, `cancel_subagent`, and
+`prune_subagent_jobs`.
+
+Six slash commands go with them: `/workflow`, `/workflows`, `/list-workflows`,
+`/workflow-status`, `/workflow-tree`, and `/delete-workflow`. The Quick start
+above therefore does not apply in this mode.
 
 ## Reusable workflows
 
@@ -112,7 +147,9 @@ See the [workflow guide](./docs/workflows.md) and
 
 ## User commands
 
-These commands are intended for people at the Pi prompt.
+These commands are intended for people at the Pi prompt. In
+[only-interactive mode](#only-interactive-mode) only `/cancel-all-flows` is
+registered.
 
 | Command             | Purpose                                                           |
 | ------------------- | ----------------------------------------------------------------- |
@@ -127,7 +164,8 @@ These commands are intended for people at the Pi prompt.
 
 ## Agent-facing tools
 
-The extension registers 21 public tools for parent agents.
+The extension registers 21 public tools for parent agents, or the 8 listed under
+[only-interactive mode](#only-interactive-mode).
 
 | Tool                                | Purpose                                                        |
 | ----------------------------------- | -------------------------------------------------------------- |
@@ -205,6 +243,8 @@ The guidance gives the parent agent reasonable default behavior when the user as
 - “implement and review” — use one writer, parallel reviewers, and capped fix/review rounds
 
 The defaults prefer async `subagent_isolated` for fresh scouts/reviewers, `subagent_with_context` for oracle checks, injected completions instead of polling, and one writer at a time for implementation. For cheap fanout, they suggest validating model availability before using optional model overrides.
+
+In [only-interactive mode](#only-interactive-mode) the flag injects `ORCHESTRATOR_ONLY_INTERACTIVE_SYSTEM_PROMPT.md` instead, which routes every delegation through `subagent_interactive` and never names a tool that mode omits.
 
 ## Cancellation context snapshots (opt-in)
 
