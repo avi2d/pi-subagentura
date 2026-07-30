@@ -106,51 +106,6 @@ describe("extension registration", () => {
     });
   });
 
-  it("registers the --only-interactive flag", () => {
-    const api = mockApi();
-
-    registerExtension(api as any);
-
-    expect(api.registerFlag).toHaveBeenCalledWith("only-interactive", {
-      description: "Enable only interactive sub-agent tools",
-      type: "boolean",
-      default: false,
-    });
-  });
-
-  it("omits in-process and workflow tools when --only-interactive is enabled", () => {
-    const api = mockApi({
-      getFlag: vi.fn((name: string) => name === "only-interactive"),
-    });
-
-    registerExtension(api as any);
-
-    const names = getRegisteredToolNames(api);
-    expect(names).toEqual(INTERACTIVE_TOOL_NAMES);
-
-    for (const name of IN_PROCESS_TOOL_NAMES) {
-      expect(names).not.toContain(name);
-    }
-    for (const name of WORKFLOW_TOOL_NAMES) {
-      expect(names).not.toContain(name);
-    }
-  });
-
-  it("keeps interactive tools and session handlers with --only-interactive", () => {
-    const api = mockApi({
-      getFlag: vi.fn((name: string) => name === "only-interactive"),
-    });
-
-    registerExtension(api as any);
-
-    expect(getRegisteredToolNames(api)).toEqual(INTERACTIVE_TOOL_NAMES);
-
-    const events = api.on.mock.calls.map(([event]: any[]) => event as string);
-    expect(events).toContain("session_start");
-    expect(events).toContain("session_shutdown");
-    expect(events).toContain("agent_settled");
-  });
-
   it("appends the bundled prompt when --orchestrator is enabled", async () => {
     const api = mockApi({
       getFlag: vi.fn((name: string) => name === "orchestrator"),
