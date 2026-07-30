@@ -188,6 +188,8 @@ export interface InteractiveSubagentState {
   workflowId?: string;
   /** Completion is delivered standalone or consumed by a workflow aggregate. */
   completionOwner?: "standalone" | "workflow";
+  /** Workflow-runner acknowledgement that this child's result was consumed; runtime-only and intentionally not persisted. */
+  workflowResultConsumed?: boolean;
   model?: string;
   startedAt: number;
   /**

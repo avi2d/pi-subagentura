@@ -207,12 +207,14 @@ export function registerWorkflowTool(
           });
         }
         if (state) {
-          return await awaitInteractiveResult(
+          const result = await awaitInteractiveResult(
             state,
             signal,
             undefined,
             onCancellationSnapshot,
           );
+          state.workflowResultConsumed = true;
+          return result;
         }
       }
 

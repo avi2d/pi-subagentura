@@ -389,10 +389,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     description: [
       "Send a follow-up prompt to a live interactive sub-agent. The message is delivered into the",
       "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
-      "is a true follow-up turn, not a fresh spawn. An idle workflow-owned child is promoted to",
-      "standalone after a successful send; a running workflow-owned child cannot accept a follow-up",
-      "until its owning workflow aggregates the current turn. The child will run the new turn and",
-      "(per its system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
+      "is a true follow-up turn, not a fresh spawn. A workflow-owned child can accept a follow-up",
+      "only after its completed turn is idle and its workflow runner has consumed the result. It is",
+      "promoted to standalone only after that follow-up is sent successfully. The child will run the",
+      "new turn and (per its system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
       "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
     ].join("\n"),
     parameters: Type.Object({
@@ -466,20 +466,24 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      if (state.completionOwner === "workflow" && state.status === "running") {
+      if (
+        state.completionOwner === "workflow" &&
+        (!state.workflowResultConsumed || state.status !== "idle")
+      ) {
         return {
           content: [
             {
               type: "text",
-              text: `Interactive sub-agent ${params.id} is still running under workflow ownership; the owning workflow must aggregate the current turn before a follow-up can be sent.`,
+              text: `Interactive sub-agent ${params.id} is still under workflow ownership; its workflow must consume the current result and the pane must be idle before a follow-up can be sent.`,
             },
           ],
           details: { id: params.id, status: "workflow_owned" },
           isError: true,
         };
       }
-      // Standalone panes accept follow-ups while running or idle. A workflow-owned pane may only
-      // accept one once idle, after its owning workflow has aggregated the completed turn.
+      // Standalone panes accept follow-ups while running or idle. Workflow ownership has two
+      // independent release conditions: artifact polling folded the completion into idle, and the
+      // workflow runner acknowledged returning that result.
       if (state.status !== "running" && state.status !== "idle") {
         return {
           content: [
@@ -497,10 +501,13 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       // Wrap so the parent gets a structured error instead of an exception trace.
       try {
         sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
-        // The poller assigns idle only after advancing the event cursor past the
-        // workflow-owned completion. Promoting after the send therefore cannot replay
-        // that completion; the next completion is delivered as a standalone one.
-        if (state.completionOwner === "workflow" && state.status === "idle") {
+        // Reaching the send proves both workflow release conditions held at the guard above.
+        // Release ownership only after sendCommandToPane succeeds so a failed send remains owned.
+        if (
+          state.completionOwner === "workflow" &&
+          state.workflowResultConsumed &&
+          state.status === "idle"
+        ) {
           state.completionOwner = "standalone";
           state.workflowId = undefined;
         }

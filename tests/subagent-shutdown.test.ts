@@ -352,19 +352,32 @@ describe("session_shutdown handler", () => {
   );
 
   it.each(["reload", "resume", "quit"])(
-    "still kills workflow-owned panes for preserving reason %s",
+    "still kills in-memory workflow-origin panes for preserving reason %s",
     (reason) => {
-      // Workflow children are in-memory only: their workflowId, supervisorOwner
+      // Workflow-origin children are in-memory only: their workflow ownership
       // and pending result live nowhere on disk, so rehydrate can never revive
-      // them. Preserving their panes would leak an orphan the user has no handle
-      // on, while a standalone pane is still rehydratable.
+      // them. That remains true after an acknowledged idle child is promoted
+      // to standalone delivery ownership; workflowResultConsumed records its
+      // origin after workflowId is cleared. Ordinary standalone panes remain
+      // rehydratable and must be preserved.
       const workflowChild = makeState("wf-child", "running");
       workflowChild.completionOwner = "workflow";
       workflowChild.workflowId = "wf-1";
+
+      const promotedChild = makeState("promoted-child", "idle");
+      promotedChild.completionOwner = "standalone";
+      promotedChild.workflowResultConsumed = true;
+      promotedChild.workflowId = undefined;
+      delete promotedChild.parentSessionId;
+
       const standalone = makeState("standalone", "running");
       interactiveTmux.interactiveSubagentRegistry.set(
         workflowChild.id,
         workflowChild,
+      );
+      interactiveTmux.interactiveSubagentRegistry.set(
+        promotedChild.id,
+        promotedChild,
       );
       interactiveTmux.interactiveSubagentRegistry.set(
         standalone.id,
@@ -374,8 +387,10 @@ describe("session_shutdown handler", () => {
       const { shutdownHandler } = setupExtension();
       shutdownHandler!({ reason });
 
-      expect(cancelByStateSpy).toHaveBeenCalledTimes(1);
+      expect(cancelByStateSpy).toHaveBeenCalledTimes(2);
       expect(cancelByStateSpy).toHaveBeenCalledWith(workflowChild);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(promotedChild);
+      expect(cancelByStateSpy).not.toHaveBeenCalledWith(standalone);
       expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
     },
   );

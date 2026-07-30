@@ -311,6 +311,15 @@ describe("workflow supervisor integration", () => {
     // the live state until artifact polling observes completion and transitions it
     // to idle, preserving the pane for inspection.
     expect(interactiveSubagentRegistry.has("workflow-child")).toBe(true);
+    expect(
+      (
+        interactiveSubagentRegistry.get(
+          "workflow-child",
+        ) as InteractiveSubagentState & {
+          workflowResultConsumed?: boolean;
+        }
+      ).workflowResultConsumed,
+    ).toBe(true);
     expect(killPane).not.toHaveBeenCalled();
     // A sync workflow returned its result inline, so it must not linger where
     // get_workflow_result could re-serve it or the supervisor could show it.

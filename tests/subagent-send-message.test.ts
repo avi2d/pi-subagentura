@@ -174,11 +174,14 @@ describe("send_interactive_subagent_message", () => {
   });
 
   it("promotes an idle workflow-owned sub-agent after sending a follow-up", async () => {
-    const state = runningState({
-      status: "idle",
-      completionOwner: "workflow",
-      workflowId: "wf-retained",
-    });
+    const state = {
+      ...runningState({
+        status: "idle",
+        completionOwner: "workflow",
+        workflowId: "wf-retained",
+      }),
+      workflowResultConsumed: true,
+    };
     mockGet.mockReturnValue(state);
     mockSendCommandToPane.mockImplementation(() => {
       expect(state.completionOwner).toBe("workflow");
@@ -196,6 +199,30 @@ describe("send_interactive_subagent_message", () => {
     expect(result.details.status).toBe("sent");
     expect(state.completionOwner).toBe("standalone");
     expect(state.workflowId).toBeUndefined();
+  });
+
+  it("rejects an idle workflow-owned sub-agent before its result is consumed", async () => {
+    const state = runningState({
+      status: "idle",
+      completionOwner: "workflow",
+      workflowId: "wf-unconsumed",
+    });
+    mockGet.mockReturnValue(state);
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-unconsumed", {
+      id: "abc12345def67890",
+      message: "continue before workflow consumption",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      id: "abc12345def67890",
+      status: "workflow_owned",
+    });
+    expect(mockSendCommandToPane).not.toHaveBeenCalled();
+    expect(state.completionOwner).toBe("workflow");
+    expect(state.workflowId).toBe("wf-unconsumed");
   });
 
   it("rejects follow-ups while a workflow-owned sub-agent is running", async () => {

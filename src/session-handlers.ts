@@ -35,6 +35,13 @@ function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
+function isInMemoryWorkflowPane(state: InteractiveSubagentState): boolean {
+  return (
+    state.completionOwner === "workflow" ||
+    state.workflowResultConsumed === true
+  );
+}
+
 function ensureInteractivePoller(globalState: any): void {
   if (globalState.__piSubagenturaInteractivePollerHandle) return;
   const handle = setInterval(() => {
@@ -370,8 +377,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
         for (const state of ownedStates) {
           interactiveSubagentRegistry.delete(state.id);
           if (
-            (!preserveInteractivePanes ||
-              state.completionOwner === "workflow") &&
+            (!preserveInteractivePanes || isInMemoryWorkflowPane(state)) &&
             (state.status === "running" ||
               state.status === "idle" ||
               state.status === "unknown")
@@ -439,7 +445,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       // Workflow children are in-memory only and must not survive a parent
       // reload/quit even when standalone interactive panes are preserved.
       for (const state of runningStates) {
-        if (preserveInteractivePanes && state.completionOwner !== "workflow")
+        if (preserveInteractivePanes && !isInMemoryWorkflowPane(state))
           continue;
         try {
           cancelInteractiveSubagentByState(state);
