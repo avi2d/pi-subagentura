@@ -7,8 +7,8 @@
  * would spawn a real tmux pane) and `startSubagentJob` (which would open a real
  * model session). Everything in between is the real code path: `registerWorkflowTool`
  * → `startWorkflowJob` → `runWorkflow` in a real Worker → `runAgent` →
- * `disposeWorkflowInteractiveSubagent`, plus the real poller, the real session
- * context stack and the real `session_shutdown` handler.
+ * `awaitInteractiveResult`, plus the real poller, the real session context stack
+ * and the real `session_shutdown` handler.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -307,10 +307,11 @@ describe("workflow supervisor integration", () => {
     const result = await execution;
 
     expect(result.details.status).toBe("done");
-    // The real dispose ran: registry entry gone, pane killed, and no `.cancelled`
-    // marker written for an agent that completed normally.
-    expect(interactiveSubagentRegistry.has("workflow-child")).toBe(false);
-    expect(killPane).toHaveBeenCalledWith("%42", undefined);
+    // Aggregating the result does not dispose the process pane. The registry keeps
+    // the live state until artifact polling observes completion and transitions it
+    // to idle, preserving the pane for inspection.
+    expect(interactiveSubagentRegistry.has("workflow-child")).toBe(true);
+    expect(killPane).not.toHaveBeenCalled();
     // A sync workflow returned its result inline, so it must not linger where
     // get_workflow_result could re-serve it or the supervisor could show it.
     expect(workflowJobRegistry.has(workflow!.id)).toBe(false);
@@ -514,7 +515,7 @@ describe("workflow supervisor integration", () => {
     expect(jobRegistry.size).toBe(0);
   });
 
-  it("deregisters a live interactive child when the workflow fails", async () => {
+  it("retains a completed interactive child when the workflow later fails", async () => {
     const { context } = liveSessionContext({ id: 7, sessionId: "session-a" });
     const { pi, findTool } = makePi();
     registerWorkflowTool(pi as never, context);
@@ -534,13 +535,20 @@ describe("workflow supervisor integration", () => {
     );
     await vi.waitFor(() => expect(mockLaunch).toHaveBeenCalledOnce());
     expect(interactiveSubagentRegistry.has("workflow-child")).toBe(true);
+    const workflow = [...workflowJobRegistry.values()].find(
+      (job) => job.name === "failing",
+    );
+    expect(workflow).toBeDefined();
 
     releaseAgent(subagentResult("reviewed"));
     const result = await execution;
 
     expect(result.isError).toBe(true);
-    expect(interactiveSubagentRegistry.has("workflow-child")).toBe(false);
-    expect(killPane).toHaveBeenCalledWith("%42", undefined);
+    // A later workflow-script error likewise does not dispose the child whose
+    // successful result was already aggregated.
+    expect(interactiveSubagentRegistry.has("workflow-child")).toBe(true);
+    expect(killPane).not.toHaveBeenCalled();
+    expect(workflowJobRegistry.has(workflow!.id)).toBe(false);
   });
 
   it("runs a sync workflow even when the async job cap is saturated", async () => {

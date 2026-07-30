@@ -955,33 +955,6 @@ export function cancelInteractiveSubagent(
   return state;
 }
 
-/**
- * Close a workflow-managed child after its result has been aggregated.
- *
- * Deregistration is unconditional, even when pane teardown fails. A workflow child
- * is in-memory only and its completion is consumed by the workflow runner, so a
- * retained entry would strand a permanently "running" supervisor row that no poll
- * tick can ever finish — and whose only user affordance (the supervisor's cancel
- * key) would write a false `.cancelled` marker. Returns the pane-cleanup error
- * message, if any, so the caller can surface a leaked pane to the user.
- */
-export function disposeWorkflowInteractiveSubagent(
-  state: InteractiveSubagentState,
-): string | undefined {
-  if (interactiveSubagentRegistry.get(state.id) === state) {
-    interactiveSubagentRegistry.delete(state.id);
-  }
-  try {
-    const mux = getMuxForState(state);
-    if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
-      mux.killPane(state.paneId, state.muxSession);
-    }
-    return undefined;
-  } catch (err) {
-    return err instanceof Error ? err.message : String(err);
-  }
-}
-
 function appendCancellation(
   state: InteractiveSubagentState,
   acknowledgeDelivery = true,

@@ -6,10 +6,7 @@ import {
   startSubagentJob,
   type JobState,
 } from "./helpers";
-import {
-  disposeWorkflowInteractiveSubagent,
-  launchInteractiveSubagent,
-} from "./interactive-tmux";
+import { launchInteractiveSubagent } from "./interactive-tmux";
 import {
   MAX_ITEMS_PER_CALL,
   INTERACTIVE_POLL_MS,
@@ -210,28 +207,12 @@ export function registerWorkflowTool(
           });
         }
         if (state) {
-          try {
-            return await awaitInteractiveResult(
-              state,
-              signal,
-              undefined,
-              onCancellationSnapshot,
-            );
-          } finally {
-            const paneError = disposeWorkflowInteractiveSubagent(state);
-            if (paneError) {
-              debugLog("warn", "workflow_child_pane_cleanup_failed", {
-                subagentId: state.id,
-                paneId: state.paneId,
-                error: paneError,
-              });
-              onProgress?.({
-                kind: "log",
-                message: `⚠ pane ${state.paneId} could not be closed — ${paneError}. Close it manually.`,
-                label,
-              });
-            }
-          }
+          return await awaitInteractiveResult(
+            state,
+            signal,
+            undefined,
+            onCancellationSnapshot,
+          );
         }
       }
 

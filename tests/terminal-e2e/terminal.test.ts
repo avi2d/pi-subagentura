@@ -553,11 +553,20 @@ describe("real Pi terminal E2E", () => {
       );
       await waitForParentSettled(scenario.marker);
 
+      let standaloneJobId: string | undefined;
       await openSupervisor();
-      await harness.waitForScreen(
-        (screen) => /▶ [▸▾] \[in-process\] → running/.test(screen),
-        "in-process row listed as running",
-      );
+      await harness.waitForScreen((screen) => {
+        const selectedStandalone = screen.match(
+          /▶ ▸ \[in-process\] → running ([a-f0-9]{16})\b/,
+        );
+        if (!selectedStandalone) return false;
+        standaloneJobId = selectedStandalone[1];
+        return true;
+      }, "standalone in-process row selected as running");
+      expect(standaloneJobId).toMatch(/^[a-f0-9]{16}$/);
+      if (!standaloneJobId) {
+        throw new Error("selected standalone job id was not captured");
+      }
       await closeSupervisor();
 
       const workflow = getScenario("background-workflow");
@@ -570,30 +579,43 @@ describe("real Pi terminal E2E", () => {
 
       await openSupervisor();
       await harness.waitForScreen(
-        (screen) => /\[workflow\] → running e2e-workflow/.test(screen),
-        "workflow row listed as running",
+        (screen) => screen.includes("▶ ▸ [workflow] → running e2e-workflow"),
+        "workflow root selected first",
       );
-      harness.sendKey("Enter");
-      await harness.waitForScreen(
-        (screen) => screen.includes("Model: subagentura-e2e/mock"),
-        "expanded in-process details",
-      );
-      harness.sendKey("j");
       harness.sendKey("Enter");
       await harness.waitForScreen(
         (screen) =>
+          screen.includes("▶ ▾ [workflow] → running e2e-workflow") &&
           screen.includes("Workflow: e2e-workflow") &&
           screen.includes("Agents:"),
-        "expanded workflow details after navigation",
+        "expanded workflow root details",
       );
-      harness.sendKey("k");
-      // `x` cancels whatever row is selected. Assert the selection moved back to
-      // the in-process child so a future change to list ordering reports a
-      // mismatch here instead of cancelling the wrong job and timing out below.
+      harness.sendKey("j");
+      await harness.waitForScreen((screen) => {
+        const selectedGroupedChild = screen.match(
+          /▶ ▸ \[in-process\] → running ([a-f0-9]{16})\b/,
+        );
+        return (
+          selectedGroupedChild !== null &&
+          selectedGroupedChild[1] !== standaloneJobId
+        );
+      }, "grouped workflow child selected");
+      harness.sendKey("j");
       await harness.waitForScreen(
-        (screen) => /▶ [▸▾] \[in-process\]/.test(screen),
-        "in-process row reselected before cancellation",
+        (screen) =>
+          screen.includes(`▶ ▸ [in-process] → running ${standaloneJobId}`),
+        "captured standalone job selected",
       );
+      harness.sendKey("Enter");
+      await harness.waitForScreen((screen) => {
+        const selectedRow = `▶ ▾ [in-process] → running ${standaloneJobId}`;
+        const selectedRowIndex = screen.indexOf(selectedRow);
+        return (
+          selectedRowIndex >= 0 &&
+          screen.indexOf("Model: subagentura-e2e/mock", selectedRowIndex) >
+            selectedRowIndex
+        );
+      }, "expanded captured standalone job details");
       harness.sendKey("x");
       await harness.waitForProvider(
         (events) =>
