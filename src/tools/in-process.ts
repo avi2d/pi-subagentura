@@ -35,6 +35,8 @@ import { resolveSpawnDepth } from "../orchestration-context";
 import {
   getActiveSessionContextToken,
   isSessionContextTokenLive,
+  type ActiveSessionContextToken,
+  type SessionContextRef,
 } from "../session-context";
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
@@ -109,10 +111,18 @@ function resolveSpawn(ctx: SpawnContext) {
   return { ...spawn, rootSessionId };
 }
 
+function captureSpawnContextToken(
+  owner?: SessionContextRef,
+): ActiveSessionContextToken | undefined {
+  return owner
+    ? { id: owner.id, generation: owner.generation }
+    : getActiveSessionContextToken();
+}
+
 function captureDeliveryOwner(
   pi: ExtensionAPI,
   ctx: SpawnContext,
-  token: ReturnType<typeof getActiveSessionContextToken>,
+  token: ActiveSessionContextToken | undefined,
 ): JobDeliveryOwner {
   let sessionId: string | undefined;
   try {
@@ -313,7 +323,10 @@ async function runSubagent(
   }
 }
 
-function registerSubagentWithContextTool(pi: ExtensionAPI): void {
+function registerSubagentWithContextTool(
+  pi: ExtensionAPI,
+  owner?: SessionContextRef,
+): void {
   pi.registerTool({
     name: "subagent_with_context",
     label: "Sub-Agent (with context)",
@@ -373,7 +386,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         )
         .map((e) => e.message);
 
-      const spawnContextToken = getActiveSessionContextToken();
+      const spawnContextToken = captureSpawnContextToken(owner);
       const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
       if (runAsync) {
         if (messages.length === 0) {
@@ -545,7 +558,10 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
+function registerSubagentIsolatedTool(
+  pi: ExtensionAPI,
+  owner?: SessionContextRef,
+): void {
   pi.registerTool({
     name: "subagent_isolated",
     label: "Sub-Agent (isolated)",
@@ -589,7 +605,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       const spawn = resolveSpawn(ctx);
       if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
 
-      const spawnContextToken = getActiveSessionContextToken();
+      const spawnContextToken = captureSpawnContextToken(owner);
       const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
       if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
@@ -1402,9 +1418,12 @@ function registerCleanupArtifactsTool(pi: ExtensionAPI): void {
   });
 }
 
-export function registerInProcessSubagentTools(pi: ExtensionAPI): void {
-  registerSubagentWithContextTool(pi);
-  registerSubagentIsolatedTool(pi);
+export function registerInProcessSubagentTools(
+  pi: ExtensionAPI,
+  owner?: SessionContextRef,
+): void {
+  registerSubagentWithContextTool(pi, owner);
+  registerSubagentIsolatedTool(pi, owner);
   registerGetSubagentStatusTool(pi);
   registerGetSubagentResultTool(pi);
   registerCancelSubagentTool(pi);
