@@ -11,6 +11,7 @@
  * hermetic and doesn't require a live tmux server.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { InteractiveSubagentState } from "../src/interactive-tmux";
 
 const { mockSendCommandToPane, mockGet } = vi.hoisted(() => ({
   mockSendCommandToPane: vi.fn(),
@@ -53,14 +54,16 @@ function getToolDef(
   return api.registerTool.mock.calls.find(([t]: any[]) => t.name === name)?.[0];
 }
 
-function runningState(overrides: Record<string, any> = {}) {
+function runningState(
+  overrides: Partial<InteractiveSubagentState> = {},
+): InteractiveSubagentState {
   return {
     id: "abc12345def67890",
     name: "Test",
     paneId: "%99",
     status: "running",
     ...overrides,
-  };
+  } as InteractiveSubagentState;
 }
 
 describe("send_interactive_subagent_message", () => {
@@ -168,6 +171,54 @@ describe("send_interactive_subagent_message", () => {
     );
     expect(result.isError).toBeFalsy();
     expect(result.details.status).toBe("sent");
+  });
+
+  it("promotes an idle workflow-owned sub-agent after sending a follow-up", async () => {
+    const state = runningState({
+      status: "idle",
+      completionOwner: "workflow",
+      workflowId: "wf-retained",
+    });
+    mockGet.mockReturnValue(state);
+    mockSendCommandToPane.mockImplementation(() => {
+      expect(state.completionOwner).toBe("workflow");
+      expect(state.workflowId).toBe("wf-retained");
+    });
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-promote", {
+      id: "abc12345def67890",
+      message: "continue independently",
+    });
+
+    expect(mockSendCommandToPane).toHaveBeenCalledOnce();
+    expect(result.isError).toBeFalsy();
+    expect(result.details.status).toBe("sent");
+    expect(state.completionOwner).toBe("standalone");
+    expect(state.workflowId).toBeUndefined();
+  });
+
+  it("rejects follow-ups while a workflow-owned sub-agent is running", async () => {
+    const state = runningState({
+      completionOwner: "workflow",
+      workflowId: "wf-active",
+    });
+    mockGet.mockReturnValue(state);
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-workflow-owned", {
+      id: "abc12345def67890",
+      message: "queue another task",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      id: "abc12345def67890",
+      status: "workflow_owned",
+    });
+    expect(mockSendCommandToPane).not.toHaveBeenCalled();
+    expect(state.completionOwner).toBe("workflow");
+    expect(state.workflowId).toBe("wf-active");
   });
 
   it.each([

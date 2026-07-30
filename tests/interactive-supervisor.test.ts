@@ -575,6 +575,44 @@ describe("interactive supervisor", () => {
     expect(child.parentSessionId).toBeUndefined();
   });
 
+  it("flattens retained idle children of terminal workflow jobs", () => {
+    const owner = { id: 7, generation: 2 };
+    const workflow = workflowJob("completed-workflow", {
+      status: "done",
+      parentSessionOwner: owner,
+    });
+    workflowJobRegistry.set(workflow.id, workflow);
+    const child = state("retained-idle-child", {
+      status: "idle",
+      supervisorOwner: owner,
+      workflowId: workflow.id,
+      completionOwner: "workflow",
+    });
+    interactiveSubagentRegistry.set(child.id, child);
+
+    const items = buildAsyncSupervisorItems(
+      directSupervisorItems(undefined, owner),
+      owner,
+    );
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toEqual({
+      kind: "interactive",
+      state: child,
+      depth: 0,
+      actionable: true,
+      origin: {
+        source: "registry",
+        ownerSessionId: undefined,
+      },
+    });
+    expect(items[0]?.kind).toBe("interactive");
+    if (items[0]?.kind === "interactive") {
+      expect(items[0].state).toBe(child);
+    }
+    expect(items.some((item) => item.kind === "workflow")).toBe(false);
+  });
+
   it("flattens orphaned workflow children whose workflow row is gone", () => {
     const owner = { id: 7, generation: 2 };
     // cleanupWorkflowJobsForOwner deletes the workflow job synchronously while its

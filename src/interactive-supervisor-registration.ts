@@ -103,6 +103,7 @@ export function buildAsyncSupervisorItems(
     .sort(compareByStartedAt);
   const visibleJobs = new Map(processJobs.map((job) => [job.id, job]));
   const workflowItems: WorkflowSupervisorItem[] = workflowJobsForOwner(owner)
+    .filter((job) => job.status === "running")
     .sort(compareByStartedAt)
     .map((job) => ({
       kind: "workflow",
