@@ -10,13 +10,20 @@ import {
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { SubagentResult } from "../src/helpers";
+import type { JobState, SubagentResult } from "../src/helpers";
 import {
   deliverNotification,
   flushInProcessDeliveries,
   MAX_IN_PROCESS_DELIVERY_BYTES,
   MAX_IN_PROCESS_DELIVERY_RECORDS,
 } from "../src/notifications";
+import {
+  clearSessionScopes,
+  getSessionScopes,
+  sessionOwner,
+  setLegacyActiveSessionRefs,
+  type SessionScope,
+} from "../src/session-scope";
 
 // ── Hoisted mock: startSubagentJob must be mocked before any imports ──────
 const { mockStartSubagentJob } = vi.hoisted(() => ({
@@ -30,7 +37,7 @@ vi.mock("../src/helpers", async (importOriginal) => {
 
 // ── Imports (resolved after hoisted mock) ─────────────────────────────────
 import registerExtension from "../src/subagent";
-import { jobRegistry } from "../src/helpers";
+import { jobRegistry, registerInProcessJob } from "../src/helpers";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -184,11 +191,10 @@ function mockJobResult(
   });
 }
 
-/** Shared globals that must be cleaned between tests */
+/** Shared state that must be cleaned between tests. */
 function cleanGlobals() {
-  (globalThis as any).__piSubagenturaPiRef = undefined;
-  (globalThis as any).__piSubagenturaUi = undefined;
-  (globalThis as any).__piSubagenturaParentStreaming = false;
+  clearSessionScopes();
+  setLegacyActiveSessionRefs(undefined);
   jobRegistry.clear();
 }
 
@@ -206,12 +212,28 @@ function sentMessageOptsAt(api: any, callIndex: number) {
   return api.sendMessage.mock.calls[callIndex][1];
 }
 
+function registerOwnedNotificationJob(
+  state: JobState,
+  scope: SessionScope,
+): void {
+  state.deliveryOwner = {
+    ...state.deliveryOwner,
+    pi: scope.pi,
+    sessionScopeId: scope.id,
+    sessionScopeGeneration: scope.generation,
+  };
+  if (!registerInProcessJob(state, sessionOwner(scope))) {
+    throw new Error(`Failed to register owned notification job ${state.id}`);
+  }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 describe("notifyOnComplete", () => {
   let api: ReturnType<typeof setupExtension>["api"];
+  let scope: SessionScope;
   let isolatedToolDef: any;
   let contextToolDef: any;
   let statusToolDef: any;
@@ -230,7 +252,12 @@ describe("notifyOnComplete", () => {
     };
 
     registerExtension(_api as any);
-    (globalThis as any).__piSubagenturaUi = { notify: _api.notify };
+    const sessionContext = getSessionScopes().at(-1);
+    if (!sessionContext) throw new Error("Expected a registered session scope");
+    sessionContext.lifecycle = "started";
+    sessionContext.ui = { notify: _api.notify } as unknown as NonNullable<
+      SessionScope["ui"]
+    >;
 
     const isolatedDef = _api.registerTool.mock.calls.find(
       ([t]: any[]) => t.name === "subagent_isolated",
@@ -246,6 +273,7 @@ describe("notifyOnComplete", () => {
 
     return {
       api: _api,
+      scope: sessionContext,
       isolatedToolDef: isolatedDef,
       contextToolDef: contextDef,
       statusToolDef: statusDef,
@@ -259,6 +287,7 @@ describe("notifyOnComplete", () => {
 
     const setup = setupExtension();
     api = setup.api;
+    scope = setup.scope;
     isolatedToolDef = setup.isolatedToolDef;
     contextToolDef = setup.contextToolDef;
     statusToolDef = setup.statusToolDef;
@@ -648,7 +677,7 @@ describe("notifyOnComplete", () => {
     });
 
     it("queues triggering inject completion through Pi while streaming", async () => {
-      (globalThis as any).__piSubagenturaParentStreaming = true;
+      scope.parentStreaming = true;
       const jobId = "inject-cap";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -679,8 +708,8 @@ describe("notifyOnComplete", () => {
       });
       expect(api.sendUserMessage).not.toHaveBeenCalled();
 
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
+      scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
       expect(api.sendMessage).toHaveBeenCalledOnce();
     });
 
@@ -711,7 +740,7 @@ describe("notifyOnComplete", () => {
     });
 
     it("degrades in-process overflow to a bounded identity ledger", () => {
-      (globalThis as any).__piSubagenturaParentStreaming = true;
+      scope.parentStreaming = true;
       const states: any[] = [];
       for (let index = 0; index < 40; index++) {
         const state: any = {
@@ -724,15 +753,14 @@ describe("notifyOnComplete", () => {
           notifyOnComplete: "notify",
         };
         states.push(state);
-        jobRegistry.set(state.id, state);
+        registerOwnedNotificationJob(state, scope);
         deliverNotification(state, {
           ...SUCCESS_RESULT,
           output: `${index}:${"x".repeat(20_000)}`,
         });
       }
 
-      const queue = (globalThis as any)
-        .__piSubagenturaPendingJobDeliveries as any[];
+      const queue = scope.pendingInProcessDeliveries;
       expect(queue.length).toBeLessThanOrEqual(MAX_IN_PROCESS_DELIVERY_RECORDS);
       const completionBytes = queue
         .filter((pending) => pending.kind === "completion")
@@ -746,6 +774,9 @@ describe("notifyOnComplete", () => {
       );
       const overflow = queue.find((pending) => pending.kind === "overflow");
       expect(overflow).toBeDefined();
+      if (!overflow || overflow.kind !== "overflow") {
+        throw new Error("expected an overflow identity ledger");
+      }
       const overflowRows = readFileSync(overflow.overflowPath, "utf8")
         .trim()
         .split("\n")
@@ -758,8 +789,8 @@ describe("notifyOnComplete", () => {
       ];
       expect(new Set(identities).size).toBe(40);
 
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
+      scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
       expect(states.every((state) => state.notificationDelivered)).toBe(true);
       expect(queue).toEqual([]);
     });
@@ -814,9 +845,10 @@ describe("notifyOnComplete", () => {
           },
         },
       );
-      const contextStack = (globalThis as any)
-        .__piSubagenturaSessionContextStack;
-      expect(contextStack.at(-1).pi).toBe(child.api);
+      expect(child.scope.pi).toBe(child.api);
+      expect(getSessionScopes()).toEqual(
+        expect.arrayContaining([scope, child.scope]),
+      );
 
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {
@@ -844,19 +876,12 @@ describe("notifyOnComplete", () => {
       expect(child.api.sendMessage).not.toHaveBeenCalled();
     });
 
-    it("uses the async spawn owner after a generation rollover", async () => {
+    it("fails closed when an async spawn owner's generation rolls over", async () => {
       const jobId = "spawn-owner-generation";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-      const contextStack = (globalThis as any)
-        .__piSubagenturaSessionContextStack;
-      const activeContext = contextStack.at(-1);
-      activeContext.id = 701;
-      activeContext.generation = 1;
-      (globalThis as any).__piSubagenturaActiveSessionContextId = 701;
-      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 1;
       await isolatedToolDef.execute(
         "spawn-owner-call",
         { async: true, task: "test", notifyOnComplete: "inject" },
@@ -864,19 +889,17 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-      activeContext.generation = 2;
-      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 2;
+
+      scope.generation++;
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {
         expect(jobRegistry.get(jobId)?.status).toBe("done");
       });
       expect(api.sendMessage).not.toHaveBeenCalled();
-      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
-        [],
-      );
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
     });
 
-    it("drops a queued completion when the same context rolls generation", () => {
+    it("drops a queued completion when the same scope rolls generation", () => {
       const state: any = {
         id: "generation-rollover",
         status: "completed",
@@ -886,24 +909,22 @@ describe("notifyOnComplete", () => {
         promise: Promise.resolve(SUCCESS_RESULT),
         notifyOnComplete: "inject",
       };
-      jobRegistry.set(state.id, state);
-      (globalThis as any).__piSubagenturaParentStreaming = true;
-      (globalThis as any).__piSubagenturaActiveSessionContextId = 77;
-      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 1;
+      registerOwnedNotificationJob(state, scope);
+      scope.parentStreaming = true;
       deliverNotification(state, SUCCESS_RESULT);
-      (globalThis as any).__piSubagenturaActiveSessionContextGeneration = 2;
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
+      expect(scope.pendingInProcessDeliveries).toHaveLength(1);
+
+      scope.generation++;
+      scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
       expect(api.sendMessage).not.toHaveBeenCalled();
-      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
-        [],
-      );
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
     });
 
-    it("does not deliver a tokenless completion to a different Pi identity", () => {
-      const oldPi = api;
+    it("does not deliver one scope's completion through a peer Pi", () => {
+      const peer = setupExtension();
       const state: any = {
-        id: "pi-identity-fallback",
+        id: "peer-isolation",
         status: "completed",
         liveStatus: {},
         session: { abort: vi.fn() },
@@ -911,29 +932,63 @@ describe("notifyOnComplete", () => {
         promise: Promise.resolve(SUCCESS_RESULT),
         notifyOnComplete: "inject",
       };
-      jobRegistry.set(state.id, state);
-      (globalThis as any).__piSubagenturaParentStreaming = true;
-      (globalThis as any).__piSubagenturaActiveSessionContextId = undefined;
-      (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
-        undefined;
+      registerOwnedNotificationJob(state, scope);
+      scope.parentStreaming = true;
       deliverNotification(state, SUCCESS_RESULT);
-      const newPi = { ...oldPi, sendMessage: vi.fn() };
-      (globalThis as any).__piSubagenturaPiRef = newPi;
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
-      expect(newPi.sendMessage).not.toHaveBeenCalled();
-      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
-        [],
-      );
+
+      flushInProcessDeliveries(sessionOwner(peer.scope));
+      expect(peer.api.sendMessage).not.toHaveBeenCalled();
+      expect(peer.scope.pendingInProcessDeliveries).toEqual([]);
+      expect(scope.pendingInProcessDeliveries).toHaveLength(1);
+
+      scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(peer.api.sendMessage).not.toHaveBeenCalled();
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
     });
 
-    it("does not merge overflow ledgers across context generations", () => {
-      (globalThis as any).__piSubagenturaParentStreaming = true;
+    it("fails closed for a tokenless completion when one scope is live", () => {
+      const state: any = {
+        id: "sole-scope-tokenless-delivery",
+        status: "completed",
+        liveStatus: {},
+        session: { abort: vi.fn() },
+        startedAt: 0,
+        promise: Promise.resolve(SUCCESS_RESULT),
+        notifyOnComplete: "inject",
+      };
+
+      deliverNotification(state, SUCCESS_RESULT);
+
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
+    });
+
+    it("fails closed for a tokenless completion when peer scopes are live", () => {
+      const peer = setupExtension();
+      const state: any = {
+        id: "ambiguous-tokenless-delivery",
+        status: "completed",
+        liveStatus: {},
+        session: { abort: vi.fn() },
+        startedAt: 0,
+        promise: Promise.resolve(SUCCESS_RESULT),
+        notifyOnComplete: "inject",
+      };
+
+      deliverNotification(state, SUCCESS_RESULT);
+
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(peer.api.sendMessage).not.toHaveBeenCalled();
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
+      expect(peer.scope.pendingInProcessDeliveries).toEqual([]);
+    });
+
+    it("does not merge overflow ledgers across scope generations", () => {
+      scope.parentStreaming = true;
       for (let index = 0; index < 40; index++) {
-        const generation = index < 20 ? 1 : 2;
-        (globalThis as any).__piSubagenturaActiveSessionContextId = 88;
-        (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
-          generation;
+        if (index === 20) scope.generation++;
         const state: any = {
           id: `generation-overflow-${index}`,
           status: "completed",
@@ -943,14 +998,13 @@ describe("notifyOnComplete", () => {
           promise: Promise.resolve(SUCCESS_RESULT),
           notifyOnComplete: "notify",
         };
-        jobRegistry.set(state.id, state);
+        registerOwnedNotificationJob(state, scope);
         deliverNotification(state, {
           ...SUCCESS_RESULT,
           output: `${index}:${"x".repeat(20_000)}`,
         });
       }
-      const queue = (globalThis as any)
-        .__piSubagenturaPendingJobDeliveries as any[];
+      const queue = scope.pendingInProcessDeliveries;
       const overflows = queue.filter((pending) => pending.kind === "overflow");
       expect(overflows).toHaveLength(2);
       for (const overflow of overflows) {
@@ -959,57 +1013,66 @@ describe("notifyOnComplete", () => {
           .split("\n")
           .map((line) => JSON.parse(line));
         const generations = rows.map((row) =>
-          Number(row.jobId.split("-").pop()) < 20 ? 1 : 2,
+          Number(row.jobId.split("-").pop()) < 20 ? 0 : 1,
         );
         expect(new Set(generations)).toHaveLength(1);
+        rmSync(overflow.overflowPath, { force: true });
       }
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
+      scope.parentStreaming = false;
+      queue.length = 0;
     });
 
-    it("keeps overflow queue bounded for distinct owners", () => {
-      (globalThis as any).__piSubagenturaParentStreaming = true;
-      for (
-        let index = 0;
-        index < MAX_IN_PROCESS_DELIVERY_RECORDS + 8;
-        index++
-      ) {
-        (globalThis as any).__piSubagenturaActiveSessionContextId = 1000;
-        (globalThis as any).__piSubagenturaActiveSessionContextGeneration =
-          index + 1;
-        const state: any = {
-          id: `distinct-owner-${index}`,
-          status: "completed",
-          liveStatus: {},
-          session: { abort: vi.fn() },
-          startedAt: 0,
-          promise: Promise.resolve(SUCCESS_RESULT),
-          notifyOnComplete: "notify",
-        };
-        jobRegistry.set(state.id, state);
-        deliverNotification(state, {
-          ...SUCCESS_RESULT,
-          output: `${index}:${"x".repeat(20_000)}`,
-        });
+    it("keeps each peer scope's overflow queue bounded and isolated", () => {
+      const peer = setupExtension();
+      scope.parentStreaming = true;
+      peer.scope.parentStreaming = true;
+      for (const [label, ownerScope] of [
+        ["first", scope],
+        ["peer", peer.scope],
+      ] as const) {
+        for (let index = 0; index < 40; index++) {
+          const state: any = {
+            id: `${label}-owner-overflow-${index}`,
+            status: "completed",
+            liveStatus: {},
+            session: { abort: vi.fn() },
+            startedAt: 0,
+            promise: Promise.resolve(SUCCESS_RESULT),
+            notifyOnComplete: "notify",
+          };
+          registerOwnedNotificationJob(state, ownerScope);
+          deliverNotification(state, {
+            ...SUCCESS_RESULT,
+            output: `${index}:${"x".repeat(20_000)}`,
+          });
+        }
       }
-      const queue = (globalThis as any)
-        .__piSubagenturaPendingJobDeliveries as any[];
-      expect(queue.length).toBeLessThanOrEqual(MAX_IN_PROCESS_DELIVERY_RECORDS);
-      expect(queue.every((pending) => pending.kind === "overflow")).toBe(true);
-      const owners = queue.map(
-        (pending) =>
-          `${pending.ownerSessionContextId}:${pending.ownerSessionContextGeneration}`,
-      );
-      expect(new Set(owners).size).toBe(queue.length);
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
-      expect((globalThis as any).__piSubagenturaPendingJobDeliveries).toEqual(
-        [],
-      );
+
+      for (const ownerScope of [scope, peer.scope]) {
+        const queue = ownerScope.pendingInProcessDeliveries;
+        expect(queue.length).toBeLessThanOrEqual(
+          MAX_IN_PROCESS_DELIVERY_RECORDS,
+        );
+        expect(queue.some((pending) => pending.kind === "overflow")).toBe(true);
+        expect(
+          queue.every(
+            (pending) =>
+              pending.ownerSessionScopeId === ownerScope.id &&
+              pending.ownerSessionScopeGeneration === ownerScope.generation,
+          ),
+        ).toBe(true);
+      }
+
+      scope.parentStreaming = false;
+      peer.scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
+      flushInProcessDeliveries(sessionOwner(peer.scope));
+      expect(scope.pendingInProcessDeliveries).toEqual([]);
+      expect(peer.scope.pendingInProcessDeliveries).toEqual([]);
     });
 
     it("keeps collapsed inject and trigger semantics in one overflow envelope", () => {
-      (globalThis as any).__piSubagenturaParentStreaming = true;
+      scope.parentStreaming = true;
       for (let index = 0; index < 40; index++) {
         const state: any = {
           id: `semantic-overflow-${index}`,
@@ -1021,20 +1084,22 @@ describe("notifyOnComplete", () => {
           notifyOnComplete: index === 0 ? "inject" : "notify",
           triggerTurnOnComplete: index === 1,
         };
-        jobRegistry.set(state.id, state);
+        registerOwnedNotificationJob(state, scope);
         deliverNotification(state, {
           ...SUCCESS_RESULT,
           output: `${index}:${"x".repeat(20_000)}`,
         });
       }
 
-      const queue = (globalThis as any)
-        .__piSubagenturaPendingJobDeliveries as any[];
+      const queue = scope.pendingInProcessDeliveries;
       const overflow = queue.find((pending) => pending.kind === "overflow");
       expect(overflow).toMatchObject({
         mode: "inject",
         triggerTurn: true,
       });
+      if (!overflow || overflow.kind !== "overflow") {
+        throw new Error("expected an overflow identity ledger");
+      }
       const rows = readFileSync(overflow.overflowPath, "utf8")
         .trim()
         .split("\n")
@@ -1050,8 +1115,8 @@ describe("notifyOnComplete", () => {
         status: "done",
       });
 
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
+      scope.parentStreaming = false;
+      flushInProcessDeliveries(sessionOwner(scope));
       expect(api.sendMessage).toHaveBeenCalledOnce();
       expect(sentMessageAt(api, 0).content).toContain(overflow.overflowPath);
       expect(sentMessageAt(api, 0).details.mode).toBe("inject");
@@ -1440,7 +1505,7 @@ describe("notifyOnComplete", () => {
       expect(sentMessageAt(api, 1).content).toContain("❌");
     });
 
-    it("does NOT deliver notification when __piSubagenturaPiRef is stale (null/undefined)", async () => {
+    it("does not deliver after the owning scope shuts down", async () => {
       const jobId = "stale-pi-ref";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -1455,8 +1520,7 @@ describe("notifyOnComplete", () => {
         mockCtx(),
       );
 
-      // Clear the pi ref — deliverNotification checks !pi and returns early
-      (globalThis as any).__piSubagenturaPiRef = undefined;
+      scope.lifecycle = "shutdown";
 
       control.resolve(SUCCESS_RESULT);
 
@@ -1560,24 +1624,29 @@ describe("read_subagent_artifact (invalid id)", () => {
     cleanGlobals();
   });
 
-  it("returns status:invalid_id with a precise message for a malformed id", async () => {
+  it.each([
+    "not-a-hex-id",
+    "deadbeefcafebabe\n",
+    "deadbeefcafebabe\r\n",
+    "deadbeefcafebabe\u2028",
+    "deadbeefcafebabe\u2029",
+  ])("returns invalid_id with a precise message for %j", async (id) => {
     const toolDef = setupReadArtifactTool();
     expect(toolDef).toBeDefined();
 
     const result = await toolDef.execute(
       "call-malformed",
-      { id: "not-a-hex-id" },
+      { id },
       undefined,
       undefined,
       {} as any,
     );
 
     expect(result.isError).toBe(true);
-    expect(result.details.status).toBe("invalid_id");
-    expect(result.details.id).toBe("not-a-hex-id");
+    expect(result.details).toMatchObject({ id, status: "invalid_id" });
     const text = result.content[0].text;
     expect(text).toContain("Invalid sub-agent id");
-    expect(text).toContain("not-a-hex-id");
+    expect(text).toContain(JSON.stringify(id).slice(1, -1));
   });
 });
 
@@ -1615,7 +1684,10 @@ describe("read_subagent_artifact (output reporting)", () => {
     return { state, art, dir };
   }
 
-  function makeReadTool(mod: any) {
+  function makeReadTool(
+    mod: any,
+    state?: import("../src/interactive-tmux").InteractiveSubagentState,
+  ) {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
@@ -1626,6 +1698,10 @@ describe("read_subagent_artifact (output reporting)", () => {
       on: vi.fn(),
     };
     (mod as any).default(_api as any);
+    const ownerScope = getSessionScopes().at(-1);
+    if (!ownerScope) throw new Error("Expected artifact tool session scope");
+    ownerScope.lifecycle = "started";
+    if (state) ownerScope.interactiveStates.set(state.id, state);
     return _api.registerTool.mock.calls.find(
       ([t]: any[]) => t.name === "read_subagent_artifact",
     )?.[0];
@@ -1641,14 +1717,13 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(sub-agent exited without writing output.md — last event: done @ <ts>)' when output.md is missing and the agent finished", async () => {
-    const id = "ab12cd34";
+    const id = "ab12cd3400000001";
     const parent = tmp();
     try {
       const { state } = makeArtifactWithDone(id, parent);
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
       expect(readTool).toBeDefined();
 
       const result = await readTool.execute(
@@ -1671,7 +1746,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports a protocol-v2 completion as exited when output.md is missing", async () => {
-    const id = "ab12cd38";
+    const id = "ab12cd3800000002";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent, false);
@@ -1684,8 +1759,7 @@ describe("read_subagent_artifact (output reporting)", () => {
       });
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
 
       const result = await readTool.execute(
         "call-v2-no-output",
@@ -1707,7 +1781,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports a protocol-v2 process exit as exited when output.md is missing", async () => {
-    const id = "ab12cd39";
+    const id = "ab12cd3900000003";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent, false);
@@ -1722,8 +1796,7 @@ describe("read_subagent_artifact (output reporting)", () => {
       });
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
 
       const result = await readTool.execute(
         "call-v2-process-exit-no-output",
@@ -1745,7 +1818,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(<N> events, last: <type> @ <ts> — output.md not written yet)' when output.md is missing and the agent is still running", async () => {
-    const id = "ab12cd35";
+    const id = "ab12cd3500000004";
     const parent = tmp();
     try {
       const dir = join(parent, id);
@@ -1777,9 +1850,7 @@ describe("read_subagent_artifact (output reporting)", () => {
 
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
       const result = await readTool.execute(
         "call-2",
         { id },
@@ -1797,7 +1868,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '(empty — 0 chars)' when output.md exists but is empty", async () => {
-    const id = "ab12cd36";
+    const id = "ab12cd3600000005";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1805,9 +1876,7 @@ describe("read_subagent_artifact (output reporting)", () => {
 
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
       const result = await readTool.execute(
         "call-3",
         { id },
@@ -1824,7 +1893,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reports '<N> chars' when output.md has content", async () => {
-    const id = "ab12cd37";
+    const id = "ab12cd3700000006";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1832,9 +1901,7 @@ describe("read_subagent_artifact (output reporting)", () => {
 
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
       const result = await readTool.execute(
         "call-4",
         { id },
@@ -1851,7 +1918,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("reads protocol-v2 history by Pi turnId and lists the turn mapping", async () => {
-    const id = "ab12cd38";
+    const id = "ab12cd3800000007";
     const parent = tmp();
     try {
       const { state, art } = makeArtifactWithDone(id, parent);
@@ -1872,8 +1939,7 @@ describe("read_subagent_artifact (output reporting)", () => {
 
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
       const result = await readTool.execute(
         "call-v2-history",
         { id, turnId: "pi-user-entry-first" },
@@ -1902,14 +1968,13 @@ describe("read_subagent_artifact (output reporting)", () => {
   });
 
   it("rejects ambiguous legacy turn and protocol-v2 turnId selectors", async () => {
-    const id = "ab12cd39";
+    const id = "ab12cd3900000008";
     const parent = tmp();
     try {
       const { state } = makeArtifactWithDone(id, parent);
       const mod =
         await importFresh<typeof import("../src/subagent")>("../src/subagent");
-      mod.interactiveSubagentRegistry.set(id, state);
-      const readTool = makeReadTool(mod);
+      const readTool = makeReadTool(mod, state);
 
       const result = await readTool.execute(
         "call-ambiguous-history",

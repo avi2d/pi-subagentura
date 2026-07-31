@@ -41,6 +41,11 @@ import {
 } from "./cancellation-snapshots";
 import { withOrchestrationContext } from "./orchestration-context";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+import {
+  findSessionScope,
+  ownerlessEntitiesVisible,
+  type SessionOwnerToken,
+} from "./session-scope";
 // ── Debug Logging ─────────────────────────────────────────────────
 
 const DEBUG_LOG_DIR = process.env.SUBAGENT_DEBUG_LOG_DIR
@@ -164,8 +169,8 @@ export interface JobDeliveryOwner {
   /** Pi API identity captured when the async job was spawned. */
   pi: ExtensionAPI;
   sessionId?: string;
-  sessionContextId?: number;
-  sessionContextGeneration?: number;
+  sessionScopeId?: number;
+  sessionScopeGeneration?: number;
 }
 
 export interface JobState {
@@ -205,6 +210,10 @@ export interface JobState {
   parentJobId?: string;
   /** Orchestration depth of this job. Root parent's direct children are 1. */
   depth?: number;
+  /** Workflow owner for live supervisor presentation. */
+  workflowId?: string;
+  /** Workflow-managed jobs never independently notify the parent. */
+  completionOwner?: "standalone" | "workflow";
   /** Recorded when a cancel path fires, for observability and result shaping. */
   cancellation?: CancellationInfo & { at: number };
 }
@@ -242,13 +251,107 @@ export const jobRegistry = g.__piSubagenturaRegistry as Map<string, JobState>;
 
 export function inProcessJobBelongsToOwner(
   job: JobState,
-  owner: { id: number; generation: number } | undefined,
+  owner: SessionOwnerToken | undefined,
 ): boolean {
   if (!owner) return true;
   return (
-    job.deliveryOwner?.sessionContextId === owner.id &&
-    job.deliveryOwner?.sessionContextGeneration === owner.generation
+    job.deliveryOwner?.sessionScopeId === owner.id &&
+    job.deliveryOwner?.sessionScopeGeneration === owner.generation
   );
+}
+
+export function inProcessJobOwner(
+  job: JobState,
+): SessionOwnerToken | undefined {
+  const id = job.deliveryOwner?.sessionScopeId;
+  const generation = job.deliveryOwner?.sessionScopeGeneration;
+  return id === undefined || generation === undefined
+    ? undefined
+    : { id, generation };
+}
+
+const EMPTY_IN_PROCESS_JOBS: ReadonlyMap<string, JobState> = new Map();
+
+function exactSessionJobRegistry(
+  owner: SessionOwnerToken,
+): Map<string, JobState> | undefined {
+  const scope = findSessionScope(owner.id);
+  return scope?.generation === owner.generation
+    ? scope.inProcessJobs
+    : undefined;
+}
+
+/** Authoritative registry for one owner, or the legacy aggregate with no live scopes. */
+export function inProcessJobsForOwner(
+  owner?: SessionOwnerToken,
+): ReadonlyMap<string, JobState> {
+  if (owner) return exactSessionJobRegistry(owner) ?? EMPTY_IN_PROCESS_JOBS;
+  return ownerlessEntitiesVisible() ? jobRegistry : EMPTY_IN_PROCESS_JOBS;
+}
+
+export function getInProcessJob(
+  jobId: string,
+  owner?: SessionOwnerToken,
+): JobState | undefined {
+  if (owner) return exactSessionJobRegistry(owner)?.get(jobId);
+  return ownerlessEntitiesVisible() ? jobRegistry.get(jobId) : undefined;
+}
+
+/** Add a job to its authoritative scope and the process-wide compatibility index. */
+export function registerInProcessJob(
+  job: JobState,
+  owner?: SessionOwnerToken,
+): boolean {
+  const embeddedOwner = inProcessJobOwner(job);
+  if (
+    owner &&
+    embeddedOwner &&
+    (owner.id !== embeddedOwner.id ||
+      owner.generation !== embeddedOwner.generation)
+  ) {
+    return false;
+  }
+  const effectiveOwner = owner ?? embeddedOwner;
+  if (!effectiveOwner && !ownerlessEntitiesVisible()) return false;
+  if (effectiveOwner) {
+    const registry = exactSessionJobRegistry(effectiveOwner);
+    if (!registry) return false;
+    registry.set(job.id, job);
+  }
+  jobRegistry.set(job.id, job);
+  return true;
+}
+
+/** Remove a job without allowing one scope to delete another scope's row. */
+export function removeInProcessJob(
+  jobId: string,
+  owner?: SessionOwnerToken,
+): boolean {
+  if (!owner && !ownerlessEntitiesVisible()) return false;
+  if (!owner) {
+    const indexedJob = jobRegistry.get(jobId);
+    const indexedOwner = indexedJob ? inProcessJobOwner(indexedJob) : undefined;
+    return indexedOwner
+      ? removeInProcessJob(jobId, indexedOwner)
+      : jobRegistry.delete(jobId);
+  }
+  const registry = exactSessionJobRegistry(owner);
+  if (!registry) {
+    const aggregateJob = jobRegistry.get(jobId);
+    return aggregateJob && inProcessJobBelongsToOwner(aggregateJob, owner)
+      ? jobRegistry.delete(jobId)
+      : false;
+  }
+  const ownedJob = registry.get(jobId);
+  if (!ownedJob) {
+    const aggregateJob = jobRegistry.get(jobId);
+    return aggregateJob && inProcessJobBelongsToOwner(aggregateJob, owner)
+      ? jobRegistry.delete(jobId)
+      : false;
+  }
+  registry.delete(jobId);
+  if (jobRegistry.get(jobId) === ownedJob) jobRegistry.delete(jobId);
+  return true;
 }
 
 declare global {
@@ -276,23 +379,20 @@ export const JOB_CLEANUP_TTL_MS = 0;
 export const MAX_REGISTRY_SIZE = 100;
 
 /** Remove the oldest completed or error job from the registry */
-export function pruneOldestJob(): boolean {
-  for (const [jobId, job] of jobRegistry) {
-    if (job.status === "done" || job.status === "error") {
-      jobRegistry.delete(jobId);
-      return true;
-    }
+export function pruneOldestJob(owner?: SessionOwnerToken): boolean {
+  for (const [jobId, job] of inProcessJobsForOwner(owner)) {
+    if (job.status !== "done" && job.status !== "error") continue;
+    if (removeInProcessJob(jobId, owner ?? inProcessJobOwner(job))) return true;
   }
   return false;
 }
 
-/** Remove all completed and error jobs from the registry. Returns count removed. */
-export function pruneCompletedJobs(): number {
+/** Remove all completed and error jobs from one owner registry. Returns count removed. */
+export function pruneCompletedJobs(owner?: SessionOwnerToken): number {
   let removed = 0;
-  for (const [jobId, job] of jobRegistry) {
+  for (const [jobId, job] of inProcessJobsForOwner(owner)) {
     if (job.status === "done" || job.status === "error") {
-      jobRegistry.delete(jobId);
-      removed++;
+      if (removeInProcessJob(jobId, owner ?? inProcessJobOwner(job))) removed++;
     }
   }
   return removed;
@@ -339,16 +439,17 @@ export function readCancellationInfo(
 export function cascadeChildAborts(
   ownerJobId: string,
   info: CancellationInfo,
+  owner?: SessionOwnerToken,
 ): string[] {
   const signalled: string[] = [];
-  for (const [childId, child] of jobRegistry) {
+  for (const [childId, child] of inProcessJobsForOwner(owner)) {
     if (child.parentJobId !== ownerJobId) continue;
     if (child.status !== "running") continue;
     child.cancellation = { ...info, at: Date.now() };
     // Mark cancelled up front so late settlement cannot flip it to done/error
     // and no completion notification fires for an aborted child.
     child.status = "cancelled";
-    scheduleJobCleanup(childId, true);
+    scheduleJobCleanup(childId, true, undefined, owner);
     signalled.push(childId);
     if (child.abort) {
       try {
@@ -358,7 +459,7 @@ export function cascadeChildAborts(
       }
     } else {
       child.session.abort().catch(() => {});
-      signalled.push(...cascadeChildAborts(childId, info));
+      signalled.push(...cascadeChildAborts(childId, info, owner));
     }
   }
   return signalled;
@@ -369,11 +470,15 @@ export function cascadeChildAborts(
  * cancellation metadata, then aborts the job's controller (which snapshots and
  * tears down the session) and cascades to children.
  */
-export function abortJobTree(jobId: string, info: CancellationInfo): string[] {
-  const job = jobRegistry.get(jobId);
+export function abortJobTree(
+  jobId: string,
+  info: CancellationInfo,
+  owner?: SessionOwnerToken,
+): string[] {
+  const job = getInProcessJob(jobId, owner);
   if (!job || job.status !== "running") return [];
   job.cancellation = { ...info, at: Date.now() };
-  const cascaded = cascadeChildAborts(jobId, info);
+  const cascaded = cascadeChildAborts(jobId, info, owner);
   if (job.abort) {
     try {
       job.abort.abort(info);
@@ -390,17 +495,18 @@ export function scheduleJobCleanup(
   jobId: string,
   immediate = false,
   maxAge?: number,
+  owner?: SessionOwnerToken,
 ): void {
   if (!immediate) {
     if (maxAge && maxAge > 0) {
       setTimeout(() => {
-        jobRegistry.delete(jobId);
+        removeInProcessJob(jobId, owner);
       }, maxAge);
     }
     return; // persist indefinitely unless maxAge specified
   }
   setTimeout(() => {
-    jobRegistry.delete(jobId);
+    removeInProcessJob(jobId, owner);
   }, 0);
 }
 
@@ -520,6 +626,8 @@ export interface StartSubagentJobParams {
   depth?: number;
   /** Top-level parent session id, propagated for observability. */
   rootSessionId?: string;
+  /** Exact parent lifecycle owning registry capacity for this prepared job. */
+  owner?: SessionOwnerToken;
 }
 
 export interface StartSubagentJobResult {
@@ -566,11 +674,12 @@ export async function startSubagentJob(
     thinkingLevel,
     depth,
     rootSessionId,
+    owner,
   } = params;
 
-  // Enforce registry size cap before adding a new job
-  while (jobRegistry.size >= MAX_REGISTRY_SIZE) {
-    if (!pruneOldestJob()) break; // no old jobs to evict, allow slight overcap
+  // Enforce the cap within this exact scope; peer sessions never evict each other.
+  while (inProcessJobsForOwner(owner).size >= MAX_REGISTRY_SIZE) {
+    if (!pruneOldestJob(owner)) break; // no old jobs to evict, allow slight overcap
   }
 
   const jobId = generateJobId();
@@ -725,7 +834,7 @@ export async function startSubagentJob(
       }
       session.abort().catch(() => {});
       // Cancellation is transitive: tear down every descendant this job owns.
-      cascadeChildAborts(jobId, info);
+      cascadeChildAborts(jobId, info, owner);
     };
     if (signal.aborted) {
       handleAbort();

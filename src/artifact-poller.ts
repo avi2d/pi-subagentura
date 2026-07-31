@@ -31,13 +31,13 @@ import {
   deriveInteractiveSubagentStatusFromLifecycle,
   foldInteractiveLifecycle,
   interactiveSubagentRegistry,
-  isPaneAliveAsync,
+  getInteractivePaneLivenessAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
-import { debugLog, jobRegistry } from "./helpers";
-import { formatActivityRow } from "./rendering";
+import { debugLog, jobRegistry, type JobState } from "./helpers";
+import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -48,11 +48,11 @@ import {
   workflowJobBelongsToOwner,
   workflowJobRegistry,
 } from "./workflow-jobs";
-import type { ActiveSessionContextToken } from "./session-context";
 import {
-  parentSessionBelongsToOwner,
-  resolveLiveSessionContext,
-} from "./session-context";
+  ownerlessEntitiesVisible,
+  type SessionOwnerToken,
+  resolveLiveSessionScope,
+} from "./session-scope";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
@@ -63,31 +63,239 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+type StatusUi = Pick<ExtensionUIContext, "setStatus">;
+interface WidgetSurfaceState {
+  contributions: Map<string, string[]>;
+  rendered: string[] | undefined;
+  painted: boolean;
+}
+interface FooterSurfaceState {
+  contributions: Map<string, string>;
+  rendered: string | undefined;
+  painted: boolean;
+}
+const widgetRowsByUi = new WeakMap<
+  ExtensionUIContext,
+  Map<string, WidgetSurfaceState>
+>();
+const footerStatusesByUi = new WeakMap<
+  StatusUi,
+  Map<string, FooterSurfaceState>
+>();
 
-function getRunningSubagentCount(): number {
-  const inProcessCount = [...jobRegistry.values()].filter(
+function interactiveStatesForOwners(
+  owners: (SessionOwnerToken | undefined)[],
+): InteractiveSubagentState[] {
+  if (owners.some((owner) => owner === undefined)) {
+    return ownerlessEntitiesVisible()
+      ? [...interactiveSubagentRegistry.values()]
+      : [];
+  }
+  const states: InteractiveSubagentState[] = [];
+  for (const owner of owners) {
+    const scope = resolveLiveSessionScope(owner);
+    if (scope) states.push(...scope.interactiveStates.values());
+  }
+  return states;
+}
+
+function inProcessJobsForOwners(
+  owners: (SessionOwnerToken | undefined)[],
+): JobState[] {
+  if (owners.some((owner) => owner === undefined)) {
+    return ownerlessEntitiesVisible() ? [...jobRegistry.values()] : [];
+  }
+  const jobs: JobState[] = [];
+  for (const owner of owners) {
+    const scope = resolveLiveSessionScope(owner);
+    if (scope) jobs.push(...scope.inProcessJobs.values());
+  }
+  return jobs;
+}
+
+function getRunningSubagentCount(
+  owners: (SessionOwnerToken | undefined)[],
+): number {
+  const inProcessCount = inProcessJobsForOwners(owners).filter(
     (job) => job.status === "running",
   ).length;
-  const interactiveCount = [...interactiveSubagentRegistry.values()].filter(
-    (state) => state.status === "running" || state.status === "idle",
+  const interactiveCount = interactiveStatesForOwners(owners).filter(
+    (state) =>
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
   ).length;
   return inProcessCount + interactiveCount;
 }
 
-export function updateRunningSubagentFooter(
-  ui: Pick<ExtensionUIContext, "setStatus">,
+function mergeFooterContributions(
+  key: string,
+  contributions: Iterable<string>,
+): string | undefined {
+  let total = 0;
+  let count = 0;
+  let last: string | undefined;
+  for (const contribution of contributions) {
+    last = contribution;
+    count++;
+    const match = /^⚡ (\d+) /.exec(contribution);
+    if (match) total += Number(match[1]);
+  }
+  if (count === 0) return undefined;
+  if (count === 1 || total === 0) return last;
+  if (key === FOOTER_KEY) {
+    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} active`;
+  }
+  if (key === WORKFLOW_FOOTER_KEY) {
+    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running`;
+  }
+  return last;
+}
+
+function updateFooterStatus(
+  ui: StatusUi,
+  key: string,
+  statusText: string | undefined,
+  owner?: SessionOwnerToken,
 ): void {
-  const runningCount = getRunningSubagentCount();
+  let surfaces = footerStatusesByUi.get(ui);
+  if (!surfaces) {
+    surfaces = new Map();
+    footerStatusesByUi.set(ui, surfaces);
+  }
+  let surface = surfaces.get(key);
+  if (!surface) {
+    surface = { contributions: new Map(), rendered: undefined, painted: false };
+    surfaces.set(key, surface);
+  }
+  const contributionKey = pollOwnerKey(owner);
+  if (owner === undefined) surface.contributions.clear();
+  else if (resolveLiveSessionScope(owner)) {
+    surface.contributions.delete(pollOwnerKey(undefined));
+    const ownerPrefix = `${owner.id}:`;
+    for (const key of surface.contributions.keys()) {
+      if (key.startsWith(ownerPrefix) && key !== contributionKey) {
+        surface.contributions.delete(key);
+      }
+    }
+  }
+  if (statusText === undefined) surface.contributions.delete(contributionKey);
+  else surface.contributions.set(contributionKey, statusText);
+  const rendered = mergeFooterContributions(
+    key,
+    surface.contributions.values(),
+  );
+  if (surface.painted && surface.rendered === rendered) return;
   try {
-    ui.setStatus(
-      FOOTER_KEY,
-      runningCount > 0
-        ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
-        : undefined,
-    );
+    ui.setStatus(key, rendered);
+    surface.rendered = rendered;
+    surface.painted = true;
   } catch {
     /* ui stale */
   }
+}
+
+/**
+ * Repaint the "N sub-agents active" footer, scoped to `owner` when supplied.
+ *
+ * Liveness is decided here rather than at the call sites: callers pass the raw
+ * active token, so a token whose lifecycle already ended reads as "this session
+ * owns nothing" (count 0) instead of silently falling back to a cross-session
+ * global count.
+ */
+export function updateRunningSubagentFooter(
+  ui: StatusUi,
+  owner?: SessionOwnerToken,
+): void {
+  const ownerContext = resolveLiveSessionScope(owner);
+  const runningCount =
+    owner !== undefined && !ownerContext ? 0 : getRunningSubagentCount([owner]);
+  const statusText =
+    runningCount > 0
+      ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
+      : undefined;
+  updateFooterStatus(ui, FOOTER_KEY, statusText, owner);
+}
+
+function widgetRowsEqual(
+  previousRows: string[] | undefined,
+  nextRows: string[] | undefined,
+): boolean {
+  if (previousRows === undefined || nextRows === undefined) {
+    return previousRows === nextRows;
+  }
+  return (
+    previousRows.length === nextRows.length &&
+    previousRows.every((row, index) => row === nextRows[index])
+  );
+}
+
+function updateWidgetRows(
+  ui: ExtensionUIContext,
+  key: string,
+  rows: string[],
+  owner?: SessionOwnerToken,
+): void {
+  let surfaces = widgetRowsByUi.get(ui);
+  if (!surfaces) {
+    surfaces = new Map();
+    widgetRowsByUi.set(ui, surfaces);
+  }
+  let surface = surfaces.get(key);
+  if (!surface) {
+    surface = { contributions: new Map(), rendered: undefined, painted: false };
+    surfaces.set(key, surface);
+  }
+  const contributionKey = pollOwnerKey(owner);
+  if (owner === undefined) surface.contributions.clear();
+  else if (resolveLiveSessionScope(owner)) {
+    surface.contributions.delete(pollOwnerKey(undefined));
+    const ownerPrefix = `${owner.id}:`;
+    for (const key of surface.contributions.keys()) {
+      if (key.startsWith(ownerPrefix) && key !== contributionKey) {
+        surface.contributions.delete(key);
+      }
+    }
+  }
+  if (rows.length === 0) surface.contributions.delete(contributionKey);
+  else surface.contributions.set(contributionKey, [...rows]);
+  const renderedRows = [...surface.contributions.values()].flat();
+  const rendered = renderedRows.length > 0 ? renderedRows : undefined;
+  if (surface.painted && widgetRowsEqual(surface.rendered, rendered)) return;
+  try {
+    ui.setWidget(key, rendered, { placement: "belowEditor" });
+    surface.rendered = rendered ? [...rendered] : undefined;
+    surface.painted = true;
+  } catch {
+    /* ui stale */
+  }
+}
+/** Withdraw one ended generation from every shared UI surface. */
+export function clearSessionScopeUiContributions(
+  ui: ExtensionUIContext,
+  owner: SessionOwnerToken,
+): void {
+  updateFooterStatus(ui, FOOTER_KEY, undefined, owner);
+  updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, undefined, owner);
+  updateWidgetRows(ui, WIDGET_KEY, [], owner);
+  updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, [], owner);
+}
+
+/** Project current live rows from the exact owner scope after liveness processing. */
+function projectActivityWidgetRows(
+  ui: ExtensionUIContext | undefined,
+  owner: SessionOwnerToken | undefined,
+  now: number,
+): string[] {
+  if (!ui) return [];
+  const owners = [owner];
+  const states = interactiveStatesForOwners(owners).filter(
+    (state) =>
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
+  );
+  return states.map((state) => formatActivityRow(state, now));
 }
 
 /** Derive delivery status from an already narrowed completion event. */
@@ -121,7 +329,7 @@ function deliveryMessageFromEvent(ev: CompletionEvent): string | undefined {
 const pollsInFlight = new Map<string, Promise<void>>();
 // ── Poller ─────────────────────────────────────────────────────────────
 
-function pollOwnerKey(owner: ActiveSessionContextToken | undefined): string {
+function pollOwnerKey(owner: SessionOwnerToken | undefined): string {
   return owner ? `${owner.id}:${owner.generation}` : "unscoped";
 }
 
@@ -134,7 +342,7 @@ function pollOwnerKey(owner: ActiveSessionContextToken | undefined): string {
  */
 export function pollArtifactChanges(
   pi: ExtensionAPI,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<void> {
   const key = pollOwnerKey(owner);
   const inFlight = pollsInFlight.get(key);
@@ -148,7 +356,7 @@ export function pollArtifactChanges(
 
 async function runPollArtifactChanges(
   pi: ExtensionAPI,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<void> {
   // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
   // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
@@ -156,31 +364,40 @@ async function runPollArtifactChanges(
   try {
     const g2 = typeof global !== "undefined" ? global : globalThis;
     const initialPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
-    const ownerContext = owner ? resolveLiveSessionContext(owner) : undefined;
-    if (owner && !ownerContext) return;
+    const ownerContext = owner ? resolveLiveSessionScope(owner) : undefined;
+    if ((owner && !ownerContext) || (!owner && !ownerlessEntitiesVisible()))
+      return;
     const interactivePi =
       ownerContext?.pi ??
       (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ??
       pi;
     if (!interactivePi) return;
 
-    const states = [...interactiveSubagentRegistry.values()].filter((state) =>
-      parentSessionBelongsToOwner(state.parentSessionId, owner),
-    );
+    const stateMap =
+      ownerContext?.interactiveStates ?? interactiveSubagentRegistry;
+    const states = [...stateMap.values()];
     const liveness = await Promise.all(
       states.map(async (state) => {
         try {
-          return [state, await isPaneAliveAsync(state)] as const;
+          return [state, await getInteractivePaneLivenessAsync(state)] as const;
         } catch (err) {
           debugLog("error", "poller_liveness_error", {
             stateId: state.id,
             error: err instanceof Error ? err.message : String(err),
           });
-          return [state, false] as const;
+          return [state, "unknown"] as const;
         }
       }),
     );
-    if (owner && !resolveLiveSessionContext(owner)) return;
+    if (owner) {
+      const liveOwnerContext = resolveLiveSessionScope(owner);
+      if (
+        !liveOwnerContext ||
+        liveOwnerContext.interactiveStates !== stateMap
+      ) {
+        return;
+      }
+    }
     const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     if (
       !owner &&
@@ -189,12 +406,11 @@ async function runPollArtifactChanges(
     ) {
       return;
     }
-    const widgetRows: string[] = [];
     const ui =
       ownerContext?.ui ??
       (g2.__piSubagenturaUi as ExtensionUIContext | undefined);
-    for (const [state, paneAlive] of liveness) {
-      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
+    for (const [state, paneLiveness] of liveness) {
+      if (stateMap.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
       // the artifact log: a later done/error event must still reach the parent.
       // 'exited' is intentionally not skipped: a follow-up user entry can revive it to "running".
@@ -218,6 +434,7 @@ async function runPollArtifactChanges(
         if ("version" in ev && ev.version === 2 && ev.type === "turn_started") {
           state.activeTurnId = ev.turnId;
         }
+        if (state.completionOwner === "workflow") continue;
         if (!shouldNotify(ev) || !isCompletionEvent(ev)) continue;
         const v2 = ev.type === "completion" ? ev : undefined;
         const mode = state.notifyOnComplete ?? "inject";
@@ -251,6 +468,7 @@ async function runPollArtifactChanges(
         });
       }
       for (const issue of batch.issues) {
+        if (state.completionOwner === "workflow") continue;
         const mode = state.notifyOnComplete ?? "inject";
         const triggerTurn =
           mode === "inject"
@@ -285,7 +503,7 @@ async function runPollArtifactChanges(
       state.eventByteCursor = nextCursor;
       const next = deriveInteractiveSubagentStatusFromLifecycle(
         lifecycle,
-        paneAlive,
+        paneLiveness,
       );
       if (next !== state.status) state.status = next;
       if (next === "exited") {
@@ -309,20 +527,15 @@ async function runPollArtifactChanges(
           entry.lifecycle = state.lifecycle;
         });
       }
-
-      // Keep live interactive sub-agents in the activity widget. Exited panes are
-      // still tail-read above so a later user-role entry can revive them.
-      if (state.status === "running" || state.status === "idle") {
-        widgetRows.push(formatActivityRow(state));
-      }
     }
+    // One clock for both widgets so their coarse elapsed buckets stay aligned.
+    const now = Date.now();
+    const widgetRows = projectActivityWidgetRows(ui, owner, now);
     flushDeliveries(interactivePi, ui, owner);
     for (const state of states) {
-      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
+      if (stateMap.get(state.id) !== state) continue;
       const terminal =
-        state.status === "cancelled" ||
-        state.status === "exited" ||
-        state.status === "unknown";
+        state.status === "cancelled" || state.status === "exited";
       if (terminal) destroySessionParser(state);
       if (
         terminal &&
@@ -346,33 +559,18 @@ async function runPollArtifactChanges(
 
     // Paint footer + widget. Both are TUI surfaces that never reach the LLM.
     if (ui) {
-      updateRunningSubagentFooter(ui);
-      try {
-        ui.setWidget(
-          WIDGET_KEY,
-          widgetRows.length > 0 ? widgetRows : undefined,
-          {
-            placement: "belowEditor",
-          },
-        );
-      } catch {
-        /* ui stale */
-      }
+      updateRunningSubagentFooter(ui, owner);
+      updateWidgetRows(ui, WIDGET_KEY, widgetRows, owner);
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);
-        const workflowRows = formatWorkflowWidgetRows(Date.now(), owner);
-        ui.setStatus(
-          WORKFLOW_FOOTER_KEY,
+        const workflowRows = formatWorkflowWidgetRows(owner, now);
+        const workflowStatus =
           wfCount > 0
             ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
-            : undefined,
-        );
-        ui.setWidget(
-          WORKFLOW_WIDGET_KEY,
-          workflowRows.length > 0 ? workflowRows : undefined,
-          { placement: "belowEditor" },
-        );
+            : undefined;
+        updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus, owner);
+        updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows, owner);
       } catch {
         /* ui stale */
       }
@@ -381,15 +579,14 @@ async function runPollArtifactChanges(
     debugLog("error", "poller_error", {
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
-      registryIds: [...interactiveSubagentRegistry.keys()],
     });
     /* defensive: never let one bad poll tick crash the parent process */
   }
 }
 
 function formatWorkflowWidgetRows(
+  owner: SessionOwnerToken | undefined,
   now: number,
-  owner?: ActiveSessionContextToken,
 ): string[] {
   const rows: string[] = [];
   for (const st of workflowJobRegistry.values()) {
@@ -415,13 +612,14 @@ function formatWorkflowWidgetRows(
   return rows;
 }
 
-function formatWorkflowElapsed(ms: number): string {
-  if (ms < 0) ms = 0;
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
+/** Coarse elapsed clock; see ACTIVITY_ELAPSED_BUCKET_MS for why it is bucketed. */
+function formatWorkflowElapsed(milliseconds: number): string {
+  const bucketed = coarseElapsedMs(milliseconds);
+  const seconds = Math.floor(bucketed / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 // ── Session-log parsing state ─────────────────────────────────────────
@@ -503,10 +701,17 @@ function destroySessionParser(state: InteractiveSubagentState): void {
   }
 }
 
-/** Release every parser before the interactive registry is replaced or cleared. */
-export function clearSessionParsers(): void {
-  const parserStates = [...sessionParsers.values()];
-  for (const parserState of parserStates) {
+/** Release parsers for one exact live owner, or every parser for legacy callers. */
+export function clearSessionParsers(owner?: SessionOwnerToken): void {
+  if (owner) {
+    const scope = resolveLiveSessionScope(owner);
+    if (!scope) return;
+    for (const state of scope.interactiveStates.values()) {
+      destroySessionParser(state);
+    }
+    return;
+  }
+  for (const parserState of [...sessionParsers.values()]) {
     destroySessionParser(parserState.owner);
   }
 }

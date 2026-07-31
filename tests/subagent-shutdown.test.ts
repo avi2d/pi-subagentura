@@ -1,61 +1,111 @@
-/**
- * Behavioral tests for the `session_shutdown` handler registered by the
- * subagent extension. The handler added in the criticals-wip commit
- * introduced four new behaviors, none of which had any test:
- *
- *   1. `handle.unref?.()` on the global poller handle
- *   2. `clearInterval` of the poller handle in `session_shutdown`
- *   3. preserving live panes on reload/resume/quit and cancelling them otherwise
- *   4. clear of `interactiveSubagentRegistry` (the fix in this branch)
- *
- * These tests stub `setInterval` / `clearInterval` to capture the handle
- * and call args, and `vi.spyOn` the `cancelInteractiveSubagent` export
- * so we can assert which ids were cancelled without touching tmux.
- *
- * The two `AC-A*` tests at the bottom are regression tests for Bug A
- * (duplicate notification on parent session close). They exercise the
- * race between an in-flight poll tick and the shutdown handler by
- * calling `pollArtifactChanges` directly at the boundaries of the
- * shutdown sequence.
- */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+  type MockInstance,
+} from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { appendEvent, artifactPath } from "../src/artifact";
+import {
+  jobRegistry,
+  registerInProcessJob,
+  type JobState,
+} from "../src/helpers";
 import * as interactiveTmux from "../src/interactive-tmux";
 import type { InteractiveSubagentState } from "../src/interactive-tmux";
-import { appendEvent, artifactPath } from "../src/artifact";
-import { jobRegistry } from "../src/helpers";
-import { workflowJobRegistry } from "../src/workflow";
+import {
+  __setTmuxMultiplexer,
+  type Multiplexer,
+  type PaneLiveness,
+} from "../src/multiplexer";
+import {
+  clearSessionScopes,
+  getSessionScopes,
+  sessionOwner,
+  type SessionScope,
+} from "../src/session-scope";
 import registerExtension, { pollArtifactChanges } from "../src/subagent";
-import { __setTmuxMultiplexer } from "../src/multiplexer";
-import { getActiveSessionContextToken } from "../src/session-context";
+import { workflowJobRegistry } from "../src/workflow";
+import type { WorkflowJobState } from "../src/workflow-jobs";
 
-// ── Fixtures ──────────────────────────────────────────────────────────
-
-function makeState(
-  id: string,
-  status: InteractiveSubagentState["status"],
-): InteractiveSubagentState {
-  return {
-    id,
-    name: "test-" + id,
-    task: "test",
-    paneId: "%" + id,
-    sessionFile: "/tmp/sess-" + id + ".jsonl",
-    cwd: "/tmp",
-    startedAt: Date.now(),
-    status,
-    mux: "tmux",
-    attachCommand: "tmux attach -t " + id,
-    selectPaneCommand: "tmux select-pane -t '%" + id + "'",
-    launchScriptFile: "/tmp/launch-" + id + ".sh",
-    artifactDir: "/tmp/art-" + id,
-  };
+interface TestExtensionApi {
+  registerTool: Mock;
+  registerMessageRenderer: Mock;
+  registerFlag: Mock;
+  getFlag: Mock;
+  sendMessage: Mock;
+  sendUserMessage: Mock;
+  on: Mock;
 }
 
-/** Build a minimal ExtensionAPI mock and find the session_shutdown callback. */
-function setupExtension() {
+interface ShutdownGlobalState {
+  __piSubagenturaInteractivePollerHandle?: NodeJS.Timeout;
+  __piSubagenturaPiRef?: ExtensionAPI;
+  __piSubagenturaUi?: unknown;
+  __piSubagenturaSessionManager?: unknown;
+  __piSubagenturaParentStreaming?: boolean;
+}
+
+function shutdownGlobalState(): typeof globalThis & ShutdownGlobalState {
+  return globalThis as typeof globalThis & ShutdownGlobalState;
+}
+
+function installLivenessMultiplexer(
+  getPaneLivenessAsync: () => Promise<PaneLiveness>,
+): void {
+  const testMultiplexer = {
+    getPaneLiveness: (): PaneLiveness => "alive",
+    getPaneLivenessAsync,
+  };
+  // This unit seam exercises only the two liveness methods used by the poller.
+  __setTmuxMultiplexer(testMultiplexer as unknown as Multiplexer);
+}
+
+interface SessionStartHandler {
+  (
+    event: { reason: string },
+    ctx: {
+      cwd: string;
+      ui: Record<string, unknown>;
+      sessionManager: {
+        getSessionId: () => string;
+        getEntries: () => unknown[];
+      };
+    },
+  ): void;
+}
+
+interface Registration {
+  api: TestExtensionApi;
+  scope: SessionScope;
+  start: (
+    sessionId?: string,
+    ui?: Record<string, unknown>,
+    reason?: string,
+  ) => void;
+  shutdown: (
+    event?: { reason?: string },
+    ctx?: {
+      cwd?: string;
+      sessionManager?: { getSessionId?: () => string };
+    },
+  ) => void;
+}
+
+function setupExtension(
+  options: {
+    startSession?: boolean;
+    sessionId?: string;
+    ui?: Record<string, unknown>;
+  } = {},
+): Registration {
   const api = {
     registerTool: vi.fn(),
     registerMessageRenderer: vi.fn(),
@@ -65,387 +115,489 @@ function setupExtension() {
     sendUserMessage: vi.fn(),
     on: vi.fn(),
   };
+  // The stub implements the extension methods exercised by registration.
+  const extensionApi = api as unknown as ExtensionAPI;
+  registerExtension(extensionApi);
 
-  registerExtension(api as any);
+  const scope = getSessionScopes().find(
+    (candidate) => candidate.pi === extensionApi,
+  );
+  if (!scope) throw new Error("extension did not register a session scope");
 
-  // The extension registers two session_shutdown callbacks: a no-op early
-  // one and the actual cleanup handler at the end of the default export.
-  // We want the LAST one — the one that runs clearInterval, the cancel
-  // loop, and the registry clear.
-  let shutdownHandler:
-    ((event?: { reason?: string }, ctx?: { cwd?: string }) => void) | undefined;
-  for (const [event, handler] of (api.on as any).mock.calls) {
+  const sessionStartHandler = api.on.mock.calls.find(
+    ([event]) => event === "session_start",
+  )?.[1] as SessionStartHandler;
+  let shutdownHandler: Registration["shutdown"] | undefined;
+  for (const [event, handler] of api.on.mock.calls) {
     if (event === "session_shutdown") {
-      shutdownHandler = handler as (
-        event?: { reason?: string },
-        ctx?: { cwd?: string },
-      ) => void;
+      shutdownHandler = handler as Registration["shutdown"];
     }
   }
+  if (!shutdownHandler)
+    throw new Error("session_shutdown handler not registered");
 
-  return { api, shutdownHandler };
+  const start = (
+    sessionId = options.sessionId ?? `parent-${scope.id}`,
+    ui = options.ui ?? {},
+    reason = "new",
+  ) => {
+    sessionStartHandler(
+      { reason },
+      {
+        cwd: "/tmp",
+        ui,
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getEntries: () => [],
+        },
+      },
+    );
+  };
+
+  const registration = { api, scope, start, shutdown: shutdownHandler };
+  if (options.startSession !== false) start();
+  return registration;
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────
+function shutdownContext(sessionId: string) {
+  return {
+    cwd: "/tmp",
+    sessionManager: { getSessionId: () => sessionId },
+  };
+}
+
+function makeState(
+  id: string,
+  status: InteractiveSubagentState["status"],
+  artifactDir = `/tmp/art-${id}`,
+): InteractiveSubagentState {
+  return {
+    id,
+    name: `test-${id}`,
+    task: "test",
+    paneId: `%${id}`,
+    sessionFile: `/tmp/sess-${id}.jsonl`,
+    cwd: "/tmp",
+    startedAt: Date.now(),
+    status,
+    mux: "tmux",
+    attachCommand: `tmux attach -t ${id}`,
+    selectPaneCommand: `tmux select-pane -t '%${id}'`,
+    launchScriptFile: `/tmp/launch-${id}.sh`,
+    artifactDir,
+  };
+}
+
+function ownedInteractive(
+  scope: SessionScope,
+  id: string,
+  status: InteractiveSubagentState["status"],
+  options: Partial<InteractiveSubagentState> = {},
+): InteractiveSubagentState {
+  const state = Object.assign(makeState(id, status), options);
+  interactiveTmux.registerInteractiveSubagentState(state, scope);
+  return state;
+}
+
+function ownedWorkflow(scope: SessionScope, id: string) {
+  const abort = new AbortController();
+  const workflow = {
+    id,
+    name: id,
+    status: "running" as const,
+    startedAt: Date.now(),
+    promise: new Promise<never>(() => {}),
+    abort,
+    suppressCompletionNotification: false,
+    parentSessionOwner: sessionOwner(scope),
+    snapshot: {
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 0,
+      phases: [],
+    },
+  };
+  // The fixture supplies the lifecycle fields consumed by shutdown.
+  workflowJobRegistry.set(id, workflow as unknown as WorkflowJobState);
+  return { workflow, abort };
+}
+
+function ownedJob(scope: SessionScope, id: string) {
+  const abort = vi.fn().mockResolvedValue(undefined);
+  const job = {
+    id,
+    status: "running",
+    session: { abort } as unknown as JobState["session"],
+    startedAt: Date.now(),
+    promise: new Promise<never>(() => {}),
+    liveStatus: {
+      turn: 0,
+      output: "",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    },
+    deliveryOwner: {
+      pi: scope.pi,
+      sessionScopeId: scope.id,
+      sessionScopeGeneration: scope.generation,
+    },
+  } satisfies JobState;
+  if (!registerInProcessJob(job, sessionOwner(scope))) {
+    throw new Error(`failed to register owned job ${id}`);
+  }
+  return { job, abort };
+}
 
 describe("session_shutdown handler", () => {
-  let setIntervalSpy: ReturnType<typeof vi.spyOn>;
-  let clearIntervalSpy: ReturnType<typeof vi.spyOn>;
-  let cancelSpy: ReturnType<typeof vi.spyOn>;
-  let cancelByStateSpy: ReturnType<typeof vi.spyOn>;
-  let fakeHandle: { unref: ReturnType<typeof vi.fn> };
+  let setIntervalSpy: MockInstance<typeof setInterval>;
+  let clearIntervalSpy: MockInstance<typeof clearInterval>;
+  let cancelByStateSpy: MockInstance<
+    typeof interactiveTmux.cancelInteractiveSubagentByState
+  >;
+  let fakeHandle: { unref: Mock };
+  let tmpRoot: string | undefined;
 
   beforeEach(() => {
-    // Reset global poller / registry / ref state so the default export's
-    // `if (!g.__piSubagenturaInteractivePollerHandle)` branch is taken
-    // (so we observe a fresh setInterval call in the unref test).
-    const g = globalThis as any;
-    g.__piSubagenturaInteractivePollerHandle = undefined;
-    g.__piSubagenturaInteractiveRegistry?.clear?.();
-    const contextStack = g.__piSubagenturaSessionContextStack;
-    if (Array.isArray(contextStack)) contextStack.length = 0;
-    g.__piSubagenturaSessionContextIdCounter = 0;
-    g.__piSubagenturaPiRef = undefined;
-    g.__piSubagenturaUi = undefined;
-    g.__piSubagenturaSessionManager = undefined;
-    g.__piSubagenturaParentStreaming = false;
+    clearSessionScopes();
     jobRegistry.clear();
     workflowJobRegistry.clear();
-    __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
-    } as any);
+    interactiveTmux.interactiveSubagentRegistry.clear();
+    const globalState = shutdownGlobalState();
+    globalState.__piSubagenturaInteractivePollerHandle = undefined;
+    globalState.__piSubagenturaPiRef = undefined;
+    globalState.__piSubagenturaUi = undefined;
+    globalState.__piSubagenturaSessionManager = undefined;
+    globalState.__piSubagenturaParentStreaming = false;
 
-    // Stub the global timers. setInterval returns a fake handle with a
-    // vi.fn() unref method; clearInterval is a no-op spy.
+    installLivenessMultiplexer(async () => "alive");
     fakeHandle = { unref: vi.fn() };
-    setIntervalSpy = vi
-      .spyOn(globalThis, "setInterval")
-      .mockReturnValue(fakeHandle as any) as any;
-    clearIntervalSpy = vi
-      .spyOn(globalThis, "clearInterval")
-      .mockImplementation(() => {}) as any;
-
-    // Spy on cancelInteractiveSubagent + cancelInteractiveSubagentByState so the
-    // handler's iteration logic can be observed without touching the filesystem
-    // or running tmux. The shutdown handler now uses the byState variant
-    // (bypasses registry lookup) after snapshotting.
-    cancelSpy = vi.spyOn(interactiveTmux, "cancelInteractiveSubagent") as any;
-    cancelSpy.mockImplementation(((id: string) =>
-      interactiveTmux.interactiveSubagentRegistry.get(id)) as any);
+    setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    setIntervalSpy.mockReturnValue(fakeHandle as unknown as NodeJS.Timeout);
+    clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+    clearIntervalSpy.mockImplementation(() => {});
     cancelByStateSpy = vi.spyOn(
       interactiveTmux,
       "cancelInteractiveSubagentByState",
-    ) as any;
-    cancelByStateSpy.mockImplementation((() => undefined) as any);
+    );
+    cancelByStateSpy.mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     setIntervalSpy.mockRestore();
     clearIntervalSpy.mockRestore();
-    cancelSpy.mockRestore();
     cancelByStateSpy.mockRestore();
-    // The shutdown handler nulls the global handle; restore to undefined
-    // so the next test starts from a clean slate.
-    (globalThis as any).__piSubagenturaInteractivePollerHandle = undefined;
+    shutdownGlobalState().__piSubagenturaInteractivePollerHandle = undefined;
+    clearSessionScopes();
+    jobRegistry.clear();
+    workflowJobRegistry.clear();
+    interactiveTmux.interactiveSubagentRegistry.clear();
+    __setTmuxMultiplexer(undefined);
+    if (tmpRoot) {
+      rmSync(tmpRoot, { recursive: true, force: true });
+      tmpRoot = undefined;
+    }
     vi.restoreAllMocks();
   });
 
-  // AC-A* tests create tmp artifact dirs; declared here (before any inner
-  // afterEach that references it) per AGENTS.md "declare before" rule.
-  let tmpRoot: string;
+  it("shares one poller across peer scopes and tears it down after the final scope", () => {
+    const a = setupExtension({ startSession: false });
+    const b = setupExtension({ startSession: false });
 
-  it("unrefs the poller handle on extension registration", () => {
-    setupExtension();
+    a.start("session-a");
+    expect(setIntervalSpy).toHaveBeenCalledOnce();
+    expect(fakeHandle.unref).toHaveBeenCalledOnce();
+    const sharedPoller =
+      shutdownGlobalState().__piSubagenturaInteractivePollerHandle;
 
-    // setInterval is gated on the global handle being undefined, so the
-    // default export called our spy and got fakeHandle back. The very
-    // next line in subagent.ts is `handle.unref?.()`.
-    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
-    expect(fakeHandle.unref).toHaveBeenCalledTimes(1);
+    b.start("session-b");
+    expect(setIntervalSpy).toHaveBeenCalledOnce();
+    expect(shutdownGlobalState().__piSubagenturaInteractivePollerHandle).toBe(
+      sharedPoller,
+    );
+
+    a.shutdown({ reason: "new" }, shutdownContext("session-a"));
+    expect(clearIntervalSpy).not.toHaveBeenCalled();
+    expect(shutdownGlobalState().__piSubagenturaInteractivePollerHandle).toBe(
+      sharedPoller,
+    );
+
+    b.shutdown({ reason: "quit" }, shutdownContext("session-b"));
+    expect(clearIntervalSpy).toHaveBeenCalledOnce();
+    expect(clearIntervalSpy).toHaveBeenCalledWith(sharedPoller);
+    expect(
+      shutdownGlobalState().__piSubagenturaInteractivePollerHandle,
+    ).toBeUndefined();
   });
 
-  it("clearIntervals the poller in session_shutdown", () => {
-    // Pre-seed the global handle so the default export's if-guard skips
-    // the setInterval call and the handler sees the pre-seeded handle.
-    const handle = { unref: vi.fn() };
-    (globalThis as any).__piSubagenturaInteractivePollerHandle = handle;
+  it.each(["a", "b"])(
+    "shutting down scope %s cleans its exact owner and preserves its peer",
+    (which) => {
+      const a = setupExtension({ sessionId: "session-a" });
+      const b = setupExtension({ sessionId: "session-b" });
+      const aState = ownedInteractive(a.scope, "state-a", "unknown", {
+        parentSessionId: "session-a",
+      });
+      const bState = ownedInteractive(b.scope, "state-b", "unknown", {
+        parentSessionId: "session-b",
+      });
+      const aWorkflow = ownedWorkflow(a.scope, "workflow-a");
+      const bWorkflow = ownedWorkflow(b.scope, "workflow-b");
+      const aJob = ownedJob(a.scope, "job-a");
+      const bJob = ownedJob(b.scope, "job-b");
+      const shutting = which === "a" ? a : b;
+      const surviving = which === "a" ? b : a;
+      const shuttingState = which === "a" ? aState : bState;
+      const survivingState = which === "a" ? bState : aState;
+      const shuttingWorkflow = which === "a" ? aWorkflow : bWorkflow;
+      const survivingWorkflow = which === "a" ? bWorkflow : aWorkflow;
+      const shuttingJob = which === "a" ? aJob : bJob;
+      const survivingJob = which === "a" ? bJob : aJob;
 
-    const { shutdownHandler } = setupExtension();
-    expect(shutdownHandler).toBeTypeOf("function");
+      shutting.shutdown({ reason: "new" }, shutdownContext(`session-${which}`));
 
-    shutdownHandler!();
+      expect(shutting.scope.lifecycle).toBe("shutdown");
+      expect(surviving.scope.lifecycle).toBe("started");
+      expect(getSessionScopes()).toEqual([surviving.scope]);
+      expect(shutting.scope.interactiveStates.size).toBe(0);
+      expect(surviving.scope.interactiveStates.get(survivingState.id)).toBe(
+        survivingState,
+      );
+      expect(cancelByStateSpy).toHaveBeenCalledWith(shuttingState);
+      expect(cancelByStateSpy).not.toHaveBeenCalledWith(survivingState);
+      expect(
+        interactiveTmux.interactiveSubagentRegistry.has(shuttingState.id),
+      ).toBe(false);
+      expect(
+        interactiveTmux.interactiveSubagentRegistry.get(survivingState.id),
+      ).toBe(survivingState);
+      expect(shuttingWorkflow.abort.signal.aborted).toBe(true);
+      expect(shuttingWorkflow.workflow.suppressCompletionNotification).toBe(
+        true,
+      );
+      expect(workflowJobRegistry.has(shuttingWorkflow.workflow.id)).toBe(false);
+      expect(survivingWorkflow.abort.signal.aborted).toBe(false);
+      expect(survivingWorkflow.workflow.suppressCompletionNotification).toBe(
+        false,
+      );
+      expect(workflowJobRegistry.get(survivingWorkflow.workflow.id)).toBe(
+        survivingWorkflow.workflow,
+      );
+      expect(shuttingJob.abort).toHaveBeenCalledOnce();
+      expect(jobRegistry.has(shuttingJob.job.id)).toBe(false);
+      expect(survivingJob.abort).not.toHaveBeenCalled();
+      expect(jobRegistry.get(survivingJob.job.id)).toBe(survivingJob.job);
+      expect(shutdownGlobalState().__piSubagenturaInteractivePollerHandle).toBe(
+        fakeHandle,
+      );
+    },
+  );
 
-    expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
-    expect(clearIntervalSpy).toHaveBeenCalledWith(handle);
-    // The handler also nulls the global after clearing, so a re-invocation
-    // would be a no-op (defensive: no double-clear).
+  it("accepts an omitted shutdown event and still cleans the exact scope", () => {
+    const registration = setupExtension({ sessionId: "session-a" });
+    const state = ownedInteractive(registration.scope, "state-a", "running");
+    const workflow = ownedWorkflow(registration.scope, "workflow-a");
+    const job = ownedJob(registration.scope, "job-a");
+
+    expect(() => registration.shutdown()).not.toThrow();
+
+    expect(cancelByStateSpy).toHaveBeenCalledWith(state);
+    expect(workflow.abort.signal.aborted).toBe(true);
+    expect(job.abort).toHaveBeenCalledOnce();
+    expect(registration.scope.lifecycle).toBe("shutdown");
+    expect(getSessionScopes()).toEqual([]);
     expect(
-      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+      shutdownGlobalState().__piSubagenturaInteractivePollerHandle,
     ).toBeUndefined();
   });
 
   it.each(["new", "fork"])(
-    "kills running and idle panes for non-preserving reason %s",
+    "kills live panes owned by the scope for non-preserving reason %s",
     (reason) => {
-      const running = makeState("run-1", "running");
-      const idle = makeState("idle-1", "idle");
+      const registration = setupExtension();
+      const running = ownedInteractive(
+        registration.scope,
+        "running",
+        "running",
+      );
+      const idle = ownedInteractive(registration.scope, "idle", "idle");
+      const unknown = ownedInteractive(
+        registration.scope,
+        "unknown",
+        "unknown",
+      );
+      const cancelled = ownedInteractive(
+        registration.scope,
+        "cancelled",
+        "cancelled",
+      );
+      const exited = ownedInteractive(registration.scope, "exited", "exited");
 
-      const cancelled = makeState("canc-1", "cancelled");
+      registration.shutdown({ reason });
 
-      const exited = makeState("exit-1", "exited");
-
-      interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
-      interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
-
-      interactiveTmux.interactiveSubagentRegistry.set(cancelled.id, cancelled);
-
-      interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
-
-      const { shutdownHandler } = setupExtension();
-
-      shutdownHandler!({ reason });
-
-      // The handler snapshots running states, clears the registry, then calls the
-
-      // byState variant (which bypasses the registry lookup). The id-based
-
-      // cancelInteractiveSubagent is NOT used by the shutdown handler anymore.
-
-      expect(cancelByStateSpy).toHaveBeenCalledTimes(2);
-
+      expect(cancelByStateSpy).toHaveBeenCalledTimes(3);
       expect(cancelByStateSpy).toHaveBeenCalledWith(running);
       expect(cancelByStateSpy).toHaveBeenCalledWith(idle);
-
-      expect(cancelSpy).not.toHaveBeenCalled();
+      expect(cancelByStateSpy).toHaveBeenCalledWith(unknown);
+      expect(cancelByStateSpy).not.toHaveBeenCalledWith(cancelled);
+      expect(cancelByStateSpy).not.toHaveBeenCalledWith(exited);
+      expect(registration.scope.interactiveStates.size).toBe(0);
+      for (const state of [running, idle, unknown, cancelled, exited]) {
+        expect(interactiveTmux.interactiveSubagentRegistry.has(state.id)).toBe(
+          false,
+        );
+      }
     },
   );
 
   it.each(["reload", "resume", "quit"])(
-    "preserves running and idle panes for reason %s",
+    "preserves standalone panes while removing their scope metadata for reason %s",
     (reason) => {
-      const running = makeState("run-1", "running");
-      const idle = makeState("idle-1", "idle");
-      interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
-      interactiveTmux.interactiveSubagentRegistry.set(idle.id, idle);
+      const registration = setupExtension();
+      const running = ownedInteractive(
+        registration.scope,
+        "running",
+        "running",
+      );
+      const idle = ownedInteractive(registration.scope, "idle", "idle");
+      const unknown = ownedInteractive(
+        registration.scope,
+        "unknown",
+        "unknown",
+      );
 
-      const { shutdownHandler } = setupExtension();
-      shutdownHandler!({ reason });
+      registration.shutdown({ reason });
 
       expect(cancelByStateSpy).not.toHaveBeenCalled();
-      expect(cancelSpy).not.toHaveBeenCalled();
+      expect(registration.scope.interactiveStates.size).toBe(0);
+      for (const state of [running, idle, unknown]) {
+        expect(interactiveTmux.interactiveSubagentRegistry.has(state.id)).toBe(
+          false,
+        );
+      }
     },
   );
 
-  it("clears interactiveSubagentRegistry in session_shutdown", () => {
-    // Pre-populate with both running and non-running states. The cancel
-    // loop is mocked, so it does NOT remove entries — the explicit
-    // `interactiveSubagentRegistry.clear()` is what empties the map.
-    const running = makeState("run-1", "running");
-    const exited = makeState("exit-1", "exited");
-    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
-    interactiveTmux.interactiveSubagentRegistry.set(exited.id, exited);
+  it.each(["reload", "resume", "quit"])(
+    "kills workflow-origin panes but preserves standalone panes for reason %s",
+    (reason) => {
+      const registration = setupExtension();
+      const workflowChild = ownedInteractive(
+        registration.scope,
+        "workflow-child",
+        "running",
+        { completionOwner: "workflow", workflowId: "workflow-a" },
+      );
+      const promotedChild = ownedInteractive(
+        registration.scope,
+        "promoted-child",
+        "idle",
+        {
+          completionOwner: "standalone",
+          workflowResultConsumed: true,
+          workflowId: undefined,
+        },
+      );
+      const standalone = ownedInteractive(
+        registration.scope,
+        "standalone",
+        "running",
+      );
 
-    const { shutdownHandler } = setupExtension();
-    expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(2);
+      registration.shutdown({ reason });
 
-    shutdownHandler!();
+      expect(cancelByStateSpy).toHaveBeenCalledTimes(2);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(workflowChild);
+      expect(cancelByStateSpy).toHaveBeenCalledWith(promotedChild);
+      expect(cancelByStateSpy).not.toHaveBeenCalledWith(standalone);
+      expect(registration.scope.interactiveStates.size).toBe(0);
+    },
+  );
 
-    expect(interactiveTmux.interactiveSubagentRegistry.size).toBe(0);
-  });
-
-  it("aborts, suppresses, and clears background workflows on session_shutdown", () => {
-    const abort = new AbortController();
-    const abortSpy = vi.spyOn(abort, "abort");
-    const workflow = {
-      id: "wf-shutdown",
-      name: "shutdown-test",
-      status: "running" as const,
-      startedAt: Date.now(),
-      promise: new Promise<never>(() => {}),
-      abort,
-      suppressCompletionNotification: false,
-      snapshot: {
-        agentsSpawned: 0,
-        errorCount: 0,
-        tokensSpent: 0,
-        phases: [],
+  it("drops an in-flight poll when its exact owner shuts down", async () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-race-"));
+    const ui = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const registration = setupExtension({ sessionId: "session-a", ui });
+    const state = ownedInteractive(
+      registration.scope,
+      "race-child",
+      "running",
+      {
+        artifactDir: join(tmpRoot, "race-child"),
+        parentSessionId: "session-a",
       },
-    };
-    const { shutdownHandler } = setupExtension();
-    Object.assign(workflow, {
-      parentSessionOwner: getActiveSessionContextToken(),
+    );
+    appendEvent(artifactPath(tmpRoot, state.id), {
+      ts: 1,
+      type: "done",
+      status: "done",
+      exitCode: 0,
     });
-    workflowJobRegistry.set(workflow.id, workflow);
-    shutdownHandler!();
 
-    expect(abortSpy).toHaveBeenCalledTimes(1);
-    expect(workflow.suppressCompletionNotification).toBe(true);
-    expect(workflowJobRegistry.size).toBe(0);
+    let releaseLiveness!: (value: "alive") => void;
+    const liveness = new Promise<"alive">((resolve) => {
+      releaseLiveness = resolve;
+    });
+    installLivenessMultiplexer(() => liveness);
+    const tick = setIntervalSpy.mock.calls[0][0] as () => void;
+
+    tick();
+    await Promise.resolve();
+    registration.shutdown({ reason: "new" }, shutdownContext("session-a"));
+    releaseLiveness("alive");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(registration.api.sendMessage).not.toHaveBeenCalled();
+    expect(ui.notify).not.toHaveBeenCalled();
   });
 
-  // ── Bug A regression tests (duplicate notification on shutdown) ──
-
-  // The race: a poll tick dequeued from setInterval before clearInterval
-
-  // runs can observe the in-progress cancel state. The fix (snapshot-then-clear
-
-  // in session_shutdown) means a post-shutdown tick finds an empty registry
-
-  // and delivers zero notifications. We capture the actual setInterval
-
-  // callback (via the setIntervalSpy) and invoke it before AND after the
-
-  // shutdown handler — this exercises the same code path as a real
-
-  // in-flight tick that survived clearInterval.
-
-  function makeArtifactState(
-    id: string,
-    status: InteractiveSubagentState["status"],
-    artifactDir: string,
-  ): InteractiveSubagentState {
-    return {
-      ...makeState(id, status),
-      artifactDir,
-    };
-  }
-
-  it("AC-A1: setInterval tick after session_shutdown delivers zero notifications (race-reproducing)", async () => {
-    // Empty tmp artifact dir; no events written.
-
-    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a1-"));
-
-    const artifactDir = join(tmpRoot, "run-1");
-
-    const running = makeArtifactState("run-1", "running", artifactDir);
-
-    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
-
-    const { api, shutdownHandler } = setupExtension();
-
-    (globalThis as any).__piSubagenturaPiRef = api;
-    const notify = vi.fn();
-    (globalThis as any).__piSubagenturaUi = {
-      notify,
+  it("does not re-deliver an artifact completion after shutdown", async () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-delivery-"));
+    const ui = {
+      notify: vi.fn(),
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     };
-
-    // Capture the actual setInterval callback. setupExtension() above
-
-    // registered the poller, so setIntervalSpy.mock.calls[0][0] is the
-
-    // production callback (`() => pollArtifactChanges(pi)`) we need to
-
-    // invoke to exercise the real code path — not a hand-written wrapper.
-
+    const registration = setupExtension({ sessionId: "session-a", ui });
+    const state = ownedInteractive(
+      registration.scope,
+      "done-child",
+      "running",
+      {
+        artifactDir: join(tmpRoot, "done-child"),
+        parentSessionId: "session-a",
+      },
+    );
+    appendEvent(artifactPath(tmpRoot, state.id), {
+      ts: 1,
+      type: "done",
+      status: "done",
+      exitCode: 0,
+    });
+    const owner = sessionOwner(registration.scope);
     const tick = setIntervalSpy.mock.calls[0][0] as () => void;
 
-    // 1. Pre-shutdown tick: no artifact events, no notification.
+    await pollArtifactChanges(
+      registration.api as unknown as ExtensionAPI,
+      owner,
+    );
+    expect(registration.api.sendMessage).toHaveBeenCalledOnce();
+    expect(ui.notify).toHaveBeenCalledOnce();
 
+    registration.shutdown({ reason: "quit" }, shutdownContext("session-a"));
     tick();
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    expect(api.sendMessage).toHaveBeenCalledTimes(0);
-
-    // 2. Shutdown handler runs. The order of operations inside
-
-    // session_shutdown is what we're protecting: snapshot → clear → cancel.
-
-    // If someone re-orders to cancel → clear, the post-shutdown tick below
-
-    // would still see an empty registry (clear runs last), so this test
-
-    // alone would pass. The cancellation must use the byState export
-
-    // (covered by the test at line ~166) for the shutdown handler to
-
-    // actually kill panes after clear.
-
-    shutdownHandler!();
-
-    // 3. Post-shutdown tick (the in-flight one that survived clearInterval):
-
-    //    must deliver zero notifications because the registry is empty.
-
-    tick();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    expect(api.sendMessage).toHaveBeenCalledTimes(0);
-  });
-
-  it("AC-A2: setInterval tick after shutdown does not re-deliver a done event already in the artifact", async () => {
-    tmpRoot = mkdtempSync(join(tmpdir(), "pi-shutdown-a2-"));
-
-    const artifactDir = join(tmpRoot, "run-1");
-
-    const running = makeArtifactState("run-1", "running", artifactDir);
-
-    // Pre-write a done event with a fixed ts.
-
-    const doneTs = 1000;
-
-    const art = artifactPath(join(artifactDir, ".."), "run-1");
-
-    appendEvent(art, { ts: doneTs, type: "done", status: "done", exitCode: 0 });
-
-    interactiveTmux.interactiveSubagentRegistry.set(running.id, running);
-    __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
-    } as any);
-
-    const { api, shutdownHandler } = setupExtension();
-
-    (globalThis as any).__piSubagenturaPiRef = api;
-    const notify = vi.fn();
-    (globalThis as any).__piSubagenturaUi = {
-      notify,
-      setStatus: vi.fn(),
-      setWidget: vi.fn(),
-    };
-
-    // Capture the actual setInterval callback for the real code path.
-
-    const tick = setIntervalSpy.mock.calls[0][0] as () => void;
-
-    // 1. Pre-shutdown tick: the done event (cursor=0, ts=1000) is
-
-    // delivered. Exactly one notification.
-
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await pollArtifactChanges(api as any);
-
-    expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledOnce();
-
-    // 2. Shutdown handler runs.
-
-    shutdownHandler!();
-
-    // 3. Post-shutdown tick (in-flight race survivor): the registry is
-
-    // empty (snapshot-before-clear), so the tick does no work. Total
-
-    // notification count stays at 1 — no duplicate delivered.
-
-    tick();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    expect(api.sendMessage).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledOnce();
-    __setTmuxMultiplexer(undefined);
-  });
-
-  afterEach(() => {
-    // Clean up tmp artifact dirs created by the AC-A* tests.
-    if (tmpRoot) {
-      try {
-        rmSync(tmpRoot, { recursive: true, force: true });
-      } catch {
-        /* best-effort */
-      }
-    }
+    expect(registration.api.sendMessage).toHaveBeenCalledOnce();
+    expect(ui.notify).toHaveBeenCalledOnce();
   });
 });

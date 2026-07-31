@@ -1037,12 +1037,17 @@ export interface CleanupResult {
   dryRun: boolean;
 }
 
+/** Runtime-created ownership marker used to isolate historical artifact access. */
+export const INTERACTIVE_ARTIFACT_OWNER_FILE = ".parent-session-id";
+
 export interface CleanupOptions {
   /**
    * Set of sub-agent IDs that are currently tracked/active in the registry.
    * Directories matching these IDs are always preserved regardless of age.
    */
   activeIds?: Set<string>;
+  /** When supplied, only artifacts carrying this exact parent-session marker are eligible. */
+  ownerSessionId?: string;
   /** If true, report what would be deleted without actually deleting. */
   dryRun?: boolean;
   /** Override "now" for testing (unix-ms timestamp). Defaults to Date.now(). */
@@ -1155,6 +1160,21 @@ function cleanupArtifactRoot(
 
       // Only directories that actually look like artifact dirs are eligible.
       if (!hasDirectArtifactFiles(candidate)) continue;
+      if (options?.ownerSessionId !== undefined) {
+        let artifactOwner: string | undefined;
+        try {
+          artifactOwner = readFileSync(
+            join(candidate, INTERACTIVE_ARTIFACT_OWNER_FILE),
+            "utf8",
+          );
+        } catch {
+          /* Legacy artifacts without ownership evidence fail closed. */
+        }
+        if (artifactOwner !== options.ownerSessionId) {
+          result.skipped++;
+          continue;
+        }
+      }
       // Active-ids check.
       if (activeIds?.has(name)) {
         result.skipped++;

@@ -3,8 +3,8 @@
  *
  * Two layered defences are exercised here:
  *
- *  1. The 8-hex-char regex check on the id (blocks "../" sequences and other
- *     non-hex shapes — the original criticals fix).
+ *  1. The 16-lowercase-hex regex check on the id (blocks "../" sequences and
+ *     other non-hex shapes — the original criticals fix).
  *  2. A realpath-aware containment check via is-path-inside, so a symlink
  *     at <root>/<cwd>/artifacts/<id> pointing outside the artifact root
  *     is rejected even though the id itself is well-formed
@@ -16,20 +16,34 @@
  * (or the realpath check) makes these return null.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importFresh } from "./test-utils";
+import {
+  appendInteractiveState,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
+} from "../src/artifact";
+import { registerInteractiveSubagentTools } from "../src/tools/interactive";
+import { clearSessionScopes, registerSessionScope } from "../src/session-scope";
 
 describe("findArtifactById (path-traversal guard)", () => {
   let tmp: string;
   let legitDir: string;
 
   beforeEach(() => {
+    clearSessionScopes();
     tmp = mkdtempSync(join(tmpdir(), "pi-subagentura-findartifact-"));
     // The production layout is <root>/<cwdLabel>/artifacts/<id>.
     // Create one such directory to use for the well-formed id test.
-    legitDir = join(tmp, "cwdLabel1", "artifacts", "deadbeef");
+    legitDir = join(tmp, "cwdLabel1", "artifacts", "deadbeefcafebabe");
     mkdirSync(legitDir, { recursive: true });
     // POSITIVE CONTROLS — these dirs are what the malicious ids would
     // resolve to via path.join. The pre-fix vulnerable code would find
@@ -44,6 +58,7 @@ describe("findArtifactById (path-traversal guard)", () => {
   afterEach(() => {
     rmSync(tmp, { recursive: true, force: true });
     vi.unstubAllEnvs();
+    clearSessionScopes();
   });
 
   it("returns null for ids with path-traversal sequences", async () => {
@@ -68,7 +83,7 @@ describe("findArtifactById (path-traversal guard)", () => {
     }
   });
 
-  it("returns null for ids that do not match the 8-hex-char shape", async () => {
+  it("returns null for ids that do not match the 16-hex-char shape", async () => {
     const { findArtifactById } =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     // Either too short, too long, contains non-hex / non-ASCII / control
@@ -78,14 +93,18 @@ describe("findArtifactById (path-traversal guard)", () => {
     for (const bad of [
       "",
       "abc",
-      "zzzzzzzz",
-      "1234567",
-      "123456789",
+      "z".repeat(16),
+      "123456789abcdef", // 15 chars
+      "123456789abcdef01", // 17 chars
+      "deadbeefcafebabe\n", // valid id plus LF
+      "deadbeefcafebabe\r\n", // valid id plus CRLF
+      "deadbeefcafebabe\u2028", // valid id plus Unicode line separator
+      "deadbeefcafebabe\u2029", // valid id plus Unicode paragraph separator
       "abc1234 ",
       "abc-1234",
-      "DEADBEEF", // uppercase hex — must not match [a-f0-9]
-      "абвгдежз", // Cyrillic unicode, 8 chars by codepoint count
-      "\0\0\0\0\0\0\0\0", // 8 NUL bytes
+      "DEADBEEFCAFEBABE", // uppercase hex — must not match [a-f0-9]
+      "абвгдежзийклмноп", // Cyrillic unicode, 16 chars by codepoint count
+      "\0".repeat(16), // 16 NUL bytes
       "a".repeat(1000), // absurdly long
     ]) {
       expect(
@@ -100,23 +119,23 @@ describe("findArtifactById (path-traversal guard)", () => {
     expect(statSync(legitDir).isDirectory()).toBe(true);
     const { findArtifactById } =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
-    const art = findArtifactById("deadbeef");
+    const art = findArtifactById("deadbeefcafebabe");
     expect(
       art,
       "well-formed id with matching dir on disk should be found",
     ).not.toBeNull();
-    expect(art!.id).toBe("deadbeef");
+    expect(art!.id).toBe("deadbeefcafebabe");
   });
 
   it("returns null for a well-formed id that does not exist on disk", async () => {
     const { findArtifactById } =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
-    expect(findArtifactById("feedface")).toBeNull();
+    expect(findArtifactById("feedfacecafebeef")).toBeNull();
   });
 
   it("blocks symlink escapes (realpath-aware containment check)", async () => {
-    // Replace the legit deadbeef directory with a symlink that points
-    // OUTSIDE the artifact root. The id "deadbeef" is well-formed and
+    // Replace the legit deadbeefcafebabe directory with a symlink that points
+    // OUTSIDE the artifact root. The id "deadbeefcafebabe" is well-formed and
     // statSync-follows-symlinks would see a directory at the candidate
     // path — only the realpath check inside findArtifactById can stop
     // this primitive. The target has to escape the root, not just the
@@ -131,10 +150,53 @@ describe("findArtifactById (path-traversal guard)", () => {
 
     const { findArtifactById } =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
-    const art = findArtifactById("deadbeef");
+    const art = findArtifactById("deadbeefcafebabe");
     expect(
       art,
       "symlink escaping the artifact root must be rejected",
     ).toBeNull();
+  });
+  it("does not trust persisted ownership over a conflicting marker", async () => {
+    writeFileSync(
+      join(legitDir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      "foreign-session",
+    );
+    appendInteractiveState(tmp, {
+      id: "deadbeefcafebabe",
+      paneId: "%1",
+      mux: "tmux",
+      artifactDir: legitDir,
+      sessionFile: join(tmp, "child.jsonl"),
+      parentSessionId: "current-session",
+    });
+    const tools = new Map<string, { execute: Function }>();
+    const pi = {
+      registerTool: (tool: { name: string; execute: Function }) =>
+        tools.set(tool.name, tool),
+    } as any;
+    const scope = registerSessionScope({
+      id: 740,
+      generation: 1,
+      lifecycle: "started",
+      pi,
+      sessionManager: { getSessionId: () => "current-session" },
+    });
+    registerInteractiveSubagentTools(pi, scope);
+
+    const result = await tools
+      .get("read_subagent_artifact")
+      ?.execute(
+        "read-conflict",
+        { id: "deadbeefcafebabe" },
+        undefined,
+        undefined,
+        { cwd: tmp },
+      );
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: { status: "not_found" },
+    });
+    clearSessionScopes();
   });
 });

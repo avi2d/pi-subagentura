@@ -6,12 +6,14 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import isPathInside from "is-path-inside";
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
   isArtifactOutputSettled,
+  loadInteractiveStates,
   lastEvent,
   listOutputHistory,
   listOutputTurns,
@@ -38,8 +40,18 @@ import {
 } from "../notifications";
 import { InteractiveParams } from "../schemas";
 import { updateRunningSubagentFooter } from "../artifact-poller";
+import {
+  getStartedSessionScopes,
+  resolveToolSessionScope,
+  sessionOwner,
+  type SessionScope,
+  type SessionToolToken,
+} from "../session-scope";
 
-const SUBAGENT_ID_RE = /^[a-f0-9]{8}$/;
+const SUBAGENT_ID_INVALID_CHAR_RE = /[^a-f0-9]/;
+function isValidSubagentId(id: string): boolean {
+  return id.length === 16 && !SUBAGENT_ID_INVALID_CHAR_RE.test(id);
+}
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
 const FOLLOWUP_COMPLETION_REMINDER =
@@ -51,13 +63,13 @@ function formatFollowupPreview(message: string): string {
 }
 
 export function findArtifactById(id: string): SubagentArtifact | null {
-  // Sub-agent ids are randomBytes(4).toString("hex") at spawn time, i.e. 8 hex
-  // chars. Validate the id before joining it into a path so that an
+  // Sub-agent ids are randomBytes(8).toString("hex") at spawn time, i.e. 16
+  // lowercase hex chars. Validate the id before joining it into a path so that an
   // LLM-supplied id like "../../../etc" can't escape the artifact root
   // (path.join normalises "..", so a malicious id would otherwise resolve
   // to a sibling directory and get exfiltrated to the parent LLM via
   // read_subagent_artifact).
-  if (!SUBAGENT_ID_RE.test(id)) return null;
+  if (!isValidSubagentId(id)) return null;
 
   const root =
     process.env.PI_CODING_AGENT_SESSION_DIR ??
@@ -109,7 +121,63 @@ function getArtifactForState(
   return artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 }
 
-export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
+function resolveInteractiveToolStates(token: SessionToolToken | undefined):
+  | {
+      scope?: SessionScope;
+      states: Map<string, InteractiveSubagentState>;
+    }
+  | undefined {
+  const scope = resolveToolSessionScope(token);
+  if (scope) return { scope, states: scope.interactiveStates };
+  if (!token && getStartedSessionScopes().length === 0) {
+    return { states: interactiveSubagentRegistry };
+  }
+  return undefined;
+}
+
+function findOwnedDiskArtifact(
+  cwd: string,
+  id: string,
+  scope: SessionScope | undefined,
+): SubagentArtifact | null {
+  if (!scope) return findArtifactById(id);
+  let parentSessionId: string | undefined;
+  try {
+    parentSessionId = scope.sessionManager?.getSessionId?.();
+  } catch {
+    return null;
+  }
+  if (!parentSessionId) return null;
+  const artifact = findArtifactById(id);
+  if (!artifact) return null;
+  try {
+    const persistedOwner = readFileSync(
+      join(artifact.dir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      "utf8",
+    );
+    return persistedOwner === parentSessionId ? artifact : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    // Older artifacts may still have exact evidence in the persisted state file.
+  }
+  const persisted = loadInteractiveStates(cwd)?.states[id];
+  if (!persisted || persisted.parentSessionId !== parentSessionId) return null;
+  try {
+    return realpathSync(persisted.artifactDir) === realpathSync(artifact.dir)
+      ? artifact
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function registerInteractiveSubagentTools(
+  pi: ExtensionAPI,
+  registrationScope?: SessionScope,
+): void {
+  const toolToken: SessionToolToken | undefined = registrationScope
+    ? { id: registrationScope.id }
+    : undefined;
   // ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
   pi.registerTool({
     name: "subagent_interactive",
@@ -127,6 +195,19 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     parameters: InteractiveParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const registration = resolveInteractiveToolStates(toolToken);
+      if (!registration) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "This interactive tool registration is no longer attached to a live session.",
+            },
+          ],
+          details: { status: "session_unavailable" },
+          isError: true,
+        };
+      }
       const completionMode = params.notifyOnComplete ?? "notify";
       const triggerTurn = completionTriggersTurn(
         completionMode,
@@ -173,12 +254,22 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
           thinkingLevel: params.thinkingLevel,
+          sessionScope: registration.scope,
         });
-        updateRunningSubagentFooter(ctx.ui);
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
 
         const displayMode = state.windowName
           ? "background (new window/tab)"
           : "visible split";
+        const locationLines = [`Artifact: ${state.artifactDir}`];
+        if (!(state.mux === "tmux" && process.env.TMUX)) {
+          locationLines.push(`Attach: ${state.attachCommand}`);
+        }
+        locationLines.push(`Focus: ${state.selectPaneCommand}`);
+        locationLines.push(`Session: ${state.sessionFile}`);
         return {
           content: [
             {
@@ -186,7 +277,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
               text:
                 `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
                 `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
-                `Artifact: ${state.artifactDir}\nAttach: ${state.attachCommand}\nFocus: ${state.selectPaneCommand}\nSession: ${state.sessionFile}`,
+                locationLines.join("\n"),
             },
           ],
           details: {
@@ -264,13 +355,22 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
-      pruneDeadInteractiveSubagents();
-      updateRunningSubagentFooter(ctx.ui);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const visibleStates = registration?.states;
+      if (visibleStates) {
+        pruneDeadInteractiveSubagents(visibleStates.values());
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      }
       const states = params.jobId
-        ? [interactiveSubagentRegistry.get(params.jobId)].filter(
+        ? [visibleStates?.get(params.jobId)].filter(
             (s): s is InteractiveSubagentState => Boolean(s),
           )
-        : [...interactiveSubagentRegistry.values()];
+        : visibleStates
+          ? [...visibleStates.values()]
+          : [];
 
       if (states.length === 0) {
         return {
@@ -315,7 +415,15 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
-      const state = cancelInteractiveSubagent(params.jobId);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const ownedState = registration?.states.get(params.jobId);
+      const state = ownedState
+        ? cancelInteractiveSubagent(
+            params.jobId,
+            "cancel_interactive_subagent",
+            ownedState,
+          )
+        : undefined;
       let userNotification: string;
       if (!state) {
         return {
@@ -329,7 +437,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      updateRunningSubagentFooter(ctx.ui);
+      updateRunningSubagentFooter(
+        ctx.ui,
+        registration?.scope ? sessionOwner(registration.scope) : undefined,
+      );
       const snapshotText = state.cancellationSnapshot?.path
         ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
         : state.cancellationSnapshot?.error
@@ -379,8 +490,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     description: [
       "Send a follow-up prompt to a live interactive sub-agent. The message is delivered into the",
       "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
-      "is a true follow-up turn, not a fresh spawn. The child will run the new turn and (per its",
-      "system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
+      "is a true follow-up turn, not a fresh spawn. A workflow-owned child can accept a follow-up",
+      "only after its completed turn is idle and its workflow runner has consumed the result. It is",
+      "promoted to standalone only after that follow-up is sent successfully. The child will run the",
+      "new turn and (per its system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
       "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
     ].join("\n"),
     parameters: Type.Object({
@@ -396,12 +509,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
 
     async execute(_toolCallId, params): Promise<any> {
       // Validate the id shape first for a precise error.
-      if (!SUBAGENT_ID_RE.test(params.id)) {
+      if (!isValidSubagentId(params.id)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },
@@ -441,7 +554,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      const state = interactiveSubagentRegistry.get(params.id);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const state = registration?.states.get(params.id);
       if (!state) {
         return {
           content: [
@@ -454,9 +568,24 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      // Accept both "running" (mid-turn) and "idle" (REPL open, between turns) — that's the whole
-      // point of follow-up support. Mid-turn sends are safe: tmux send-keys just queues keystrokes
-      // in the REPL input buffer, which submits when the current turn finishes.
+      if (
+        state.completionOwner === "workflow" &&
+        (!state.workflowResultConsumed || state.status !== "idle")
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Interactive sub-agent ${params.id} is still under workflow ownership; its workflow must consume the current result and the pane must be idle before a follow-up can be sent.`,
+            },
+          ],
+          details: { id: params.id, status: "workflow_owned" },
+          isError: true,
+        };
+      }
+      // Standalone panes accept follow-ups while running or idle. Workflow ownership has two
+      // independent release conditions: artifact polling folded the completion into idle, and the
+      // workflow runner acknowledged returning that result.
       if (state.status !== "running" && state.status !== "idle") {
         return {
           content: [
@@ -474,6 +603,16 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       // Wrap so the parent gets a structured error instead of an exception trace.
       try {
         sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
+        // Reaching the send proves both workflow release conditions held at the guard above.
+        // Release ownership only after sendCommandToPane succeeds so a failed send remains owned.
+        if (
+          state.completionOwner === "workflow" &&
+          state.workflowResultConsumed &&
+          state.status === "idle"
+        ) {
+          state.completionOwner = "standalone";
+          state.workflowId = undefined;
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -560,15 +699,15 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       // Validate the id shape FIRST so a malformed id gets a precise error
       // instead of being collapsed into the generic "not found" message.
-      if (!SUBAGENT_ID_RE.test(params.id)) {
+      if (!isValidSubagentId(params.id)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },
@@ -587,10 +726,15 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      const state = interactiveSubagentRegistry.get(params.id);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const state = registration?.states.get(params.id);
+      const foreignInMemoryState =
+        !state && interactiveSubagentRegistry.has(params.id);
       const art = state
         ? getArtifactForState(state)
-        : findArtifactById(params.id);
+        : registration && !foreignInMemoryState
+          ? findOwnedDiskArtifact(ctx.cwd, params.id, registration.scope)
+          : null;
       if (!art) {
         return {
           content: [
@@ -689,16 +833,23 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     name: "list_subagent_artifacts",
     label: "List Subagent Artifacts",
     description: [
-      "List all known interactive sub-agents (in this session and from past sessions whose",
-      "artifacts are still on disk). Returns id, name, status, and last-update time. Use",
-      "read_subagent_artifact to fetch a specific one.",
+      "List interactive sub-agent artifacts visible to this parent session.",
+      "Returns id, name, status, and last-update time. Use read_subagent_artifact",
+      "to fetch a specific one.",
     ].join("\n"),
     parameters: Type.Object({}),
 
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx): Promise<any> {
-      pruneDeadInteractiveSubagents();
-      updateRunningSubagentFooter(ctx.ui);
-      const states = [...interactiveSubagentRegistry.values()];
+      const registration = resolveInteractiveToolStates(toolToken);
+      const visibleStates = registration?.states;
+      if (visibleStates) {
+        pruneDeadInteractiveSubagents(visibleStates.values());
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      }
+      const states = visibleStates ? [...visibleStates.values()] : [];
       const summary = states.map((s) => {
         const art = getArtifactForState(s);
         const last = lastEvent(art);

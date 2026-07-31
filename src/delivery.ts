@@ -23,11 +23,13 @@ import {
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
 import {
-  parentSessionBelongsToOwner,
-  resolveLiveSessionContext,
-  type ActiveSessionContextToken,
-} from "./session-context";
-import { inProcessJobBelongsToOwner } from "./helpers";
+  interactiveStateBelongsToOwner,
+  ownerlessEntitiesVisible,
+  resolveLiveSessionScope,
+  resolveStreamingFlag,
+  type SessionOwnerToken,
+} from "./session-scope";
+import { inProcessJobOwner, inProcessJobsForOwner } from "./helpers";
 
 export const MAX_DELIVERY_RECORDS = 32;
 export const MAX_DELIVERY_QUEUE_BYTES = 256 * 1024;
@@ -36,18 +38,42 @@ export const MAX_FLUSH_BYTES = 64 * 1024;
 /** Maximum immutable output snapshot accepted from the artifact protocol. */
 export const MAX_ARTIFACT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_FORMATTED_IDENTIFIER = 96;
-
-function runningInProcessJobCount(owner?: ActiveSessionContextToken): number {
-  const g = globalThis as any;
-  const registry = g.__piSubagenturaRegistry;
-  if (!(registry instanceof Map)) return 0;
-  return [...registry.values()].filter((job) => {
-    const status = (job as { status?: unknown })?.status;
-    return status === "running" && inProcessJobBelongsToOwner(job, owner);
-  }).length;
+interface DeliveryGlobalState {
+  __piSubagenturaInteractiveRegistry?: Map<string, InteractiveSubagentState>;
+  __piSubagenturaSessionManager?: { getEntries?: () => unknown[] };
 }
 
-function runningInProcessJobsNote(owner?: ActiveSessionContextToken): string {
+const EMPTY_INTERACTIVE_STATES: readonly InteractiveSubagentState[] = [];
+
+function deliveryGlobals(): typeof globalThis & DeliveryGlobalState {
+  return globalThis as typeof globalThis & DeliveryGlobalState;
+}
+
+function interactiveStatesForOwner(
+  owner?: SessionOwnerToken,
+): Iterable<InteractiveSubagentState> {
+  if (owner) {
+    return (
+      resolveLiveSessionScope(owner)?.interactiveStates.values() ??
+      EMPTY_INTERACTIVE_STATES
+    );
+  }
+  if (!ownerlessEntitiesVisible()) return EMPTY_INTERACTIVE_STATES;
+  return (
+    deliveryGlobals().__piSubagenturaInteractiveRegistry?.values() ??
+    EMPTY_INTERACTIVE_STATES
+  );
+}
+
+function runningInProcessJobCount(owner?: SessionOwnerToken): number {
+  return [...inProcessJobsForOwner(owner).values()].filter(
+    (job) =>
+      job.status === "running" &&
+      (owner !== undefined || !inProcessJobOwner(job)),
+  ).length;
+}
+
+function runningInProcessJobsNote(owner?: SessionOwnerToken): string {
   const remaining = runningInProcessJobCount(owner);
   if (remaining <= 0) return "";
   const noun = remaining === 1 ? "job" : "jobs";
@@ -57,7 +83,7 @@ function runningInProcessJobsNote(owner?: ActiveSessionContextToken): string {
 
 function appendRunningJobsNote(
   content: string,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): string {
   const note = runningInProcessJobsNote(owner);
   return note ? `${content}\n${note}` : content;
@@ -298,7 +324,7 @@ function pointer(intent: PersistedDeliveryIntent): string {
 
 function formatIntent(
   intent: PersistedDeliveryIntent,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): string {
   const header = `[Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}, turn ${boundedIdentifier(intent.turnId, "unknown")}, ${intent.status}]`;
   const output = intent.mode === "inject" ? readBoundedOutput(intent) : null;
@@ -324,17 +350,17 @@ function formatIntent(
 export function flushDeliveries(
   pi: ExtensionAPI,
   ui: ExtensionUIContext | undefined,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): void {
-  const g = globalThis as any;
   reconcileAllDeliveryReceipts(owner);
   const llm: Array<{
     state: InteractiveSubagentState;
     intent: PersistedDeliveryIntent;
     content: string;
   }> = [];
-  for (const state of g.__piSubagenturaInteractiveRegistry?.values?.() ?? []) {
-    if (!parentSessionBelongsToOwner(state.parentSessionId, owner)) continue;
+  for (const state of interactiveStatesForOwner(owner)) {
+    if (!interactiveStateBelongsToOwner(state, owner)) continue;
+    if (state.completionOwner === "workflow") continue;
     for (const intent of state.pendingDeliveries ?? []) {
       if (intent.state === "dispatchAttempted") continue;
       llm.push({ state, intent, content: formatIntent(intent, owner) });
@@ -352,7 +378,7 @@ export function flushDeliveries(
     bytes += separatorBytes + itemBytes;
   }
   const triggersTurn = selected.some(({ intent }) => intent.triggerTurn);
-  if (g.__piSubagenturaParentStreaming && !triggersTurn) return;
+  if (resolveStreamingFlag(owner) && !triggersTurn) return;
   const deliveryIds = selected.map(({ intent }) => intent.deliveryId);
   try {
     pi.sendMessage(
@@ -399,23 +425,37 @@ export function flushDeliveries(
   reconcileAllDeliveryReceipts(owner);
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function deliveryIdsFromEntry(entry: unknown): unknown[] | undefined {
+  const record = objectRecord(entry);
+  if (record?.type !== "custom" && record?.type !== "custom_message") {
+    return undefined;
+  }
+  const details = objectRecord(record.details);
+  const messageDetails = objectRecord(objectRecord(record.message)?.details);
+  const ids = details?.deliveryIds ?? messageDetails?.deliveryIds;
+  return Array.isArray(ids) ? ids : undefined;
+}
+
 export function reconcileDeliveryReceipts(
   state: InteractiveSubagentState,
   entries: unknown[],
+  owner?: SessionOwnerToken,
 ): void {
   compactDeliveryReceipts(state);
   const seen = new Set<string>();
-  for (const entry of entries as any[]) {
-    if (entry?.type !== "custom" && entry?.type !== "custom_message") continue;
-    const ids =
-      entry?.details?.deliveryIds ?? entry?.message?.details?.deliveryIds;
-    if (Array.isArray(ids)) {
-      for (const id of ids) if (typeof id === "string") seen.add(id);
-    }
+  for (const entry of entries) {
+    const ids = deliveryIdsFromEntry(entry);
+    if (!ids) continue;
+    for (const id of ids) if (typeof id === "string") seen.add(id);
   }
   let changed = false;
-  const canRetryUncommittedDispatch = !(globalThis as any)
-    .__piSubagenturaParentStreaming;
+  const canRetryUncommittedDispatch = !resolveStreamingFlag(owner);
   for (const intent of state.pendingDeliveries ?? []) {
     if (seen.has(intent.deliveryId)) {
       (state.deliveryReceipts ??= []).push(intent.deliveryId);
@@ -436,16 +476,13 @@ export function reconcileDeliveryReceipts(
   persistState(state);
 }
 
-export function reconcileAllDeliveryReceipts(
-  owner?: ActiveSessionContextToken,
-): void {
-  const g = globalThis as any;
+export function reconcileAllDeliveryReceipts(owner?: SessionOwnerToken): void {
   const entries = owner
-    ? resolveLiveSessionContext(owner)?.sessionManager?.getEntries?.()
-    : g.__piSubagenturaSessionManager?.getEntries?.();
+    ? resolveLiveSessionScope(owner)?.sessionManager?.getEntries?.()
+    : deliveryGlobals().__piSubagenturaSessionManager?.getEntries?.();
   if (!Array.isArray(entries)) return;
-  for (const state of g.__piSubagenturaInteractiveRegistry?.values?.() ?? []) {
-    if (!parentSessionBelongsToOwner(state.parentSessionId, owner)) continue;
-    reconcileDeliveryReceipts(state, entries);
+  for (const state of interactiveStatesForOwner(owner)) {
+    if (!interactiveStateBelongsToOwner(state, owner)) continue;
+    reconcileDeliveryReceipts(state, entries, owner);
   }
 }

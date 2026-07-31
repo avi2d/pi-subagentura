@@ -6,7 +6,7 @@
 
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cancelAllFlows } from "./cancel-all-flows";
-import type { SessionContextRef } from "./session-context";
+import type { SessionScope } from "./session-scope";
 
 function snapshotSummary(
   result: Awaited<ReturnType<typeof cancelAllFlows>>,
@@ -23,11 +23,11 @@ function snapshotSummary(
 
 export function registerCancelAllFlows(
   pi: ExtensionAPI,
-  sessionContext?: SessionContextRef,
+  sessionScope?: SessionScope,
 ): void {
   const owner = () =>
-    sessionContext
-      ? { id: sessionContext.id, generation: sessionContext.generation }
+    sessionScope
+      ? { id: sessionScope.id, generation: sessionScope.generation }
       : undefined;
   // ── ctrl+alt+x shortcut ────────────────────────────────────────────
   if (typeof pi.registerShortcut === "function") {

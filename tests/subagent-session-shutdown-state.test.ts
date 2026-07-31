@@ -4,53 +4,96 @@
  * pane preservation on reload, defensive guard for missing ctx.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { appendInteractiveState, loadInteractiveStates } from "../src/artifact";
-import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import {
+  interactiveSubagentRegistry,
+  registerInteractiveSubagentState,
+} from "../src/interactive-tmux";
 import { importFresh } from "./test-utils";
 import { makeTmp, makeState } from "./subagent-rehydrate-helpers";
+import { clearSessionScopes, type SessionScope } from "../src/session-scope";
+
+interface SessionContext {
+  cwd?: string;
+  sessionManager?: {
+    getSessionId?: () => string;
+    getEntries?: () => unknown[];
+  };
+}
+
+type LifecycleHandler = (
+  event?: { type?: string; reason?: string },
+  ctx?: SessionContext,
+) => void;
+
+interface ExtensionFixture {
+  shutdownHandlers: LifecycleHandler[];
+  startHandlers: LifecycleHandler[];
+  scope: SessionScope;
+}
 
 describe("session_shutdown clean-slate on /new and quit", () => {
   let cwd: string;
 
   beforeEach(() => {
     cwd = makeTmp();
-    const g = globalThis as any;
-    g.__piSubagenturaInteractiveRegistry?.clear?.();
+    const g = globalThis as typeof globalThis & {
+      __piSubagenturaInteractiveRegistry?: Map<string, unknown>;
+      __piSubagenturaPiRef?: ExtensionAPI;
+    };
+    g.__piSubagenturaInteractiveRegistry?.clear();
     g.__piSubagenturaPiRef = undefined;
+    clearSessionScopes();
   });
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
     vi.doUnmock("node:child_process");
+    clearSessionScopes();
   });
 
-  async function setupExtension() {
-    const api = {
-      registerTool: vi.fn(),
-      registerMessageRenderer: vi.fn(),
-      registerFlag: vi.fn(),
-      getFlag: vi.fn().mockReturnValue(false),
-      sendMessage: vi.fn(),
-      sendUserMessage: vi.fn(),
-      on: vi.fn(),
-    };
-    const mod =
-      await importFresh<typeof import("../src/subagent")>("../src/subagent");
-    mod.default(api as any);
+  async function setupExtension(): Promise<ExtensionFixture> {
+    const api = { on: vi.fn() };
+    const mod = await importFresh<{
+      registerSessionHandlers: (pi: ExtensionAPI) => SessionScope;
+    }>("../src/session-handlers");
+    // This test double intentionally implements only lifecycle registration.
+    const scope = mod.registerSessionHandlers(api as unknown as ExtensionAPI);
 
-    const shutdownHandlers: Array<(event: any, ctx: any) => void> = [];
-    const startHandlers: Array<(event: any, ctx: any) => void> = [];
-    for (const [event, handler] of (api.on as any).mock.calls) {
+    const shutdownHandlers: LifecycleHandler[] = [];
+    const startHandlers: LifecycleHandler[] = [];
+    const registrations = api.on.mock.calls as unknown as Array<
+      [string, LifecycleHandler]
+    >;
+    for (const [event, handler] of registrations) {
       if (event === "session_shutdown") shutdownHandlers.push(handler);
       if (event === "session_start") startHandlers.push(handler);
     }
-    return { api, shutdownHandlers, startHandlers, mod };
+    return {
+      shutdownHandlers,
+      startHandlers,
+      scope,
+    };
   }
 
-  it("session_shutdown with reason='new' deletes the state file", async () => {
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
+  function startSession(
+    extension: ExtensionFixture,
+    reason = "new",
+    sessionId = "pi",
+  ) {
+    const ctx = {
+      cwd,
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    };
+    extension.startHandlers.at(-1)!({ type: "session_start", reason }, ctx);
+    expect(extension.scope.lifecycle).toBe("started");
+    return ctx;
+  }
+
+  it("deletes state on final /new shutdown without touching a live peer", async () => {
     appendInteractiveState(cwd, {
       id: "abc12345",
       paneId: "%42",
@@ -59,19 +102,52 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       sessionFile: "/tmp/sess.jsonl",
     });
     expect(loadInteractiveStates(cwd)).not.toBeNull();
-    const { shutdownHandlers } = await setupExtension();
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    heavyHandler(
+
+    const owner = await setupExtension();
+    const peer = await setupExtension();
+    const ownerCtx = startSession(owner, "new", "session-owner");
+    const peerCtx = startSession(peer, "new", "session-peer");
+    const ownerState = makeState(cwd, "owner-state");
+    ownerState.parentSessionId = "session-owner";
+    ownerState.status = "exited";
+    const peerState = makeState(cwd, "peer-state");
+    peerState.parentSessionId = "session-peer";
+    registerInteractiveSubagentState(ownerState, owner.scope);
+    registerInteractiveSubagentState(peerState, peer.scope);
+    for (const state of [ownerState, peerState]) {
+      appendInteractiveState(cwd, {
+        id: state.id,
+        paneId: state.paneId,
+        mux: "tmux",
+        artifactDir: state.artifactDir,
+        sessionFile: state.sessionFile,
+        parentSessionId: state.parentSessionId,
+      });
+    }
+
+    owner.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "new" },
-      {
-        cwd,
-      },
+      ownerCtx,
+    );
+
+    expect(loadInteractiveStates(cwd)).not.toBeNull();
+    expect(loadInteractiveStates(cwd)?.states[ownerState.id]).toBeUndefined();
+    expect(loadInteractiveStates(cwd)?.states[peerState.id]).toBeDefined();
+    expect(owner.scope.interactiveStates.size).toBe(0);
+    expect(interactiveSubagentRegistry.has(ownerState.id)).toBe(false);
+    expect(peer.scope.interactiveStates.get(peerState.id)).toBe(peerState);
+    expect(interactiveSubagentRegistry.get(peerState.id)).toBe(peerState);
+
+    peer.shutdownHandlers.at(-1)!(
+      { type: "session_shutdown", reason: "new" },
+      peerCtx,
     );
     expect(loadInteractiveStates(cwd)).toBeNull();
+    expect(peer.scope.interactiveStates.size).toBe(0);
+    expect(interactiveSubagentRegistry.has(peerState.id)).toBe(false);
   });
 
   it("session_shutdown with reason='quit' KEEPS the state file (rehydrate depends on it)", async () => {
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
     appendInteractiveState(cwd, {
       id: "abc12345",
       paneId: "%42",
@@ -80,13 +156,11 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       sessionFile: "/tmp/sess.jsonl",
     });
     expect(loadInteractiveStates(cwd)).not.toBeNull();
-    const { shutdownHandlers } = await setupExtension();
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    heavyHandler(
+    const extension = await setupExtension();
+    const ctx = startSession(extension);
+    extension.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "quit" },
-      {
-        cwd,
-      },
+      ctx,
     );
     expect(loadInteractiveStates(cwd)).not.toBeNull();
   });
@@ -94,7 +168,6 @@ describe("session_shutdown clean-slate on /new and quit", () => {
   it("rehydrates interactive subagents after quit and matching startup", async () => {
     const id = "survives-quit";
     const sessionId = "session-mine";
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
     appendInteractiveState(cwd, {
       id,
       paneId: "%42",
@@ -104,28 +177,28 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       parentSessionId: sessionId,
     });
 
-    const { shutdownHandlers } = await setupExtension();
-    const shutdownHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    shutdownHandler(
+    const firstExtension = await setupExtension();
+    const firstCtx = startSession(firstExtension, "new", sessionId);
+    const state = makeState(cwd, id);
+    state.parentSessionId = sessionId;
+    registerInteractiveSubagentState(state, firstExtension.scope);
+    firstExtension.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "quit" },
-      { cwd, sessionManager: { getSessionId: () => sessionId } },
+      firstCtx,
     );
 
+    expect(firstExtension.scope.interactiveStates.size).toBe(0);
     expect(interactiveSubagentRegistry.has(id)).toBe(false);
     expect(loadInteractiveStates(cwd)?.states[id]).toBeDefined();
 
-    const { startHandlers } = await setupExtension();
-    const startHandler = startHandlers[startHandlers.length - 1];
-    startHandler(
-      { type: "session_start", reason: "startup" },
-      { cwd, sessionManager: { getSessionId: () => sessionId } },
-    );
+    const secondExtension = await setupExtension();
+    startSession(secondExtension, "startup", sessionId);
 
+    expect(secondExtension.scope.interactiveStates.has(id)).toBe(true);
     expect(interactiveSubagentRegistry.has(id)).toBe(true);
   });
 
   it("session_shutdown with reason='reload' KEEPS the state file (rehydrate depends on it)", async () => {
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
     appendInteractiveState(cwd, {
       id: "abc12345",
       paneId: "%42",
@@ -133,19 +206,16 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       artifactDir: join(cwd, "abc12345"),
       sessionFile: "/tmp/sess.jsonl",
     });
-    const { shutdownHandlers } = await setupExtension();
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    heavyHandler(
+    const extension = await setupExtension();
+    const ctx = startSession(extension);
+    extension.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "reload" },
-      {
-        cwd,
-      },
+      ctx,
     );
     expect(loadInteractiveStates(cwd)).not.toBeNull();
   });
 
   it("session_shutdown with reason='resume' KEEPS the state file", async () => {
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
     appendInteractiveState(cwd, {
       id: "abc12345",
       paneId: "%42",
@@ -153,13 +223,11 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       artifactDir: join(cwd, "abc12345"),
       sessionFile: "/tmp/sess.jsonl",
     });
-    const { shutdownHandlers } = await setupExtension();
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    heavyHandler(
+    const extension = await setupExtension();
+    const ctx = startSession(extension);
+    extension.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "resume" },
-      {
-        cwd,
-      },
+      ctx,
     );
     expect(loadInteractiveStates(cwd)).not.toBeNull();
   });
@@ -172,20 +240,19 @@ describe("session_shutdown clean-slate on /new and quit", () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({ execFileSync }));
 
-    const { shutdownHandlers, mod } = await setupExtension();
+    const extension = await setupExtension();
+    const ctx = startSession(extension);
     const state = makeState(cwd, "abc12345");
     state.parentSessionId = "pi";
-    mod.interactiveSubagentRegistry.set(state.id, state);
+    registerInteractiveSubagentState(state, extension.scope);
 
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
-    heavyHandler(
+    extension.shutdownHandlers.at(-1)!(
       { type: "session_shutdown", reason: "reload" },
-      {
-        cwd,
-        sessionManager: { getSessionId: () => "pi" },
-      },
+      ctx,
     );
 
+    expect(extension.scope.interactiveStates.size).toBe(0);
+    expect(interactiveSubagentRegistry.has(state.id)).toBe(false);
     expect(execFileSync).not.toHaveBeenCalledWith(
       "tmux",
       expect.arrayContaining(["kill-pane"]),
@@ -194,7 +261,6 @@ describe("session_shutdown clean-slate on /new and quit", () => {
   });
 
   it("session_shutdown is a no-op for the state file when ctx.cwd is missing", async () => {
-    await importFresh<typeof import("../src/subagent")>("../src/subagent");
     appendInteractiveState(cwd, {
       id: "abc12345",
       paneId: "%42",
@@ -202,10 +268,13 @@ describe("session_shutdown clean-slate on /new and quit", () => {
       artifactDir: join(cwd, "abc12345"),
       sessionFile: "/tmp/sess.jsonl",
     });
-    const { shutdownHandlers } = await setupExtension();
-    const heavyHandler = shutdownHandlers[shutdownHandlers.length - 1];
+    const extension = await setupExtension();
+    startSession(extension);
     expect(() =>
-      heavyHandler({ type: "session_shutdown", reason: "new" }, undefined),
+      extension.shutdownHandlers.at(-1)!(
+        { type: "session_shutdown", reason: "new" },
+        undefined,
+      ),
     ).not.toThrow();
     // File is unchanged because ctx was undefined — defensive guard.
     expect(loadInteractiveStates(cwd)).not.toBeNull();

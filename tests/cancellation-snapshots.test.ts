@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   existsSync,
   mkdirSync,
@@ -10,10 +11,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { jobRegistry } from "../src/helpers";
+import {
+  jobRegistry,
+  registerInProcessJob,
+  type JobState,
+} from "../src/helpers";
 import { registerInProcessSubagentTools } from "../src/tools/in-process";
 import { cancelAllFlows } from "../src/cancel-all-flows";
 import { registerSessionHandlers } from "../src/session-handlers";
+import { clearSessionScopes, sessionOwner } from "../src/session-scope";
 import { registerWorkflowTool } from "../src/workflow-tool";
 import { startWorkflowJob, workflowJobRegistry } from "../src/workflow-jobs";
 import {
@@ -116,6 +122,7 @@ function setSnapshotEnv(dir: string, maxBytes?: number): void {
 beforeEach(() => {
   jobRegistry.clear();
   workflowJobRegistry.clear();
+  clearSessionScopes();
 });
 
 afterEach(() => {
@@ -440,30 +447,84 @@ describe("cancellation snapshots", () => {
     expect(concurrentResult.details.snapshots).toContainEqual(receipt);
   });
 
-  it("snapshots in-process jobs before session shutdown aborts them", async () => {
+  it("snapshots only the owning scope's jobs before aborting them", async () => {
     const root = mkdtempSync(join(tmpdir(), "cancel-snapshot-shutdown-"));
     setSnapshotEnv(root);
-    const handlers: Record<string, Array<(...args: any[]) => any>> = {};
-    registerSessionHandlers({
-      on: (event: string, handler: (...args: any[]) => any) => {
-        (handlers[event] ??= []).push(handler);
+    type LifecycleHandler = (...args: unknown[]) => unknown;
+    const handlers: Record<string, LifecycleHandler[]> = {};
+    const peerHandlers: Record<string, LifecycleHandler[]> = {};
+    const captureHandlers = (
+      target: Record<string, LifecycleHandler[]>,
+    ): ExtensionAPI =>
+      ({
+        on: (event: string, handler: LifecycleHandler) => {
+          (target[event] ??= []).push(handler);
+        },
+      }) as unknown as ExtensionAPI;
+    const scope = registerSessionHandlers(captureHandlers(handlers));
+    const peerScope = registerSessionHandlers(captureHandlers(peerHandlers));
+    const sessionManager = { getSessionId: () => "owner-session" };
+    handlers.session_start.at(-1)!(
+      { reason: "startup" },
+      { cwd: root, sessionManager },
+    );
+    peerHandlers.session_start.at(-1)!(
+      { reason: "startup" },
+      {
+        cwd: root,
+        sessionManager: { getSessionId: () => "peer-session" },
       },
-    } as any);
+    );
+
     const input = inProcessInput();
     const abort = vi.fn(() => {
       expect(allFiles(root).length).toBeGreaterThan(0);
     });
-    jobRegistry.set("job-shutdown", {
+    const peerAbort = vi.fn();
+    const owner = sessionOwner(scope);
+    const peerOwner = sessionOwner(peerScope);
+    // The fixture supplies the fields exercised by scoped shutdown cleanup.
+    const job = {
       id: "job-shutdown",
       status: "running",
       session: { ...input.session, abort },
       liveStatus: { output: input.partialOutput, activeTool: input.activeTool },
       cwd: input.cwd,
       modelLabel: input.model,
-    } as any);
+      deliveryOwner: {
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
+      },
+    } as unknown as JobState;
+    const peerJob = {
+      ...job,
+      id: "job-peer",
+      session: { ...input.session, abort: peerAbort },
+      deliveryOwner: {
+        sessionScopeId: peerOwner.id,
+        sessionScopeGeneration: peerOwner.generation,
+      },
+    } as unknown as JobState;
+    expect(registerInProcessJob(job, owner)).toBe(true);
+    expect(registerInProcessJob(peerJob, peerOwner)).toBe(true);
+
     const shutdown = handlers.session_shutdown.at(-1)!;
-    await shutdown({ reason: "new" }, { cwd: root, sessionManager: {} });
+    await shutdown({ reason: "new" }, { cwd: root, sessionManager });
+
     expect(abort).toHaveBeenCalledOnce();
-    expect(jobRegistry.size).toBe(0);
+    expect(job.cancellationSnapshot?.status).toBe("written");
+    expect(scope.inProcessJobs.size).toBe(0);
+    expect(jobRegistry.has(job.id)).toBe(false);
+    expect(peerAbort).not.toHaveBeenCalled();
+    expect(peerScope.inProcessJobs.get(peerJob.id)).toBe(peerJob);
+    expect(jobRegistry.get(peerJob.id)).toBe(peerJob);
+
+    await peerHandlers.session_shutdown.at(-1)!(
+      { reason: "quit" },
+      {
+        cwd: root,
+        sessionManager: { getSessionId: () => "peer-session" },
+      },
+    );
   });
 });

@@ -7,10 +7,17 @@
  *   - returns a structured error if tmux itself rejects the send-keys call
  *
  * The tool uses `sendCommandToPane` (which shells out to `tmux send-keys`)
- * and `interactiveSubagentRegistry` — both are mocked here so the test stays
- * hermetic and doesn't require a live tmux server.
+ * and the registration-captured SessionScope state map — both stay hermetic
+ * here, so the test doesn't require a live tmux server.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { InteractiveSubagentState } from "../src/interactive-tmux";
+import {
+  clearSessionScopes,
+  getSessionScopes,
+  sessionOwner,
+  type SessionScope,
+} from "../src/session-scope";
 
 const { mockSendCommandToPane, mockGet } = vi.hoisted(() => ({
   mockSendCommandToPane: vi.fn(),
@@ -26,7 +33,7 @@ vi.mock("../src/interactive-tmux", async (importOriginal) => {
     sendCommandToPane: mockSendCommandToPane,
     interactiveSubagentRegistry: {
       get: mockGet,
-    } as any,
+    } as unknown as Map<string, InteractiveSubagentState>,
   };
 });
 
@@ -42,25 +49,51 @@ function setupExtension() {
     sendUserMessage: vi.fn(),
     on: vi.fn(),
   };
-  registerExtension(api as any);
-  return api;
+  // The stub implements only the ExtensionAPI methods registration exercises.
+  const extensionApi = api as unknown as Parameters<
+    typeof registerExtension
+  >[0];
+  registerExtension(extensionApi);
+  const sessionScope = getSessionScopes().find(
+    (scope) => scope.pi === extensionApi,
+  );
+  if (!sessionScope)
+    throw new Error("extension did not register a session scope");
+  sessionScope.lifecycle = "started";
+  sessionScope.sessionManager = {
+    getSessionId: () => "send-message-parent-session",
+  };
+  return Object.assign(api, { sessionScope });
 }
 
 function getToolDef(
   api: { registerTool: ReturnType<typeof vi.fn> },
   name: string,
 ) {
-  return api.registerTool.mock.calls.find(([t]: any[]) => t.name === name)?.[0];
+  return api.registerTool.mock.calls.find(([tool]) => tool.name === name)?.[0];
 }
 
-function runningState(overrides: Record<string, any> = {}) {
+function runningState(
+  overrides: Partial<InteractiveSubagentState> = {},
+): InteractiveSubagentState {
   return {
-    id: "abc12345",
+    id: "abc12345def67890",
     name: "Test",
     paneId: "%99",
     status: "running",
     ...overrides,
-  };
+  } as InteractiveSubagentState;
+}
+function registerState(
+  scope: SessionScope,
+  overrides: Partial<InteractiveSubagentState> = {},
+): InteractiveSubagentState {
+  const value = runningState({
+    sessionOwner: sessionOwner(scope),
+    ...overrides,
+  });
+  scope.interactiveStates.set(value.id, value);
+  return value;
 }
 
 describe("send_interactive_subagent_message", () => {
@@ -68,11 +101,12 @@ describe("send_interactive_subagent_message", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    api = setupExtension() as any;
+    api = setupExtension();
   });
 
   afterEach(() => {
     vi.clearAllMocks();
+    clearSessionScopes();
   });
 
   it("is registered with the expected name", () => {
@@ -81,41 +115,41 @@ describe("send_interactive_subagent_message", () => {
   });
 
   it("sends the message to the pane and returns success details", async () => {
-    mockGet.mockReturnValue(runningState());
+    registerState(api.sessionScope);
     mockSendCommandToPane.mockReturnValue(undefined);
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-1", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "now do step 2",
     });
 
-    expect(mockGet).toHaveBeenCalledWith("abc12345");
+    expect(mockGet).not.toHaveBeenCalled();
     expect(mockSendCommandToPane).toHaveBeenCalledWith(
       expect.objectContaining({ paneId: "%99" }),
       expect.stringMatching(/^now do step 2 \[MANDATORY COMPLETION PROTOCOL/),
     );
     expect(result.isError).toBeFalsy();
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       paneId: "%99",
       messageLength: "now do step 2".length,
       status: "sent",
     });
     expect(result.content[0].text).toContain(
-      "Sent follow-up to interactive sub-agent abc12345",
+      "Sent follow-up to interactive sub-agent abc12345def67890",
     );
     expect(result.content[0].text).toContain("pane %99");
     expect(result.content[0].text).toContain("Message sent:\nnow do step 2");
   });
 
   it("appends the mandatory done reminder to every follow-up turn", async () => {
-    mockGet.mockReturnValue(runningState({ status: "idle" }));
+    registerState(api.sessionScope, { status: "idle" });
     mockSendCommandToPane.mockReturnValue(undefined);
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     await toolDef.execute("call-reminder", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "inspect the second case",
     });
 
@@ -128,12 +162,12 @@ describe("send_interactive_subagent_message", () => {
   });
 
   it("shows the sent message and trims an oversized preview", async () => {
-    mockGet.mockReturnValue(runningState());
+    registerState(api.sessionScope);
     mockSendCommandToPane.mockReturnValue(undefined);
     const message = "a".repeat(600);
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-long", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -151,12 +185,12 @@ describe("send_interactive_subagent_message", () => {
   it("accepts 'idle' sub-agents (the follow-up case — child between turns, REPL open)", async () => {
     // 'idle' is the whole point of the follow-up flow: the child finished a turn, REPL is still
     // open, status='idle' (not 'exited'). The tool must accept sends in this state.
-    mockGet.mockReturnValue(runningState({ status: "idle" }));
+    registerState(api.sessionScope, { status: "idle" });
     mockSendCommandToPane.mockReturnValue(undefined);
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-1b", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "follow-up after turn 1",
     });
 
@@ -170,17 +204,93 @@ describe("send_interactive_subagent_message", () => {
     expect(result.details.status).toBe("sent");
   });
 
-  it("rejects malformed ids with a precise error", async () => {
+  it("promotes an idle workflow-owned sub-agent after sending a follow-up", async () => {
+    const state = registerState(api.sessionScope, {
+      status: "idle",
+      completionOwner: "workflow",
+      workflowId: "wf-retained",
+      workflowResultConsumed: true,
+    });
+    mockSendCommandToPane.mockImplementation(() => {
+      expect(state.completionOwner).toBe("workflow");
+      expect(state.workflowId).toBe("wf-retained");
+    });
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-promote", {
+      id: "abc12345def67890",
+      message: "continue independently",
+    });
+
+    expect(mockSendCommandToPane).toHaveBeenCalledOnce();
+    expect(result.isError).toBeFalsy();
+    expect(result.details.status).toBe("sent");
+    expect(state.completionOwner).toBe("standalone");
+    expect(state.workflowId).toBeUndefined();
+  });
+
+  it("rejects an idle workflow-owned sub-agent before its result is consumed", async () => {
+    const state = registerState(api.sessionScope, {
+      status: "idle",
+      completionOwner: "workflow",
+      workflowId: "wf-unconsumed",
+    });
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-unconsumed", {
+      id: "abc12345def67890",
+      message: "continue before workflow consumption",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      id: "abc12345def67890",
+      status: "workflow_owned",
+    });
+    expect(mockSendCommandToPane).not.toHaveBeenCalled();
+    expect(state.completionOwner).toBe("workflow");
+    expect(state.workflowId).toBe("wf-unconsumed");
+  });
+
+  it("rejects follow-ups while a workflow-owned sub-agent is running", async () => {
+    const state = registerState(api.sessionScope, {
+      completionOwner: "workflow",
+      workflowId: "wf-active",
+    });
+
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+    const result = await toolDef.execute("call-workflow-owned", {
+      id: "abc12345def67890",
+      message: "queue another task",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      id: "abc12345def67890",
+      status: "workflow_owned",
+    });
+    expect(mockSendCommandToPane).not.toHaveBeenCalled();
+    expect(state.completionOwner).toBe("workflow");
+    expect(state.workflowId).toBe("wf-active");
+  });
+
+  it.each([
+    "not-hex",
+    "deadbeefcafebabe\n",
+    "deadbeefcafebabe\r\n",
+    "deadbeefcafebabe\u2028",
+    "deadbeefcafebabe\u2029",
+  ])("rejects malformed id %j with a precise error", async (id) => {
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-2", {
-      id: "not-hex",
+      id,
       message: "hi",
     });
 
     expect(mockGet).not.toHaveBeenCalled();
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
-    expect(result.details.status).toBe("invalid_id");
+    expect(result.details).toMatchObject({ id, status: "invalid_id" });
     expect(result.content[0].text).toMatch(/Invalid sub-agent id/);
   });
 
@@ -191,7 +301,7 @@ describe("send_interactive_subagent_message", () => {
       // reject it before any registry / tmux work happens.
       const toolDef = getToolDef(api, "send_interactive_subagent_message");
       const result = await toolDef.execute("call-empty", {
-        id: "abc12345",
+        id: "abc12345def67890",
         message,
       });
 
@@ -210,7 +320,7 @@ describe("send_interactive_subagent_message", () => {
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const message = "x".repeat(64 * 1024 + 1);
     const result = await toolDef.execute("call-huge", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -218,7 +328,7 @@ describe("send_interactive_subagent_message", () => {
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       status: "message_too_large",
       messageLength: 64 * 1024 + 1,
       maxBytes: 64 * 1024,
@@ -229,13 +339,13 @@ describe("send_interactive_subagent_message", () => {
 
   it("accepts a message exactly at the 64 KiB boundary", async () => {
     // Boundary check: 64 KiB is allowed, 64 KiB + 1 is not.
-    mockGet.mockReturnValue(runningState());
+    registerState(api.sessionScope);
     mockSendCommandToPane.mockReturnValue(undefined);
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const message = "x".repeat(64 * 1024);
     const result = await toolDef.execute("call-boundary", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message,
     });
 
@@ -246,15 +356,15 @@ describe("send_interactive_subagent_message", () => {
     expect(result.details.status).toBe("sent");
     expect(result.details.messageLength).toBe(64 * 1024);
   });
-  it("rejects unknown sub-agent ids", async () => {
-    mockGet.mockReturnValue(undefined);
-
+  it("rejects ids found only in the aggregate compatibility registry", async () => {
+    mockGet.mockReturnValue(runningState({ id: "deadbeefcafebabe" }));
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-3", {
-      id: "deadbeef",
+      id: "deadbeefcafebabe",
       message: "hi",
     });
 
+    expect(mockGet).not.toHaveBeenCalled();
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
     expect(result.details.status).toBe("not_found");
@@ -263,11 +373,11 @@ describe("send_interactive_subagent_message", () => {
   it.each(["cancelled", "exited", "unknown"] as const)(
     "refuses to send when the sub-agent status is %s",
     async (status) => {
-      mockGet.mockReturnValue(runningState({ status }));
+      registerState(api.sessionScope, { status });
 
       const toolDef = getToolDef(api, "send_interactive_subagent_message");
       const result = await toolDef.execute("call-4", {
-        id: "abc12345",
+        id: "abc12345def67890",
         message: "hi",
       });
 
@@ -279,20 +389,20 @@ describe("send_interactive_subagent_message", () => {
   );
 
   it("returns a structured error when tmux send-keys throws (pane gone between check and send)", async () => {
-    mockGet.mockReturnValue(runningState());
+    registerState(api.sessionScope);
     mockSendCommandToPane.mockImplementation(() => {
       throw new Error("can't find pane: %99");
     });
 
     const toolDef = getToolDef(api, "send_interactive_subagent_message");
     const result = await toolDef.execute("call-5", {
-      id: "abc12345",
+      id: "abc12345def67890",
       message: "hi",
     });
 
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({
-      id: "abc12345",
+      id: "abc12345def67890",
       paneId: "%99",
       status: "send_failed",
     });

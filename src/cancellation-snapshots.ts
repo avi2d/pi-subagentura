@@ -28,6 +28,7 @@ export type CancellationSnapshotSource =
   | "cancel_subagent"
   | "cancel_all"
   | "workflow"
+  | "supervisor"
   | "cancel_interactive_subagent"
   | "session_shutdown";
 export type CancellationSnapshotStatus =

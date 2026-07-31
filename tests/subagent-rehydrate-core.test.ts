@@ -27,7 +27,7 @@ describe("rehydrateInteractiveSubagents", () => {
     vi.doMock("../src/multiplexer", () => ({
       getMux: () => ({
         name: "tmux",
-        isPaneAlive: () => false,
+        getPaneLiveness: () => "dead",
         buildAttachCommands: (state: { windowName?: string }) => ({
           attachCommand: `tmux attach -t ${state.windowName ?? "session"}`,
           focusCommand: `tmux select-window -t ${state.windowName ?? "session"}`,

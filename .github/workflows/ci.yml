@@ -14,6 +14,10 @@ jobs:
   test:
     name: Test (Pi ${{ matrix.pi-version }})
     runs-on: ubuntu-latest
+    # Per-test bounds exist, but nothing the runner enforces bounds vitest worker
+    # shutdown or a wedged tmux server; without this a hang burns the 360 min
+    # default across both matrix legs on every push and pull_request.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +59,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux
 
+      # zellij is not in apt, so pull the prebuilt musl binary from the release
+      # the backend is verified against. Without a real zellij on PATH the whole
+      # zellij suite is mocked, which is exactly how a `dump-screen` argv that
+      # zellij rejects outright shipped with CI green.
+      - name: Install zellij
+        env:
+          ZELLIJ_VERSION: v0.44.3
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zellij.tar.gz \
+            "https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz"
+          sudo tar -xzf /tmp/zellij.tar.gz -C /usr/local/bin zellij
+          sudo chmod +x /usr/local/bin/zellij
+          zellij --version
+
       - name: Type check
         run: npm run typecheck
       - name: Run unit tests
@@ -67,6 +86,34 @@ jobs:
         env:
           PI_SUBAGENTURA_TMUX_SOCKET: pi-subagentura-ci-${{ github.run_id }}-${{ github.run_attempt }}
           TERM: xterm-256color
+
+      - name: Run zellij integration tests
+        run: npm run test:zellij
+        env:
+          TERM: xterm-256color
+
+      # Decision (was deferred): the terminal E2E suite runs on every push, pull
+      # request and the nightly cron, but only on the PINNED SDK leg. It asserts
+      # on Pi's TUI paint ("Async Subagents", "Model: subagentura-e2e/mock",
+      # 'Workflow "e2e-workflow" complete'), so on the floating `latest` leg any
+      # cosmetic upstream change would turn master red with no local change and
+      # read as a flake. Unit/integration coverage stays strict on both legs.
+      - name: Run terminal visual E2E tests
+        if: matrix.pi-version == '0.80.6'
+        timeout-minutes: 8
+        env:
+          # The harness builds a replacement environment and picks its own
+          # per-harness tmux socket (pid + random), so only the diagnostics
+          # destination is worth setting here. Diagnostics are written on failure.
+          SUBAGENTURA_E2E_DIAGNOSTICS: ${{ runner.temp }}/subagentura-e2e
+        run: npm run test:tui
+      - name: Upload terminal E2E diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: terminal-e2e-${{ matrix.pi-version }}
+          path: ${{ runner.temp }}/subagentura-e2e
+          if-no-files-found: ignore
 
       - name: Format check
         run: npm run format:check

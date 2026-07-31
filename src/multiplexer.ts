@@ -23,13 +23,92 @@
  *   4. Throw with a setup hint pointing at both backends.
  */
 
-import { execFileSync, type ExecSyncOptions } from "node:child_process";
+import { execFileSync, spawn, type ExecSyncOptions } from "node:child_process";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 import { ZellijMultiplexer } from "./multiplexer-zellij";
 import { assertNever } from "./artifact";
 
 /** Names of the supported multiplexer backends. Kept narrow on purpose. */
 export type MuxName = "tmux" | "zellij";
+/** Result of a backend pane-listing liveness probe. */
+export type PaneLiveness = "alive" | "dead" | "unknown";
+
+/** Backend-neutral structured reference to a durable mux pane. */
+export interface PaneRef {
+  readonly paneId: string;
+  readonly windowName?: string;
+  readonly session?: string;
+}
+
+/**
+ * Optional transport features supported by a multiplexer backend.
+ *
+ * `structuredFocus` — `focusPane(ref)` can reach the referenced pane from a
+ *   `PaneRef` alone, without asking the user to paste a command.
+ * `boundedCapture` — `capturePane(ref, opts)` returns the pane's text, bounded
+ *   by `maxLines`/`maxBytes`.
+ * `nativeOverlay` — `showNativeViewer(title, content)` has a backend-native
+ *   surface to render into. Note this describes the BACKEND, not the current
+ *   process: both backends additionally require the parent process to be inside
+ *   a session and return `false` from `showNativeViewer` when it is not.
+ */
+export interface MultiplexerCapabilities {
+  readonly structuredFocus: boolean;
+  readonly boundedCapture: boolean;
+  readonly nativeOverlay: boolean;
+}
+
+/**
+ * Verified capability matrix, keyed by backend name.
+ *
+ * Single source of truth: both backends expose the matching entry as their
+ * `capabilities` field, and UI code that wants to gate an action can read the
+ * entry directly from a `MuxName` (e.g. `InteractiveSubagentState.mux`) without
+ * resolving a backend instance or paying an availability probe.
+ *
+ * Every flag below is asserted against the real `tmux` / `zellij` binaries in
+ * `tests/tmux.integration.test.ts` and `tests/zellij.integration.test.ts` —
+ * flipping one to `true` without a passing real-binary assertion is how the
+ * broken zellij `dump-screen` argv shipped green.
+ */
+export const MUX_CAPABILITIES: Readonly<
+  Record<MuxName, MultiplexerCapabilities>
+> = {
+  tmux: {
+    // `select-window -t <pane_id>`: pane ids are server-global.
+    structuredFocus: true,
+    // `capture-pane -p -S -<lines>` reaches scrollback.
+    boundedCapture: true,
+    // `display-popup -E`.
+    nativeOverlay: true,
+  },
+  zellij: {
+    // `action focus-pane-id` / `action go-to-tab-name`, both `--session` scoped.
+    structuredFocus: true,
+    // `action dump-screen --full`. Verified against zellij 0.44.3 — this was
+    // `false` in practice until the bogus `/dev/stdout` positional was dropped.
+    boundedCapture: true,
+    // `action new-pane --floating`.
+    nativeOverlay: true,
+  },
+} as const;
+
+/** Read the verified capability set for a backend name. */
+export function muxCapabilities(name: MuxName): MultiplexerCapabilities {
+  return MUX_CAPABILITIES[name];
+}
+
+/** Bounds applied by backend-neutral pane capture. */
+export interface CapturePaneOptions {
+  readonly maxBytes: number;
+  readonly maxLines: number;
+}
+
+/** Result of a bounded pane capture operation. */
+export interface CapturePaneResult {
+  readonly output: string;
+  readonly truncated: boolean;
+}
 
 /**
  * Per-spawn state about how a child pane was created. The state is set on
@@ -39,6 +118,7 @@ export type MuxName = "tmux" | "zellij";
  */
 export interface Multiplexer {
   readonly name: MuxName;
+  readonly capabilities: MultiplexerCapabilities;
 
   /**
    * True iff this backend's binary is on PATH AND a server is currently
@@ -71,7 +151,7 @@ export interface Multiplexer {
    *                           and generate their own (zellij requires unique
    *                           tab names per session).
    * @returns paneId           String id usable in subsequent `sendKeys` /
-   *                           `isPaneAlive` / `killPane` calls. The string
+   *                           `getPaneLiveness` / `killPane` calls. The string
    *                           format is backend-specific (tmux uses `%N`,
    *                           zellij uses `terminal_N` or just an integer
    *                           stringified).
@@ -80,6 +160,8 @@ export interface Multiplexer {
    *                           for background mode, undefined for visible
    *                           split mode (the pane lives in the same window
    *                           as the parent).
+   * @returns session          The actual session containing the created pane,
+   *                           used to scope later attachment probes.
    */
   createPane(opts: {
     name: string;
@@ -92,22 +174,19 @@ export interface Multiplexer {
   }): { paneId: string; windowName?: string; session?: string };
 
   /**
-   * Probe whether the pane is still alive (the backend still knows about
-   * it). MUST NOT throw — return false on any failure (dead pane, backend
-   * down, pane id malformed). Used by the artifact poller on every tick.
+   * Probe whether the pane is still known to the backend.
+   *
+   * A successful pane listing returns `alive` when the pane is present and
+   * `dead` when it is absent. Command, setup, timeout, and parse failures return
+   * `unknown`; callers must not mistake an unavailable backend for a dead pane.
    *
    * @param session  The session returned by `createPane`. zellij needs it to
-   *                 target the right server; tmux ignores it (pane ids are
-   *                 server-global).
+   *                 target the right server; tmux pane ids are server-global.
    */
-  isPaneAlive(paneId: string, session?: string): boolean;
+  getPaneLiveness(paneId: string, session?: string): PaneLiveness;
 
-  /**
-   * Asynchronously probe pane liveness without blocking the parent event loop.
-   * Used by the recurring artifact poller; implementations must resolve false
-   * on backend errors rather than throwing.
-   */
-  isPaneAliveAsync(paneId: string, session?: string): Promise<boolean>;
+  /** Asynchronously perform the same tri-state pane-listing probe. */
+  getPaneLivenessAsync(paneId: string, session?: string): Promise<PaneLiveness>;
 
   /**
    * Send literal text to the pane's shell input buffer, character-by-character.
@@ -140,6 +219,25 @@ export interface Multiplexer {
    *                 tmux ignores it).
    */
   killPane(paneId: string, session?: string): void;
+
+  /** Focus the referenced pane or its containing window/tab. */
+  focusPane(ref: PaneRef): Promise<void>;
+
+  /** Capture bounded pane output without blocking the parent event loop. */
+  capturePane(
+    ref: PaneRef,
+    opts: CapturePaneOptions,
+  ): Promise<CapturePaneResult>;
+
+  /** Show bounded supervisor content in an optional backend-native surface. */
+  showNativeViewer(title: string, content: string): Promise<boolean>;
+
+  /**
+   * Whether at least one client is currently attached to the session hosting
+   * this backend's panes. `undefined` = cannot determine.
+   * MUST NOT throw; resolve undefined on backend errors.
+   */
+  hasAttachedClientAsync?(session?: string): Promise<boolean | undefined>;
 
   /**
    * Build the user-facing commands to attach to (or focus) the child's pane.
@@ -268,10 +366,14 @@ export function __resetMuxInstances(): void {
  * Test whether a binary is on PATH. Used by both backends' `isAvailable`.
  * Cheap (one sh -c exec); safe to call repeatedly. The 5s timeout guards
  * against a hung PATH (e.g., NFS hang) blocking the agent's startup probe.
+ *
+ * Deliberately NOT a login shell (`-lc`): sourcing the user's profile on every
+ * availability probe is slow, has side effects, and can even change the PATH
+ * the probe reports relative to the PATH we actually spawn children with.
  */
 export function commandExists(command: string): boolean {
   try {
-    execFileSync("/bin/sh", ["-lc", `command -v ${shellEscape(command)}`], {
+    execFileSync("/bin/sh", ["-c", `command -v ${shellEscape(command)}`], {
       stdio: "ignore",
       timeout: 5000,
     });
@@ -279,6 +381,120 @@ export function commandExists(command: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Sanitize a free-form name into a safe window/tab/session segment.
+ *
+ * Shared by both backends AND by the orchestrator in `interactive-tmux.ts`,
+ * which reuses it for the artifact/session path segments, so a sub-agent's
+ * display name maps to exactly one segment everywhere — a second, drifting copy
+ * of this logic is how a window name and its artifact directory came apart.
+ * `.` is excluded on purpose: tmux target syntax reads
+ * `window.pane`, so a window literally named `review.v2` can be created but
+ * never selected again — `tmux select-window -t review.v2` fails with
+ * `can't find pane: v2`, permanently breaking focus and the copy-paste attach
+ * strings for that sub-agent. Agent names are model/task-derived, so dots are
+ * not hypothetical.
+ */
+export function safeSegment(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"
+  );
+}
+
+/** Maximum length of a native-viewer overlay title. */
+export const MAX_VIEWER_TITLE_LENGTH = 120;
+
+/**
+ * Sanitize an untrusted sub-agent name for use as a native-overlay title.
+ *
+ * The sub-agent name is attacker-reachable: it is unvalidated in the tool
+ * schema and defaults to text lifted from the task prompt, so a prompt
+ * injection can choose it. It then lands in `tmux display-popup -T <title>` —
+ * and a popup title is a tmux FORMAT, not a string. Formats run shell commands
+ * via `#(...)` jobs, so `#(curl … | sh)` as a title is remote code execution
+ * the moment a human opens the native viewer for that row. `shellEscape` does
+ * not help: tmux evaluates the format itself, after argv parsing.
+ *
+ * Therefore:
+ *   - `#` is removed — it is the only format introducer (`#(cmd)` executes,
+ *     `#{...}` expands), so removing it neutralizes both.
+ *   - control characters (CR/LF/ESC/BEL/NUL) are collapsed to spaces so a
+ *     title cannot forge line boundaries or drive the parent's terminal.
+ *   - leading `-` is removed: zellij's clap-based CLI parses `--name -rf` as a
+ *     flag and rejects the whole command (`Found argument '-r' …`).
+ */
+export function sanitizeViewerTitle(title: string): string {
+  const cleaned = title
+    .replace(/#/g, "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^-+/, "")
+    .trim();
+  return (cleaned || "subagent").slice(0, MAX_VIEWER_TITLE_LENGTH);
+}
+
+/**
+ * Grace window used to tell "the overlay is up" apart from "the backend
+ * rejected our argv". Short enough to be imperceptible when a human presses
+ * `n` in the overlay, long enough for a clap/tmux usage error to surface.
+ */
+export const NATIVE_VIEWER_SPAWN_GRACE_MS = 250;
+
+/**
+ * Spawn a native overlay without blocking the caller for the overlay's
+ * lifetime.
+ *
+ * `tmux display-popup -E` keeps the invoking client alive until the popup
+ * closes, so running it through `execFileSync` froze the entire pi process —
+ * no input, no rendering, no poller tick — until a human pressed Enter or the
+ * exec timeout SIGTERM'd the client out from under the popup and we then
+ * reported failure for an overlay that had demonstrably appeared.
+ *
+ * Instead: spawn asynchronously with no timeout, and resolve `true` once the
+ * child has survived `graceMs` (i.e. the overlay is up and waiting for the
+ * user). A backend that rejects the request — `no current client`, a clap
+ * usage error, a missing binary — exits non-zero well inside the grace window,
+ * so genuine failures still resolve `false`.
+ */
+export function spawnNativeViewer(
+  cmd: string,
+  args: readonly string[],
+  graceMs: number = NATIVE_VIEWER_SPAWN_GRACE_MS,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    try {
+      // Detachment and ignored stdio are both established before `unref`.
+      // Otherwise the long-lived popup can retain the Pi process through its
+      // child handle or inherited pipes even after this promise has resolved.
+      const child = spawn(cmd, [...args], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.once("error", () => settle(false));
+      child.once("exit", () => settle(false));
+      child.unref();
+      // Surviving the complete startup window is the success signal.
+      timer = setTimeout(() => settle(true), graceMs);
+      timer.unref();
+    } catch {
+      settle(false);
+    }
+  });
 }
 
 /** POSIX-style single-quote escape. Safe for paths, names, and command args. */
@@ -337,4 +553,39 @@ export function execMuxOrThrow(
       cause: err,
     });
   }
+}
+
+/** Upper bound for tmux's `execFile` pane-capture buffer. */
+export const MAX_CAPTURE_READ_BYTES = 1024 * 1024;
+
+/**
+ * Apply line and byte bounds to captured pane output.
+ *
+ * When the byte cut lands mid UTF-8 sequence, the start offset advances past
+ * continuation bytes so the decoded preview never begins with U+FFFD.
+ */
+export function boundCaptureOutput(
+  output: string,
+  opts: CapturePaneOptions,
+): CapturePaneResult {
+  const maxLines = Math.max(0, Math.floor(opts.maxLines));
+  const maxBytes = Math.max(0, Math.floor(opts.maxBytes));
+  let truncated = false;
+  let bounded = output;
+  const lines = bounded.split("\n");
+  if (maxLines > 0 && lines.length > maxLines) {
+    bounded = lines.slice(-maxLines).join("\n");
+    truncated = true;
+  } else if (maxLines === 0 && bounded.length > 0) {
+    bounded = "";
+    truncated = true;
+  }
+  const buf = Buffer.from(bounded, "utf8");
+  if (buf.length > maxBytes) {
+    let start = buf.length - maxBytes;
+    while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++;
+    bounded = buf.subarray(start).toString("utf8");
+    truncated = true;
+  }
+  return { output: bounded, truncated };
 }

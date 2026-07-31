@@ -226,24 +226,45 @@ export function renderSubagentNotify(
   return new Text(line, 0, 0);
 }
 
-/** Format a single TUI widget row for a live sub-agent. */
-export function formatActivityRow(state: InteractiveSubagentState): string {
+/**
+ * Coarse bucket for widget elapsed clocks.
+ *
+ * The poller memoizes `setStatus`/`setWidget` so an identical row never
+ * repaints. Quantizing elapsed time to this bucket keeps the row byte-identical
+ * across the polls that fall inside one bucket, so the clock is visible again
+ * without reintroducing a repaint on every 5s tick.
+ */
+export const ACTIVITY_ELAPSED_BUCKET_MS = 10_000;
+
+/** Quantize an elapsed duration down to the coarse widget bucket. */
+export function coarseElapsedMs(milliseconds: number): number {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return 0;
+  return (
+    Math.floor(milliseconds / ACTIVITY_ELAPSED_BUCKET_MS) *
+    ACTIVITY_ELAPSED_BUCKET_MS
+  );
+}
+
+/** Format a widget row with a coarse elapsed clock (see the bucket above). */
+export function formatActivityRow(
+  state: InteractiveSubagentState,
+  now: number = Date.now(),
+): string {
   if (state.status === "idle") {
     return `○ ${state.name}: idle — ready for follow-up`;
   }
-  const ago = state.lastActivityAt
-    ? ` (${agoStr(Date.now() - state.lastActivityAt)})`
-    : "";
   const summary = state.lastToolSummary ?? "starting…";
+  const ago = state.lastActivityAt
+    ? ` (${agoStr(coarseElapsedMs(now - state.lastActivityAt))})`
+    : "";
   return `▶ ${state.name}: ${summary}${ago}`;
 }
 
-function agoStr(ms: number): string {
-  if (ms < 0) ms = 0;
-  if (ms < 1000) return "just now";
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  return `${Math.floor(m / 60)}h ago`;
+function agoStr(milliseconds: number): string {
+  if (milliseconds < ACTIVITY_ELAPSED_BUCKET_MS) return "just now";
+  const seconds = Math.floor(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
 }

@@ -105,23 +105,16 @@ describe("no parent-side timeout completion synthesis", () => {
   let root: string;
 
   beforeEach(() => {
-    // Mock child_process so isTmuxPaneAlive returns true for the synthetic %99 pane used in
-    // makeState. Without this, CI environments without a real %99 pane would make the poller
-    // mark state as "unknown" (pane dead) instead of "running"/"idle", breaking assertions that
-    // check the post-poll status. The mock is permissive: any non-pane-liveness call also
-    // returns success so the poller's "show-options" read for @pi-exit-code doesn't throw.
+    // A successful pane listing containing %99 keeps the synthetic child live.
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
-      execFileSync: (_file: string, args: string[]) => {
-        if (args[0] === "display-message") return Buffer.from("%99");
-        return "";
-      },
+      execFileSync: () => Buffer.from("%99\n"),
       execFile: (
         _file: string,
         _args: string[],
         _options: object,
         callback: (error: Error | null, stdout?: string) => void,
-      ) => callback(null, "#99"),
+      ) => callback(null, "%99\n"),
     }));
     root = makeTmp();
     const g = globalThis as any;

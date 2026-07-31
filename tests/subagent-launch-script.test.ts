@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -236,14 +236,42 @@ function installTmuxMock() {
   return calls;
 }
 
+const SPAWN_ENV_NAMES = [
+  "TMUX",
+  "TMUX_PANE",
+  "HOME",
+  "ZELLIJ",
+  "ZELLIJ_SESSION_NAME",
+  "PI_CODING_AGENT_SESSION_DIR",
+  "PI_SUBAGENTURA_AGENT_ID",
+  "PI_SUBAGENTURA_ROOT_ID",
+  "PI_SUBAGENTURA_LINEAGE_SESSION_ROOT",
+  "PI_SUBAGENTURA_DEPTH",
+  "PI_SUBAGENTURA_MAX_DEPTH",
+  "PI_SUBAGENTURA_MAX_NODES",
+] as const;
+
+type SpawnEnvName = (typeof SPAWN_ENV_NAMES)[number];
+
 describe("spawn-time state persistence", () => {
   let cwd: string;
   let tmuxCalls: string[][];
+  let savedEnv: Record<SpawnEnvName, string | undefined>;
   const SESSION = "019e500a-bae9-783a-869a-ac7c106b4ab7";
 
   beforeEach(() => {
     tmuxCalls = installTmuxMock();
     cwd = mkdtempSync(join(tmpdir(), "pi-subagentura-spawn-persist-"));
+    savedEnv = Object.fromEntries(
+      SPAWN_ENV_NAMES.map((name) => [name, process.env[name]]),
+    ) as Record<SpawnEnvName, string | undefined>;
+    process.env.PI_CODING_AGENT_SESSION_DIR = cwd;
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = cwd;
+    delete process.env.PI_SUBAGENTURA_AGENT_ID;
+    delete process.env.PI_SUBAGENTURA_ROOT_ID;
+    delete process.env.PI_SUBAGENTURA_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_NODES;
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
     process.env.TMUX_PANE = "%1";
     process.env.HOME = process.env.HOME ?? "/tmp";
@@ -257,6 +285,11 @@ describe("spawn-time state persistence", () => {
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
     vi.doUnmock("node:child_process");
+    for (const name of SPAWN_ENV_NAMES) {
+      const value = savedEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
 
   it("launchInteractiveSubagent with parentSessionId writes the state file", async () => {
@@ -273,6 +306,10 @@ describe("spawn-time state persistence", () => {
     const loaded = loadInteractiveStates(cwd);
     expect(loaded?.states[state.id]?.paneId).toBe(state.paneId);
     expect(loaded?.states[state.id]?.mux).toBe(state.mux);
+    // Path-segment containment, not a prefix match: `startsWith` would also
+    // accept an unintended sibling such as `${cwd}-other/...`.
+    expect(relative(cwd, state.artifactDir).split(sep)[0]).not.toBe("..");
+    expect(isAbsolute(relative(cwd, state.artifactDir))).toBe(false);
   });
 
   it("launchInteractiveSubagent without parentSessionId does NOT write the state file", async () => {

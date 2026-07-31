@@ -23,8 +23,24 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import type { Multiplexer } from "./multiplexer";
-import { commandExists, execMuxOrThrow, shellEscape } from "./multiplexer";
+import type {
+  CapturePaneOptions,
+  CapturePaneResult,
+  Multiplexer,
+  PaneLiveness,
+  PaneRef,
+} from "./multiplexer";
+import {
+  boundCaptureOutput,
+  commandExists,
+  execMuxOrThrow,
+  MAX_CAPTURE_READ_BYTES,
+  MUX_CAPABILITIES,
+  safeSegment,
+  sanitizeViewerTitle,
+  shellEscape,
+  spawnNativeViewer,
+} from "./multiplexer";
 
 /**
  * Optional test/CI isolation for real tmux integration tests.
@@ -51,8 +67,8 @@ function settleTmuxSocketPaneForTests(): void {
 
 /**
  * Extract the session name, window index, and pane index of a tmux pane
- * via `display-message`. Throws if the pane is dead or the id is malformed —
- * callers that want a liveness probe should use `isPaneAlive` instead.
+ * via `display-message`. Throws if the pane is dead or the response is
+ * malformed.
  */
 function getPaneLocation(paneId: string): {
   session: string;
@@ -72,25 +88,27 @@ function getPaneLocation(paneId: string): {
     ]),
     { encoding: "utf8", timeout: 5000 },
   ).trim();
-  const [session, window, pane] = output.split("\t");
+  const fields = output.split("\t");
+  if (fields.length !== 3 || fields.some((field) => field.length === 0)) {
+    throw new Error(`Malformed tmux pane location: ${output || "(empty)"}`);
+  }
+  const [session, window, pane] = fields as [string, string, string];
   return { session, window, pane };
 }
 
-/** Sanitize a free-form name into a tmux-safe segment. tmux names allow most
- * chars but reject `:`, `.`, and whitespace; we collapse everything else to
- * a single dash to keep the resulting window/session names copy-pasteable. */
-function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
-  );
+function parsePaneListing(output: string): ReadonlySet<string> {
+  const trimmed = output.trim();
+  if (!trimmed) return new Set();
+  const paneIds = trimmed.split(/\r?\n/);
+  if (paneIds.some((paneId) => !/^%\d+$/.test(paneId))) {
+    throw new Error("Malformed tmux pane listing");
+  }
+  return new Set(paneIds);
 }
 
 export class TmuxMultiplexer implements Multiplexer {
   readonly name = "tmux" as const;
+  readonly capabilities = MUX_CAPABILITIES.tmux;
 
   /** Shared detached session used when the parent is outside tmux. */
   private detachedSessionName?: string;
@@ -148,7 +166,7 @@ export class TmuxMultiplexer implements Multiplexer {
     parentPane?: string;
     windowName?: string;
     id?: string; // sub-agent id (8 hex); used for the relaxed-path unique session name
-  }): { paneId: string; windowName?: string } {
+  }): { paneId: string; windowName?: string; session: string } {
     if (!commandExists("tmux")) {
       throw new Error(
         "tmux is not available. Install tmux or set PATH to include it.",
@@ -160,7 +178,7 @@ export class TmuxMultiplexer implements Multiplexer {
     // usage organized without changing the in-session behavior below.
     if (!process.env.TMUX) {
       let isFirstPane = this.detachedSessionName === undefined;
-      let sessionName =
+      const sessionName =
         this.detachedSessionName ??
         `pi-subagent-${opts.id ?? safeSegment(opts.name)}`;
       if (!isFirstPane && !this.hasSession(sessionName)) {
@@ -207,7 +225,7 @@ export class TmuxMultiplexer implements Multiplexer {
             ]),
             { encoding: "utf8", timeout: 10000 },
           ).trim();
-      if (!paneId.startsWith("%")) {
+      if (!/^%\d+$/.test(paneId)) {
         throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
       }
       this.detachedSessionName = sessionName;
@@ -233,7 +251,7 @@ export class TmuxMultiplexer implements Multiplexer {
         }
       }
       settleTmuxSocketPaneForTests();
-      return { paneId, windowName };
+      return { paneId, windowName, session: sessionName };
     }
 
     // Standard path: parent is in tmux.
@@ -289,8 +307,17 @@ export class TmuxMultiplexer implements Multiplexer {
         },
       ).trim();
     }
-    if (!paneId.startsWith("%")) {
+    if (!/^%\d+$/.test(paneId)) {
       throw new Error(`Unexpected tmux pane id: ${paneId || "(empty)"}`);
+    }
+    let session: string;
+    try {
+      session = getPaneLocation(paneId).session;
+    } catch (error) {
+      this.killPane(paneId);
+      throw new Error(`Failed to determine session for tmux pane ${paneId}`, {
+        cause: error,
+      });
     }
     if (!opts.background) {
       // Pane title is cosmetic and the new window already shows `name`.
@@ -308,39 +335,49 @@ export class TmuxMultiplexer implements Multiplexer {
       }
     }
     settleTmuxSocketPaneForTests();
-    return { paneId, windowName };
+    return { paneId, windowName, session };
   }
 
-  isPaneAlive(paneId: string): boolean {
+  getPaneLiveness(paneId: string): PaneLiveness {
+    if (!/^%\d+$/.test(paneId)) return "unknown";
     try {
-      execFileSync(
+      const output = execFileSync(
         "tmux",
-        withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
+        withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
         {
-          stdio: "ignore",
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
           timeout: 5000,
         },
       );
-      return true;
+      return parsePaneListing(output).has(paneId) ? "alive" : "dead";
     } catch {
-      return false;
+      return "unknown";
     }
   }
 
-  isPaneAliveAsync(paneId: string): Promise<boolean> {
+  getPaneLivenessAsync(paneId: string): Promise<PaneLiveness> {
+    if (!/^%\d+$/.test(paneId)) return Promise.resolve("unknown");
     return new Promise((resolve) => {
       try {
         execFile(
           "tmux",
-          withTmuxSocket(["display-message", "-p", "-t", paneId, "#{pane_id}"]),
-          { timeout: 5000 },
-          (error) => {
-            resolve(!error);
+          withTmuxSocket(["list-panes", "-a", "-F", "#{pane_id}"]),
+          { encoding: "utf8", timeout: 5000 },
+          (error, stdout) => {
+            if (error) {
+              resolve("unknown");
+              return;
+            }
+            try {
+              resolve(parsePaneListing(stdout).has(paneId) ? "alive" : "dead");
+            } catch {
+              resolve("unknown");
+            }
           },
         );
       } catch {
-        // A synchronous child-process setup failure is also a dead pane.
-        resolve(false);
+        resolve("unknown");
       }
     });
   }
@@ -350,7 +387,10 @@ export class TmuxMultiplexer implements Multiplexer {
       "tmux",
       "send-keys",
       "tmux",
-      withTmuxSocket(["send-keys", "-t", paneId, "-l", text]),
+      // `--` terminates flag parsing: agent follow-up text is user/model
+      // controlled and text starting with `-` would otherwise be read as a
+      // send-keys flag (`command send-keys: unknown flag -n`, exit 1).
+      withTmuxSocket(["send-keys", "-t", paneId, "-l", "--", text]),
       {
         encoding: "utf8",
         timeout: 5000,
@@ -382,6 +422,163 @@ export class TmuxMultiplexer implements Multiplexer {
     }
   }
 
+  /**
+   * Focus the pane, addressed by its tmux pane id.
+   *
+   * Pane ids (`%N`) are tmux-server-global, so a single target resolves the
+   * pane, its window AND its session unambiguously. The previous
+   * `select-window -t <windowName>` was none of those things: window names come
+   * from `safeSegment(name)`, so two sub-agents both called "reviewer" collide,
+   * and an unqualified name target resolves against whichever session tmux
+   * scans first — verified to focus the WRONG session's window while returning
+   * exit 0, i.e. reporting success for focusing a different agent.
+   *
+   * `select-window` is required even for a visible split (`select-pane` alone
+   * does not change the active window), and `select-pane` is required to land
+   * on the right pane within that window — so both run, chained in one tmux
+   * invocation via a literal `;` argument.
+   */
+  focusPane(ref: PaneRef): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const args = withTmuxSocket([
+        "select-window",
+        "-t",
+        ref.paneId,
+        ";",
+        "select-pane",
+        "-t",
+        ref.paneId,
+      ]);
+      execFile("tmux", args, { timeout: 5000 }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  capturePane(
+    ref: PaneRef,
+    opts: CapturePaneOptions,
+  ): Promise<CapturePaneResult> {
+    const lines = Math.max(0, Math.floor(opts.maxLines));
+    return new Promise((resolve, reject) => {
+      execFile(
+        "tmux",
+        withTmuxSocket([
+          "capture-pane",
+          "-p",
+          "-t",
+          ref.paneId,
+          "-S",
+          `-${lines}`,
+        ]),
+        {
+          encoding: "utf8",
+          maxBuffer: MAX_CAPTURE_READ_BYTES,
+          timeout: 5000,
+        },
+        (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(boundCaptureOutput(stdout, opts));
+        },
+      );
+    });
+  }
+
+  /**
+   * Open the bounded supervisor content in a tmux popup.
+   *
+   * `title` is the sub-agent's display name, which is attacker-reachable, and
+   * `display-popup -T` evaluates its argument as a tmux FORMAT — `#(...)` in a
+   * format spawns a shell job. `sanitizeViewerTitle` strips the `#` introducer;
+   * see its doc comment. `shellEscape` cannot substitute for it, because tmux
+   * evaluates the format after argv parsing.
+   *
+   * The popup itself runs `read`, i.e. it lives until the user dismisses it,
+   * and `-E` keeps the invoking tmux client alive for that whole time. So this
+   * must never be spawned synchronously — `spawnNativeViewer` returns as soon
+   * as the popup is up and leaves it running.
+   */
+  showNativeViewer(title: string, content: string): Promise<boolean> {
+    if (!process.env.TMUX) return Promise.resolve(false);
+    const command = `printf '%s\\n' ${shellEscape(content)}; printf '\\nPress Enter to close'; read _`;
+    return spawnNativeViewer(
+      "tmux",
+      withTmuxSocket([
+        "display-popup",
+        "-E",
+        "-T",
+        sanitizeViewerTitle(title),
+        "sh",
+        "-lc",
+        command,
+      ]),
+    );
+  }
+
+  /**
+   * Whether a tmux client is attached to `session` (or to the server at all,
+   * when no session is given).
+   *
+   * A successful session listing first distinguishes an absent target session
+   * (`false`) from an unavailable or timed-out backend (`undefined`). Only a
+   * successful `list-clients` result can then establish attached/no-client
+   * state for an existing target.
+   */
+  hasAttachedClientAsync(session?: string): Promise<boolean | undefined> {
+    return new Promise((resolve) => {
+      try {
+        execFile(
+          "tmux",
+          withTmuxSocket(["list-sessions", "-F", "#{session_name}"]),
+          { encoding: "utf8", timeout: 5000 },
+          (sessionError, sessionOutput) => {
+            if (sessionError) {
+              resolve(undefined);
+              return;
+            }
+            const trimmed = sessionOutput.trim();
+            const sessions = trimmed ? trimmed.split(/\r?\n/) : [];
+            if (sessions.some((name) => name.length === 0)) {
+              resolve(undefined);
+              return;
+            }
+            if (session && !sessions.includes(session)) {
+              resolve(false);
+              return;
+            }
+
+            const target = session ? ["-t", session] : [];
+            try {
+              execFile(
+                "tmux",
+                withTmuxSocket([
+                  "list-clients",
+                  ...target,
+                  "-F",
+                  "#{client_name}",
+                ]),
+                { encoding: "utf8", timeout: 5000 },
+                (clientError, clientOutput) => {
+                  resolve(
+                    clientError ? undefined : clientOutput.trim().length > 0,
+                  );
+                },
+              );
+            } catch {
+              resolve(undefined);
+            }
+          },
+        );
+      } catch {
+        resolve(undefined);
+      }
+    });
+  }
+
   buildAttachCommands(opts: { paneId: string; windowName?: string }): {
     attachCommand: string;
     focusCommand: string;
@@ -389,15 +586,29 @@ export class TmuxMultiplexer implements Multiplexer {
     if (opts.windowName) {
       // Background mode: pane lives in a named detached window. Attach
       // command chains `attach -t <session>` with
-      // `select-window -t <windowName>` so it works from outside the
-      // session too. Inside-tmux callers get the same effect via `\;`
-      // chaining — the attach errors with "nested sessions" but the
-      // select-window still runs.
+      // `select-window -t <session>:<windowName>` so it works from outside the
+      // session too.
+      //
+      // The window target MUST carry the session qualifier. Window names are
+      // `safeSegment(name)`, so two sub-agents both called "reviewer" collide,
+      // and a bare name target resolves against whichever session tmux scans
+      // first: verified against tmux 3.7b, `select-window -t reviewer` with
+      // `reviewer` windows in both `collide-a` and `collide-b` moves
+      // `collide-b` — the most recently created session — and exits 0. That is
+      // the same silent wrong-agent focus `focusPane` was fixed for, except
+      // here it lands in a string we hand the user to paste.
+      //
+      // Note the `\;` chain is genuinely for outside-tmux use: from inside a
+      // session on the same server, tmux refuses with "sessions should be
+      // nested with care, unset $TMUX to force" and the chained select-window
+      // does NOT run either (verified 3.7b). Inside-tmux callers get
+      // `focusCommand`, which is why it is a standalone command.
       const location = getPaneLocation(opts.paneId);
       const tmux = tmuxCommandPrefix();
+      const targetWindow = `${location.session}:${opts.windowName}`;
       return {
-        attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(opts.windowName)}`,
-        focusCommand: `${tmux} select-window -t ${shellEscape(opts.windowName)}`,
+        attachCommand: `${tmux} attach -t ${shellEscape(location.session)} \\; select-window -t ${shellEscape(targetWindow)}`,
+        focusCommand: `${tmux} select-window -t ${shellEscape(targetWindow)}`,
       };
     }
     // Visible split: attach by pane id inside the parent's window.

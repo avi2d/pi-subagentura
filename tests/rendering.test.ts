@@ -59,6 +59,8 @@ import {
   renderAsyncSpawn,
   renderSubagentNotify,
   formatActivityRow,
+  coarseElapsedMs,
+  ACTIVITY_ELAPSED_BUCKET_MS,
 } from "../src/rendering";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
@@ -759,35 +761,74 @@ describe("renderSubagentNotify", () => {
 });
 
 describe("formatActivityRow", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
+  it("formats a row with the latest activity summary and a coarse clock", () => {
+    const result = formatActivityRow(
+      {
+        lastActivityAt: 3000,
+        lastToolSummary: "reading main.ts",
+        name: "helper-1",
+        id: "x",
+        task: "",
+        paneId: "",
+        sessionFile: "",
+        cwd: "",
+        startedAt: 0,
+        status: "running",
+        mux: "tmux",
+        attachCommand: "",
+        selectPaneCommand: "",
+        launchScriptFile: "",
+        artifactDir: "",
+      },
+      33_000,
+    );
+    expect(result).toBe("▶ helper-1: reading main.ts (30s ago)");
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("formats row with lastActivityAt and lastToolSummary", () => {
-    vi.setSystemTime(5000);
-    // ago = Date.now() - lastActivityAt = 5000 - 3000 = 2000ms (2s)
-    const result = formatActivityRow({
-      lastActivityAt: 3000,
+  it("keeps the row byte-identical inside one coarse bucket and changes across it", () => {
+    const state = {
+      lastActivityAt: 1_000,
       lastToolSummary: "reading main.ts",
-      name: "helper-1",
+      name: "helper-bucket",
       id: "x",
       task: "",
       paneId: "",
       sessionFile: "",
       cwd: "",
       startedAt: 0,
-      status: "running",
-      mux: "tmux",
+      status: "running" as const,
+      mux: "tmux" as const,
       attachCommand: "",
       selectPaneCommand: "",
       launchScriptFile: "",
       artifactDir: "",
-    });
-    expect(result).toBe("\u25b6 helper-1: reading main.ts (2s ago)");
+    };
+
+    // Sub-bucket elapsed reads as "just now" and never changes mid-bucket, so
+    // the poller's memoized setWidget suppresses the repaint.
+    expect(formatActivityRow(state, 1_500)).toBe(
+      formatActivityRow(state, 1_000 + ACTIVITY_ELAPSED_BUCKET_MS - 1),
+    );
+    expect(formatActivityRow(state, 1_500)).toBe(
+      "▶ helper-bucket: reading main.ts (just now)",
+    );
+    expect(formatActivityRow(state, 1_000 + ACTIVITY_ELAPSED_BUCKET_MS)).toBe(
+      formatActivityRow(state, 1_000 + 2 * ACTIVITY_ELAPSED_BUCKET_MS - 1),
+    );
+    expect(formatActivityRow(state, 1_000 + ACTIVITY_ELAPSED_BUCKET_MS)).toBe(
+      "▶ helper-bucket: reading main.ts (10s ago)",
+    );
+    expect(formatActivityRow(state, 61_000)).toBe(
+      "▶ helper-bucket: reading main.ts (1m ago)",
+    );
+    expect(formatActivityRow(state, 3_601_000)).toBe(
+      "▶ helper-bucket: reading main.ts (1h ago)",
+    );
+  });
+
+  it("clamps a clock skewed into the future to just now", () => {
+    expect(coarseElapsedMs(-5_000)).toBe(0);
+    expect(coarseElapsedMs(Number.NaN)).toBe(0);
   });
 
   it("renders idle agents as ready for follow-up without stale activity", () => {
@@ -810,12 +851,12 @@ describe("formatActivityRow", () => {
     });
     expect(result).toBe("○ helper-idle: idle — ready for follow-up");
     expect(result).not.toContain("stale tool");
-    expect(result).not.toContain("starting");
   });
 
-  it("formats row without lastActivityAt (no ago suffix)", () => {
+  it("formats a running row without activity metadata", () => {
     const result = formatActivityRow({
       name: "helper-2",
+      // No lastActivityAt: the row omits the clock entirely.
       lastToolSummary: "searching",
       id: "x",
       task: "",
@@ -830,138 +871,30 @@ describe("formatActivityRow", () => {
       launchScriptFile: "",
       artifactDir: "",
     });
-    expect(result).toBe("\u25b6 helper-2: searching");
+    expect(result).toBe("▶ helper-2: searching");
   });
 
-  it("formats row without lastToolSummary (falls back to starting\u2026)", () => {
-    vi.setSystemTime(10000);
-    const result = formatActivityRow({
-      lastActivityAt: 8000,
-      name: "helper-3",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    expect(result).toBe("\u25b6 helper-3: starting\u2026 (2s ago)");
-  });
-
-  it("formats row without lastActivityAt and without lastToolSummary", () => {
-    const result = formatActivityRow({
-      name: "helper-4",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    expect(result).toBe("\u25b6 helper-4: starting\u2026");
-  });
-
-  it("renders ago as 'just now' for sub-second ages", () => {
-    vi.setSystemTime(1000);
-    const result = formatActivityRow({
-      lastActivityAt: 999,
-      lastToolSummary: "last tick",
-      name: "fast",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    expect(result).toBe("\u25b6 fast: last tick (just now)");
-  });
-
-  it("renders ago as 'Xm ago' for minute-range ages", () => {
-    vi.setSystemTime(180_000);
-    const result = formatActivityRow({
-      lastActivityAt: 120_000,
-      lastToolSummary: "minute work",
-      name: "long-run",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    // diff = 60000ms = 60s = 1m
-    expect(result).toBe("\u25b6 long-run: minute work (1m ago)");
-  });
-
-  it("renders ago as 'Xh ago' for hour-range ages", () => {
-    vi.setSystemTime(7_200_000);
-    const result = formatActivityRow({
-      lastActivityAt: 3_600_000,
-      lastToolSummary: "hour work",
-      name: "endurance",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    // diff = 3600000ms = 3600s = 60m = 1h
-    expect(result).toBe("\u25b6 endurance: hour work (1h ago)");
-  });
-
-  it("handles negative time difference (clamped to 0 \u2192 'just now')", () => {
-    vi.setSystemTime(100);
-    const result = formatActivityRow({
-      lastActivityAt: 500,
-      lastToolSummary: "future",
-      name: "time-travel",
-      id: "x",
-      task: "",
-      paneId: "",
-      sessionFile: "",
-      cwd: "",
-      startedAt: 0,
-      status: "running",
-      mux: "tmux",
-      attachCommand: "",
-      selectPaneCommand: "",
-      launchScriptFile: "",
-      artifactDir: "",
-    });
-    // Date.now() - 500 = -400, clamped to 0 \u2192 "just now"
-    expect(result).toBe("\u25b6 time-travel: future (just now)");
+  it("falls back to starting when no activity summary exists", () => {
+    const result = formatActivityRow(
+      {
+        lastActivityAt: 8000,
+        name: "helper-3",
+        id: "x",
+        task: "",
+        paneId: "",
+        sessionFile: "",
+        cwd: "",
+        startedAt: 0,
+        status: "running",
+        mux: "tmux",
+        attachCommand: "",
+        selectPaneCommand: "",
+        launchScriptFile: "",
+        artifactDir: "",
+      },
+      8000,
+    );
+    expect(result).toBe("▶ helper-3: starting… (just now)");
   });
 });
 

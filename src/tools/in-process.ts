@@ -20,8 +20,11 @@ import {
   buildLiveUpdate,
   debugLog,
   formatUsage,
-  jobRegistry,
+  getInProcessJob,
+  inProcessJobOwner,
+  inProcessJobsForOwner,
   pruneCompletedJobs,
+  registerInProcessJob,
   scheduleJobCleanup,
   startSubagentJob,
   type JobDeliveryOwner,
@@ -33,9 +36,14 @@ import {
 } from "../helpers";
 import { resolveSpawnDepth } from "../orchestration-context";
 import {
-  getActiveSessionContextToken,
-  isSessionContextTokenLive,
-} from "../session-context";
+  getStartedSessionScopes,
+  resolveLiveSessionScope,
+  resolveToolSessionScope,
+  sessionOwner,
+  type SessionOwnerToken,
+  type SessionScope,
+  type SessionToolToken,
+} from "../session-scope";
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
@@ -78,8 +86,11 @@ type InProcessSubagentDetails =
     }
   | { status: "cancelled" | "not_found"; jobId?: string };
 
-function updateRunningFooter(ctx: RunningFooterContext): void {
-  updateRunningSubagentFooter(ctx.ui);
+function updateRunningFooter(
+  ctx: RunningFooterContext,
+  owner?: SessionOwnerToken,
+): void {
+  updateRunningSubagentFooter(ctx.ui, owner);
 }
 
 const ZERO_USAGE: Usage = {
@@ -109,10 +120,20 @@ function resolveSpawn(ctx: SpawnContext) {
   return { ...spawn, rootSessionId };
 }
 
+function resolveExecutionOwner(
+  token: SessionToolToken | undefined,
+): { owner?: SessionOwnerToken } | undefined {
+  const scope = resolveToolSessionScope(token);
+  if (scope) return { owner: sessionOwner(scope) };
+  // A supplied token must never fall back to whichever peer registered last.
+  if (token || getStartedSessionScopes().length > 0) return undefined;
+  return {};
+}
+
 function captureDeliveryOwner(
   pi: ExtensionAPI,
   ctx: SpawnContext,
-  token: ReturnType<typeof getActiveSessionContextToken>,
+  owner: SessionOwnerToken | undefined,
 ): JobDeliveryOwner {
   let sessionId: string | undefined;
   try {
@@ -123,8 +144,8 @@ function captureDeliveryOwner(
   return {
     pi,
     sessionId,
-    sessionContextId: token?.id,
-    sessionContextGeneration: token?.generation,
+    sessionScopeId: owner?.id,
+    sessionScopeGeneration: owner?.generation,
   };
 }
 
@@ -161,6 +182,18 @@ function cancelledAsyncSpawnResult(): AgentToolResult<InProcessSubagentDetails> 
       },
     ],
     details: { status: "cancelled" },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
+}
+function unavailableSessionResult(): AgentToolResult<InProcessSubagentDetails> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: "This tool registration's parent session is no longer active.",
+      },
+    ],
+    details: { status: "not_found" },
     isError: true,
   } as AgentToolResult<InProcessSubagentDetails>;
 }
@@ -206,38 +239,52 @@ function settleAsyncJob(
   jobId: string,
   jobState: JobState,
   result: SubagentResult,
-  ctx: RunningFooterContext,
+  ctx: RunningFooterContext | undefined,
 ): void {
   if (jobState.status === "cancelled") return;
+  const owner = inProcessJobOwner(jobState);
   if (result.cancelled) {
     jobState.status = "cancelled";
     jobState.result = result;
-    scheduleJobCleanup(jobId, true);
-    updateRunningFooter(ctx);
+    scheduleJobCleanup(jobId, true, undefined, owner);
+    if (ctx) updateRunningFooter(ctx, owner);
     return;
   }
   jobState.status = result.isError ? "error" : "done";
   jobState.result = result;
-  scheduleJobCleanup(jobId, false, jobState.maxAge);
+  scheduleJobCleanup(jobId, false, jobState.maxAge, owner);
 
+  // A workflow aggregate consumes its children's results itself; the child must
+  // never independently notify or inject into the parent session.
   const shouldDeliver =
+    jobState.completionOwner !== "workflow" &&
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
     !jobState.resultRetrieved &&
     (jobState.activeResultWaits ?? 0) === 0;
   if (shouldDeliver) {
     deliverNotification(jobState, result);
-  } else if (jobState.notifyOnComplete && !jobState.notificationDelivered) {
+  } else if (
+    jobState.completionOwner !== "workflow" &&
+    jobState.notifyOnComplete &&
+    !jobState.notificationDelivered
+  ) {
     notifyInProcessCompletionWithoutDelivery(jobState, result);
   }
 
-  updateRunningFooter(ctx);
+  if (ctx) updateRunningFooter(ctx, owner);
 }
 
-function attachAsyncJobSettlement(
+/**
+ * Write the terminal status/result onto an async job when its promise settles.
+ *
+ * `ctx` is optional so non-tool spawn paths (workflow children) can reuse the
+ * same settlement without owning a footer surface — the poller repaints anyway.
+ */
+export function attachAsyncJobSettlement(
   jobId: string,
   jobState: JobState,
-  ctx: RunningFooterContext,
+  ctx?: RunningFooterContext,
 ): void {
   const settledPromise = jobState.promise.catch(createAsyncJobErrorResult);
   jobState.promise = settledPromise;
@@ -259,6 +306,7 @@ async function runSubagent(
   thinkingLevel?: ThinkingLevel,
   depth?: number,
   rootSessionId?: string,
+  owner?: SessionOwnerToken,
 ): Promise<SubagentResult> {
   try {
     const { jobPromise, modelWarning, start } = await startSubagentJob({
@@ -274,6 +322,7 @@ async function runSubagent(
       thinkingLevel,
       depth,
       rootSessionId,
+      owner,
     });
     start?.();
     const result = await jobPromise;
@@ -300,7 +349,10 @@ async function runSubagent(
   }
 }
 
-function registerSubagentWithContextTool(pi: ExtensionAPI): void {
+function registerSubagentWithContextTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "subagent_with_context",
     label: "Sub-Agent (with context)",
@@ -336,6 +388,9 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
+      const { owner } = execution;
       const runAsync = params.async ?? true;
       debugLog("info", "tool_call", {
         toolName: "subagent_with_context",
@@ -360,8 +415,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         )
         .map((e) => e.message);
 
-      const spawnContextToken = getActiveSessionContextToken();
-      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, owner);
       if (runAsync) {
         if (messages.length === 0) {
           return {
@@ -402,8 +456,9 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           thinkingLevel: params.thinkingLevel,
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
+          owner,
         });
-        if (!isSessionContextTokenLive(spawnContextToken)) {
+        if (owner && !resolveLiveSessionScope(owner)) {
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
@@ -432,8 +487,11 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
           maxAge: params.maxAge,
         };
 
-        jobRegistry.set(jobId, jobState);
-        updateRunningFooter(ctx);
+        if (!registerInProcessJob(jobState, owner)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
+          return cancelledAsyncSpawnResult();
+        }
+        updateRunningFooter(ctx, owner);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
         start?.();
@@ -489,6 +547,7 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
         params.thinkingLevel,
         spawn.childDepth,
         spawn.rootSessionId,
+        owner,
       );
 
       if (result.cancelled) {
@@ -532,7 +591,10 @@ function registerSubagentWithContextTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
+function registerSubagentIsolatedTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "subagent_isolated",
     label: "Sub-Agent (isolated)",
@@ -559,6 +621,9 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
     parameters: BaseParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
+      const { owner } = execution;
       const runAsync = params.async ?? true;
       debugLog("info", "tool_call", {
         toolName: "subagent_isolated",
@@ -576,8 +641,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
       const spawn = resolveSpawn(ctx);
       if (spawn.exceedsLimit) return depthLimitResult(spawn.limit);
 
-      const spawnContextToken = getActiveSessionContextToken();
-      const deliveryOwner = captureDeliveryOwner(pi, ctx, spawnContextToken);
+      const deliveryOwner = captureDeliveryOwner(pi, ctx, owner);
       if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
         // Own the child's session so any ancestor abort cascades to it.
@@ -606,8 +670,9 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           thinkingLevel: params.thinkingLevel,
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
+          owner,
         });
-        if (!isSessionContextTokenLive(spawnContextToken)) {
+        if (owner && !resolveLiveSessionScope(owner)) {
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
@@ -636,8 +701,11 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
           maxAge: params.maxAge,
         };
 
-        jobRegistry.set(jobId, jobState);
-        updateRunningFooter(ctx);
+        if (!registerInProcessJob(jobState, owner)) {
+          discardAsyncSpawn(abort, session, disposeBeforeStart);
+          return cancelledAsyncSpawnResult();
+        }
+        updateRunningFooter(ctx, owner);
 
         attachAsyncJobSettlement(jobId, jobState, ctx);
         start?.();
@@ -681,6 +749,7 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
         params.thinkingLevel,
         spawn.childDepth,
         spawn.rootSessionId,
+        owner,
       );
 
       if (result.cancelled) {
@@ -724,7 +793,10 @@ function registerSubagentIsolatedTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerGetSubagentStatusTool(pi: ExtensionAPI): void {
+function registerGetSubagentStatusTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "get_subagent_status",
     label: "Get Subagent Status",
@@ -733,13 +805,15 @@ function registerGetSubagentStatusTool(pi: ExtensionAPI): void {
     parameters: StatusParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
       debugLog("info", "tool_call", {
         toolName: "get_subagent_status",
         toolCallId: _toolCallId,
         jobId: params.jobId,
       });
 
-      const job = jobRegistry.get(params.jobId);
+      const job = getInProcessJob(params.jobId, execution.owner);
 
       if (!job) {
         return {
@@ -806,7 +880,10 @@ function registerGetSubagentStatusTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerGetSubagentResultTool(pi: ExtensionAPI): void {
+function registerGetSubagentResultTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "get_subagent_result",
     label: "Get Subagent Result",
@@ -819,7 +896,9 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
     parameters: ResultParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-      const job = jobRegistry.get(params.jobId);
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
+      const job = getInProcessJob(params.jobId, execution.owner);
       debugLog("info", "tool_call", {
         toolName: "get_subagent_result",
         toolCallId: _toolCallId,
@@ -957,6 +1036,9 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+      if (execution.owner && !resolveLiveSessionScope(execution.owner)) {
+        return unavailableSessionResult();
+      }
       const result = waitResult.value!;
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
@@ -1009,7 +1091,10 @@ function registerGetSubagentResultTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerCancelSubagentTool(pi: ExtensionAPI): void {
+function registerCancelSubagentTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "cancel_subagent",
     label: "Cancel Subagent",
@@ -1017,7 +1102,9 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
     parameters: CancelParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const job = jobRegistry.get(params.jobId);
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
+      const job = getInProcessJob(params.jobId, execution.owner);
       debugLog("info", "tool_call", {
         toolName: "cancel_subagent",
         toolCallId: _toolCallId,
@@ -1085,13 +1172,13 @@ function registerCancelSubagentTool(pi: ExtensionAPI): void {
       });
       try {
         // Aborts this job AND cascades to every descendant it owns.
-        abortJobTree(params.jobId, info);
+        abortJobTree(params.jobId, info, execution.owner);
       } catch {
         /* Session may already be disposed; abort is best-effort */
       }
       job.status = "cancelled";
-      scheduleJobCleanup(params.jobId, true);
-      updateRunningFooter(ctx);
+      scheduleJobCleanup(params.jobId, true, undefined, execution.owner);
+      updateRunningFooter(ctx, execution.owner);
 
       return {
         content: [{ type: "text", text: `Job ${params.jobId} cancelled.` }],
@@ -1216,7 +1303,10 @@ function registerListAvailableModelsTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerPruneSubagentJobsTool(pi: ExtensionAPI): void {
+function registerPruneSubagentJobsTool(
+  pi: ExtensionAPI,
+  toolToken?: SessionToolToken,
+): void {
   pi.registerTool({
     name: "prune_subagent_jobs",
     label: "Prune Subagent Jobs",
@@ -1227,14 +1317,17 @@ function registerPruneSubagentJobsTool(pi: ExtensionAPI): void {
     ].join("\n"),
     parameters: Type.Object({}),
 
-    async execute() {
-      const before = jobRegistry.size;
+    async execute(): Promise<any> {
+      const execution = resolveExecutionOwner(toolToken);
+      if (!execution) return unavailableSessionResult();
+      const registry = inProcessJobsForOwner(execution.owner);
+      const before = registry.size;
       debugLog("info", "tool_call", {
         toolName: "prune_subagent_jobs",
       });
 
-      const removed = pruneCompletedJobs();
-      const after = jobRegistry.size;
+      const removed = pruneCompletedJobs(execution.owner);
+      const after = registry.size;
 
       return {
         content: [
@@ -1270,7 +1363,13 @@ function registerPruneSubagentJobsTool(pi: ExtensionAPI): void {
   });
 }
 
-function registerCleanupArtifactsTool(pi: ExtensionAPI): void {
+function registerCleanupArtifactsTool(
+  pi: ExtensionAPI,
+  registrationScope?: SessionScope,
+): void {
+  const toolToken: SessionToolToken | undefined = registrationScope
+    ? { id: registrationScope.id }
+    : undefined;
   pi.registerTool({
     name: "cleanup_subagent_artifacts",
     label: "Cleanup Subagent Artifacts",
@@ -1307,11 +1406,53 @@ function registerCleanupArtifactsTool(pi: ExtensionAPI): void {
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
-      const activeIds = new Set<string>();
-      for (const state of interactiveSubagentRegistry.values()) {
-        activeIds.add(state.id);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
+      const scope = resolveToolSessionScope(toolToken);
+      if (
+        !scope &&
+        (toolToken !== undefined || getStartedSessionScopes().length > 0)
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "This cleanup tool registration is no longer attached to a live session.",
+            },
+          ],
+          details: { status: "session_unavailable" },
+          isError: true,
+        };
       }
+      let parentSessionId: string | undefined;
+      try {
+        parentSessionId =
+          scope?.sessionManager?.getSessionId?.() ??
+          ctx?.sessionManager?.getSessionId?.();
+      } catch {
+        /* Missing ownership evidence fails closed below. */
+      }
+      if (
+        !parentSessionId &&
+        (scope !== undefined || getStartedSessionScopes().length > 0)
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Cannot clean artifacts without current parent-session ownership evidence.",
+            },
+          ],
+          details: { status: "session_unavailable" },
+          isError: true,
+        };
+      }
+      const activeIds = new Set<string>();
+      const states =
+        scope?.interactiveStates ??
+        (getStartedSessionScopes().length === 0
+          ? interactiveSubagentRegistry
+          : new Map());
+      for (const state of states.values()) activeIds.add(state.id);
 
       const dryRun = params.dryRun !== false; // default true for safety
       const ttlMs = params.ttlMs;
@@ -1327,6 +1468,7 @@ function registerCleanupArtifactsTool(pi: ExtensionAPI): void {
 
       const result: CleanupResult = cleanupOldArtifacts(rootDir, ttlMs, {
         activeIds,
+        ownerSessionId: parentSessionId,
         dryRun,
       });
 
@@ -1389,16 +1531,35 @@ function registerCleanupArtifactsTool(pi: ExtensionAPI): void {
   });
 }
 
-export function registerInProcessSubagentTools(pi: ExtensionAPI): void {
-  registerSubagentWithContextTool(pi);
-  registerSubagentIsolatedTool(pi);
-  registerGetSubagentStatusTool(pi);
-  registerGetSubagentResultTool(pi);
-  registerCancelSubagentTool(pi);
+export function registerInProcessSubagentTools(
+  pi: ExtensionAPI,
+  scope?: SessionScope,
+): void {
+  const toolToken: SessionToolToken | undefined = scope
+    ? { id: scope.id }
+    : undefined;
+  registerSubagentWithContextTool(pi, toolToken);
+  registerSubagentIsolatedTool(pi, toolToken);
+  registerGetSubagentStatusTool(pi, toolToken);
+  registerGetSubagentResultTool(pi, toolToken);
+  registerCancelSubagentTool(pi, toolToken);
 }
 
-export function registerInProcessMaintenanceTools(pi: ExtensionAPI): void {
+export function registerInProcessMaintenanceTools(
+  pi: ExtensionAPI,
+  scope?: SessionScope,
+): void {
   registerListAvailableModelsTool(pi);
-  registerPruneSubagentJobsTool(pi);
-  registerCleanupArtifactsTool(pi);
+  registerPruneSubagentJobsTool(pi, scope ? { id: scope.id } : undefined);
+  registerCleanupArtifactsTool(pi, scope);
+}
+
+export function registerSubagentModelListTool(pi: ExtensionAPI): void {
+  registerListAvailableModelsTool(pi);
+}
+export function registerSubagentArtifactsCleanupTool(
+  pi: ExtensionAPI,
+  scope?: SessionScope,
+): void {
+  registerCleanupArtifactsTool(pi, scope);
 }

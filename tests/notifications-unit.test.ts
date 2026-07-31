@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type Mock,
+} from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   jobRegistry,
   type JobState,
@@ -12,6 +21,13 @@ import {
   sanitizeOutput,
   shouldNotify,
 } from "../src/notifications";
+import {
+  clearSessionScopes,
+  registerSessionScope,
+  removeSessionScope,
+  sessionOwner,
+  type SessionScope,
+} from "../src/session-scope";
 
 const SUCCESS_RESULT: SubagentResult = {
   output: "All tests pass",
@@ -52,14 +68,13 @@ function makeJobState(overrides?: Partial<JobState>): JobState {
 }
 
 function cleanGlobals() {
+  clearSessionScopes();
   const globalState = globalThis as any;
   globalState.__piSubagenturaPiRef = undefined;
   globalState.__piSubagenturaUi = undefined;
   globalState.__piSubagenturaSessionManager = undefined;
-  globalState.__piSubagenturaActiveSessionContextId = undefined;
   globalState.__piSubagenturaParentStreaming = false;
   globalState.__piSubagenturaPendingJobDeliveries = [];
-  globalState.__piSubagenturaInProcessFlushScheduled = false;
   jobRegistry.clear();
 }
 
@@ -226,36 +241,121 @@ describe("in-process completion delivery queue", () => {
     expect(job.notificationDelivered).toBeFalsy();
   });
 
-  it("does not deliver a queued completion into a replacement session context", async () => {
+  it("does not deliver a queued completion into a replacement session scope", async () => {
     const firstSessionSend = vi.fn();
     const secondSessionSend = vi.fn();
-    const globalState = globalThis as any;
-    globalState.__piSubagenturaActiveSessionContextId = 1;
-    globalState.__piSubagenturaPiRef = {
+    const firstPi = {
       sendMessage: firstSessionSend,
-    };
-    globalState.__piSubagenturaSessionManager = {
-      getSessionId: () => "parent-session-a",
-    };
-    globalState.__piSubagenturaParentStreaming = true;
-    const job = makeJobState({ notifyOnComplete: "notify" });
+    } as unknown as ExtensionAPI;
+    const firstScope = registerSessionScope({
+      id: 1,
+      generation: 1,
+      lifecycle: "started",
+      pi: firstPi,
+      parentStreaming: true,
+      sessionManager: { getSessionId: () => "parent-session-a" },
+    });
+    const firstOwner = sessionOwner(firstScope);
+    const job = makeJobState({
+      notifyOnComplete: "notify",
+      deliveryOwner: {
+        pi: firstPi,
+        sessionId: "parent-session-a",
+        sessionScopeId: firstOwner.id,
+        sessionScopeGeneration: firstOwner.generation,
+      },
+    });
 
     deliverNotification(job, SUCCESS_RESULT);
     await Promise.resolve();
     expect(firstSessionSend).not.toHaveBeenCalled();
 
-    globalState.__piSubagenturaActiveSessionContextId = 2;
-    globalState.__piSubagenturaPiRef = {
-      sendMessage: secondSessionSend,
-    };
-    globalState.__piSubagenturaSessionManager = {
-      getSessionId: () => "parent-session-a",
-    };
-    globalState.__piSubagenturaParentStreaming = false;
-    flushInProcessDeliveries();
+    removeSessionScope(firstScope.id);
+    const secondScope = registerSessionScope({
+      id: 2,
+      generation: 1,
+      lifecycle: "started",
+      pi: { sendMessage: secondSessionSend } as unknown as ExtensionAPI,
+      sessionManager: { getSessionId: () => "parent-session-a" },
+    });
+    flushInProcessDeliveries(sessionOwner(secondScope));
 
     expect(secondSessionSend).not.toHaveBeenCalled();
     expect(job.notificationDelivered).toBeFalsy();
+  });
+});
+describe("peer in-process delivery isolation", () => {
+  beforeEach(cleanGlobals);
+  afterEach(cleanGlobals);
+
+  function peerScope(id: number, parentStreaming: boolean, sendMessage: Mock) {
+    return registerSessionScope({
+      id,
+      generation: 1,
+      lifecycle: "started",
+      pi: { sendMessage } as unknown as ExtensionAPI,
+      parentStreaming,
+      sessionManager: { getSessionId: () => `session-${id}` },
+    });
+  }
+
+  function ownedJob(id: string, scope: SessionScope): JobState {
+    const owner = sessionOwner(scope);
+    return makeJobState({
+      id,
+      deliveryOwner: {
+        pi: scope.pi,
+        sessionId: `session-${scope.id}`,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
+      },
+    });
+  }
+
+  it("does not let B streaming suppress A completion delivery", async () => {
+    const sendA = vi.fn();
+    const sendB = vi.fn();
+    const scopeA = peerScope(101, false, sendA);
+    const scopeB = peerScope(102, true, sendB);
+    const jobA = ownedJob("job-a", scopeA);
+    const jobB = ownedJob("job-b", scopeB);
+
+    deliverNotification(jobB, SUCCESS_RESULT);
+    deliverNotification(jobA, SUCCESS_RESULT);
+    await Promise.resolve();
+
+    expect(sendA).toHaveBeenCalledOnce();
+    expect(sendB).not.toHaveBeenCalled();
+    expect(jobA.notificationDelivered).toBe(true);
+    expect(jobB.notificationDelivered).toBeFalsy();
+    expect(scopeA.pendingInProcessDeliveries).toHaveLength(0);
+    expect(scopeB.pendingInProcessDeliveries).toHaveLength(1);
+  });
+
+  it("flushes only A's queue and leaves B's queue intact", async () => {
+    const sendA = vi.fn();
+    const sendB = vi.fn();
+    const scopeA = peerScope(111, true, sendA);
+    const scopeB = peerScope(112, true, sendB);
+    const ownerA = sessionOwner(scopeA);
+    const jobA = ownedJob("queued-a", scopeA);
+    const jobB = ownedJob("queued-b", scopeB);
+
+    deliverNotification(jobA, SUCCESS_RESULT);
+    deliverNotification(jobB, SUCCESS_RESULT);
+    await Promise.resolve();
+    expect(sendA).not.toHaveBeenCalled();
+    expect(sendB).not.toHaveBeenCalled();
+
+    scopeA.parentStreaming = false;
+    flushInProcessDeliveries(ownerA);
+
+    expect(sendA).toHaveBeenCalledOnce();
+    expect(sendB).not.toHaveBeenCalled();
+    expect(jobA.notificationDelivered).toBe(true);
+    expect(jobB.notificationDelivered).toBeFalsy();
+    expect(scopeA.pendingInProcessDeliveries).toHaveLength(0);
+    expect(scopeB.pendingInProcessDeliveries).toHaveLength(1);
   });
 });
 

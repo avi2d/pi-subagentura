@@ -33,12 +33,15 @@ import { registerWorkflowTool } from "./workflow";
 import {
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
+  registerSubagentArtifactsCleanupTool,
+  registerSubagentModelListTool,
 } from "./tools/in-process";
 import { registerInteractiveSubagentTools } from "./tools/interactive";
 import { registerSessionHandlers } from "./session-handlers";
 import { registerChildProtocol } from "./child-protocol";
 import { registerCancelAllFlows } from "./cancel-all-flows-registration";
 import { renderSubagentNotify } from "./rendering";
+import { registerInteractiveSupervisor } from "./interactive-supervisor-registration";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
 /**
@@ -84,6 +87,14 @@ const ORCHESTRATOR_SYSTEM_PROMPT = readFileSync(
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENTURA_CHILD === "1") {
     registerChildProtocol(pi);
+    if (typeof pi.registerMessageRenderer === "function") {
+      pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
+    }
+    const sessionScope = registerSessionHandlers(pi);
+    registerInteractiveSubagentTools(pi, sessionScope);
+    registerSubagentArtifactsCleanupTool(pi, sessionScope);
+    registerSubagentModelListTool(pi);
+    registerInteractiveSupervisor(pi, sessionScope);
     return;
   }
   if (typeof pi.registerMessageRenderer !== "function") {
@@ -103,14 +114,14 @@ export default function (pi: ExtensionAPI) {
     };
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  const sessionContext = registerSessionHandlers(pi);
-  registerWorkflowTool(pi, sessionContext);
-  registerInProcessSubagentTools(pi);
-  registerInteractiveSubagentTools(pi);
-  registerInProcessMaintenanceTools(pi);
-
+  const sessionScope = registerSessionHandlers(pi);
+  registerInteractiveSubagentTools(pi, sessionScope);
+  registerInteractiveSupervisor(pi, sessionScope);
+  registerWorkflowTool(pi, sessionScope);
+  registerInProcessSubagentTools(pi, sessionScope);
+  registerInProcessMaintenanceTools(pi, sessionScope);
   // ── Cancel-all-flows shortcut and command ──────────────────────
-  registerCancelAllFlows(pi, sessionContext);
+  registerCancelAllFlows(pi, sessionScope);
 }
 
 /**

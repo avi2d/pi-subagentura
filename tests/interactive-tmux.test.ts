@@ -5,14 +5,18 @@ import {
 } from "../src/interactive-tmux";
 import {
   mkdtempSync,
+  mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   existsSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importFresh } from "./test-utils";
+import { hashLineageRoot } from "../src/interactive-lineage";
 
 import { loadInteractiveStates } from "../src/artifact";
 /** Standard tmux pane id returned by mocks when "new-window"/"split-window" is called. */
@@ -33,6 +37,41 @@ function installMockExec(scenario: (file: string, args: string[]) => string) {
   delete process.env.ZELLIJ_SESSION_NAME;
 }
 
+function lineageNodesDir(sessionRoot: string, rootId: string): string {
+  return join(
+    sessionRoot,
+    "subagentura",
+    "trees",
+    hashLineageRoot(rootId),
+    "nodes",
+  );
+}
+
+/** Write a schema-valid node manifest so the prune sweep can read it. */
+function writeLineageNode(
+  nodesDir: string,
+  agentId: string,
+  paneId: string,
+  parentAgentId?: string,
+): void {
+  writeFileSync(
+    join(nodesDir, `${agentId}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      agentId,
+      rootId: "root-session",
+      rootHash: hashLineageRoot("root-session"),
+      parentAgentId,
+      ownerSessionId: "owner-session",
+      name: agentId,
+      taskPreview: "task",
+      startedAt: "2026-07-25T10:00:00.000Z",
+      cwd: "/repo",
+      pane: { backend: "tmux", paneId },
+    }) + "\n",
+  );
+}
+
 function makeArgs() {
   return {
     TMUX: "/tmp/tmux-1000/default,12345,0",
@@ -50,6 +89,11 @@ describe("interactive-tmux", () => {
 
   afterEach(() => {
     rmSync(makeTmp(), { recursive: true, force: true });
+    delete process.env.PI_SUBAGENTURA_AGENT_ID;
+    delete process.env.PI_SUBAGENTURA_ROOT_ID;
+    delete process.env.PI_SUBAGENTURA_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_NODES;
     vi.doUnmock("node:child_process");
     vi.doUnmock("node:fs");
     vi.doUnmock("../src/artifact");
@@ -100,10 +144,14 @@ describe("interactive-tmux", () => {
 
     expect(state.paneId).toBe(MOCK_PANE_ID);
     expect(state.windowName).toBe("demo");
-    // Background mode: attach command should target the named window, not the pane.
-    expect(state.attachCommand).toContain("select-window -t 'demo'");
+    // Background mode: attach command should target the named window, not the
+    // pane — and the window target must carry the session qualifier
+    // (MOCK_LOCATION reports session `sess`). A bare `-t 'demo'` resolves
+    // against whichever session tmux scans first, so two agents sharing a
+    // safe-segmented name would send the user to the wrong one.
+    expect(state.attachCommand).toContain("select-window -t 'sess:demo'");
     expect(state.attachCommand).not.toContain("select-pane");
-    expect(state.selectPaneCommand).toContain("select-window -t 'demo'");
+    expect(state.selectPaneCommand).toContain("select-window -t 'sess:demo'");
 
     // new-window was used (not split-window) — the user's tmux layout is undisturbed.
     const usedNewWindow = calls.some((args) => args[0] === "new-window");
@@ -130,6 +178,268 @@ describe("interactive-tmux", () => {
     expect(statSync(join(state.artifactDir, "cli.mjs")).mode & 0o777).toBe(
       0o700,
     );
+
+    // Omitting parentSessionId keeps workflow-style children out of rehydrate state.
+    expect(existsSync(join(tmp, ".pi", "subagentura-state.json"))).toBe(false);
+  });
+
+  it("writes a lineage manifest before exposure and propagates child identity", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_AGENT_ID = "parent-agent";
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_DEPTH = "1";
+    process.env.PI_SUBAGENTURA_MAX_DEPTH = "4";
+    process.env.TMUX = makeArgs().TMUX;
+    process.env.TMUX_PANE = "%9";
+    installMockExec((_file, args) => {
+      if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      if (args[0] === "show-options") return "0\n";
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    const state = mod.launchInteractiveSubagent({
+      name: "Nested",
+      task: "spawn recursively",
+      cwd: tmp,
+      parentSessionId: "owner-session",
+      parentCwd: tmp,
+    });
+
+    const manifestPath = join(
+      tmp,
+      "subagentura",
+      "trees",
+      hashLineageRoot("root-session"),
+      "nodes",
+      `${state.id}.json`,
+    );
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    expect(manifest).toMatchObject({
+      agentId: state.id,
+      parentAgentId: "parent-agent",
+      rootId: "root-session",
+      ownerSessionId: "owner-session",
+      cwd: tmp,
+    });
+    const launchScript = readFileSync(state.launchScriptFile, "utf8");
+    expect(launchScript).toContain(
+      `export PI_SUBAGENTURA_AGENT_ID='${state.id}'`,
+    );
+    expect(launchScript).toContain("export PI_SUBAGENTURA_DEPTH='2'");
+  });
+
+  it("rejects recursive spawns beyond the configured depth before creating a pane", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_DEPTH = "2";
+    process.env.PI_SUBAGENTURA_MAX_DEPTH = "2";
+    process.env.TMUX = makeArgs().TMUX;
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Too deep",
+        task: "fail",
+        cwd: tmp,
+        parentSessionId: "owner-session",
+      }),
+    ).toThrow(/depth 3 exceeds max 2/);
+    expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+  });
+
+  it("rejects recursive spawns when the lineage node cap is reached", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "1";
+    const nodesDir = join(
+      tmp,
+      "subagentura",
+      "trees",
+      hashLineageRoot("root-session"),
+      "nodes",
+    );
+    mkdirSync(nodesDir, { recursive: true });
+    writeFileSync(join(nodesDir, "existing.json"), "{}\n");
+    process.env.TMUX = makeArgs().TMUX;
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Too many",
+        task: "fail",
+        cwd: tmp,
+        parentSessionId: "owner-session",
+      }),
+    ).toThrow(/reached max nodes 1/);
+    expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+  });
+
+  it("prunes dead lineage nodes so an all-time spawn total cannot wedge the tree", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "4";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    for (let index = 0; index < 4; index++) {
+      writeLineageNode(nodesDir, `dead${index}`, `%${index + 10}`);
+    }
+    process.env.TMUX = makeArgs().TMUX;
+    installMockExec((_file, args) => {
+      if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "list-panes") return "";
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      if (args[0] === "show-options") return "0\n";
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    const state = mod.launchInteractiveSubagent({
+      name: "Revived",
+      task: "spawn after the tree filled up with dead nodes",
+      cwd: tmp,
+      parentSessionId: "owner-session",
+      parentCwd: tmp,
+    });
+
+    expect(state.id).toBeTruthy();
+    const remaining = readdirSync(nodesDir).filter((entry) =>
+      entry.endsWith(".json"),
+    );
+    expect(remaining).toEqual([`${state.id}.json`]);
+  });
+
+  it("admits by active count when a dead ancestor is retained for a live child", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "2";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    writeLineageNode(nodesDir, "dead-parent", "%30");
+    writeLineageNode(nodesDir, "live-child", "%31", "dead-parent");
+    process.env.TMUX = makeArgs().TMUX;
+    installMockExec((_file, args) => {
+      if (args[0] === "list-panes") return "%31\n";
+      if (args[0] === "new-window") return `${MOCK_PANE_ID}\n`;
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      if (args[0] === "show-options") return "0\n";
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    const state = mod.launchInteractiveSubagent({
+      name: "Within active cap",
+      task: "spawn while a stale ancestor preserves lineage",
+      cwd: tmp,
+      parentSessionId: "owner-session",
+      parentCwd: tmp,
+    });
+
+    expect(state.id).toBeTruthy();
+    expect(
+      readdirSync(nodesDir).filter((entry) => entry.endsWith(".json")),
+    ).toEqual(
+      expect.arrayContaining([
+        "dead-parent.json",
+        "live-child.json",
+        `${state.id}.json`,
+      ]),
+    );
+  });
+
+  it("counts unknown panes against spawn admission", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "1";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    writeLineageNode(nodesDir, "unknown", "%32");
+    process.env.TMUX = makeArgs().TMUX;
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      if (args[0] === "list-panes") throw new Error("tmux socket unavailable");
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Unknown capacity",
+        task: "must remain bounded",
+        cwd: tmp,
+        parentSessionId: "owner-session",
+      }),
+    ).toThrow(/reached max nodes 1/);
+    expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+    expect(readdirSync(nodesDir)).toEqual(["unknown.json"]);
+  });
+
+  it("still refuses a spawn when every retained lineage node is live", async () => {
+    const tmp = makeTmp();
+    process.env.PI_CODING_AGENT_SESSION_DIR = tmp;
+    process.env.PI_SUBAGENTURA_ROOT_ID = "root-session";
+    process.env.PI_SUBAGENTURA_MAX_NODES = "4";
+    const nodesDir = lineageNodesDir(tmp, "root-session");
+    mkdirSync(nodesDir, { recursive: true });
+    for (let index = 0; index < 4; index++) {
+      writeLineageNode(nodesDir, `live${index}`, `%${index + 20}`);
+    }
+    process.env.TMUX = makeArgs().TMUX;
+    const calls: string[][] = [];
+    installMockExec((_file, args) => {
+      calls.push(args);
+      if (args[0] === "display-message") return MOCK_LOCATION;
+      if (args[0] === "list-panes") {
+        return "%20\n%21\n%22\n%23\n";
+      }
+      return "";
+    });
+    const mod = await importFresh<typeof import("../src/interactive-tmux")>(
+      "../src/interactive-tmux",
+    );
+
+    expect(() =>
+      mod.launchInteractiveSubagent({
+        name: "Too many",
+        task: "fail",
+        cwd: tmp,
+        parentSessionId: "owner-session",
+      }),
+    ).toThrow(/reached max nodes 4/);
+    expect(calls.some((args) => args[0] === "new-window")).toBe(false);
+    expect(
+      readdirSync(nodesDir).filter((entry) => entry.endsWith(".json")),
+    ).toHaveLength(4);
   });
 
   it("launches in visible-split mode when background: false", async () => {
@@ -348,6 +658,7 @@ describe("interactive-tmux", () => {
   it("pruneDeadInteractiveSubagents uses the incremental lifecycle fold", async () => {
     process.env.PI_CODING_AGENT_SESSION_DIR = makeTmp();
     process.env.TMUX = makeArgs().TMUX;
+    installMockExec(() => "");
 
     const mod = await importFresh<typeof import("../src/interactive-tmux")>(
       "../src/interactive-tmux",

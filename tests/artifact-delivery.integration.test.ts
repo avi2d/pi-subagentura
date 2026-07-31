@@ -43,10 +43,7 @@ import { __setTmuxMultiplexer } from "../src/multiplexer";
 import { pollArtifactChanges } from "../src/artifact-poller";
 import { renderSubagentNotify } from "../src/rendering";
 import { appendDeterministicTurn } from "./helpers/deterministic-artifacts";
-import {
-  getSessionContextStack,
-  registerSessionContext,
-} from "../src/session-context";
+import { clearSessionScopes, registerSessionScope } from "../src/session-scope";
 
 const roots: string[] = [];
 
@@ -109,7 +106,7 @@ afterEach(() => {
   (globalThis as any).__piSubagenturaSessionManager = undefined;
   (globalThis as any).__piSubagenturaPiRef = undefined;
   interactiveSubagentRegistry.clear();
-  getSessionContextStack().length = 0;
+  clearSessionScopes();
   __setTmuxMultiplexer(undefined);
 });
 
@@ -129,12 +126,12 @@ describe("artifact protocol v2 delivery", () => {
     };
     const ownerA = { id: 301, generation: 1 };
     const ownerB = { id: 302, generation: 1 };
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       ...ownerA,
       pi: {} as any,
       sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
     });
-    registerSessionContext({
+    const scopeB = registerSessionScope({
       ...ownerB,
       pi: {} as any,
       sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
@@ -165,6 +162,8 @@ describe("artifact protocol v2 delivery", () => {
     });
     interactiveSubagentRegistry.set(stateA.id, stateA);
     interactiveSubagentRegistry.set(stateB.id, stateB);
+    scopeA.interactiveStates.set(stateA.id, stateA);
+    scopeB.interactiveStates.set(stateB.id, stateB);
     const sendMessage = vi.fn();
 
     flushDeliveries({ sendMessage } as any, undefined, ownerB);
@@ -370,8 +369,8 @@ describe("artifact protocol v2 delivery", () => {
     (globalThis as any).__piSubagenturaInteractiveRegistry =
       interactiveSubagentRegistry;
     __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
     } as any);
     const first = appendDeterministicTurn(art, 1, "first immutable result");
     const second = appendDeterministicTurn(art, 2, "second immutable result");
@@ -393,6 +392,57 @@ describe("artifact protocol v2 delivery", () => {
     ]);
   });
 
+  it("does not independently deliver workflow-owned completions", async () => {
+    const art = makeArtifact();
+    const state = makeState(art.dir);
+    state.completionOwner = "workflow";
+    state.notifyOnComplete = "inject";
+    state.eventByteCursor = 0;
+    interactiveSubagentRegistry.set(state.id, state);
+    (globalThis as any).__piSubagenturaInteractiveRegistry =
+      interactiveSubagentRegistry;
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
+    appendDeterministicTurn(art, 1, "workflow-owned result");
+    const sendMessage = vi.fn();
+    await pollArtifactChanges({ sendMessage } as any);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(state.pendingDeliveries).toEqual([]);
+    expect(state.eventByteCursor).toBeGreaterThan(0);
+  });
+
+  it("polls workflow-owned children under their live supervisor owner", async () => {
+    const art = makeArtifact();
+    const owner = { id: 411, generation: 1 };
+    const sendMessage = vi.fn();
+    const scope = registerSessionScope({
+      ...owner,
+      pi: { sendMessage } as any,
+      sessionManager: { getSessionId: () => "workflow-parent" },
+    });
+    const state = {
+      ...makeState(art.dir),
+      parentSessionId: undefined,
+      supervisorOwner: owner,
+      completionOwner: "standalone" as const,
+      eventByteCursor: 0,
+    };
+    (globalThis as any).__piSubagenturaInteractiveRegistry =
+      interactiveSubagentRegistry;
+    interactiveSubagentRegistry.set(state.id, state);
+    scope.interactiveStates.set(state.id, state);
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+    } as any);
+    appendDeterministicTurn(art, 1, "owner-visible result");
+    await pollArtifactChanges({ sendMessage } as any, owner);
+    expect(state.eventByteCursor).toBeGreaterThan(0);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+
   it("queues an explicit omission message for oversized completion output", async () => {
     const art = makeArtifact();
     const state = makeState(art.dir);
@@ -403,8 +453,8 @@ describe("artifact protocol v2 delivery", () => {
     (globalThis as any).__piSubagenturaInteractiveRegistry =
       interactiveSubagentRegistry;
     __setTmuxMultiplexer({
-      isPaneAlive: () => true,
-      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
     } as any);
     const bytes = MAX_OUTPUT_SNAPSHOT_BYTES + 1;
     writeOutput(art, "");

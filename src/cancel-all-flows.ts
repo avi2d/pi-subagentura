@@ -6,13 +6,10 @@
  * - /cancel-all-flows command
  *
  * Preserves idle interactive panes (they consume no tokens).
- * Preserves done/error/cancelled jobs and workflows.
+ * Cancels running and unknown interactive panes; unknown liveness still
+ * represents potentially active work.
  */
-import {
-  inProcessJobBelongsToOwner,
-  jobRegistry,
-  scheduleJobCleanup,
-} from "./helpers";
+import { inProcessJobsForOwner, scheduleJobCleanup } from "./helpers";
 import {
   cancelInteractiveSubagent,
   interactiveSubagentRegistry,
@@ -21,8 +18,11 @@ import {
   normalizeCancelledWorkflowState,
   workflowJobsForOwner,
 } from "./workflow-jobs";
-import type { ActiveSessionContextToken } from "./session-context";
-import { parentSessionBelongsToOwner } from "./session-context";
+import {
+  interactiveStateBelongsToOwner,
+  resolveLiveSessionScope,
+  type SessionOwnerToken,
+} from "./session-scope";
 import {
   snapshotInProcessSession,
   snapshotInteractiveContext,
@@ -38,7 +38,7 @@ export interface CancelAllResult {
 }
 
 export async function cancelAllFlows(
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<CancelAllResult> {
   const result: CancelAllResult = {
     jobsAborted: 0,
@@ -57,11 +57,14 @@ export async function cancelAllFlows(
   };
 
   // Snapshot every known child before the first potentially slow abort.
-  const interactiveStates = [...interactiveSubagentRegistry.values()].filter(
-    (state) => parentSessionBelongsToOwner(state.parentSessionId, owner),
+  const interactiveRegistry = owner
+    ? resolveLiveSessionScope(owner)?.interactiveStates
+    : interactiveSubagentRegistry;
+  const interactiveStates = [...(interactiveRegistry?.values() ?? [])].filter(
+    (state) => interactiveStateBelongsToOwner(state, owner),
   );
   for (const state of interactiveStates) {
-    if (state.status !== "running") continue;
+    if (state.status !== "running" && state.status !== "unknown") continue;
     state.cancellationSnapshot = snapshotInteractiveContext({
       kind: "interactive",
       id: state.id,
@@ -74,8 +77,8 @@ export async function cancelAllFlows(
     });
     addSnapshot(state.cancellationSnapshot);
   }
-  const jobs = [...jobRegistry.values()].filter(
-    (job) => job.status === "running" && inProcessJobBelongsToOwner(job, owner),
+  const jobs = [...inProcessJobsForOwner(owner).values()].filter(
+    (job) => job.status === "running",
   );
   const jobCancellation = {
     source: "cancel_all" as const,
@@ -108,7 +111,7 @@ export async function cancelAllFlows(
       /* session may already be disposed */
     }
     job.status = "cancelled";
-    scheduleJobCleanup(job.id, true);
+    scheduleJobCleanup(job.id, true, undefined, owner);
     result.jobsAborted++;
   }
 
@@ -128,11 +131,15 @@ export async function cancelAllFlows(
     }
   }
 
-  // 3. Kill running interactive agents; preserve idle ones
+  // 3. Kill active interactive agents; preserve confirmed-idle ones
   for (const state of interactiveStates) {
-    if (state.status === "running") {
+    if (state.status === "running" || state.status === "unknown") {
       try {
-        const cancelled = cancelInteractiveSubagent(state.id);
+        const cancelled = cancelInteractiveSubagent(
+          state.id,
+          "cancel_all",
+          state,
+        );
         if (cancelled) {
           result.interactiveKilled++;
           if (cancelled.cancellationSnapshot) {

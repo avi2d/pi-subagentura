@@ -23,9 +23,23 @@
  * of the codebase compiles unchanged.
  */
 
+import {
+  findSessionScope,
+  sessionOwner,
+  resolveLiveSessionScope,
+  sessionIdForOwner,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "./session-scope";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
@@ -33,6 +47,7 @@ import {
   appendInteractiveState,
   appendCompletionEvent,
   artifactPath,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
   assertNever,
   newEventId,
   type SubagentEvent,
@@ -42,16 +57,32 @@ import {
 } from "./artifact";
 import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
 import {
+  type CapturePaneOptions,
+  type CapturePaneResult,
   getMux,
   NoMultiplexerAvailableError,
   type MuxName,
   type Multiplexer,
+  type PaneLiveness,
+  type PaneRef,
+  safeSegment,
 } from "./multiplexer";
 import {
   snapshotInteractiveContext,
   type CancellationSnapshotReceipt,
   type CancellationSnapshotSource,
 } from "./cancellation-snapshots";
+import {
+  countLineageManifestsSync,
+  DEFAULT_MAX_DEPTH,
+  DEFAULT_MAX_NODES,
+  hashLineageRoot,
+  LINEAGE_SCHEMA_VERSION,
+  type LineageManifest,
+  pruneTerminalLineageNodesSync,
+  resolveLineageStorePathsSync,
+  writeLineageManifestAtomicSync,
+} from "./interactive-lineage";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
@@ -159,6 +190,16 @@ export interface InteractiveSubagentState {
    * session_start. Optional for tests that don't care about reload semantics.
    */
   parentSessionId?: string;
+  /** Live supervisor owner; intentionally not persisted for workflow children. */
+  supervisorOwner?: SessionOwnerToken;
+  /** Exact runtime session generation that owns this state; never persisted. */
+  sessionOwner?: SessionOwnerToken;
+  /** Workflow that owns this child, when completion is aggregated by the workflow. */
+  workflowId?: string;
+  /** Completion is delivered standalone or consumed by a workflow aggregate. */
+  completionOwner?: "standalone" | "workflow";
+  /** Workflow-runner acknowledgement that this child's result was consumed; runtime-only and intentionally not persisted. */
+  workflowResultConsumed?: boolean;
   model?: string;
   startedAt: number;
   /**
@@ -240,6 +281,36 @@ if (!globalThis.__piSubagenturaInteractiveRegistry) {
 
 export const interactiveSubagentRegistry =
   globalThis.__piSubagenturaInteractiveRegistry!;
+/** Insert a state into its authoritative session map and the legacy aggregate index. */
+export function registerInteractiveSubagentState(
+  state: InteractiveSubagentState,
+  scope?: SessionScope,
+): void {
+  if (scope) {
+    state.sessionOwner = sessionOwner(scope);
+    scope.interactiveStates.set(state.id, state);
+  }
+  interactiveSubagentRegistry.set(state.id, state);
+}
+
+/** Remove the same state object from every registry that currently indexes it. */
+export function removeInteractiveSubagentState(
+  state: InteractiveSubagentState,
+): boolean {
+  let removed = false;
+  if (interactiveSubagentRegistry.get(state.id) === state) {
+    removed = interactiveSubagentRegistry.delete(state.id);
+  }
+  const owner = state.sessionOwner;
+  if (owner) {
+    const scope = findSessionScope(owner.id);
+    if (scope?.interactiveStates.get(state.id) === state) {
+      scope.interactiveStates.delete(state.id);
+      removed = true;
+    }
+  }
+  return removed;
+}
 
 /**
  * True iff a tmux server is running and the parent is attached to one of its
@@ -256,16 +327,6 @@ export function tmuxSetupHint(): string {
     "Start pi inside tmux or zellij, for example:\n" +
     "  tmux new -A -s pi 'pi'\n" +
     "  zellij --session pi  (or just start pi inside an existing zellij session)"
-  );
-}
-
-function safeSegment(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
   );
 }
 
@@ -365,6 +426,7 @@ export function writeLaunchScript(
   path: string,
   command: string,
   artifactDir: string,
+  internalEnv: Record<string, string> = {},
 ): void {
   mkdirSync(dirname(path), { recursive: true });
 
@@ -391,11 +453,16 @@ export function writeLaunchScript(
     "set -e",
     `export ARTIFACT_DIR=${escape(artifactDir)}`,
     "export PI_SUBAGENTURA_CHILD=1",
-    `"${cliPath}" start`,
+    ...Object.entries(internalEnv).map(
+      ([name, value]) => `export ${name}=${escape(value)}`,
+    ),
+    // Single-quote the helper path like every other interpolated path in this
+    // script; a double-quoted path still expands $, `` and \ inside it.
+    `${escape(cliPath)} start`,
     "on_exit() {",
     "    rc=$?",
     "    trap - EXIT",
-    `    "${cliPath}" process-exit "$rc" || true`,
+    `    ${escape(cliPath)} process-exit "$rc" || true`,
     '    tmux set-option -p -t "$TMUX_PANE" @pi-exit-code "$rc" 2>/dev/null || true',
     '    exit "$rc"',
     "}",
@@ -433,6 +500,14 @@ export function launchInteractiveSubagent(params: {
    * skipped (used by tests that don't care about reload).
    */
   parentSessionId?: string;
+  /** Live supervisor owner independent of persistence and delivery policy. */
+  supervisorOwner?: SessionOwnerToken;
+  /** Current runtime scope that authoritatively owns the spawned state. */
+  sessionScope?: SessionScope;
+  /** Workflow owner for grouping and cancellation. */
+  workflowId?: string;
+  /** Workflow-managed completions are consumed by the workflow runner. */
+  completionOwner?: "standalone" | "workflow";
   /**
    * The parent session's working directory, used for the state file location.
    * If omitted, falls back to `cwd` (backward-compatible for tests).
@@ -441,17 +516,84 @@ export function launchInteractiveSubagent(params: {
   /** Thinking/reasoning level for the child Pi process. */
   thinkingLevel?: ThinkingLevel;
 }): InteractiveSubagentState {
-  const id = randomBytes(4).toString("hex");
+  // 8 bytes, not 4: at 32 bits a birthday collision inside one tree is not
+  // remote, and the duplicate-id path only degrades gracefully — it does not
+  // recover the shadowed agent.
+  const id = randomBytes(8).toString("hex");
   const cwd = resolve(params.cwd);
   const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
+  const artifactOwnerSessionId =
+    params.parentSessionId ?? sessionIdForOwner(params.supervisorOwner);
   const background = params.background !== false; // default true (hidden)
   const paths = createInteractiveSubagentPaths({ id, name: params.name, cwd });
+  const parentAgentId = process.env.PI_SUBAGENTURA_AGENT_ID;
+  const rootId = process.env.PI_SUBAGENTURA_ROOT_ID ?? params.parentSessionId;
+  const sessionRoot =
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT ?? defaultSessionRoot();
+  const currentDepth = Number.parseInt(
+    process.env.PI_SUBAGENTURA_DEPTH ?? "0",
+    10,
+  );
+  const maxDepth = Number.parseInt(
+    process.env.PI_SUBAGENTURA_MAX_DEPTH ?? String(DEFAULT_MAX_DEPTH),
+    10,
+  );
+  const effectiveCurrentDepth = Number.isFinite(currentDepth)
+    ? currentDepth
+    : 0;
+  const effectiveMaxDepth =
+    Number.isFinite(maxDepth) && maxDepth >= 0 ? maxDepth : DEFAULT_MAX_DEPTH;
+  const nextDepth = effectiveCurrentDepth + 1;
+  if (rootId && nextDepth > effectiveMaxDepth) {
+    throw new Error(
+      `interactive sub-agent depth ${nextDepth} exceeds max ${effectiveMaxDepth}`,
+    );
+  }
+  const configuredMaxNodes = Number.parseInt(
+    process.env.PI_SUBAGENTURA_MAX_NODES ?? String(DEFAULT_MAX_NODES),
+    10,
+  );
+  const maxNodes =
+    Number.isFinite(configuredMaxNodes) && configuredMaxNodes > 0
+      ? configuredMaxNodes
+      : DEFAULT_MAX_NODES;
+  // The cap applies whenever a lineage root exists, even when this spawn will
+  // not persist a manifest of its own — recursion inside a tree still has to be
+  // bounded by that tree's budget.
+  const lineageStore = rootId
+    ? resolveLineageStorePathsSync(sessionRoot, rootId)
+    : undefined;
+  if (lineageStore) {
+    let activeCount = existsSync(lineageStore.nodesDir)
+      ? countLineageManifestsSync(lineageStore.nodesDir)
+      : 0;
+    if (activeCount >= maxNodes) {
+      // Physical manifests include confirmed-dead ancestors retained to keep
+      // child lineage connected. Probe only at the cap, then admit by the
+      // active/non-dead count; unknown panes conservatively consume capacity.
+      activeCount = pruneTerminalLineageNodesSync(
+        lineageStore.nodesDir,
+        (manifest) => getLineagePaneLiveness(manifest) === "dead",
+      ).active;
+    }
+    if (activeCount >= maxNodes) {
+      throw new Error(
+        `interactive sub-agent tree reached max nodes ${maxNodes} (${activeCount} nodes are active or have unknown liveness)`,
+      );
+    }
+  }
   const prompt = buildInteractivePrompt({
     task: params.task,
     contextText: params.contextText,
   });
-
   mkdirSync(paths.artifactDir, { recursive: true });
+  if (artifactOwnerSessionId) {
+    writeFileSync(
+      join(paths.artifactDir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      artifactOwnerSessionId,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  }
   writeFileSync(paths.promptFile, prompt, { encoding: "utf8", mode: 0o600 });
 
   // Cap the persona to prevent a misbehaving parent from shipping a huge
@@ -513,6 +655,7 @@ export function launchInteractiveSubagent(params: {
     id,
   });
   let persistedState = false;
+  let lineageManifestPath: string | undefined;
   // Persist as soon as the pane is addressable. A crash after this point is
   // recoverable on reload. If persistence itself fails, abort and kill the
   // pane; otherwise the child would be invisible to rehydrate after a restart.
@@ -544,6 +687,43 @@ export function launchInteractiveSubagent(params: {
       throw err;
     }
   }
+  if (rootId && params.parentSessionId) {
+    try {
+      lineageManifestPath = writeLineageManifestAtomicSync(
+        lineageStore!.nodesDir,
+        {
+          schemaVersion: LINEAGE_SCHEMA_VERSION,
+          agentId: id,
+          ...(parentAgentId ? { parentAgentId } : {}),
+          rootId,
+          rootHash: hashLineageRoot(rootId),
+          ownerSessionId: params.parentSessionId,
+          name: params.name,
+          taskPreview: params.task.replace(/\s+/g, " ").slice(0, 4096),
+          startedAt: new Date().toISOString(),
+          cwd,
+          pane: {
+            backend: mux.name,
+            paneId,
+            ...(muxSession ? { muxSession } : {}),
+            ...(windowName ? { windowName } : {}),
+          },
+          artifactDir: paths.artifactDir,
+          childSessionFile: paths.sessionFile,
+        },
+      );
+    } catch (err) {
+      if (persistedState) {
+        try {
+          removeInteractiveState(stateCwd, id);
+        } catch {
+          /* preserve the lineage error */
+        }
+      }
+      mux.killPane(paneId, muxSession);
+      throw err;
+    }
+  }
   try {
     const command = buildPiInteractiveCommand({
       sessionFile: paths.sessionFile,
@@ -554,7 +734,14 @@ export function launchInteractiveSubagent(params: {
       cwd,
       thinkingLevel: params.thinkingLevel,
     });
-    writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir);
+    writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir, {
+      ...(rootId ? { PI_SUBAGENTURA_ROOT_ID: rootId } : {}),
+      ...(rootId ? { PI_SUBAGENTURA_LINEAGE_SESSION_ROOT: sessionRoot } : {}),
+      PI_SUBAGENTURA_AGENT_ID: id,
+      PI_SUBAGENTURA_DEPTH: String(nextDepth),
+      PI_SUBAGENTURA_MAX_DEPTH: String(effectiveMaxDepth),
+      PI_SUBAGENTURA_MAX_NODES: String(maxNodes),
+    });
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     mux.sendKeys(
       paneId,
@@ -571,6 +758,13 @@ export function launchInteractiveSubagent(params: {
         removeInteractiveState(stateCwd, id);
       } catch {
         /* best effort — the pane kill below is the important cleanup */
+      }
+    }
+    if (lineageManifestPath) {
+      try {
+        rmSync(lineageManifestPath, { force: true });
+      } catch {
+        /* best effort */
       }
     }
     mux.killPane(paneId, muxSession);
@@ -602,11 +796,17 @@ export function launchInteractiveSubagent(params: {
     notifyOnComplete: params.notifyOnComplete ?? "inject",
     triggerTurnOnComplete: params.triggerTurnOnComplete,
     parentSessionId: params.parentSessionId,
+    supervisorOwner: params.supervisorOwner,
+    workflowId: params.workflowId,
+    completionOwner: params.completionOwner,
     eventByteCursor: 0,
     pendingDeliveries: [],
     deliveryReceipts: [],
   };
-  interactiveSubagentRegistry.set(id, state);
+  registerInteractiveSubagentState(
+    state,
+    params.sessionScope ?? resolveLiveSessionScope(params.supervisorOwner),
+  );
   return state;
 }
 
@@ -620,19 +820,105 @@ function getMuxForState(state: InteractiveSubagentState): Multiplexer {
   return getMux({ preference: state.mux });
 }
 
-/**
- * Probe whether a pane is still alive, using the mux that created it.
- * Mux-agnostic — replaces `isTmuxPaneAlive(paneId)`.
- */
+export function paneRefForState(state: InteractiveSubagentState): PaneRef {
+  return {
+    paneId: state.paneId,
+    windowName: state.windowName,
+    session: state.muxSession,
+  };
+}
+
+export function focusInteractiveSubagent(
+  state: InteractiveSubagentState,
+): Promise<void> {
+  return getMuxForState(state).focusPane(paneRefForState(state));
+}
+
+export function captureInteractiveSubagent(
+  state: InteractiveSubagentState,
+  options: CapturePaneOptions,
+): Promise<CapturePaneResult> {
+  return getMuxForState(state).capturePane(paneRefForState(state), options);
+}
+
+export function showInteractiveSubagentNativeViewer(
+  state: InteractiveSubagentState,
+  content: string,
+): Promise<boolean> {
+  return getMuxForState(state).showNativeViewer(state.name, content);
+}
+
+/** Probe pane liveness using the mux that created it. */
+export function getInteractivePaneLiveness(
+  state: InteractiveSubagentState,
+): PaneLiveness {
+  return getMuxForState(state).getPaneLiveness(state.paneId, state.muxSession);
+}
+
+/** Preserve active state unless the backend explicitly confirms pane death. */
 export function isPaneAlive(state: InteractiveSubagentState): boolean {
-  return getMuxForState(state).isPaneAlive(state.paneId, state.muxSession);
+  return getInteractivePaneLiveness(state) !== "dead";
 }
 
 /** Probe pane liveness without blocking the parent event loop. */
-export function isPaneAliveAsync(
+export function getInteractivePaneLivenessAsync(
+  state: InteractiveSubagentState,
+): Promise<PaneLiveness> {
+  return getMuxForState(state).getPaneLivenessAsync(
+    state.paneId,
+    state.muxSession,
+  );
+}
+
+/** Preserve active state unless the async backend explicitly confirms death. */
+export async function isPaneAliveAsync(
   state: InteractiveSubagentState,
 ): Promise<boolean> {
-  return getMuxForState(state).isPaneAliveAsync(state.paneId, state.muxSession);
+  return (await getInteractivePaneLivenessAsync(state)) !== "dead";
+}
+
+/** Probe the pane recorded in a lineage manifest. */
+export function getLineagePaneLiveness(
+  manifest: LineageManifest,
+): PaneLiveness {
+  const backend = manifest.pane.backend;
+  if (backend !== "tmux" && backend !== "zellij") return "unknown";
+  try {
+    return getMux({ preference: backend }).getPaneLiveness(
+      manifest.pane.paneId,
+      manifest.pane.muxSession,
+    );
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Whether a mux client is attached to the session hosting this agent's pane.
+ *
+ * `undefined` means "cannot tell". Focus is server-side state — tmux
+ * `select-window` exits 0 with zero clients attached — so a successful focus is
+ * invisible to the user for a detached `pi-subagent-<id>` session, which is the
+ * normal case for the relaxed spawn path.
+ *
+ * The probe itself belongs to the multiplexer layer. Backends opt in by
+ * implementing the optional `hasAttachedClientAsync(session?)` method; until
+ * they do, this resolves `undefined` and the UI stays quiet.
+ */
+export async function interactiveSubagentHasAttachedClient(
+  state: InteractiveSubagentState,
+): Promise<boolean | undefined> {
+  const mux = getMuxForState(state) as Multiplexer & {
+    hasAttachedClientAsync?: (
+      session?: string,
+    ) => Promise<boolean | undefined> | boolean | undefined;
+  };
+  if (typeof mux.hasAttachedClientAsync !== "function") return undefined;
+  try {
+    return await mux.hasAttachedClientAsync(state.muxSession);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -671,7 +957,7 @@ export function buildAttachCommandsForState(
  * subagent.ts; PR #2 will route through `state.mux` so this becomes mux-agnostic.
  */
 export function isTmuxPaneAlive(paneId: string): boolean {
-  return new TmuxMultiplexer().isPaneAlive(paneId);
+  return new TmuxMultiplexer().getPaneLiveness(paneId) === "alive";
 }
 
 /**
@@ -687,8 +973,10 @@ export function sendCommandToTmuxPane(paneId: string, command: string): void {
 export function cancelInteractiveSubagent(
   id: string,
   source: CancellationSnapshotSource = "cancel_interactive_subagent",
+  ownedState?: InteractiveSubagentState,
 ): InteractiveSubagentState | undefined {
-  const state = interactiveSubagentRegistry.get(id);
+  const state =
+    ownedState?.id === id ? ownedState : interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
 
   const snapshot = snapshotInteractiveContext({
@@ -718,13 +1006,16 @@ export function cancelInteractiveSubagent(
 
   // 3. Kill the pane via the backend that created it. The wrapper's EXIT trap fires and records the event.
   const mux = getMuxForState(state);
-  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
     mux.killPane(state.paneId, state.muxSession);
   }
   return state;
 }
 
-function appendCancellation(state: InteractiveSubagentState): void {
+function appendCancellation(
+  state: InteractiveSubagentState,
+  acknowledgeDelivery = true,
+): void {
   let turnId = "process";
   try {
     const active = JSON.parse(
@@ -752,6 +1043,7 @@ function appendCancellation(state: InteractiveSubagentState): void {
     });
   }
   if (!completion) return;
+  if (!acknowledgeDelivery) return;
   const mode = state.notifyOnComplete ?? "inject";
   const deliveryId = deliveryIdFor({
     parentSessionId: state.parentSessionId ?? "pi",
@@ -763,6 +1055,38 @@ function appendCancellation(state: InteractiveSubagentState): void {
   // transition already accounts for it. Persist a synthetic receipt before pane
   // teardown so polling or rehydrate cannot inject a duplicate completion.
   acknowledgeDeliveryWithoutDispatch(state, deliveryId);
+}
+
+/**
+ * Cancel a persisted descendant without claiming its completion in the root
+ * session. The descendant's owning Pi process remains responsible for polling
+ * the durable completion and delivering it to its own session.
+ */
+export function cancelInteractiveDescendantByState(
+  state: InteractiveSubagentState,
+): InteractiveSubagentState {
+  state.cancellationSnapshot = snapshotInteractiveContext({
+    kind: "interactive",
+    id: state.id,
+    parentSessionId: state.parentSessionId,
+    cwd: state.cwd,
+    sessionFile: state.sessionFile,
+    artifactDir: state.artifactDir,
+    startedAt: state.startedAt,
+    source: "cancel_interactive_subagent",
+  });
+  try {
+    writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
+  } catch {
+    /* best effort; the owner will reconcile the durable pane state */
+  }
+  appendCancellation(state, false);
+  state.status = "cancelled";
+  const mux = getMuxForState(state);
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
+    mux.killPane(state.paneId, state.muxSession);
+  }
+  return state;
 }
 
 /**
@@ -811,9 +1135,10 @@ export function cancelInteractiveSubagentByState(
   }
   appendCancellation(state);
 
-  // 2. Kill the pane if alive (best-effort; wrapped to keep the shutdown loop alive)
+  // Explicit cancellation is destructive by request: unless absence is
+  // confirmed, attempt the kill even when the listing probe is unavailable.
   const mux = getMuxForState(state);
-  if (mux.isPaneAlive(state.paneId, state.muxSession)) {
+  if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
     try {
       mux.killPane(state.paneId, state.muxSession);
     } catch {
@@ -924,22 +1249,30 @@ export function foldInteractiveLifecycle(
 
 export function deriveInteractiveSubagentStatusFromLifecycle(
   lifecycle: PersistedLifecycleFold,
-  paneAlive: boolean,
+  paneState: boolean | PaneLiveness,
 ): InteractiveSubagentStatus {
+  const paneLiveness: PaneLiveness =
+    typeof paneState === "boolean" ? (paneState ? "alive" : "dead") : paneState;
   if (lifecycle.parentCancelled) return "cancelled";
   if (lifecycle.processStatus) {
     return lifecycle.processStatus === "cancelled" ? "cancelled" : "exited";
   }
   if (lifecycle.completionOutcome) {
     if (lifecycle.completionOutcome === "cancelled") return "cancelled";
-    return paneAlive ? "idle" : "exited";
+    if (paneLiveness === "alive") return "idle";
+    return paneLiveness === "dead" ? "exited" : "unknown";
   }
   if (lifecycle.legacyTerminal) {
     if (lifecycle.legacyTerminal === "cancelled") return "cancelled";
     if (lifecycle.legacyTerminal === "error") return "exited";
-    return paneAlive ? "idle" : "exited";
+    if (paneLiveness === "alive") return "idle";
+    return paneLiveness === "dead" ? "exited" : "unknown";
   }
-  return paneAlive ? "running" : "unknown";
+  if (paneLiveness === "alive") return "running";
+  if (paneLiveness === "unknown") return "unknown";
+  // Keep the legacy boolean helper's no-event result stable; tri-state
+  // consumers can distinguish confirmed death and transition to exited.
+  return typeof paneState === "boolean" ? "unknown" : "exited";
 }
 
 /**
@@ -957,23 +1290,22 @@ export function deriveInteractiveSubagentStatusFromLifecycle(
  * before the launch trap could write it), fall back to the session-file
  * existence check — same heuristic as before.
  */
-export function pruneDeadInteractiveSubagents(): void {
-  for (const state of interactiveSubagentRegistry.values()) {
-    if (state.status !== "running" && state.status !== "idle") continue;
-    const paneAlive = isPaneAlive(state);
-    let next = deriveInteractiveSubagentStatusFromLifecycle(
-      state.lifecycle ?? {},
-      paneAlive,
-    );
-    // Session-file fallback: if the pane is gone and no event was recorded, the child died.
-    // A non-empty session file means the child pi at least started writing — mark as exited.
+export function pruneDeadInteractiveSubagents(
+  states: Iterable<InteractiveSubagentState> = interactiveSubagentRegistry.values(),
+): void {
+  for (const state of states) {
     if (
-      next === "unknown" &&
-      state.sessionFile &&
-      existsSync(state.sessionFile)
+      state.status !== "running" &&
+      state.status !== "idle" &&
+      state.status !== "unknown"
     ) {
-      next = "exited";
+      continue;
     }
+    const paneLiveness = getInteractivePaneLiveness(state);
+    const next = deriveInteractiveSubagentStatusFromLifecycle(
+      state.lifecycle ?? {},
+      paneLiveness,
+    );
     if (next === state.status) continue;
     state.status = next;
     const exitCode =
@@ -995,11 +1327,11 @@ export function formatInteractiveState(
   ];
   if (state.windowName) lines.push(`Window: ${state.windowName}`);
   if (state.exitCode !== undefined) lines.push(`Exit code: ${state.exitCode}`);
-  lines.push(
-    `Artifact: ${state.artifactDir}`,
-    `Session: ${state.sessionFile}`,
-    `Attach: ${state.attachCommand}`,
-    `Focus: ${state.selectPaneCommand}`,
-  );
+  lines.push(`Artifact: ${state.artifactDir}`);
+  if (!(state.mux === "tmux" && process.env.TMUX)) {
+    lines.push(`Attach: ${state.attachCommand}`);
+  }
+  lines.push(`Focus: ${state.selectPaneCommand}`);
+  lines.push(`Session: ${state.sessionFile}`);
   return lines.join("\n");
 }
