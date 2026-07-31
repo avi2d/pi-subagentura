@@ -34,6 +34,7 @@ import {
   getInteractivePaneLivenessAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import { appendInteractiveDebugEvent } from "./interactive-debug";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
@@ -448,13 +449,24 @@ async function runPollArtifactChanges(
           (ev as unknown as { eventId?: string }).eventId ??
           `legacy-${record.startOffset}`;
         const status = deliveryStatusFromEvent(ev);
+        const deliveryId = deliveryIdFor({
+          parentSessionId: state.parentSessionId ?? "pi",
+          subagentId: state.id,
+          turnId,
+          mode,
+        });
+        appendInteractiveDebugEvent(state.artifactDir, "completion_observed", {
+          byteStart: record.startOffset,
+          byteEnd: record.endOffset,
+          eventId,
+          turnId,
+          source: v2?.source ?? ev.type,
+          outcome: v2?.outcome ?? status,
+          outputBytes: v2?.output?.bytes,
+          activeTurnId: state.activeTurnId,
+        });
         enqueueDelivery(state, {
-          deliveryId: deliveryIdFor({
-            parentSessionId: state.parentSessionId ?? "pi",
-            subagentId: state.id,
-            turnId,
-            mode,
-          }),
+          deliveryId,
           subagentId: state.id,
           turnId,
           eventId,
@@ -465,6 +477,14 @@ async function runPollArtifactChanges(
           output: v2?.output,
           message: deliveryMessageFromEvent(ev),
           state: "queued",
+        });
+        appendInteractiveDebugEvent(state.artifactDir, "delivery_enqueued", {
+          deliveryId,
+          turnId,
+          mode,
+          triggerTurn,
+          status,
+          pendingCount: state.pendingDeliveries?.length,
         });
       }
       for (const issue of batch.issues) {

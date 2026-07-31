@@ -20,6 +20,7 @@ import {
   updateInteractiveState,
   type PersistedDeliveryIntent,
 } from "./artifact";
+import { appendInteractiveDebugEvent } from "./interactive-debug";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
 import {
@@ -347,6 +348,26 @@ function formatIntent(
   );
 }
 
+function logDeliveryBatch(
+  items: Array<{
+    state: InteractiveSubagentState;
+    intent: PersistedDeliveryIntent;
+  }>,
+  event: string,
+  data: Record<string, unknown> = {},
+): void {
+  for (const { state, intent } of items) {
+    appendInteractiveDebugEvent(state.artifactDir, event, {
+      deliveryId: intent.deliveryId,
+      turnId: intent.turnId,
+      status: intent.status,
+      mode: intent.mode,
+      triggerTurn: intent.triggerTurn,
+      ...data,
+    });
+  }
+}
+
 export function flushDeliveries(
   pi: ExtensionAPI,
   ui: ExtensionUIContext | undefined,
@@ -378,8 +399,18 @@ export function flushDeliveries(
     bytes += separatorBytes + itemBytes;
   }
   const triggersTurn = selected.some(({ intent }) => intent.triggerTurn);
-  if (resolveStreamingFlag(owner) && !triggersTurn) return;
+  if (resolveStreamingFlag(owner) && !triggersTurn) {
+    logDeliveryBatch(selected, "delivery_deferred", {
+      reason: "parent_streaming",
+      selectedCount: selected.length,
+    });
+    return;
+  }
   const deliveryIds = selected.map(({ intent }) => intent.deliveryId);
+  logDeliveryBatch(selected, "delivery_attempt", {
+    selectedCount: selected.length,
+    deliveryIds,
+  });
   try {
     pi.sendMessage(
       {
@@ -406,9 +437,15 @@ export function flushDeliveries(
         triggerTurn: triggersTurn,
       },
     );
-  } catch {
+  } catch (error) {
+    logDeliveryBatch(selected, "delivery_failed", {
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
     return;
   }
+  logDeliveryBatch(selected, "delivery_sent", {
+    selectedCount: selected.length,
+  });
   notifyCompletionDelivery(
     ui,
     selected.map(({ intent }) => ({
@@ -421,6 +458,10 @@ export function flushDeliveries(
   for (const { state, intent } of selected) {
     intent.state = "dispatchAttempted";
     persistState(state);
+    appendInteractiveDebugEvent(state.artifactDir, "delivery_persisted", {
+      deliveryId: intent.deliveryId,
+      state: intent.state,
+    });
   }
   reconcileAllDeliveryReceipts(owner);
 }

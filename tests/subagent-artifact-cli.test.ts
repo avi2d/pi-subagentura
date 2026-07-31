@@ -103,6 +103,24 @@ describe("subagent-artifact CLI", () => {
       expect(ev.exitCode).toBe(0);
     });
 
+    it("records completion diagnostics separately from lifecycle events", () => {
+      writeFileSync(join(tmp, "output.md"), "");
+      runCli(tmp, ["done", "0"]);
+      const debugEvents = readFileSync(join(tmp, "debug.ndjson"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(debugEvents.map((event) => event.event)).toEqual([
+        "completion_attempt",
+        "completion_recorded",
+      ]);
+      expect(debugEvents[1]).toMatchObject({
+        source: "explicit",
+        outcome: "done",
+        outputBytes: 0,
+      });
+    });
+
     it("writes a done event with non-zero exit code → status error", () => {
       runCli(tmp, ["done", "1"]);
       const ev = JSON.parse(

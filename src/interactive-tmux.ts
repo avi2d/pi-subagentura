@@ -55,6 +55,7 @@ import {
   type PersistedLifecycleFold,
   removeInteractiveState,
 } from "./artifact";
+import { appendInteractiveDebugEvent } from "./interactive-debug";
 import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
 import {
   type CapturePaneOptions,
@@ -742,6 +743,17 @@ export function launchInteractiveSubagent(params: {
       PI_SUBAGENTURA_MAX_DEPTH: String(effectiveMaxDepth),
       PI_SUBAGENTURA_MAX_NODES: String(maxNodes),
     });
+    appendInteractiveDebugEvent(paths.artifactDir, "child_spawned", {
+      subagentId: id,
+      model: params.model,
+      cwd,
+      sessionFile: paths.sessionFile,
+      paneId,
+      mux: mux.name,
+      muxSession,
+      notifyOnComplete: params.notifyOnComplete,
+      triggerTurnOnComplete: params.triggerTurnOnComplete,
+    });
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     mux.sendKeys(
       paneId,
@@ -978,6 +990,14 @@ export function cancelInteractiveSubagent(
   const state =
     ownedState?.id === id ? ownedState : interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
+  appendInteractiveDebugEvent(state.artifactDir, "cancel_requested", {
+    source,
+    subagentId: state.id,
+    status: state.status,
+    activeTurnId: state.activeTurnId,
+    paneId: state.paneId,
+    mux: state.mux,
+  });
 
   const snapshot = snapshotInteractiveContext({
     kind: "interactive",
@@ -1134,6 +1154,14 @@ export function cancelInteractiveSubagentByState(
     /* best-effort */
   }
   appendCancellation(state);
+  appendInteractiveDebugEvent(state.artifactDir, "cancel_requested", {
+    source: "session_shutdown",
+    subagentId: state.id,
+    status: state.status,
+    activeTurnId: state.activeTurnId,
+    paneId: state.paneId,
+    mux: state.mux,
+  });
 
   // Explicit cancellation is destructive by request: unless absence is
   // confirmed, attempt the kill even when the listing probe is unavailable.

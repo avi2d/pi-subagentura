@@ -65,6 +65,17 @@ const boundedOptionalEventText = (value) =>
 const cmd = process.argv[2];
 const arg = process.argv[3];
 const write = (obj) => appendFileSync(statusFile, JSON.stringify(obj) + "\n", { mode: 0o600 });
+const debug = (event, data = {}) => {
+  try {
+    appendFileSync(
+      join(dir, "debug.ndjson"),
+      JSON.stringify({ ts: Date.now(), pid: process.pid, event, ...data }) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // Diagnostics must never change the lifecycle command's exit status.
+  }
+};
 const readEvents = () => {
   try {
     return readFileSync(statusFile, "utf8")
@@ -172,8 +183,17 @@ const snapshot = (eventId) => {
   };
 };
 const completion = (outcome, source, extra = {}) => {
+  debug("completion_attempt", {
+    turnId,
+    outcome,
+    source,
+    alreadyCompleted: completed(),
+  });
   withCompletionLock(() => {
-    if (completed()) return;
+    if (completed()) {
+      debug("completion_skipped", { turnId, outcome, source });
+      return;
+    }
     const eventId = randomUUID();
     const snapshotResult = snapshot(eventId);
     write({
@@ -188,12 +208,20 @@ const completion = (outcome, source, extra = {}) => {
       ...snapshotResult,
       ...extra,
     });
+    debug("completion_recorded", {
+      turnId,
+      eventId,
+      outcome,
+      source,
+      outputBytes: snapshotResult.output?.bytes,
+    });
   });
 };
 
 switch (cmd) {
   case "start":
     write({ ts: Date.now(), type: "started", status: "running" });
+    debug("process_start", { turnId });
     break;
   case "done": {
     const exitCode = Number(arg ?? 0);
@@ -212,6 +240,12 @@ switch (cmd) {
   case "process-exit": {
     const exitCode = Number(arg ?? 0);
     const cancelled = existsSync(join(dir, ".cancelled"));
+    debug("process_exit", {
+      turnId,
+      exitCode,
+      cancelled,
+      completedBeforeExit: completed(),
+    });
     if (!completed()) {
       completion(cancelled ? "cancelled" : "error", "process_exit", {
         exitCode,
