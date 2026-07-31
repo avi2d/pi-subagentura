@@ -37,7 +37,7 @@ flowchart TB
 
   InTools[tools/in-process.ts]
   InKernel[helpers.ts / AgentSession]
-  InJobs[(in-process jobRegistry)]
+  InJobs[(per-session in-process jobs)]
   InNotify[notifications.ts]
 
   IntTools[tools/interactive.ts]
@@ -89,13 +89,13 @@ flowchart TB
 
 ### 2.1 The three execution shapes
 
-| Shape                    | Execution location                         | Primary live state                            | Completion authority                                                          | How final information reaches parent context                                                                               |
-| ------------------------ | ------------------------------------------ | --------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| In-process, synchronous  | Pi extension process, child `AgentSession` | Child Pi session and execute callback         | Returned `SubagentResult`                                                     | Direct final `AgentToolResult` from the spawn tool                                                                         |
-| In-process, asynchronous | Pi extension process, child `AgentSession` | Global `jobRegistry`                          | Settled job promise and stored result                                         | `notifications.ts` injects `subagent-notify`, or parent calls `get_subagent_result`                                        |
-| Interactive              | Separate `pi` process in tmux/Zellij       | Live interactive registry plus artifact files | Physical completion event in `events.ndjson`; immutable v2 snapshot for bytes | `artifact-poller.ts` queues delivery and `delivery.ts` injects `subagent-notify`; explicit artifact read remains available |
-| Workflow, foreground     | Worker thread and VM in extension process  | `Engine`, worker RPC state, selected runner   | Worker terminal result after outstanding agent calls settle                   | Direct final `workflow` tool result                                                                                        |
-| Workflow, background     | Same Worker/VM arrangement                 | Global `workflowJobRegistry`                  | Settled workflow job promise                                                  | `workflow-notify` asks parent to call `get_workflow_result`                                                                |
+| Shape                    | Execution location                         | Primary live state                                            | Completion authority                                                          | How final information reaches parent context                                                                               |
+| ------------------------ | ------------------------------------------ | ------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| In-process, synchronous  | Pi extension process, child `AgentSession` | Child Pi session and execute callback                         | Returned `SubagentResult`                                                     | Direct final `AgentToolResult` from the spawn tool                                                                         |
+| In-process, asynchronous | Pi extension process, child `AgentSession` | Per-session scope registry (with a legacy process-wide index) | Settled job promise and stored result                                         | `notifications.ts` injects `subagent-notify`, or parent calls `get_subagent_result`                                        |
+| Interactive              | Separate `pi` process in tmux/Zellij       | Live interactive registry plus artifact files                 | Physical completion event in `events.ndjson`; immutable v2 snapshot for bytes | `artifact-poller.ts` queues delivery and `delivery.ts` injects `subagent-notify`; explicit artifact read remains available |
+| Workflow, foreground     | Worker thread and VM in extension process  | `Engine`, worker RPC state, selected runner                   | Worker terminal result after outstanding agent calls settle                   | Direct final `workflow` tool result                                                                                        |
+| Workflow, background     | Same Worker/VM arrangement                 | Global `workflowJobRegistry`                                  | Settled workflow job promise                                                  | `workflow-notify` asks parent to call `get_workflow_result`                                                                |
 
 ### 2.2 Mode comparison
 
@@ -118,7 +118,7 @@ flowchart TB
 
 The only recurring scheduler is `src/session-handlers.ts:ensureInteractivePoller`.
 After `session_start`, it creates one process-global, unref'ed five-second interval.
-Every interval firing calls `pollArtifactChanges` once per live session context with that owner's `{id, generation}` token.
+Every interval firing calls `pollArtifactChanges` once per live session scope with that owner's `{id, generation}` token.
 `src/artifact-poller.ts` performs the owner-scoped tick and suppresses overlapping ticks for the same owner.
 Neither child Pi, neither mux backend, nor an in-process `AgentSession` owns this timer.
 Workflow process-backed calls have a separate bounded `awaitInteractiveResult` loop in `src/workflow-worker.ts`; that loop waits for one runner call and is not the recurring global scheduler.
@@ -134,12 +134,12 @@ Workflow process-backed calls have a separate bounded `awaitInteractiveResult` l
 
 **Who owns each registry?**
 
-- `src/helpers.ts` owns `jobRegistry` for asynchronous in-process jobs.
-- `src/interactive-tmux.ts` owns `interactiveSubagentRegistry` for live interactive agents.
+- `src/helpers.ts` owns per-session in-process job maps and the legacy aggregate `jobRegistry` index.
+- `src/interactive-tmux.ts` owns per-session interactive state maps and the legacy aggregate `interactiveSubagentRegistry` index.
 - `src/artifact.ts` owns the schema and locking for durable `.pi/subagentura-state.json` recovery records.
 - `src/workflow-jobs.ts` owns `workflowJobRegistry` for background workflows.
-- `src/session-context.ts` owns the live parent context stack and generation fences.
-- `src/notifications.ts` owns the bounded pending in-process delivery queue.
+- `src/session-scope.ts` owns the live parent session-scope registry and generation fences.
+- `src/notifications.ts` owns per-session pending in-process delivery queues and the legacy aggregate queue.
 - `src/session-handlers.ts` owns the one global poller handle.
 
 **How does every mode reach parent context?**
@@ -157,22 +157,21 @@ Workflow process-backed calls have a separate bounded `awaitInteractiveResult` l
 `src/subagent.ts` is the composition root and supported runtime entry.
 Registration is mode-gated so a child process does not recursively expose the full parent orchestration surface.
 
-| Condition                               | Registration / behavior                                                                                                                                                                       | Owner                                                                 |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Every activation                        | Register the `subagent-notify` renderer                                                                                                                                                       | `src/subagent.ts:default`, `renderSubagentNotify`                     |
-| Every parent activation                 | Register Pi session lifecycle callbacks                                                                                                                                                       | `registerSessionHandlers`                                             |
-| Normal parent with `--orchestrator`     | Append the bundled `ORCHESTRATOR_SYSTEM_PROMPT.md` during `before_agent_start`                                                                                                                | `src/subagent.ts:default`                                             |
-| Normal parent, not `--only-interactive` | Register in-process spawn, status, result, cancel, model, prune, and cleanup tools                                                                                                            | `registerInProcessSubagentTools`, `registerInProcessMaintenanceTools` |
-| Normal parent                           | Register interactive spawn/status/cancel/send/read/list tools                                                                                                                                 | `registerInteractiveSubagentTools`                                    |
-| Normal parent, not `--only-interactive` | Register workflow tools and commands                                                                                                                                                          | `registerWorkflowTool` through internal `workflow.ts` barrel          |
-| Normal parent                           | Register cross-mode cancel command/shortcut                                                                                                                                                   | `registerCancelAllFlows`                                              |
-| Normal parent                           | Register supervisor command/shortcut/UI routes                                                                                                                                                | `registerInteractiveSupervisor`                                       |
-| `--only-interactive`                    | Skip workflow registration and in-process spawn/status/result/cancel/prune; retain interactive tools, model listing, artifact cleanup, supervisor, cancel-all, renderer, and session handlers | root mode gate                                                        |
-| `PI_SUBAGENTURA_CHILD=1`                | Register child artifact protocol and the restricted child-facing surface, then return                                                                                                         | `registerChildProtocol` path in `src/subagent.ts`                     |
-| `session_start`                         | Create/replace live session context, optionally rehydrate, then ensure the global interval                                                                                                    | `src/session-handlers.ts`                                             |
-| `agent_start`                           | Mark this parent as streaming                                                                                                                                                                 | `src/session-handlers.ts`                                             |
-| `agent_settled`                         | Clear streaming and flush interactive plus in-process deliveries                                                                                                                              | `src/session-handlers.ts`                                             |
-| `session_shutdown`                      | Fence generation, owner-clean registries, preserve or kill panes by reason, stop interval only after the last context                                                                         | `src/session-handlers.ts`                                             |
+| Condition                           | Registration / behavior                                                                                             | Owner                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Every activation                    | Register the `subagent-notify` renderer                                                                             | `src/subagent.ts:default`, `renderSubagentNotify`                     |
+| Every parent activation             | Register Pi session lifecycle callbacks                                                                             | `registerSessionHandlers`                                             |
+| Normal parent with `--orchestrator` | Append the bundled `ORCHESTRATOR_SYSTEM_PROMPT.md` during `before_agent_start`                                      | `src/subagent.ts:default`                                             |
+| Normal parent                       | Register in-process spawn, status, result, cancel, model, prune, and cleanup tools                                  | `registerInProcessSubagentTools`, `registerInProcessMaintenanceTools` |
+| Normal parent                       | Register interactive spawn/status/cancel/send/read/list tools                                                       | `registerInteractiveSubagentTools`                                    |
+| Normal parent                       | Register workflow tools and commands                                                                                | `registerWorkflowTool` through internal `workflow.ts` barrel          |
+| Normal parent                       | Register cross-mode cancel command/shortcut                                                                         | `registerCancelAllFlows`                                              |
+| Normal parent                       | Register supervisor command/shortcut/UI routes                                                                      | `registerInteractiveSupervisor`                                       |
+| `PI_SUBAGENTURA_CHILD=1`            | Register child artifact protocol and the restricted child-facing surface, then return                               | `registerChildProtocol` path in `src/subagent.ts`                     |
+| `session_start`                     | Create/replace live session scope, optionally rehydrate, then ensure the global interval                            | `src/session-handlers.ts`                                             |
+| `agent_start`                       | Mark this parent as streaming                                                                                       | `src/session-handlers.ts`                                             |
+| `agent_settled`                     | Clear streaming and flush interactive plus in-process deliveries                                                    | `src/session-handlers.ts`                                             |
+| `session_shutdown`                  | Fence generation, owner-clean registries, preserve or kill panes by reason, stop interval only after the last scope | `src/session-handlers.ts`                                             |
 
 The child launch wrapper exports both `PI_SUBAGENTURA_CHILD=1` and `ARTIFACT_DIR`.
 The child protocol requires the artifact directory; the root mode gate prevents the launched child from recursively behaving like a normal parent extension.
@@ -187,7 +186,7 @@ Type-only edges sometimes point upward to describe state without creating emitte
 ```mermaid
 flowchart TB
   L0[Leaf contracts and primitives
-abortable-wait, schemas, session-context,
+abortable-wait, schemas, session-scope,
 orchestration-context, pi-sdk-compat,
 cancellation-snapshots, interactive-lineage,
 workflow parser and structured output]
@@ -242,7 +241,7 @@ It registers `subagent_with_context`, `subagent_isolated`, `get_subagent_status`
 It resolves Pi runtime compatibility, creates an in-memory `SessionManager` and `AgentSession`, subscribes to Pi events, builds the prompt, aggregates usage, and disposes the session.
 
 `src/orchestration-context.ts` carries nested `jobId`, depth, and root-session identity through `AsyncLocalStorage`.
-`src/session-context.ts` supplies the parent session identity and generation token.
+`src/session-scope.ts` supplies parent session scopes, ownership tokens, and generation fences.
 `src/notifications.ts` is the asynchronous completion broker.
 
 ### 5.2 Context and model selection
@@ -342,7 +341,7 @@ Pi UI notifications are presentation only.
 The target controller aborts the `AgentSession`; `cascadeChildAborts` walks recorded `parentJobId` descendants.
 The kernel checks the signal after `prompt()` because Pi may resolve rather than reject a prompt on abort.
 
-The process-global registry survives module reload but not process restart.
+The authoritative in-process registry is per session scope; its legacy process-wide index survives module reload but not process restart.
 Done/error entries persist by default, can expire by positive `maxAge`, can be pruned explicitly, and may be evicted oldest-first at the 100-entry cap.
 Cancelled entries are scheduled for immediate deletion.
 
@@ -562,15 +561,15 @@ An oversized record is scanned to its newline and represented as a bounded issue
 Its exact lifecycle is:
 
 1. Pi emits `session_start`;
-2. the handler installs a live context and generation token;
+2. the handler installs a live session scope and generation token;
 3. for `startup`, `reload`, or `resume`, it rehydrates matching interactive state;
 4. only then it calls `ensureInteractivePoller`;
 5. one global `setInterval(..., 5000)` is created and `unref()` is called;
-6. each interval firing iterates the live context stack and invokes one owner-scoped `pollArtifactChanges` tick;
-7. the interval is cleared only when the final live context shuts down.
+6. each interval firing iterates the live session-scope registry and invokes one owner-scoped `pollArtifactChanges` tick;
+7. the interval is cleared only when the final live scope shuts down.
 
 A stale interval from an older release is discarded.
-Nested Pi contexts share the same timer but receive independent owner ticks.
+Nested Pi session scopes share the same timer but receive independent owner ticks.
 
 ### 8.2 Owner-scoped poll tick
 
@@ -696,24 +695,19 @@ The first later tick therefore resumes from durable physical cursors and can dra
 
 Shutdown ordering prevents late cross-session delivery:
 
-1. close the supervisor overlay but retain the UI reference briefly;
-2. find the shutting context;
-3. advance its generation and remove it from the context stack;
-4. restore active globals to any remaining top context;
-5. owner-clean workflow jobs;
-6. for nested shutdown, remove only that owner's interactive and in-process states, preserving panes on `reload`, `resume`, or `quit`;
-7. if another context remains, leave the global interval running and return;
-8. on final shutdown, clear the global interval;
-9. snapshot interactive state objects;
-10. clear session parsers and the entire interactive registry **before** killing panes;
-11. preserve panes for `reload`, `resume`, and `quit`, otherwise cancel by the saved state objects;
-12. snapshot all running in-process jobs before aborting them;
-13. abort controllers/sessions and clear `jobRegistry`;
-14. clear global Pi/session/streaming references;
-15. delete durable interactive state only for shutdown reason `new`.
+1. close the supervisor overlay and clear session parsers for the owner;
+2. snapshot running in-process jobs and suppress/abort owner-scoped workflow jobs;
+3. clear owner-scoped in-process deliveries;
+4. remove owner-scoped interactive states before killing panes, preserving panes on `reload`, `resume`, or `quit`;
+5. abort and remove owner-scoped in-process jobs;
+6. mark the scope shut down, advance its generation, and remove it from the session-scope registry;
+7. restore active globals to the latest remaining scope;
+8. if another scope remains, leave the global interval running and return;
+9. on final shutdown, clear the global interval;
+10. delete durable interactive state only for shutdown reason `new`.
 
 Clearing registry identity before pane teardown means an already-dequeued poll tick cannot dispatch into a dead parent.
-Generation advancement independently fences any tick or notification that captured the old context.
+Generation advancement independently fences any tick or notification that captured the old owner scope.
 
 ---
 
@@ -890,20 +884,20 @@ Delivery is owner-fenced, guarded against reentrancy, retried a bounded number o
 
 ### 11.1 Persistence table
 
-| State                              | Owner and location                    | Survives module reload |            Survives process restart | Recovery path                          |
-| ---------------------------------- | ------------------------------------- | ---------------------: | ----------------------------------: | -------------------------------------- |
-| In-process jobs                    | `helpers.ts` global `jobRegistry`     |                    Yes |                                  No | None                                   |
-| In-process pending delivery        | `notifications.ts` global queue       |                    Yes | No, except overflow ledger metadata | None                                   |
-| Interactive live objects           | `interactive-tmux.ts` global registry |                    Yes |                                  No | Rebuilt from durable state             |
-| Interactive lifecycle/output       | Artifact directory                    |                    Yes |                                 Yes | Byte-cursor polling and artifact reads |
-| Interactive cursors/queue/receipts | `<cwd>/.pi/subagentura-state.json`    |                    Yes |                                 Yes | `rehydrateInteractiveSubagents`        |
-| Parent delivery receipt            | Parent Pi session custom entry        |                    Yes |                    Yes with session | Reconciled by `details.deliveryIds`    |
-| Child conversation                 | Child Pi session JSONL                |                    Yes |                                 Yes | Reopened by Pi; tailed for observation |
-| Workflow jobs/results              | `workflow-jobs.ts` global registry    |                    Yes |                                  No | None                                   |
-| Workflow scripts                   | `~/.pi-subagentura/workflows/*.js`    |                    Yes |                                 Yes | Load by validated name                 |
-| Session ownership                  | `session-context.ts` global stack     |                    Yes |                                  No | New `session_start` generation         |
-| Interactive lineage                | bounded lineage manifests             |                    Yes |                                 Yes | Supervisor projection                  |
-| Cancellation diagnostics           | configured snapshot directory         |                    Yes |                                 Yes | Explicit inspection only               |
+| State                              | Owner and location                                                    | Survives module reload |            Survives process restart | Recovery path                          |
+| ---------------------------------- | --------------------------------------------------------------------- | ---------------------: | ----------------------------------: | -------------------------------------- |
+| In-process jobs                    | `helpers.ts` per-session job maps plus legacy `jobRegistry` index     |                    Yes |                                  No | None                                   |
+| In-process pending delivery        | `notifications.ts` per-session queues plus legacy aggregate queue     |                    Yes | No, except overflow ledger metadata | None                                   |
+| Interactive live objects           | `interactive-tmux.ts` per-session maps plus legacy aggregate registry |                    Yes |                                  No | Rebuilt from durable state             |
+| Interactive lifecycle/output       | Artifact directory                                                    |                    Yes |                                 Yes | Byte-cursor polling and artifact reads |
+| Interactive cursors/queue/receipts | `<cwd>/.pi/subagentura-state.json`                                    |                    Yes |                                 Yes | `rehydrateInteractiveSubagents`        |
+| Parent delivery receipt            | Parent Pi session custom entry                                        |                    Yes |                    Yes with session | Reconciled by `details.deliveryIds`    |
+| Child conversation                 | Child Pi session JSONL                                                |                    Yes |                                 Yes | Reopened by Pi; tailed for observation |
+| Workflow jobs/results              | `workflow-jobs.ts` global registry                                    |                    Yes |                                  No | None                                   |
+| Workflow scripts                   | `~/.pi-subagentura/workflows/*.js`                                    |                    Yes |                                 Yes | Load by validated name                 |
+| Session ownership                  | `session-scope.ts` live scope registry                                |                    Yes |                                  No | New `session_start` generation         |
+| Interactive lineage                | bounded lineage manifests                                             |                    Yes |                                 Yes | Supervisor projection                  |
+| Cancellation diagnostics           | configured snapshot directory                                         |                    Yes |                                 Yes | Explicit inspection only               |
 
 ### 11.2 Authority table
 
@@ -916,7 +910,7 @@ Delivery is owner-fenced, guarded against reentrancy, retried a bounded number o
 | Is an interactive process alive?                | Recorded mux backend's liveness probe                                 | Last event timestamp                                        |
 | Was a parent delivery committed?                | Matching parent session custom entry with `details.deliveryIds`       | Successful `sendMessage` return, UI toast                   |
 | Where does artifact polling resume?             | Persisted physical byte cursor and partial-line replay boundary       | Event timestamp                                             |
-| Who owns a state?                               | Exact parent session ID plus live context generation                  | Current top UI alone                                        |
+| Who owns a state?                               | Exact parent session ID plus live scope generation                    | Current top UI alone                                        |
 | What is interactive descendant topology?        | Validated lineage manifests                                           | Artifact event parent guesses                               |
 | What is a workflow job result?                  | Settled `WorkflowJobState` promise/result                             | Worker progress log, notification summary                   |
 | What usage did process workflow runner consume? | Aggregated assistant usage in child session JSONL                     | Artifact output byte size                                   |
@@ -952,43 +946,43 @@ The following table inventories all 42 source files exactly once as modules.
 |   # | Module                                       | Responsibility                                                                                                             | Direct internal dependencies                                                                                                                                                                                                                                                   |
 | --: | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 |   1 | `src/abortable-wait.ts`                      | Abort-aware promise race and result type                                                                                   | None                                                                                                                                                                                                                                                                           |
-|   2 | `src/artifact-poller.ts`                     | Owner-scoped artifact/session polling, lifecycle folding, durable enqueue/drain, footer/widget projection                  | `artifact`, `interactive-tmux`, `notifications`, `delivery`, `helpers`, `rendering`, `workflow-core`, `workflow-jobs`, `session-context`                                                                                                                                       |
+|   2 | `src/artifact-poller.ts`                     | Owner-scoped artifact/session polling, lifecycle folding, durable enqueue/drain, footer/widget projection                  | `artifact`, `interactive-tmux`, `notifications`, `delivery`, `helpers`, `rendering`, `workflow-core`, `workflow-jobs`, `session-scope`                                                                                                                                         |
 |   3 | `src/artifact.ts`                            | Canonical artifact event/state schemas, bounded NDJSON I/O, immutable snapshots, state locks and persistence               | `helpers`; type-only `multiplexer`                                                                                                                                                                                                                                             |
-|   4 | `src/cancel-all-flows-registration.ts`       | Registers cross-mode keyboard shortcut and slash command                                                                   | `cancel-all-flows`; type-only `session-context`                                                                                                                                                                                                                                |
-|   5 | `src/cancel-all-flows.ts`                    | Owner-scoped cancellation across all three registries and snapshot receipt collection                                      | `helpers`, `interactive-tmux`, `workflow-jobs`, `session-context`, `cancellation-snapshots`                                                                                                                                                                                    |
+|   4 | `src/cancel-all-flows-registration.ts`       | Registers cross-mode keyboard shortcut and slash command                                                                   | `cancel-all-flows`; type-only `session-scope`                                                                                                                                                                                                                                  |
+|   5 | `src/cancel-all-flows.ts`                    | Owner-scoped cancellation across all three registries and snapshot receipt collection                                      | `helpers`, `interactive-tmux`, `workflow-jobs`, `session-scope`, `cancellation-snapshots`                                                                                                                                                                                      |
 |   6 | `src/cancellation-snapshots.ts`              | Optional bounded atomic deduplicated cancellation diagnostics                                                              | None                                                                                                                                                                                                                                                                           |
 |   7 | `src/child-protocol.ts`                      | Converts child Pi lifecycle callbacks to active-turn and artifact events                                                   | `artifact`                                                                                                                                                                                                                                                                     |
-|   8 | `src/delivery.ts`                            | Durable interactive delivery queue, validated output injection, dispatch attempts and receipt reconciliation               | `artifact`, `notifications`, `session-context`, `helpers`; type-only `interactive-tmux`                                                                                                                                                                                        |
+|   8 | `src/delivery.ts`                            | Durable interactive delivery queue, validated output injection, dispatch attempts and receipt reconciliation               | `artifact`, `notifications`, `session-scope`, `helpers`; type-only `interactive-tmux`                                                                                                                                                                                          |
 |   9 | `src/helpers.ts`                             | In-process execution kernel, model/session compatibility use, job registry, live status, cancellation trees                | `pi-sdk-compat`, `workflow-structured-output`, `cancellation-snapshots`, `orchestration-context`; type-only `interactive-tmux`                                                                                                                                                 |
 |  10 | `src/interactive-lineage.ts`                 | Bounded durable lineage manifests, projection, and leaf-first subtree cancellation                                         | None                                                                                                                                                                                                                                                                           |
-|  11 | `src/interactive-supervisor-registration.ts` | Registers supervisor shortcut/command and routes focus, capture, and cancel actions                                        | `interactive-supervisor-ui`, `interactive-tmux`, `interactive-lineage`, `multiplexer`, `helpers`, `cancellation-snapshots`, `artifact-poller`, `workflow-jobs`, `session-context`                                                                                              |
+|  11 | `src/interactive-supervisor-registration.ts` | Registers supervisor shortcut/command and routes focus, capture, and cancel actions                                        | `interactive-supervisor-ui`, `interactive-tmux`, `interactive-lineage`, `multiplexer`, `helpers`, `cancellation-snapshots`, `artifact-poller`, `workflow-jobs`, `session-scope`                                                                                                |
 |  12 | `src/interactive-supervisor-ui.ts`           | TUI for async jobs, details, navigation, and active overlay close hook                                                     | `interactive-tmux`; type-only `helpers`, `workflow-jobs`                                                                                                                                                                                                                       |
 |  13 | `src/interactive-tmux.ts`                    | Backend-neutral interactive launch, registry, lifecycle, follow-up, focus/capture, cancellation and persisted-state bridge | `subagent-artifact-cli`, `artifact`, `delivery`, `multiplexer`, `cancellation-snapshots`, `interactive-lineage`, `multiplexer-tmux`                                                                                                                                            |
 |  14 | `src/multiplexer-tmux.ts`                    | tmux implementation of pane/session creation, input, liveness, capture, focus and kill                                     | `multiplexer`                                                                                                                                                                                                                                                                  |
 |  15 | `src/multiplexer-zellij.ts`                  | Zellij implementation of pane/tab creation, normalized identity, input, liveness, capture, focus and kill                  | `multiplexer`                                                                                                                                                                                                                                                                  |
 |  16 | `src/multiplexer.ts`                         | Multiplexer contracts, backend resolver/cache, subprocess and bounded UTF-8 capture helpers                                | `multiplexer-tmux`, `multiplexer-zellij`, `artifact`                                                                                                                                                                                                                           |
 |  17 | `src/ndjson.d.ts`                            | Local declaration shim for external `ndjson` package                                                                       | None project-internal                                                                                                                                                                                                                                                          |
-|  18 | `src/notifications.ts`                       | Bounded in-memory in-process completion queue, formatting, follow-up dispatch and retry                                    | `helpers`, `artifact`, `session-context`; type-only `interactive-tmux`                                                                                                                                                                                                         |
+|  18 | `src/notifications.ts`                       | Bounded in-memory in-process completion queue, formatting, follow-up dispatch and retry                                    | `helpers`, `artifact`, `session-scope`; type-only `interactive-tmux`                                                                                                                                                                                                           |
 |  19 | `src/orchestration-context.ts`               | Reload-stable `AsyncLocalStorage` lineage/depth propagation and spawn limit                                                | None                                                                                                                                                                                                                                                                           |
 |  20 | `src/pi-sdk-compat.ts`                       | Pi SDK boundary for modern runtime versus legacy auth/model-registry APIs                                                  | None project-internal                                                                                                                                                                                                                                                          |
 |  21 | `src/rehydrate.ts`                           | Reconstructs live interactive state from durable records and reconciles delivery receipts                                  | `artifact`, `delivery`, `interactive-tmux`                                                                                                                                                                                                                                     |
 |  22 | `src/rendering.ts`                           | Pure/shared tool, async spawn, notification and activity-row renderers                                                     | `helpers`, `notifications`; type-only `subagent`, `interactive-tmux`                                                                                                                                                                                                           |
 |  23 | `src/schemas.ts`                             | Shared TypeBox schemas for in-process and interactive tools                                                                | None project-internal                                                                                                                                                                                                                                                          |
-|  24 | `src/session-context.ts`                     | Global live Pi/UI/session stack, owner generations and liveness guards                                                     | None project-internal                                                                                                                                                                                                                                                          |
-|  25 | `src/session-handlers.ts`                    | Pi lifecycle adapter, sole global poll interval, rehydrate/flush/shutdown orchestration                                    | `artifact`, `artifact-poller`, `delivery`, `notifications`, `helpers`, `cancellation-snapshots`, `rehydrate`, `interactive-tmux`, `workflow-jobs`, `session-context`, `interactive-supervisor-ui`                                                                              |
+|  24 | `src/session-scope.ts`                       | Live session-scope registry, owner generations and liveness guards                                                         | None project-internal                                                                                                                                                                                                                                                          |
+|  25 | `src/session-handlers.ts`                    | Pi lifecycle adapter, sole global poll interval, rehydrate/flush/shutdown orchestration                                    | `artifact`, `artifact-poller`, `delivery`, `notifications`, `helpers`, `cancellation-snapshots`, `rehydrate`, `interactive-tmux`, `workflow-jobs`, `session-scope`, `interactive-supervisor-ui`                                                                                |
 |  26 | `src/subagent-artifact-cli.ts`               | Stores and materializes the standalone artifact-local `cli.mjs` source                                                     | `artifact` constants                                                                                                                                                                                                                                                           |
 |  27 | `src/subagent.ts`                            | Package/Pi composition root, parent/child mode selection, registrations, renderer and unstable internal re-exports         | `helpers`, `workflow`, `tools/in-process`, `tools/interactive`, `session-handlers`, `child-protocol`, `cancel-all-flows-registration`, `rendering`, `interactive-supervisor-registration`; re-exports from `rehydrate`, `notifications`, `interactive-tmux`, `artifact-poller` |
-|  28 | `src/tools/in-process.ts`                    | Pi adapters for in-process spawn/status/result/cancel and maintenance                                                      | `artifact-poller`, `artifact`, `helpers`, `orchestration-context`, `session-context`, `abortable-wait`, `cancellation-snapshots`, `notifications`, `interactive-tmux`, `rendering`, `schemas`                                                                                  |
+|  28 | `src/tools/in-process.ts`                    | Pi adapters for in-process spawn/status/result/cancel and maintenance                                                      | `artifact-poller`, `artifact`, `helpers`, `orchestration-context`, `session-scope`, `abortable-wait`, `cancellation-snapshots`, `notifications`, `interactive-tmux`, `rendering`, `schemas`                                                                                    |
 |  29 | `src/tools/interactive.ts`                   | Pi adapters for interactive spawn/status/cancel/send and artifact read/list                                                | `artifact`, `interactive-tmux`, `helpers`, `notifications`, `schemas`, `artifact-poller`                                                                                                                                                                                       |
 |  30 | `src/workflow-core.ts`                       | Workflow limits/contracts, usage, schemas, semaphores and saved-script storage                                             | `workflow-script`; type-only `helpers`, `cancellation-snapshots`                                                                                                                                                                                                               |
-|  31 | `src/workflow-jobs.ts`                       | Background workflow registry, ownership, snapshots, active runners, cancellation and completion retry                      | `helpers`, `session-context`, `workflow-worker`, `workflow-core`; type-only `cancellation-snapshots`                                                                                                                                                                           |
+|  31 | `src/workflow-jobs.ts`                       | Background workflow registry, ownership, snapshots, active runners, cancellation and completion retry                      | `helpers`, `session-scope`, `workflow-worker`, `workflow-core`; type-only `cancellation-snapshots`                                                                                                                                                                             |
 |  32 | `src/workflow-picker-ui.ts`                  | Saved-workflow run/delete/cancel picker                                                                                    | None project-internal                                                                                                                                                                                                                                                          |
 |  33 | `src/workflow-script.d.mts`                  | Declaration surface for parser runtime companion                                                                           | None                                                                                                                                                                                                                                                                           |
 |  34 | `src/workflow-script.mjs`                    | Acorn metadata parser, export stripping, guarded Date/Math and safe stringify                                              | None project-internal                                                                                                                                                                                                                                                          |
 |  35 | `src/workflow-script.ts`                     | Typed TypeScript bridge to parser runtime                                                                                  | `workflow-script.mjs`                                                                                                                                                                                                                                                          |
 |  36 | `src/workflow-structured-output.ts`          | Native terminating capture tool for in-process workflow schemas                                                            | None project-internal                                                                                                                                                                                                                                                          |
-|  37 | `src/workflow-tool.ts`                       | Pi workflow tools/commands, runner selection, foreground/background delivery and workflow UIs                              | `abortable-wait`, `helpers`, `interactive-tmux`, `workflow-core`, `workflow-jobs`, `workflow-ui`, `workflow-worker`, `notifications`, `workflow-tree-ui`, `workflow-picker-ui`, `cancellation-snapshots`, `orchestration-context`, `session-context`                           |
-|  38 | `src/workflow-tree-ui.ts`                    | Owner-scoped workflow job tree, details and direct cancel UI                                                               | `workflow-jobs`, `workflow-core`; type-only `session-context`                                                                                                                                                                                                                  |
+|  37 | `src/workflow-tool.ts`                       | Pi workflow tools/commands, runner selection, foreground/background delivery and workflow UIs                              | `abortable-wait`, `helpers`, `interactive-tmux`, `workflow-core`, `workflow-jobs`, `workflow-ui`, `workflow-worker`, `notifications`, `workflow-tree-ui`, `workflow-picker-ui`, `cancellation-snapshots`, `orchestration-context`, `session-scope`                             |
+|  38 | `src/workflow-tree-ui.ts`                    | Owner-scoped workflow job tree, details and direct cancel UI                                                               | `workflow-jobs`, `workflow-core`; type-only `session-scope`                                                                                                                                                                                                                    |
 |  39 | `src/workflow-ui.ts`                         | Pure foreground workflow progress renderer                                                                                 | `workflow-core`, `artifact`                                                                                                                                                                                                                                                    |
 |  40 | `src/workflow-worker-thread.mjs`             | Worker-side VM, DSL globals, RPC correlation, nested workflow execution and budget observation                             | `workflow-script.mjs`                                                                                                                                                                                                                                                          |
 |  41 | `src/workflow-worker.ts`                     | Host Engine, worker lifecycle/RPC, concurrency/accounting, process artifact wait and usage parsing                         | `artifact`, `helpers`, `workflow-core`, `workflow-script`, `interactive-tmux`; type-only `cancellation-snapshots`; file-URL `workflow-worker-thread.mjs`                                                                                                                       |
@@ -1029,7 +1023,7 @@ The restrictive exports map matters: shipping all source files in `package.json#
 
 - [ ] The root selects exactly the parent or child registration bundle.
 - [ ] A child launched with `PI_SUBAGENTURA_CHILD=1` cannot recursively expose the normal parent orchestration surface.
-- [ ] Owner-sensitive work is matched by parent session ID and live context generation.
+- [ ] Owner-sensitive work is matched by parent session ID and live scope generation.
 - [ ] A stale generation cannot start a prepared async in-process prompt.
 - [ ] A stale generation cannot receive an in-process, interactive, or workflow completion.
 - [ ] Each live registry has one explicit module owner.
@@ -1038,8 +1032,8 @@ The restrictive exports map matters: shipping all source files in `package.json#
 ### Polling and delivery
 
 - [ ] `session-handlers.ts` owns the sole recurring timer.
-- [ ] The timer starts only after `session_start` context capture and recovery.
-- [ ] Exactly one global unref'ed five-second interval serves all live contexts.
+- [ ] The timer starts only after `session_start` scope capture and recovery.
+- [ ] Exactly one global unref'ed five-second interval serves all live scopes.
 - [ ] At most one artifact poll tick is in flight per owner token.
 - [ ] Artifact progress is defined by physical byte cursor, never timestamp.
 - [ ] Completion intent is durably enqueued before cursor persistence and dispatch.
