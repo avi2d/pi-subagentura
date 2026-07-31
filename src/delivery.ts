@@ -37,6 +37,13 @@ export const MAX_FLUSH_BYTES = 64 * 1024;
 export const MAX_ARTIFACT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_FORMATTED_IDENTIFIER = 96;
 
+function parentIsStreaming(): boolean {
+  const state = globalThis as any;
+  return typeof state.__piSubagenturaParentAgentActive === "boolean"
+    ? state.__piSubagenturaParentAgentActive
+    : state.__piSubagenturaParentStreaming === true;
+}
+
 function runningInProcessJobCount(owner?: ActiveSessionContextToken): number {
   const g = globalThis as any;
   const registry = g.__piSubagenturaRegistry;
@@ -353,7 +360,7 @@ export function flushDeliveries(
     bytes += separatorBytes + itemBytes;
   }
   const triggersTurn = selected.some(({ intent }) => intent.triggerTurn);
-  if (g.__piSubagenturaParentStreaming && !triggersTurn) return;
+  if (parentIsStreaming()) return;
   const deliveryIds = selected.map(({ intent }) => intent.deliveryId);
   try {
     pi.sendMessage(
@@ -415,8 +422,7 @@ export function reconcileDeliveryReceipts(
     }
   }
   let changed = false;
-  const canRetryUncommittedDispatch = !(globalThis as any)
-    .__piSubagenturaParentStreaming;
+  const canRetryUncommittedDispatch = !parentIsStreaming();
   for (const intent of state.pendingDeliveries ?? []) {
     if (seen.has(intent.deliveryId)) {
       (state.deliveryReceipts ??= []).push(intent.deliveryId);

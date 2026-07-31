@@ -192,12 +192,15 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
 
   g2.__piSubagenturaPiRef = pi;
   g2.__piSubagenturaParentStreaming = false;
+  g2.__piSubagenturaParentAgentActive = false;
 
   pi.on("agent_start", () => {
     g2.__piSubagenturaParentStreaming = true;
+    g2.__piSubagenturaParentAgentActive = true;
   });
   pi.on("agent_settled", () => {
     g2.__piSubagenturaParentStreaming = false;
+    g2.__piSubagenturaParentAgentActive = false;
     flushDeliveries(pi, sessionContext.ui, {
       id: sessionContext.id,
       generation: sessionContext.generation,
@@ -225,6 +228,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
     g2.__piSubagenturaSessionManager = ctx.sessionManager;
     g2.__piSubagenturaPiRef = pi;
     g2.__piSubagenturaParentStreaming = false;
+    g2.__piSubagenturaParentAgentActive = false;
 
     // Rehydrate on startup (resumed session after quit), reload, and resume.
     // The session ID filter ensures only subagents created in this specific session
@@ -307,6 +311,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       }
       setActiveSessionRefs(startedAncestors[startedAncestors.length - 1]);
       g2.__piSubagenturaParentStreaming = false;
+      g2.__piSubagenturaParentAgentActive = false;
 
       // A live ancestor may defer global teardown while this nested context
       // cleans its own state. Descendants never participate in this decision:
@@ -496,6 +501,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionContextRef {
       g2.__piSubagenturaPiRef = undefined;
       g2.__piSubagenturaSessionManager = undefined;
       g2.__piSubagenturaParentStreaming = false;
+      g2.__piSubagenturaParentAgentActive = false;
       // Clean-slate the state file on /new. On quit/reload/resume we KEEP the file so the
       // next session_start can rehydrate the sub-agents (their panes survive).
       if (event?.reason === "new" && ctx?.cwd) {

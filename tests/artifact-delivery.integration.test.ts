@@ -533,9 +533,12 @@ describe("artifact protocol v2 delivery", () => {
     const notify = vi.fn();
     const ui = { notify } as any;
     (globalThis as any).__piSubagenturaParentStreaming = true;
-
+    (globalThis as any).__piSubagenturaParentAgentActive = true;
     flushDeliveries({ sendMessage } as any, ui);
-
+    expect(sendMessage).not.toHaveBeenCalled();
+    (globalThis as any).__piSubagenturaParentStreaming = false;
+    (globalThis as any).__piSubagenturaParentAgentActive = false;
+    flushDeliveries({ sendMessage } as any, ui);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0][0].details.deliveryIds).toEqual([
       deliveryId,

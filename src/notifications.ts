@@ -18,6 +18,13 @@ import {
   type ActiveSessionContextToken,
 } from "./session-context";
 
+function parentIsStreaming(): boolean {
+  const state = globalThis as any;
+  return typeof state.__piSubagenturaParentAgentActive === "boolean"
+    ? state.__piSubagenturaParentAgentActive
+    : state.__piSubagenturaParentStreaming === true;
+}
+
 /**
  * @deprecated Delivery is queue-bounded rather than concurrency-capped.
  * Retained as a runtime export for compatibility with existing consumers.
@@ -513,21 +520,11 @@ export function notifyInProcessCompletionWithoutDelivery(
 }
 
 function requestInProcessDeliveryFlush(): void {
-  const g = globalThis as any;
-  if (!g.__piSubagenturaParentStreaming) {
-    flushInProcessDeliveries();
-    return;
-  }
-  if (g.__piSubagenturaInProcessFlushScheduled) return;
-  g.__piSubagenturaInProcessFlushScheduled = true;
-  queueMicrotask(() => {
-    g.__piSubagenturaInProcessFlushScheduled = false;
-    flushInProcessDeliveries();
-  });
+  if (parentIsStreaming()) return;
+  flushInProcessDeliveries();
 }
 
 export function flushInProcessDeliveries(): void {
-  const g = globalThis as any;
   const queue = pendingJobDeliveries();
   for (let index = 0; index < queue.length;) {
     if (resolvePendingDeliveryTarget(queue[index])) {
@@ -538,9 +535,9 @@ export function flushInProcessDeliveries(): void {
   }
   if (queue.length === 0) return;
 
-  const streaming = Boolean(g.__piSubagenturaParentStreaming);
-  const deliveryOwner =
-    (streaming ? queue.find(pendingTriggersTurn) : undefined) ?? queue[0];
+  const streaming = parentIsStreaming();
+  if (streaming) return;
+  const deliveryOwner = queue[0];
   const target = resolvePendingDeliveryTarget(deliveryOwner);
   if (!target) return;
 
@@ -600,7 +597,6 @@ export function flushInProcessDeliveries(): void {
 
   if (llm.length === 0) return;
   const triggersTurn = llm.some(({ trigger }) => trigger);
-  if (streaming && !triggersTurn) return;
   const deliveryIds = llm.map(({ pending }) => pending.deliveryId);
   try {
     target.pi.sendMessage(

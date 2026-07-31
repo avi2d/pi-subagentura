@@ -238,6 +238,7 @@ describe("notifyOnComplete", () => {
     registerExtension(_api as any);
     const sessionContext = getSessionContextStack().at(-1);
     if (sessionContext) sessionContext.lifecycle = "started";
+    (globalThis as any).__piSubagenturaParentAgentActive = undefined;
     (globalThis as any).__piSubagenturaUi = { notify: _api.notify };
 
     const isolatedDef = _api.registerTool.mock.calls.find(
@@ -655,8 +656,9 @@ describe("notifyOnComplete", () => {
       );
     });
 
-    it("queues triggering inject completion through Pi while streaming", async () => {
+    it("batches triggering inject completion until the parent settles", async () => {
       (globalThis as any).__piSubagenturaParentStreaming = true;
+      (globalThis as any).__piSubagenturaParentAgentActive = true;
       const jobId = "inject-cap";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -677,19 +679,21 @@ describe("notifyOnComplete", () => {
       );
 
       control.resolve(SUCCESS_RESULT);
-      await vi.waitFor(() => {
-        expect(jobRegistry.get(jobId)?.status).toBe("done");
-        expect(api.sendMessage).toHaveBeenCalledOnce();
-      });
+      await vi.waitFor(() =>
+        expect(jobRegistry.get(jobId)?.status).toBe("done"),
+      );
+      await Promise.resolve();
+      expect(api.sendMessage).not.toHaveBeenCalled();
+
+      (globalThis as any).__piSubagenturaParentStreaming = false;
+      (globalThis as any).__piSubagenturaParentAgentActive = false;
+      flushInProcessDeliveries();
+      expect(api.sendMessage).toHaveBeenCalledOnce();
       expect(api.sendMessage.mock.calls[0][1]).toMatchObject({
         deliverAs: "followUp",
         triggerTurn: true,
       });
       expect(api.sendUserMessage).not.toHaveBeenCalled();
-
-      (globalThis as any).__piSubagenturaParentStreaming = false;
-      flushInProcessDeliveries();
-      expect(api.sendMessage).toHaveBeenCalledOnce();
     });
 
     it("allows sequential inject completions without a lifetime cap", async () => {

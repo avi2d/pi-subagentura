@@ -38,6 +38,7 @@ afterEach(() => {
   }
   interactiveSubagentRegistry.clear();
   delete (globalThis as any).__piSubagenturaParentStreaming;
+  delete (globalThis as any).__piSubagenturaParentAgentActive;
   delete (globalThis as any).__piSubagenturaPiRef;
   delete (globalThis as any).__piSubagenturaUi;
   delete (globalThis as any).__piSubagenturaSessionManager;
@@ -190,27 +191,39 @@ describe("Pi session delivery integration", () => {
     await harness.session.waitForIdle();
   });
 
-  it("queues one streaming inject before its provider turn", async () => {
+  it("batches streaming inject notifications before their provider turn", async () => {
     const { harness, sendMessage, state } = await setup("inject", true);
     const firstTurn = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     (globalThis as any).__piSubagenturaSessionManager = harness.sessionManager;
 
+    enqueueDelivery(state, {
+      deliveryId: "second-streaming-delivery",
+      subagentId: state.id,
+      turnId: "turn-2",
+      eventId: "event-2",
+      mode: "inject",
+      triggerTurn: true,
+      status: "cancelled",
+      artifactDir: state.artifactDir,
+      message: "second completion",
+      state: "queued",
+    });
     flushDeliveries(
       (globalThis as any).__piSubagenturaPiRef,
       (globalThis as any).__piSubagenturaUi,
     );
-    expect(sendMessage).toHaveBeenCalledOnce();
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
-    expect(sendMessage).toHaveBeenCalledOnce();
-    expect(state.pendingDeliveries).toHaveLength(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(state.pendingDeliveries).toHaveLength(2);
     expect(harness.contexts).toHaveLength(1);
 
     harness.completeNext("parent done");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(2));
+    expect(sendMessage).toHaveBeenCalledOnce();
+    const message = sendMessage.mock.calls[0][0] as any;
+    expect(message.content).toContain("inject completion");
+    expect(message.content).toContain("second completion");
+    expect(message.details.deliveryIds).toHaveLength(2);
     expect(harness.contexts[1].messages.at(-1)).toMatchObject({
       role: "user",
     });
@@ -374,7 +387,7 @@ describe("Pi session delivery integration", () => {
     },
   );
 
-  it("batches a triggering burst despite a stale streaming flag", async () => {
+  it("batches triggering completions while the parent is active", async () => {
     const harness = await createPiSessionHarness(repoRoot);
     harnesses.push(harness);
     const sessionContext = getSessionContextStack().at(-1);
@@ -382,7 +395,9 @@ describe("Pi session delivery integration", () => {
       sessionContext.lifecycle = "started";
       sessionContext.sessionManager = harness.sessionManager;
     }
-    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const firstTurn = harness.session.prompt("parent turn");
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+
     const result: any = {
       isError: false,
       output: "result",
@@ -409,7 +424,16 @@ describe("Pi session delivery integration", () => {
     };
     deliverNotification(first, result);
     deliverNotification(second, result);
-    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    await Promise.resolve();
+    expect(harness.contexts).toHaveLength(1);
+    expect(
+      harness.sessionManager
+        .getEntries()
+        .filter((entry: any) => entry.type === "custom_message"),
+    ).toHaveLength(0);
+
+    harness.completeNext();
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(2));
     expect(
       harness.sessionManager
         .getEntries()
@@ -417,6 +441,7 @@ describe("Pi session delivery integration", () => {
     ).toHaveLength(1);
     harness.completeNext();
     await harness.session.waitForIdle();
+    await firstTurn;
   });
 
   it("delivers artifact completion through poller and broker", async () => {
