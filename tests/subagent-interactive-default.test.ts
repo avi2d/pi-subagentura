@@ -3,6 +3,16 @@
  * prompt running-footer refreshes.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const {
   mockCancelInteractiveSubagent,
@@ -30,6 +40,12 @@ import {
   formatInteractiveState,
   interactiveSubagentRegistry,
 } from "../src/interactive-tmux";
+import {
+  clearSessionScopes,
+  getStartedSessionScopes,
+  registerSessionScope,
+} from "../src/session-scope";
+import { registerInteractiveSubagentTools } from "../src/tools/interactive";
 
 const savedTmux = process.env.TMUX;
 
@@ -111,12 +127,11 @@ describe("subagent_interactive tool lifecycle", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    interactiveSubagentRegistry.clear();
+    clearSessionScopes();
     const g = globalThis as any;
-    const stack = g.__piSubagenturaSessionContextStack;
-    if (Array.isArray(stack)) stack.length = 0;
     g.__piSubagenturaInteractivePollerHandle = undefined;
     api = setupExtension() as any;
+    startSession(mockCtx());
     mockLaunchInteractiveSubagent.mockReset();
     mockCancelInteractiveSubagent.mockReset();
     mockPruneDeadInteractiveSubagents.mockReset();
@@ -128,13 +143,12 @@ describe("subagent_interactive tool lifecycle", () => {
 
   afterEach(() => {
     interactiveSubagentRegistry.clear();
+    clearSessionScopes();
     const g = globalThis as any;
     if (g.__piSubagenturaInteractivePollerHandle) {
       clearInterval(g.__piSubagenturaInteractivePollerHandle);
       g.__piSubagenturaInteractivePollerHandle = undefined;
     }
-    const stack = g.__piSubagenturaSessionContextStack;
-    if (Array.isArray(stack)) stack.length = 0;
     vi.clearAllMocks();
     if (savedTmux === undefined) delete process.env.TMUX;
     else process.env.TMUX = savedTmux;
@@ -310,6 +324,10 @@ describe("subagent_interactive tool lifecycle", () => {
     };
     mockLaunchInteractiveSubagent.mockImplementationOnce(() => {
       interactiveSubagentRegistry.set(state.id, state as any);
+      getStartedSessionScopes()[0]?.interactiveStates.set(
+        state.id,
+        state as any,
+      );
       return state;
     });
 
@@ -345,6 +363,7 @@ describe("subagent_interactive tool lifecycle", () => {
     interactiveSubagentRegistry.set(foreign.id, foreign as any);
     mockLaunchInteractiveSubagent.mockImplementationOnce(() => {
       interactiveSubagentRegistry.set(mine.id, mine as any);
+      getStartedSessionScopes()[0]?.interactiveStates.set(mine.id, mine as any);
       return mine;
     });
 
@@ -374,10 +393,10 @@ describe("subagent_interactive tool lifecycle", () => {
       parentSessionId: "another-session-id",
     };
     interactiveSubagentRegistry.set(foreign.id, foreign as any);
-    const stack = (globalThis as any).__piSubagenturaSessionContextStack ?? [];
-    for (const context of stack) context.generation += 1;
+    const [scope] = getStartedSessionScopes();
+    if (scope) scope.lifecycle = "shutdown";
 
-    await toolDef.execute(
+    const result = await toolDef.execute(
       "call-footer-stale",
       { task: "research X" },
       undefined,
@@ -385,10 +404,8 @@ describe("subagent_interactive tool lifecycle", () => {
       ctx,
     );
 
-    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
-      "subagentura-running",
-      undefined,
-    );
+    expect(result.details.status).toBe("session_unavailable");
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
   });
 
   it("refreshes the footer when status pruning detects an exit", async () => {
@@ -396,6 +413,7 @@ describe("subagent_interactive tool lifecycle", () => {
     const ctx = mockCtx();
     const state = mockInteractiveState();
     interactiveSubagentRegistry.set(state.id, state as any);
+    getStartedSessionScopes()[0]?.interactiveStates.set(state.id, state as any);
     mockPruneDeadInteractiveSubagents.mockImplementationOnce(() => {
       state.status = "exited";
     });
@@ -441,6 +459,7 @@ describe("subagent_interactive tool lifecycle", () => {
     const ctx = mockCtx();
     const state = mockInteractiveState();
     interactiveSubagentRegistry.set(state.id, state as any);
+    getStartedSessionScopes()[0]?.interactiveStates.set(state.id, state as any);
     mockCancelInteractiveSubagent.mockImplementationOnce(() => {
       state.status = "cancelled";
       return state;
@@ -454,7 +473,11 @@ describe("subagent_interactive tool lifecycle", () => {
       ctx,
     );
 
-    expect(mockCancelInteractiveSubagent).toHaveBeenCalledWith("abc12345");
+    expect(mockCancelInteractiveSubagent).toHaveBeenCalledWith(
+      "abc12345",
+      "cancel_interactive_subagent",
+      expect.objectContaining({ id: "abc12345" }),
+    );
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("no separate cancellation completion"),
       "warning",
@@ -482,5 +505,140 @@ describe("subagent_interactive tool lifecycle", () => {
     const desc = properties.notifyOnComplete.description ?? "";
     expect(desc).toMatch(/notify.*default|default.*notify/i);
     expect(desc).toContain('"inject"');
+  });
+
+  it("isolates peer status, cancel, send, list, and read tools", async () => {
+    clearSessionScopes();
+    interactiveSubagentRegistry.clear();
+    const toolsA = new Map<string, { execute: Function }>();
+    const toolsB = new Map<string, { execute: Function }>();
+    const piA = {
+      registerTool: (tool: { name: string; execute: Function }) =>
+        toolsA.set(tool.name, tool),
+    };
+    const piB = {
+      registerTool: (tool: { name: string; execute: Function }) =>
+        toolsB.set(tool.name, tool),
+    };
+    const scopeA = registerSessionScope({
+      id: 901,
+      generation: 1,
+      lifecycle: "started",
+      pi: piA as unknown as Parameters<
+        typeof registerInteractiveSubagentTools
+      >[0],
+      sessionManager: { getSessionId: () => "peer-a" },
+    });
+    const scopeB = registerSessionScope({
+      id: 902,
+      generation: 1,
+      lifecycle: "started",
+      pi: piB as unknown as Parameters<
+        typeof registerInteractiveSubagentTools
+      >[0],
+      sessionManager: { getSessionId: () => "peer-b" },
+    });
+    registerInteractiveSubagentTools(scopeA.pi, scopeA);
+    registerInteractiveSubagentTools(scopeB.pi, scopeB);
+    const owned = {
+      ...mockInteractiveState(),
+      id: "aaaaaaaaaaaaaaaa",
+      parentSessionId: "peer-a",
+    };
+    const foreign = {
+      ...mockInteractiveState(),
+      id: "bbbbbbbbbbbbbbbb",
+      parentSessionId: "peer-b",
+    };
+    scopeA.interactiveStates.set(owned.id, owned as never);
+    scopeB.interactiveStates.set(foreign.id, foreign as never);
+    interactiveSubagentRegistry.set(owned.id, owned as never);
+    interactiveSubagentRegistry.set(foreign.id, foreign as never);
+
+    const ctx = mockCtx();
+    interactiveSubagentRegistry.delete(owned.id);
+    mockCancelInteractiveSubagent.mockClear();
+    const ownedCancel = await toolsA
+      .get("cancel_interactive_subagent")
+      ?.execute("cancel-owned", { jobId: owned.id }, undefined, undefined, ctx);
+    expect(ownedCancel.isError).not.toBe(true);
+    expect(mockCancelInteractiveSubagent).toHaveBeenCalledOnce();
+    interactiveSubagentRegistry.set(owned.id, owned as never);
+
+    const status = await toolsA
+      .get("get_interactive_subagent_status")
+      ?.execute("status", {}, undefined, undefined, ctx);
+    expect(
+      status.details.subagents.map((state: { id: string }) => state.id),
+    ).toEqual([owned.id]);
+    const foreignStatus = await toolsA
+      .get("get_interactive_subagent_status")
+      ?.execute(
+        "status-foreign",
+        { jobId: foreign.id },
+        undefined,
+        undefined,
+        ctx,
+      );
+    expect(foreignStatus.details.status).toBe("not_found");
+
+    mockCancelInteractiveSubagent.mockClear();
+    const cancel = await toolsA
+      .get("cancel_interactive_subagent")
+      ?.execute("cancel", { jobId: foreign.id }, undefined, undefined, ctx);
+    expect(cancel.details.status).toBe("not_found");
+    expect(mockCancelInteractiveSubagent).not.toHaveBeenCalled();
+
+    const send = await toolsA
+      .get("send_interactive_subagent_message")
+      ?.execute("send", { id: foreign.id, message: "hello" });
+    expect(send.details.status).toBe("not_found");
+
+    const list = await toolsA
+      .get("list_subagent_artifacts")
+      ?.execute("list", {}, undefined, undefined, ctx);
+    expect(
+      list.details.subagents.map((state: { id: string }) => state.id),
+    ).toEqual([owned.id]);
+
+    const read = await toolsA
+      .get("read_subagent_artifact")
+      ?.execute("read", { id: foreign.id }, undefined, undefined, {
+        ...ctx,
+        cwd: "/tmp",
+      });
+    expect(read.details.status).toBe("not_found");
+  });
+
+  it("cleanup deletes only artifacts marked for the current parent session", async () => {
+    const root = mkdtempSync(join(tmpdir(), "interactive-cleanup-scope-"));
+    try {
+      const ownedDir = join(root, "cccccccccccccccc");
+      const foreignDir = join(root, "dddddddddddddddd");
+      for (const [dir, owner] of [
+        [ownedDir, "test-session-id"],
+        [foreignDir, "another-session-id"],
+      ] as const) {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "events.ndjson"), "");
+        writeFileSync(join(dir, ".parent-session-id"), owner);
+        utimesSync(dir, new Date(0), new Date(0));
+      }
+      const cleanup = api.registerTool.mock.calls.find(
+        ([tool]: any[]) => tool.name === "cleanup_subagent_artifacts",
+      )?.[0];
+      const result = await cleanup.execute(
+        "cleanup",
+        { ttlMs: 60_000, rootDir: root, dryRun: false },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      expect(result.details.removed).toBe(1);
+      expect(existsSync(ownedDir)).toBe(false);
+      expect(existsSync(foreignDir)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -9,14 +9,34 @@ import type {
   SubagentResult,
   Usage,
 } from "./helpers";
-import { formatUsage, jobRegistry } from "./helpers";
+import {
+  formatUsage,
+  getInProcessJob,
+  inProcessJobOwner,
+  inProcessJobsForOwner,
+} from "./helpers";
 import { isCompletionEvent, type SubagentEvent } from "./artifact";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import {
-  getActiveSessionContextToken,
-  resolveLiveSessionContext,
-  type ActiveSessionContextToken,
-} from "./session-context";
+  findSessionScope,
+  getStartedSessionScopes,
+  resolveLiveSessionScope,
+  resolveStreamingFlag,
+  resolveToolSessionOwner,
+  type SessionOwnerToken,
+} from "./session-scope";
+interface NotificationGlobalState {
+  __piSubagenturaPiRef?: ExtensionAPI;
+  __piSubagenturaUi?: CompletionNotificationUi;
+  __piSubagenturaSessionManager?: {
+    getSessionId?: () => string;
+  };
+  __piSubagenturaPendingJobDeliveries?: PendingJobDelivery[];
+}
+
+function notificationGlobals(): typeof globalThis & NotificationGlobalState {
+  return globalThis as typeof globalThis & NotificationGlobalState;
+}
 
 /**
  * @deprecated Delivery is queue-bounded rather than concurrency-capped.
@@ -39,8 +59,8 @@ interface PendingJobCompletion {
   deliveryId: string;
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
-  ownerSessionContextId?: number;
-  ownerSessionContextGeneration?: number;
+  ownerSessionScopeId?: number;
+  ownerSessionScopeGeneration?: number;
   jobState: JobState;
   result: SubagentResult;
 }
@@ -50,19 +70,34 @@ interface PendingJobOverflow {
   deliveryId: string;
   ownerPi: ExtensionAPI;
   ownerSessionId?: string;
-  ownerSessionContextId?: number;
-  ownerSessionContextGeneration?: number;
+  ownerSessionScopeId?: number;
+  ownerSessionScopeGeneration?: number;
   overflowPath: string;
   mode: NotifyOnComplete;
   triggerTurn: boolean;
   status: "done" | "error";
 }
 
-type PendingJobDelivery = PendingJobCompletion | PendingJobOverflow;
+export type PendingJobDelivery = PendingJobCompletion | PendingJobOverflow;
 
-function pendingJobDeliveries(): PendingJobDelivery[] {
-  const g = globalThis as any;
-  return (g.__piSubagenturaPendingJobDeliveries ??= []);
+const scheduledFlushQueues = new WeakSet<PendingJobDelivery[]>();
+
+function effectiveDeliveryOwner(
+  owner?: SessionOwnerToken,
+): SessionOwnerToken | undefined {
+  return owner ?? resolveToolSessionOwner(undefined);
+}
+
+function pendingJobDeliveries(
+  owner?: SessionOwnerToken,
+): PendingJobDelivery[] | undefined {
+  const effectiveOwner = effectiveDeliveryOwner(owner);
+  if (effectiveOwner) {
+    return resolveLiveSessionScope(effectiveOwner)?.pendingInProcessDeliveries;
+  }
+  if (owner || getStartedSessionScopes().length > 0) return undefined;
+  const state = notificationGlobals();
+  return (state.__piSubagenturaPendingJobDeliveries ??= []);
 }
 
 function pendingDeliveryBytes(queue: PendingJobDelivery[]): number {
@@ -118,18 +153,18 @@ function mergeJobOverflowSemantics(
   if (collapsed.result.isError) summary.status = "error";
 }
 
-function ownerSessionContextOf(
+function ownerSessionScopeOf(
   pending: PendingJobDelivery,
-): ActiveSessionContextToken | undefined {
+): SessionOwnerToken | undefined {
   if (
-    pending.ownerSessionContextId === undefined ||
-    pending.ownerSessionContextGeneration === undefined
+    pending.ownerSessionScopeId === undefined ||
+    pending.ownerSessionScopeGeneration === undefined
   ) {
     return undefined;
   }
   return {
-    id: pending.ownerSessionContextId,
-    generation: pending.ownerSessionContextGeneration,
+    id: pending.ownerSessionScopeId,
+    generation: pending.ownerSessionScopeGeneration,
   };
 }
 
@@ -137,8 +172,8 @@ function sameDeliveryOwner(
   left: PendingJobDelivery,
   right: PendingJobDelivery,
 ): boolean {
-  const leftContext = ownerSessionContextOf(left);
-  const rightContext = ownerSessionContextOf(right);
+  const leftContext = ownerSessionScopeOf(left);
+  const rightContext = ownerSessionScopeOf(right);
   if (
     leftContext?.id !== rightContext?.id ||
     leftContext?.generation !== rightContext?.generation
@@ -169,9 +204,9 @@ function sessionIdFrom(
 function resolvePendingDeliveryTarget(
   pending: PendingJobDelivery,
 ): PendingDeliveryTarget | undefined {
-  const ownerSessionContext = ownerSessionContextOf(pending);
-  if (ownerSessionContext) {
-    const context = resolveLiveSessionContext(ownerSessionContext);
+  const ownerSessionScope = ownerSessionScopeOf(pending);
+  if (ownerSessionScope) {
+    const context = resolveLiveSessionScope(ownerSessionScope);
     if (!context || context.pi !== pending.ownerPi) return undefined;
     if (
       pending.ownerSessionId !== undefined &&
@@ -179,17 +214,13 @@ function resolvePendingDeliveryTarget(
     ) {
       return undefined;
     }
-    const g = globalThis as any;
-    const activePi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
     return {
       pi: pending.ownerPi,
-      ui: (context.ui ??
-        (activePi === pending.ownerPi ? g.__piSubagenturaUi : undefined)) as
-        CompletionNotificationUi | undefined,
+      ui: context.ui as CompletionNotificationUi | undefined,
     };
   }
 
-  const g = globalThis as any;
+  const g = notificationGlobals();
   const pi = g.__piSubagenturaPiRef as ExtensionAPI | undefined;
   if (!pi || pending.ownerPi !== pi) return undefined;
   if (
@@ -266,8 +297,8 @@ function collapseOldestJobDelivery(queue: PendingJobDelivery[]): boolean {
       .slice(0, 32),
     ownerPi: collapsed.ownerPi,
     ownerSessionId: collapsed.ownerSessionId,
-    ownerSessionContextId: collapsed.ownerSessionContextId,
-    ownerSessionContextGeneration: collapsed.ownerSessionContextGeneration,
+    ownerSessionScopeId: collapsed.ownerSessionScopeId,
+    ownerSessionScopeGeneration: collapsed.ownerSessionScopeGeneration,
     overflowPath,
     mode: "notify",
     triggerTurn: false,
@@ -377,21 +408,27 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
   }
   return summary;
 }
-function runningInProcessJobCount(): number {
-  return [...jobRegistry.values()].filter((job) => job.status === "running")
-    .length;
+function runningInProcessJobCount(owner?: SessionOwnerToken): number {
+  return [...inProcessJobsForOwner(owner).values()].filter(
+    (job) =>
+      job.status === "running" &&
+      (owner !== undefined || !inProcessJobOwner(job)),
+  ).length;
 }
 
-function runningInProcessJobsNote(): string {
-  const remaining = runningInProcessJobCount();
+function runningInProcessJobsNote(owner?: SessionOwnerToken): string {
+  const remaining = runningInProcessJobCount(owner);
   if (remaining <= 0) return "";
   const noun = remaining === 1 ? "job" : "jobs";
   const verb = remaining === 1 ? "is" : "are";
   return `${remaining} in-process sub-agent ${noun} ${verb} still running\nDo not claim all review work is complete yet`;
 }
 
-function appendRunningJobsNote(content: string): string {
-  const note = runningInProcessJobsNote();
+function appendRunningJobsNote(
+  content: string,
+  owner?: SessionOwnerToken,
+): string {
+  const note = runningInProcessJobsNote(owner);
   return note ? `${content}\n${note}` : content;
 }
 
@@ -406,36 +443,52 @@ function completionMessageOptions(triggerTurnOnComplete?: boolean): {
 }
 
 /**
- * Deliver async subagent completion notification.
- * Reads pi from globalThis to survive module reloads.
+ * Resolve the async spawn's exact live owner.
+ * Process-global compatibility refs are used only before any session starts.
  */
+interface JobDeliveryContext {
+  owner?: SessionOwnerToken;
+  pi: ExtensionAPI;
+  sessionId?: string;
+}
+
+function resolveJobDeliveryContext(
+  jobState: JobState,
+): JobDeliveryContext | undefined {
+  const globals = notificationGlobals();
+  const explicitOwner = inProcessJobOwner(jobState);
+  if (!explicitOwner && getStartedSessionScopes().length > 0) return undefined;
+  const owner = explicitOwner ?? resolveToolSessionOwner(undefined);
+  const scope = owner ? resolveLiveSessionScope(owner) : undefined;
+  if (explicitOwner && !scope) return undefined;
+  if (!owner && getStartedSessionScopes().length > 0) return undefined;
+  const pi =
+    jobState.deliveryOwner?.pi ?? scope?.pi ?? globals.__piSubagenturaPiRef;
+  if (!pi || (scope && scope.pi !== pi)) return undefined;
+  return {
+    owner,
+    pi,
+    sessionId:
+      jobState.deliveryOwner?.sessionId ??
+      sessionIdFrom(
+        scope?.sessionManager ?? globals.__piSubagenturaSessionManager,
+      ),
+  };
+}
+
 export function deliverNotification(
   jobState: JobState,
   result: SubagentResult,
 ): void {
-  const g2 = typeof global !== "undefined" ? global : globalThis;
-  const deliveryOwner = jobState.deliveryOwner;
-  const pi =
-    deliveryOwner?.pi ?? (g2.__piSubagenturaPiRef as ExtensionAPI | undefined);
-  if (!pi) return; // extension not loaded yet
+  const context = resolveJobDeliveryContext(jobState);
+  if (!context) return;
   const mode = jobState.notifyOnComplete ?? "inject";
-  const ownerSessionId = deliveryOwner
-    ? deliveryOwner.sessionId
-    : g2.__piSubagenturaSessionManager?.getSessionId?.();
-  const ownerSessionContext = deliveryOwner
-    ? deliveryOwner.sessionContextId !== undefined &&
-      deliveryOwner.sessionContextGeneration !== undefined
-      ? {
-          id: deliveryOwner.sessionContextId,
-          generation: deliveryOwner.sessionContextGeneration,
-        }
-      : undefined
-    : getActiveSessionContextToken();
   const deliveryId = createHash("sha256")
     .update(`${jobState.id}\0${mode}`)
     .digest("hex")
     .slice(0, 32);
-  const queue = pendingJobDeliveries();
+  const queue = pendingJobDeliveries(context.owner);
+  if (!queue) return;
   if (!queue.some((item) => item.deliveryId === deliveryId)) {
     const output = Buffer.from(result.output, "utf8")
       .subarray(0, MAX_IN_PROCESS_OUTPUT_BYTES)
@@ -450,10 +503,10 @@ export function deliverNotification(
     queue.push({
       kind: "completion",
       deliveryId,
-      ownerPi: pi,
-      ownerSessionId,
-      ownerSessionContextId: ownerSessionContext?.id,
-      ownerSessionContextGeneration: ownerSessionContext?.generation,
+      ownerPi: context.pi,
+      ownerSessionId: context.sessionId,
+      ownerSessionScopeId: context.owner?.id,
+      ownerSessionScopeGeneration: context.owner?.generation,
       jobState,
       result: boundedResult,
     });
@@ -465,7 +518,7 @@ export function deliverNotification(
       if (!discardOldestOverflow(queue)) break;
     }
   }
-  requestInProcessDeliveryFlush();
+  requestInProcessDeliveryFlush(context.owner);
 }
 
 /** Show completion UI when explicit result retrieval suppresses LLM delivery. */
@@ -473,29 +526,15 @@ export function notifyInProcessCompletionWithoutDelivery(
   jobState: JobState,
   result: SubagentResult,
 ): void {
-  const g = typeof global !== "undefined" ? global : globalThis;
-  const deliveryOwner = jobState.deliveryOwner;
-  const ownerPi =
-    deliveryOwner?.pi ?? (g.__piSubagenturaPiRef as ExtensionAPI | undefined);
-  if (!ownerPi) return;
-  const ownerSessionContext = deliveryOwner
-    ? deliveryOwner.sessionContextId !== undefined &&
-      deliveryOwner.sessionContextGeneration !== undefined
-      ? {
-          id: deliveryOwner.sessionContextId,
-          generation: deliveryOwner.sessionContextGeneration,
-        }
-      : undefined
-    : getActiveSessionContextToken();
+  const context = resolveJobDeliveryContext(jobState);
+  if (!context) return;
   const pending: PendingJobCompletion = {
     kind: "completion",
     deliveryId: `ui-only:${jobState.id}`,
-    ownerPi,
-    ownerSessionId: deliveryOwner
-      ? deliveryOwner.sessionId
-      : sessionIdFrom(g.__piSubagenturaSessionManager),
-    ownerSessionContextId: ownerSessionContext?.id,
-    ownerSessionContextGeneration: ownerSessionContext?.generation,
+    ownerPi: context.pi,
+    ownerSessionId: context.sessionId,
+    ownerSessionScopeId: context.owner?.id,
+    ownerSessionScopeGeneration: context.owner?.generation,
     jobState,
     result,
   };
@@ -512,23 +551,45 @@ export function notifyInProcessCompletionWithoutDelivery(
   ]);
 }
 
-function requestInProcessDeliveryFlush(): void {
-  const g = globalThis as any;
-  if (!g.__piSubagenturaParentStreaming) {
-    flushInProcessDeliveries();
+function requestInProcessDeliveryFlush(owner?: SessionOwnerToken): void {
+  const effectiveOwner = effectiveDeliveryOwner(owner);
+  const queue = pendingJobDeliveries(effectiveOwner);
+  if (!queue) return;
+  if (!resolveStreamingFlag(effectiveOwner)) {
+    flushInProcessDeliveries(effectiveOwner);
     return;
   }
-  if (g.__piSubagenturaInProcessFlushScheduled) return;
-  g.__piSubagenturaInProcessFlushScheduled = true;
+  if (scheduledFlushQueues.has(queue)) return;
+  scheduledFlushQueues.add(queue);
   queueMicrotask(() => {
-    g.__piSubagenturaInProcessFlushScheduled = false;
-    flushInProcessDeliveries();
+    scheduledFlushQueues.delete(queue);
+    flushInProcessDeliveries(effectiveOwner);
   });
 }
 
-export function flushInProcessDeliveries(): void {
-  const g = globalThis as any;
-  const queue = pendingJobDeliveries();
+export function clearInProcessDeliveries(owner: SessionOwnerToken): number {
+  const scope = findSessionScope(owner.id);
+  if (!scope || scope.generation !== owner.generation) return 0;
+  const queue = scope.pendingInProcessDeliveries;
+  const removed = queue.length;
+  for (const pending of queue) {
+    if (pending.kind !== "overflow") continue;
+    try {
+      unlinkSync(pending.overflowPath);
+    } catch {
+      /* The ledger may already have been delivered or removed. */
+    }
+  }
+  queue.length = 0;
+  scheduledFlushQueues.delete(queue);
+  return removed;
+}
+
+export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
+  const effectiveOwner = effectiveDeliveryOwner(owner);
+  const queue = pendingJobDeliveries(effectiveOwner);
+  if (!queue) return;
+  scheduledFlushQueues.delete(queue);
   for (let index = 0; index < queue.length;) {
     if (resolvePendingDeliveryTarget(queue[index])) {
       index++;
@@ -538,7 +599,7 @@ export function flushInProcessDeliveries(): void {
   }
   if (queue.length === 0) return;
 
-  const streaming = Boolean(g.__piSubagenturaParentStreaming);
+  const streaming = resolveStreamingFlag(effectiveOwner);
   const deliveryOwner =
     (streaming ? queue.find(pendingTriggersTurn) : undefined) ?? queue[0];
   const target = resolvePendingDeliveryTarget(deliveryOwner);
@@ -552,14 +613,14 @@ export function flushInProcessDeliveries(): void {
     status: "done" | "error";
   }> = [];
   let bytes = 0;
-  const runningJobsCount = runningInProcessJobCount();
+  const runningJobsCount = runningInProcessJobCount(effectiveOwner);
   for (const pending of queue) {
     if (!sameDeliveryOwner(pending, deliveryOwner)) continue;
     if (pending.kind === "overflow") {
       let content =
         "⚠️ In-process completion delivery overflowed its bounded queue." +
         `\nCompletion identity ledger: ${pending.overflowPath}`;
-      content = appendRunningJobsNote(content);
+      content = appendRunningJobsNote(content, effectiveOwner);
       const itemBytes = Buffer.byteLength(content, "utf8");
       if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES)
         break;
@@ -585,7 +646,7 @@ export function flushInProcessDeliveries(): void {
       mode === "inject"
         ? `${summary}\n[Untrusted sub-agent output]\n${sanitizeOutput(result.output) || "(sub-agent produced no output)"}`
         : `${summary}\nResult retained in job ${jobState.id}; use get_subagent_result for details.`;
-    content = appendRunningJobsNote(content);
+    content = appendRunningJobsNote(content, effectiveOwner);
     const itemBytes = Buffer.byteLength(content, "utf8");
     if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES) break;
     llm.push({
@@ -643,18 +704,24 @@ export function flushInProcessDeliveries(): void {
     })),
   );
   for (const { pending } of llm) {
-    if (pending.kind === "overflow") markOverflowDelivered(pending);
-    else pending.jobState.notificationDelivered = true;
+    if (pending.kind === "overflow") {
+      markOverflowDelivered(pending, effectiveOwner);
+    } else {
+      pending.jobState.notificationDelivered = true;
+    }
   }
   const delivered = new Set(deliveryIds);
   const remaining = queue.filter(
     (pending) => !delivered.has(pending.deliveryId),
   );
   queue.splice(0, queue.length, ...remaining);
-  if (queue.length > 0) flushInProcessDeliveries();
+  if (queue.length > 0) flushInProcessDeliveries(effectiveOwner);
 }
 
-function markOverflowDelivered(pending: PendingJobOverflow): void {
+function markOverflowDelivered(
+  pending: PendingJobOverflow,
+  owner?: SessionOwnerToken,
+): void {
   try {
     const lines = readFileSync(pending.overflowPath, "utf8").split("\n");
     for (const line of lines) {
@@ -662,8 +729,10 @@ function markOverflowDelivered(pending: PendingJobOverflow): void {
       try {
         const record = JSON.parse(line) as { jobId?: string };
         if (record.jobId) {
-          const state = jobRegistry.get(record.jobId);
-          if (state) state.notificationDelivered = true;
+          const state = getInProcessJob(record.jobId, owner);
+          if (state && (owner !== undefined || !inProcessJobOwner(state))) {
+            state.notificationDelivered = true;
+          }
         }
       } catch {
         /* malformed overflow rows remain represented by the pointer notification */

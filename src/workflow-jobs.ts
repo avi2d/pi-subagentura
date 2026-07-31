@@ -1,10 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { debugLog } from "./helpers";
 import {
-  getActiveSessionContextToken,
-  isSessionContextTokenLive,
-  type ActiveSessionContextToken,
-} from "./session-context";
+  getActiveSessionOwner,
+  isSessionOwnerLive,
+  type SessionOwnerToken,
+} from "./session-scope";
 import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
@@ -68,7 +68,7 @@ export interface WorkflowJobState {
   /** Number of successful delivery attempts. Only increments on success. */
   notificationAttempt?: number;
   /** Parent session lifecycle that owns this workflow job. */
-  parentSessionOwner?: ActiveSessionContextToken;
+  parentSessionOwner?: SessionOwnerToken;
 }
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
@@ -90,7 +90,7 @@ export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
 
 export function workflowJobBelongsToOwner(
   job: WorkflowJobState,
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): boolean {
   if (!owner) return !job.parentSessionOwner;
   return (
@@ -102,18 +102,18 @@ export function workflowJobBelongsToOwner(
 export function workflowJobBelongsToActiveSession(
   job: WorkflowJobState,
 ): boolean {
-  return workflowJobBelongsToOwner(job, getActiveSessionContextToken());
+  return workflowJobBelongsToOwner(job, getActiveSessionOwner());
 }
 
 export function getWorkflowJobForActiveSession(
   workflowId: string,
 ): WorkflowJobState | undefined {
-  return getWorkflowJobForOwner(workflowId, getActiveSessionContextToken());
+  return getWorkflowJobForOwner(workflowId, getActiveSessionOwner());
 }
 
 export function getWorkflowJobForOwner(
   workflowId: string,
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): WorkflowJobState | undefined {
   const job = workflowJobRegistry.get(workflowId);
   if (!job || !workflowJobBelongsToOwner(job, owner)) return undefined;
@@ -121,11 +121,11 @@ export function getWorkflowJobForOwner(
 }
 
 export function workflowJobsForActiveSession(): WorkflowJobState[] {
-  return workflowJobsForOwner(getActiveSessionContextToken());
+  return workflowJobsForOwner(getActiveSessionOwner());
 }
 
 export function workflowJobsForOwner(
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): WorkflowJobState[] {
   return [...workflowJobRegistry.values()].filter((job) =>
     workflowJobBelongsToOwner(job, owner),
@@ -133,7 +133,7 @@ export function workflowJobsForOwner(
 }
 
 export function cleanupWorkflowJobsForOwner(
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): void {
   for (const [id, job] of workflowJobRegistry) {
     if (!workflowJobBelongsToOwner(job, owner)) continue;
@@ -186,7 +186,7 @@ export function startWorkflowJob(
     StartWorkflowJobOptions | ((workflowId: string) => StartWorkflowJobOptions),
   startedAt?: number,
   onComplete?: (job: WorkflowJobState) => boolean | void,
-  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
+  owner: SessionOwnerToken | undefined = getActiveSessionOwner(),
   executionMode: "async" | "sync" = "async",
 ): WorkflowJobState {
   const parentSessionOwner = owner;
@@ -320,10 +320,7 @@ function invokeCompletionHook(job: WorkflowJobState): void {
   ) {
     return;
   }
-  if (
-    job.parentSessionOwner &&
-    !isSessionContextTokenLive(job.parentSessionOwner)
-  ) {
+  if (job.parentSessionOwner && !isSessionOwnerLive(job.parentSessionOwner)) {
     return;
   }
   // Already exhausted — no-op, no increment, no log.
@@ -372,7 +369,7 @@ function invokeCompletionHook(job: WorkflowJobState): void {
 
 /** Retry terminal workflow notifications that failed in this parent session. */
 export function retryPendingWorkflowNotifications(
-  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
+  owner: SessionOwnerToken | undefined = getActiveSessionOwner(),
 ): void {
   for (const job of workflowJobsForOwner(owner)) {
     if (job.status === "running") continue;
@@ -390,7 +387,7 @@ export function normalizeCancelledWorkflowState(state: WorkflowJobState): void {
 
 /** Count running workflow jobs (status === "running"). */
 export function getRunningWorkflowCount(
-  owner: ActiveSessionContextToken | undefined = getActiveSessionContextToken(),
+  owner: SessionOwnerToken | undefined = getActiveSessionOwner(),
 ): number {
   let count = 0;
   for (const st of workflowJobRegistry.values()) {

@@ -631,7 +631,11 @@ export async function awaitInteractiveResult(
   for (;;) {
     if (signal?.aborted) {
       try {
-        const cancelled = cancelInteractiveSubagent(state.id, "workflow");
+        const cancelled = cancelInteractiveSubagent(
+          state.id,
+          "workflow",
+          state,
+        );
         if (cancelled?.cancellationSnapshot) {
           onCancellationSnapshot?.(cancelled.cancellationSnapshot);
         }

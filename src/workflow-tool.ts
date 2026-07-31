@@ -2,11 +2,15 @@ import { Type } from "typebox";
 import { abortableWait } from "./abortable-wait";
 import {
   debugLog,
-  jobRegistry,
+  registerInProcessJob,
+  removeInProcessJob,
   startSubagentJob,
   type JobState,
 } from "./helpers";
-import { launchInteractiveSubagent } from "./interactive-tmux";
+import {
+  launchInteractiveSubagent,
+  registerInteractiveSubagentState,
+} from "./interactive-tmux";
 import {
   MAX_ITEMS_PER_CALL,
   INTERACTIVE_POLL_MS,
@@ -48,11 +52,12 @@ import type {
 import { cancellationSnapshotsEnabled } from "./cancellation-snapshots";
 import { getOrchestrationContext } from "./orchestration-context";
 import {
-  getActiveSessionContextToken,
-  isSessionContextTokenLive,
-  type ActiveSessionContextToken,
-  type SessionContextRef,
-} from "./session-context";
+  getActiveSessionOwner,
+  isSessionOwnerLive,
+  resolveLiveSessionScope,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "./session-scope";
 import { attachAsyncJobSettlement } from "./tools/in-process";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
@@ -144,18 +149,18 @@ export function formatWorkflowNotificationSummary(
 
 export function registerWorkflowTool(
   pi: ExtensionAPI,
-  sessionContext?: SessionContextRef,
+  sessionScope?: SessionScope,
 ): void {
   debugLog("info", "workflow_registered", {});
-  const owner = (): ActiveSessionContextToken | undefined =>
-    sessionContext
-      ? { id: sessionContext.id, generation: sessionContext.generation }
-      : getActiveSessionContextToken();
+  const owner = (): SessionOwnerToken | undefined =>
+    sessionScope
+      ? { id: sessionScope.id, generation: sessionScope.generation }
+      : getActiveSessionOwner();
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(
     ctx: any,
     ownedWorkflowId: string,
-    supervisorOwner: ActiveSessionContextToken | undefined,
+    supervisorOwner: SessionOwnerToken | undefined,
   ): WorkflowAgentRunner {
     return async ({
       prompt,
@@ -169,6 +174,12 @@ export function registerWorkflowTool(
       onProgress,
       onCancellationSnapshot,
     }) => {
+      if (supervisorOwner && !isSessionOwnerLive(supervisorOwner)) {
+        throw new Error(
+          "Workflow agent cancelled: its parent session is no longer live.",
+        );
+      }
+
       let lastUpdateTs = 0;
       const THROTTLE_MS = 2000;
 
@@ -183,6 +194,7 @@ export function registerWorkflowTool(
       const tryProcess = isolation !== "in-process";
       if (tryProcess) {
         let state: ReturnType<typeof launchInteractiveSubagent> | undefined;
+        const childScope = resolveLiveSessionScope(supervisorOwner);
         try {
           state = launchInteractiveSubagent({
             name: (label || "wf-agent").slice(0, 40),
@@ -194,6 +206,7 @@ export function registerWorkflowTool(
             background: true,
             thinkingLevel,
             supervisorOwner,
+            sessionScope: childScope,
             workflowId: ownedWorkflowId,
             completionOwner: "workflow",
           });
@@ -207,6 +220,11 @@ export function registerWorkflowTool(
           });
         }
         if (state) {
+          // launchInteractiveSubagent performs this registration itself. Repeating
+          // the idempotent synchronization here keeps alternate launch adapters and
+          // test doubles on the same production contract: the owner scope is the
+          // authoritative index, while the process-global registry is compatibility.
+          registerInteractiveSubagentState(state, childScope);
           const result = await awaitInteractiveResult(
             state,
             signal,
@@ -218,15 +236,14 @@ export function registerWorkflowTool(
         }
       }
 
-      // A child whose deliveryOwner carries no session-context identity matches
+      // A child whose deliveryOwner carries no session-scope identity matches
       // no owner-scoped sweep: it is invisible in the supervisor and the footer,
-      // and session_shutdown's jobRegistry drain skips it outright. Prefer the
-      // live active token, and leave the child unregistered rather than create
-      // an unreachable registry row.
-      const childOwner = supervisorOwner ?? getActiveSessionContextToken();
+      // and session shutdown skips it outright. Prefer the live owner, and leave
+      // the child unregistered rather than create an unreachable registry row.
+      const childOwner = supervisorOwner ?? getActiveSessionOwner();
 
-      // Own the child's session so an ancestor abort cascades to it, and so the
-      // session_shutdown drain can reach it through jobRegistry.
+      // Own the child session so its parent abort cascades to it and exact-scope
+      // shutdown can drain it from the authoritative job map.
       const abort = new AbortController();
       const forwardAbort = () => abort.abort(signal?.reason);
       if (signal?.aborted) abort.abort(signal.reason);
@@ -255,6 +272,7 @@ export function registerWorkflowTool(
         onCancellationSnapshot,
         cancellationSource: "workflow",
         thinkingLevel,
+        owner: childOwner,
         ...(isolation === "in-process" && schema !== undefined
           ? { workflowStructuredOutputSchema: schema }
           : {}),
@@ -263,7 +281,7 @@ export function registerWorkflowTool(
       // session_shutdown drains jobRegistry, so registering now would re-insert
       // into an already-drained registry and start a model turn that no abort path
       // can reach (the PR #59 shutdown-escape hole).
-      if (childOwner && !isSessionContextTokenLive(childOwner)) {
+      if (childOwner && !isSessionOwnerLive(childOwner)) {
         signal?.removeEventListener("abort", forwardAbort);
         discardWorkflowChildSpawn(abort, prepared);
         throw new Error(
@@ -286,12 +304,18 @@ export function registerWorkflowTool(
         completionOwner: "workflow",
         deliveryOwner: {
           pi,
-          sessionContextId: childOwner?.id,
-          sessionContextGeneration: childOwner?.generation,
+          sessionScopeId: childOwner?.id,
+          sessionScopeGeneration: childOwner?.generation,
         },
       };
       if (childOwner) {
-        jobRegistry.set(childJob.id, childJob);
+        if (!registerInProcessJob(childJob, childOwner)) {
+          signal?.removeEventListener("abort", forwardAbort);
+          discardWorkflowChildSpawn(abort, prepared);
+          throw new Error(
+            "Workflow agent cancelled: parent session shut down before the child was registered.",
+          );
+        }
         // Without settlement the row would stay "running" forever: cancellable in
         // the supervisor after it finished, double-counted against its own
         // workflow in the footer, and given a false cancellation record on quit.
@@ -300,7 +324,7 @@ export function registerWorkflowTool(
         debugLog("warn", "workflow_child_unregistered", {
           jobId: childJob.id,
           workflowId: ownedWorkflowId,
-          reason: "no live session context to own the child",
+          reason: "no live session scope to own the child",
         });
       }
       prepared.start?.();
@@ -308,7 +332,7 @@ export function registerWorkflowTool(
         return await prepared.jobPromise;
       } finally {
         signal?.removeEventListener("abort", forwardAbort);
-        jobRegistry.delete(childJob.id);
+        if (childOwner) removeInProcessJob(childJob.id, childOwner);
       }
     };
   }
@@ -464,6 +488,20 @@ export function registerWorkflowTool(
           isError: true,
         };
       }
+      const workflowOwner = owner();
+      if (
+        sessionScope &&
+        (!workflowOwner || !isSessionOwnerLive(workflowOwner))
+      ) {
+        const error =
+          "Workflow tool registration is no longer attached to a live session.";
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${error}` }],
+          details: { status: "session_unavailable", error },
+          isError: true,
+        };
+      }
+
       const script: string | null =
         typeof params.script === "string" && params.script.trim()
           ? params.script
@@ -481,7 +519,6 @@ export function registerWorkflowTool(
         };
       }
 
-      const workflowOwner = owner();
       const baseOpts = (workflowId: string) => ({
         args: params.args,
         cwd: ctx.cwd,
@@ -999,6 +1036,14 @@ export function registerWorkflowTool(
       if (!script) throw new Error(`No saved workflow named "${name}".`);
       const meta = parseWorkflow(script).meta;
       const workflowOwner = owner();
+      if (
+        sessionScope &&
+        (!workflowOwner || !isSessionOwnerLive(workflowOwner))
+      ) {
+        throw new Error(
+          "Workflow command registration is no longer attached to a live session.",
+        );
+      }
       const job = startWorkflowJob(
         meta.name,
         script,
@@ -1292,9 +1337,7 @@ export function registerWorkflowTool(
     ].join("\n");
   }
 
-  function renderWorkflowJobs(
-    owner: ActiveSessionContextToken | undefined,
-  ): string {
+  function renderWorkflowJobs(owner: SessionOwnerToken | undefined): string {
     const lines: string[] = [];
     const now = Date.now();
     let count = 0;

@@ -12,6 +12,7 @@ import {
   interactiveSubagentRegistry,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import type { SessionOwnerToken } from "./session-scope";
 import type { WorkflowJobState } from "./workflow-jobs";
 
 export const INTERACTIVE_SUPERVISOR_SHORTCUT = "ctrl+alt+a";
@@ -24,9 +25,12 @@ const DETAIL_WORKFLOW_AGENT_COUNT = 20;
 
 export type InteractiveSupervisorAction = { kind: "close" };
 type SupervisorDone = (action: InteractiveSupervisorAction) => void;
-// A set, not a single handle: two concurrent overlays used to orphan the first
-// `done`, so shutdown could only ever close the last one.
-const activeDoneHandles = new Set<SupervisorDone>();
+// Keep the exact lifecycle owner beside each callback so peer shutdown cannot
+// close another session's overlay.
+const activeDoneHandles = new Map<
+  SupervisorDone,
+  SessionOwnerToken | undefined
+>();
 
 interface SupervisorItemBase {
   depth: number;
@@ -497,6 +501,7 @@ export async function showInteractiveSupervisor(
     InteractiveSupervisorOptions,
     "done" | "requestRender" | "notify"
   > = {},
+  owner?: SessionOwnerToken,
 ): Promise<InteractiveSupervisorAction> {
   const custom = (ui as ExtensionUIContext & { custom?: Function }).custom;
   let component: InteractiveSupervisorComponent | undefined;
@@ -520,7 +525,7 @@ export async function showInteractiveSupervisor(
         done: SupervisorDone,
       ) => {
         registeredDone = done;
-        activeDoneHandles.add(done);
+        activeDoneHandles.set(done, owner);
         backdrop = showSupervisorBackdrop(tui, theme);
         component = new InteractiveSupervisorComponent({
           ...options,
@@ -546,9 +551,18 @@ export async function showInteractiveSupervisor(
   }
 }
 
-/** Close every open supervisor overlay, not just the most recent one. */
-export function closeActiveInteractiveSupervisor(): void {
-  for (const done of [...activeDoneHandles]) {
+/** Close overlays owned by one exact lifecycle, or every overlay for legacy callers. */
+export function closeActiveInteractiveSupervisor(
+  owner?: SessionOwnerToken,
+): void {
+  for (const [done, overlayOwner] of [...activeDoneHandles]) {
+    if (
+      owner &&
+      (overlayOwner?.id !== owner.id ||
+        overlayOwner.generation !== owner.generation)
+    ) {
+      continue;
+    }
     activeDoneHandles.delete(done);
     done({ kind: "close" });
   }

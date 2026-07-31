@@ -23,7 +23,14 @@
  * of the codebase compiles unchanged.
  */
 
-import type { ActiveSessionContextToken } from "./session-context";
+import {
+  findSessionScope,
+  sessionOwner,
+  resolveLiveSessionScope,
+  sessionIdForOwner,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "./session-scope";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { randomBytes } from "node:crypto";
 import {
@@ -40,6 +47,7 @@ import {
   appendInteractiveState,
   appendCompletionEvent,
   artifactPath,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
   assertNever,
   newEventId,
   type SubagentEvent,
@@ -183,7 +191,9 @@ export interface InteractiveSubagentState {
    */
   parentSessionId?: string;
   /** Live supervisor owner; intentionally not persisted for workflow children. */
-  supervisorOwner?: ActiveSessionContextToken;
+  supervisorOwner?: SessionOwnerToken;
+  /** Exact runtime session generation that owns this state; never persisted. */
+  sessionOwner?: SessionOwnerToken;
   /** Workflow that owns this child, when completion is aggregated by the workflow. */
   workflowId?: string;
   /** Completion is delivered standalone or consumed by a workflow aggregate. */
@@ -271,6 +281,36 @@ if (!globalThis.__piSubagenturaInteractiveRegistry) {
 
 export const interactiveSubagentRegistry =
   globalThis.__piSubagenturaInteractiveRegistry!;
+/** Insert a state into its authoritative session map and the legacy aggregate index. */
+export function registerInteractiveSubagentState(
+  state: InteractiveSubagentState,
+  scope?: SessionScope,
+): void {
+  if (scope) {
+    state.sessionOwner = sessionOwner(scope);
+    scope.interactiveStates.set(state.id, state);
+  }
+  interactiveSubagentRegistry.set(state.id, state);
+}
+
+/** Remove the same state object from every registry that currently indexes it. */
+export function removeInteractiveSubagentState(
+  state: InteractiveSubagentState,
+): boolean {
+  let removed = false;
+  if (interactiveSubagentRegistry.get(state.id) === state) {
+    removed = interactiveSubagentRegistry.delete(state.id);
+  }
+  const owner = state.sessionOwner;
+  if (owner) {
+    const scope = findSessionScope(owner.id);
+    if (scope?.interactiveStates.get(state.id) === state) {
+      scope.interactiveStates.delete(state.id);
+      removed = true;
+    }
+  }
+  return removed;
+}
 
 /**
  * True iff a tmux server is running and the parent is attached to one of its
@@ -461,7 +501,9 @@ export function launchInteractiveSubagent(params: {
    */
   parentSessionId?: string;
   /** Live supervisor owner independent of persistence and delivery policy. */
-  supervisorOwner?: ActiveSessionContextToken;
+  supervisorOwner?: SessionOwnerToken;
+  /** Current runtime scope that authoritatively owns the spawned state. */
+  sessionScope?: SessionScope;
   /** Workflow owner for grouping and cancellation. */
   workflowId?: string;
   /** Workflow-managed completions are consumed by the workflow runner. */
@@ -480,6 +522,8 @@ export function launchInteractiveSubagent(params: {
   const id = randomBytes(8).toString("hex");
   const cwd = resolve(params.cwd);
   const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
+  const artifactOwnerSessionId =
+    params.parentSessionId ?? sessionIdForOwner(params.supervisorOwner);
   const background = params.background !== false; // default true (hidden)
   const paths = createInteractiveSubagentPaths({ id, name: params.name, cwd });
   const parentAgentId = process.env.PI_SUBAGENTURA_AGENT_ID;
@@ -542,8 +586,14 @@ export function launchInteractiveSubagent(params: {
     task: params.task,
     contextText: params.contextText,
   });
-
   mkdirSync(paths.artifactDir, { recursive: true });
+  if (artifactOwnerSessionId) {
+    writeFileSync(
+      join(paths.artifactDir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      artifactOwnerSessionId,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  }
   writeFileSync(paths.promptFile, prompt, { encoding: "utf8", mode: 0o600 });
 
   // Cap the persona to prevent a misbehaving parent from shipping a huge
@@ -753,7 +803,10 @@ export function launchInteractiveSubagent(params: {
     pendingDeliveries: [],
     deliveryReceipts: [],
   };
-  interactiveSubagentRegistry.set(id, state);
+  registerInteractiveSubagentState(
+    state,
+    params.sessionScope ?? resolveLiveSessionScope(params.supervisorOwner),
+  );
   return state;
 }
 
@@ -920,8 +973,10 @@ export function sendCommandToTmuxPane(paneId: string, command: string): void {
 export function cancelInteractiveSubagent(
   id: string,
   source: CancellationSnapshotSource = "cancel_interactive_subagent",
+  ownedState?: InteractiveSubagentState,
 ): InteractiveSubagentState | undefined {
-  const state = interactiveSubagentRegistry.get(id);
+  const state =
+    ownedState?.id === id ? ownedState : interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
 
   const snapshot = snapshotInteractiveContext({
@@ -1235,8 +1290,10 @@ export function deriveInteractiveSubagentStatusFromLifecycle(
  * before the launch trap could write it), fall back to the session-file
  * existence check — same heuristic as before.
  */
-export function pruneDeadInteractiveSubagents(): void {
-  for (const state of interactiveSubagentRegistry.values()) {
+export function pruneDeadInteractiveSubagents(
+  states: Iterable<InteractiveSubagentState> = interactiveSubagentRegistry.values(),
+): void {
+  for (const state of states) {
     if (
       state.status !== "running" &&
       state.status !== "idle" &&

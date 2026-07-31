@@ -28,11 +28,11 @@ import {
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
 import {
-  advanceSessionContextGeneration,
-  getSessionContextStack,
-  registerSessionContext,
-  removeSessionContext,
-} from "../src/session-context";
+  advanceSessionScopeGeneration,
+  clearSessionScopes,
+  registerSessionScope,
+  removeSessionScope,
+} from "../src/session-scope";
 function makeTmp(): string {
   return mkdtempSync(join(tmpdir(), "pi-subagentura-poll-"));
 }
@@ -81,7 +81,7 @@ describe("pollArtifactChanges", () => {
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaUi = undefined;
     g.__piSubagenturaParentStreaming = false;
-    getSessionContextStack().length = 0;
+    clearSessionScopes();
   });
 
   afterEach(() => {
@@ -122,12 +122,13 @@ describe("pollArtifactChanges", () => {
     const sendMessage = vi.fn();
     const setStatus = vi.fn();
     const setWidget = vi.fn();
-    registerSessionContext({
+    const scope = registerSessionScope({
       ...owner,
       pi: { sendMessage } as any,
       ui: { notify: vi.fn(), setStatus, setWidget } as any,
       sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
     });
+    scope.interactiveStates.set(item.id, item.state);
     let releaseLiveness!: () => void;
     let livenessStarted = false;
     const blockedLiveness = new Promise<void>((resolve) => {
@@ -187,17 +188,19 @@ describe("pollArtifactChanges", () => {
     const ownerB = { id: 402, generation: 1 };
     const sendMessage = installDeliverySpies();
     const wrongSendMessage = vi.fn();
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       id: 401,
       generation: 1,
       pi: {} as any,
       sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
     });
-    registerSessionContext({
+    const scopeB = registerSessionScope({
       ...ownerB,
       pi: { sendMessage } as any,
       sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
     });
+    scopeA.interactiveStates.set(a.id, a.state);
+    scopeB.interactiveStates.set(b.id, b.state);
     (globalThis as any).__piSubagenturaPiRef = {
       sendMessage: wrongSendMessage,
     };
@@ -237,16 +240,18 @@ describe("pollArtifactChanges", () => {
     }
     const ownerA = { id: 501, generation: 1 };
     const ownerB = { id: 502, generation: 1 };
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       ...ownerA,
       pi: { sendMessage: vi.fn() } as any,
       sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
     });
-    registerSessionContext({
+    const scopeB = registerSessionScope({
       ...ownerB,
       pi: { sendMessage: vi.fn() } as any,
       sessionManager: { getSessionId: () => "session-b", getEntries: () => [] },
     });
+    scopeA.interactiveStates.set(a.id, a.state);
+    scopeB.interactiveStates.set(b.id, b.state);
     let releaseA!: () => void;
     const blockedA = new Promise<void>((resolve) => {
       releaseA = resolve;
@@ -269,7 +274,7 @@ describe("pollArtifactChanges", () => {
     expect(bProcessedWhileAWasBlocked).toBe(true);
   });
 
-  it("retains shared activity rows when a sibling owner has none", async () => {
+  it("retains shared activity rows and footer when a sibling owner has none", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const multiplexer = await import("../src/multiplexer");
@@ -284,18 +289,19 @@ describe("pollArtifactChanges", () => {
     mod.interactiveSubagentRegistry.set(a.id, a.state);
     const ownerA = { id: 503, generation: 1 };
     const ownerB = { id: 504, generation: 1 };
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       ...ownerA,
       pi: { sendMessage: vi.fn() } as any,
       ui: sharedUi as any,
       sessionManager: { getSessionId: () => "session-a" },
     });
-    registerSessionContext({
+    registerSessionScope({
       ...ownerB,
       pi: { sendMessage: vi.fn() } as any,
       ui: sharedUi as any,
       sessionManager: { getSessionId: () => "session-b" },
     });
+    scopeA.interactiveStates.set(a.id, a.state);
     multiplexer.__setTmuxMultiplexer({
       getPaneLivenessAsync: async () => "alive",
     } as any);
@@ -310,6 +316,10 @@ describe("pollArtifactChanges", () => {
     expect(finalRows).toEqual(
       expect.arrayContaining([expect.stringContaining("agent-a")]),
     );
+    const footerCalls = sharedUi.setStatus.mock.calls.filter(
+      ([key]) => key === "subagentura-running",
+    );
+    expect(footerCalls.at(-1)?.[1]).toBe("⚡ 1 sub-agent active");
   });
 
   it("shows workflow children on the owning session's widget and footer", async () => {
@@ -324,13 +334,13 @@ describe("pollArtifactChanges", () => {
     const uiB = { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() };
     const ownerA = { id: 601, generation: 1 };
     const ownerB = { id: 602, generation: 1 };
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       ...ownerA,
       pi: { sendMessage: vi.fn() } as any,
       ui: uiA as any,
       sessionManager: { getSessionId: () => "session-a" },
     });
-    registerSessionContext({
+    const scopeB = registerSessionScope({
       ...ownerB,
       pi: { sendMessage: vi.fn() } as any,
       ui: uiB as any,
@@ -344,12 +354,14 @@ describe("pollArtifactChanges", () => {
     child.state.completionOwner = "workflow";
     child.state.parentSessionId = undefined;
     mod.interactiveSubagentRegistry.set(child.id, child.state);
+    scopeA.interactiveStates.set(child.id, child.state);
 
     // A sibling session's plain agent must be neither listed nor counted for A.
     const sibling = makeState();
     sibling.state.name = "sibling";
     sibling.state.parentSessionId = "session-b";
     mod.interactiveSubagentRegistry.set(sibling.id, sibling.state);
+    scopeB.interactiveStates.set(sibling.id, sibling.state);
 
     multiplexer.__setTmuxMultiplexer({
       isPaneAliveAsync: async () => true,
@@ -394,18 +406,20 @@ describe("pollArtifactChanges", () => {
     mod.interactiveSubagentRegistry.set(b.id, b.state);
     const ownerA = { id: 505, generation: 1 };
     const ownerB = { id: 506, generation: 1 };
-    registerSessionContext({
+    const scopeA = registerSessionScope({
       ...ownerA,
       pi: { sendMessage: vi.fn() } as any,
       ui: uiA as any,
       sessionManager: { getSessionId: () => "session-a" },
     });
-    registerSessionContext({
+    const scopeB = registerSessionScope({
       ...ownerB,
       pi: { sendMessage: vi.fn() } as any,
       ui: uiB as any,
       sessionManager: { getSessionId: () => "session-b" },
     });
+    scopeA.interactiveStates.set(a.id, a.state);
+    scopeB.interactiveStates.set(b.id, b.state);
     multiplexer.__setTmuxMultiplexer({
       getPaneLivenessAsync: async () => "alive",
     } as any);
@@ -425,7 +439,7 @@ describe("pollArtifactChanges", () => {
     expect(rowsFor(uiB).join("\n")).not.toContain("agent-a");
   });
 
-  it("preserves unscoped activity projection when contexts exist", async () => {
+  it("fails closed for ownerless polling when a session scope exists", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
     const multiplexer = await import("../src/multiplexer");
@@ -437,7 +451,7 @@ describe("pollArtifactChanges", () => {
     const unowned = makeState();
     unowned.state.name = "unowned-agent";
     mod.interactiveSubagentRegistry.set(unowned.id, unowned.state);
-    registerSessionContext({
+    registerSessionScope({
       id: 507,
       generation: 1,
       pi: { sendMessage: vi.fn() } as any,
@@ -454,10 +468,8 @@ describe("pollArtifactChanges", () => {
     const activityCalls = ui.setWidget.mock.calls.filter(
       ([key]) => key === "subagentura-activity",
     );
-    const finalRows = activityCalls.at(-1)?.[1] as string[] | undefined;
-    expect(finalRows).toEqual(
-      expect.arrayContaining([expect.stringContaining("unowned-agent")]),
-    );
+    expect(activityCalls).toEqual([]);
+    expect(unowned.state.eventByteCursor).toBeUndefined();
   });
 
   it("does not repaint unchanged poller UI", async () => {
@@ -582,7 +594,7 @@ describe("pollArtifactChanges", () => {
     mod.interactiveSubagentRegistry.set(item.id, item.state);
     const owner = { id: 601, generation: 1 };
     const sendMessage = vi.fn();
-    registerSessionContext({
+    const scope = registerSessionScope({
       ...owner,
       pi: { sendMessage } as any,
       ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() } as any,
@@ -591,6 +603,7 @@ describe("pollArtifactChanges", () => {
         getEntries: () => [],
       },
     });
+    scope.interactiveStates.set(item.id, item.state);
     let releaseLiveness!: () => void;
     const blocked = new Promise<void>((resolve) => {
       releaseLiveness = resolve;
@@ -692,7 +705,7 @@ describe("pollArtifactChanges", () => {
 
   it("abandons mutation when its owner is removed during liveness", async () => {
     const result = await pollUntilOwnerInvalidation((owner) => {
-      removeSessionContext(owner.id);
+      removeSessionScope(owner.id);
     });
 
     expect(result.state.eventByteCursor ?? 0).toBe(0);
@@ -708,7 +721,7 @@ describe("pollArtifactChanges", () => {
 
   it("abandons mutation when its owner generation advances during liveness", async () => {
     const result = await pollUntilOwnerInvalidation((owner) => {
-      advanceSessionContextGeneration(owner.id);
+      advanceSessionScopeGeneration(owner.id);
     });
 
     expect(result.state.eventByteCursor ?? 0).toBe(0);
@@ -916,7 +929,7 @@ describe("pollArtifactChanges", () => {
     expect(existsSync(logFile)).toBe(true);
     const content = readFileSync(logFile, "utf8");
     expect(content).toContain('"event":"poller_error"');
-    expect(content).toContain("bad-state");
+    expect(content).not.toContain('"registryIds"');
 
     rmSync(logDir, { recursive: true, force: true });
   });
@@ -1979,7 +1992,7 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     g.__piSubagenturaInteractiveRegistry?.clear?.();
     g.__piSubagenturaPiRef = undefined;
     g.__piSubagenturaSessionManager = undefined;
-    getSessionContextStack().length = 0;
+    clearSessionScopes();
   });
 
   function makePersistedState(): {
@@ -2024,12 +2037,12 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     state.status = "exited";
     mod.interactiveSubagentRegistry.set(id, state);
     const ownerA = { id: 601, generation: 1 };
-    registerSessionContext({
+    registerSessionScope({
       ...ownerA,
       pi: { sendMessage: vi.fn() } as any,
       sessionManager: { getSessionId: () => "session-a", getEntries: () => [] },
     });
-    registerSessionContext({
+    registerSessionScope({
       id: 602,
       generation: 1,
       pi: { sendMessage: vi.fn() } as any,

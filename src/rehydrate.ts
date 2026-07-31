@@ -11,8 +11,10 @@
  * the rehydrated states and replays any backlog.
  */
 
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
   loadInteractiveStates,
   type InteractiveSubagentPersistedStateV2,
 } from "./artifact";
@@ -21,14 +23,17 @@ import {
   buildAttachCommandsForState,
   deriveInteractiveSubagentStatusFromLifecycle,
   interactiveSubagentRegistry,
+  registerInteractiveSubagentState,
   isPaneAlive,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import { sessionOwner, type SessionScope } from "./session-scope";
 
 export function rehydrateInteractiveSubagents(
   cwd: string,
   currentSessionId?: string,
   sessionEntries: unknown[] = [],
+  scope?: SessionScope,
 ): {
   total: number;
   alive: number;
@@ -46,7 +51,23 @@ export function rehydrateInteractiveSubagents(
     if (currentSessionId && entry.parentSessionId !== currentSessionId) {
       continue;
     }
-    if (interactiveSubagentRegistry.has(entry.id)) continue;
+    if (currentSessionId) {
+      try {
+        const artifactOwner = readFileSync(
+          join(entry.artifactDir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+          "utf8",
+        );
+        if (artifactOwner !== currentSessionId) continue;
+      } catch (error) {
+        // Missing markers are valid legacy state; other read failures fail closed.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
+    }
+    if (
+      (scope?.interactiveStates ?? interactiveSubagentRegistry).has(entry.id)
+    ) {
+      continue;
+    }
 
     // Recovery is best-effort and must never throw; on missing files we
     // fall back to placeholder values (entry.id for name, 0 for startedAt).
@@ -123,10 +144,14 @@ export function rehydrateInteractiveSubagents(
       paneAlive,
     );
     rehydrated.status = next;
-    reconcileDeliveryReceipts(rehydrated, sessionEntries);
+    reconcileDeliveryReceipts(
+      rehydrated,
+      sessionEntries,
+      scope ? sessionOwner(scope) : undefined,
+    );
     if (next === "exited" || next === "cancelled") terminal++;
     else if (next === "running" || next === "idle") alive++;
-    interactiveSubagentRegistry.set(entry.id, rehydrated);
+    registerInteractiveSubagentState(rehydrated, scope);
   }
 
   return { total: Object.keys(payload.states).length, alive, terminal };

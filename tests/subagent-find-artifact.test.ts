@@ -16,16 +16,30 @@
  * (or the realpath check) makes these return null.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importFresh } from "./test-utils";
+import {
+  appendInteractiveState,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
+} from "../src/artifact";
+import { registerInteractiveSubagentTools } from "../src/tools/interactive";
+import { clearSessionScopes, registerSessionScope } from "../src/session-scope";
 
 describe("findArtifactById (path-traversal guard)", () => {
   let tmp: string;
   let legitDir: string;
 
   beforeEach(() => {
+    clearSessionScopes();
     tmp = mkdtempSync(join(tmpdir(), "pi-subagentura-findartifact-"));
     // The production layout is <root>/<cwdLabel>/artifacts/<id>.
     // Create one such directory to use for the well-formed id test.
@@ -44,6 +58,7 @@ describe("findArtifactById (path-traversal guard)", () => {
   afterEach(() => {
     rmSync(tmp, { recursive: true, force: true });
     vi.unstubAllEnvs();
+    clearSessionScopes();
   });
 
   it("returns null for ids with path-traversal sequences", async () => {
@@ -140,5 +155,48 @@ describe("findArtifactById (path-traversal guard)", () => {
       art,
       "symlink escaping the artifact root must be rejected",
     ).toBeNull();
+  });
+  it("does not trust persisted ownership over a conflicting marker", async () => {
+    writeFileSync(
+      join(legitDir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      "foreign-session",
+    );
+    appendInteractiveState(tmp, {
+      id: "deadbeefcafebabe",
+      paneId: "%1",
+      mux: "tmux",
+      artifactDir: legitDir,
+      sessionFile: join(tmp, "child.jsonl"),
+      parentSessionId: "current-session",
+    });
+    const tools = new Map<string, { execute: Function }>();
+    const pi = {
+      registerTool: (tool: { name: string; execute: Function }) =>
+        tools.set(tool.name, tool),
+    } as any;
+    const scope = registerSessionScope({
+      id: 740,
+      generation: 1,
+      lifecycle: "started",
+      pi,
+      sessionManager: { getSessionId: () => "current-session" },
+    });
+    registerInteractiveSubagentTools(pi, scope);
+
+    const result = await tools
+      .get("read_subagent_artifact")
+      ?.execute(
+        "read-conflict",
+        { id: "deadbeefcafebabe" },
+        undefined,
+        undefined,
+        { cwd: tmp },
+      );
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: { status: "not_found" },
+    });
+    clearSessionScopes();
   });
 });

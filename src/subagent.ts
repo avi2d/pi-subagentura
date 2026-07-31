@@ -90,11 +90,11 @@ export default function (pi: ExtensionAPI) {
     if (typeof pi.registerMessageRenderer === "function") {
       pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
     }
-    registerSessionHandlers(pi);
-    registerInteractiveSubagentTools(pi);
-    registerSubagentArtifactsCleanupTool(pi);
+    const sessionScope = registerSessionHandlers(pi);
+    registerInteractiveSubagentTools(pi, sessionScope);
+    registerSubagentArtifactsCleanupTool(pi, sessionScope);
     registerSubagentModelListTool(pi);
-    registerInteractiveSupervisor(pi);
+    registerInteractiveSupervisor(pi, sessionScope);
     return;
   }
   if (typeof pi.registerMessageRenderer !== "function") {
@@ -114,14 +114,14 @@ export default function (pi: ExtensionAPI) {
     };
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
-  const sessionContext = registerSessionHandlers(pi);
-  registerInteractiveSubagentTools(pi);
-  registerInteractiveSupervisor(pi, sessionContext);
-  registerWorkflowTool(pi, sessionContext);
-  registerInProcessSubagentTools(pi, sessionContext);
-  registerInProcessMaintenanceTools(pi);
+  const sessionScope = registerSessionHandlers(pi);
+  registerInteractiveSubagentTools(pi, sessionScope);
+  registerInteractiveSupervisor(pi, sessionScope);
+  registerWorkflowTool(pi, sessionScope);
+  registerInProcessSubagentTools(pi, sessionScope);
+  registerInProcessMaintenanceTools(pi, sessionScope);
   // ── Cancel-all-flows shortcut and command ──────────────────────
-  registerCancelAllFlows(pi, sessionContext);
+  registerCancelAllFlows(pi, sessionScope);
 }
 
 /**

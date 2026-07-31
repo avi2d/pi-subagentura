@@ -34,8 +34,8 @@ import {
 import { getMux, type MuxName, type PaneLiveness } from "./multiplexer";
 import {
   abortJobTree,
-  inProcessJobBelongsToOwner,
-  jobRegistry,
+  inProcessJobOwner,
+  inProcessJobsForOwner,
   scheduleJobCleanup,
   type JobState,
 } from "./helpers";
@@ -47,12 +47,31 @@ import {
 } from "./workflow-jobs";
 import {
   interactiveStateBelongsToOwner,
-  type ActiveSessionContextToken,
-  type SessionContextRef,
-} from "./session-context";
+  ownerlessEntitiesVisible,
+  resolveLiveSessionScope,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "./session-scope";
 
 const SUPERVISOR_CAPTURE_MAX_BYTES = 16 * 1024;
 const SUPERVISOR_CAPTURE_MAX_LINES = 200;
+
+const EMPTY_INTERACTIVE_STATES: ReadonlyMap<string, InteractiveSubagentState> =
+  new Map();
+
+function supervisorInteractiveStates(
+  owner: SessionOwnerToken | undefined,
+): ReadonlyMap<string, InteractiveSubagentState> {
+  if (owner) {
+    return (
+      resolveLiveSessionScope(owner)?.interactiveStates ??
+      EMPTY_INTERACTIVE_STATES
+    );
+  }
+  return ownerlessEntitiesVisible()
+    ? interactiveSubagentRegistry
+    : EMPTY_INTERACTIVE_STATES;
+}
 
 interface SupervisorProjection {
   items: InteractiveSupervisorItem[];
@@ -75,9 +94,9 @@ function isInteractiveStateActionable(
 
 export function directSupervisorItems(
   sessionId?: string,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): InteractiveSupervisorItem[] {
-  return [...interactiveSubagentRegistry.values()]
+  return [...supervisorInteractiveStates(owner).values()]
     .filter((state) => interactiveStateBelongsToOwner(state, owner, sessionId))
     .sort(compareByStartedAt)
     .map((state) => ({
@@ -96,10 +115,10 @@ export function directSupervisorItems(
 
 export function buildAsyncSupervisorItems(
   interactiveItems: InteractiveSupervisorItem[],
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): AsyncSupervisorItem[] {
-  const processJobs = [...jobRegistry.values()]
-    .filter((job) => inProcessJobBelongsToOwner(job, owner))
+  const processJobs = [...inProcessJobsForOwner(owner).values()]
+    .filter((job) => owner !== undefined || !inProcessJobOwner(job))
     .sort(compareByStartedAt);
   const visibleJobs = new Map(processJobs.map((job) => [job.id, job]));
   const workflowItems: WorkflowSupervisorItem[] = workflowJobsForOwner(owner)
@@ -232,12 +251,13 @@ function muxNameForManifest(manifest: LineageManifest): MuxName | undefined {
 
 function stateForNode(
   node: ProjectedLineageNode,
+  interactiveStates: ReadonlyMap<string, InteractiveSubagentState>,
   paneLivenessById?: Map<string, PaneLiveness>,
 ): InteractiveSubagentState | undefined {
   const manifest = node.manifest;
   const mux = muxNameForManifest(manifest);
   if (!mux) return undefined;
-  const existing = interactiveSubagentRegistry.get(manifest.agentId);
+  const existing = interactiveStates.get(manifest.agentId);
   if (existing) return existing;
   const paneLiveness = paneLivenessById?.get(manifest.agentId);
   // tmux's buildAttachCommands resolves the pane's window via execMuxOrThrow,
@@ -304,7 +324,7 @@ function parseStartedAt(value: string): number {
 
 async function loadSupervisorProjection(
   sessionId: string | undefined,
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
 ): Promise<SupervisorProjection | undefined> {
   const rootId = process.env.PI_SUBAGENTURA_ROOT_ID ?? sessionId;
   if (!rootId) return undefined;
@@ -312,6 +332,7 @@ async function loadSupervisorProjection(
     process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT ??
     process.env.PI_CODING_AGENT_SESSION_DIR ??
     join(homedir(), ".pi", "agent", "sessions");
+  const interactiveStates = supervisorInteractiveStates(owner);
   const paths = await resolveLineageStorePaths(sessionRoot, rootId);
   // Reused across the projection AND the prune sweep so no manifest is probed
   // twice per refresh.
@@ -358,8 +379,9 @@ async function loadSupervisorProjection(
     }
   }
   const items = flattened.flatMap((node): InteractiveSupervisorItem[] => {
-    const state = stateForNode(node, paneLivenessById);
+    const state = stateForNode(node, interactiveStates, paneLivenessById);
     if (!state) return [];
+    if (!interactiveStateBelongsToOwner(state, owner, sessionId)) return [];
     return [
       {
         state,
@@ -375,7 +397,7 @@ async function loadSupervisorProjection(
       },
     ];
   });
-  for (const state of interactiveSubagentRegistry.values()) {
+  for (const state of interactiveStates.values()) {
     if (!interactiveStateBelongsToOwner(state, owner, sessionId)) continue;
     if (!seen.has(state.id)) {
       items.push({
@@ -438,11 +460,11 @@ export function supervisorStatusLines(
 
 export function registerInteractiveSupervisor(
   pi: ExtensionAPI,
-  sessionContext?: SessionContextRef,
+  sessionScope?: SessionScope,
 ): void {
-  const owner = (): ActiveSessionContextToken | undefined =>
-    sessionContext
-      ? { id: sessionContext.id, generation: sessionContext.generation }
+  const owner = (): SessionOwnerToken | undefined =>
+    sessionScope
+      ? { id: sessionScope.id, generation: sessionScope.generation }
       : undefined;
   const open = async (ctx: {
     ui: Parameters<typeof showInteractiveSupervisor>[0];
@@ -458,139 +480,171 @@ export function registerInteractiveSupervisor(
       refreshError = errorMessage(error);
       return undefined;
     });
-    await showInteractiveSupervisor(ctx.ui, {
-      items: () =>
-        buildAsyncSupervisorItems(
-          projection?.items ?? directSupervisorItems(sessionId, activeOwner),
-          activeOwner,
-        ),
-      status: () => supervisorStatusLines(projection, refreshError),
-      refresh: async () => {
-        // A swallowed failure used to freeze the snapshot indefinitely with no
-        // indication; the error now reaches the overlay footer.
-        try {
-          projection = await loadSupervisorProjection(sessionId, activeOwner);
-          refreshError = undefined;
-        } catch (error) {
-          refreshError = errorMessage(error);
-        }
-      },
-      focus: focusInteractiveSubagent,
-      hasAttachedClient: interactiveSubagentHasAttachedClient,
-      view: async (state) => {
-        const capture = await captureInteractiveSubagent(state, {
-          maxBytes: SUPERVISOR_CAPTURE_MAX_BYTES,
-          maxLines: SUPERVISOR_CAPTURE_MAX_LINES,
-        });
-        const suffix = capture.truncated ? "\n… output truncated" : "";
-        ctx.ui.notify(
-          capture.output.length > 0
-            ? `${state.name} terminal output:\n${capture.output}${suffix}`
-            : `${state.name} has no captured terminal output yet.`,
-          "info",
-        );
-      },
-      nativeView: async (state) => {
-        const capture = await captureInteractiveSubagent(state, {
-          maxBytes: SUPERVISOR_CAPTURE_MAX_BYTES,
-          maxLines: SUPERVISOR_CAPTURE_MAX_LINES,
-        });
-        const opened = await showInteractiveSubagentNativeViewer(
-          state,
-          capture.output ||
-            `${state.name} has no captured terminal output yet.`,
-        );
-        if (!opened) {
+    await showInteractiveSupervisor(
+      ctx.ui,
+      {
+        items: () =>
+          buildAsyncSupervisorItems(
+            projection?.items ?? directSupervisorItems(sessionId, activeOwner),
+            activeOwner,
+          ),
+        status: () => supervisorStatusLines(projection, refreshError),
+        refresh: async () => {
+          // A swallowed failure used to freeze the snapshot indefinitely with no
+          // indication; the error now reaches the overlay footer.
+          try {
+            projection = await loadSupervisorProjection(sessionId, activeOwner);
+            refreshError = undefined;
+          } catch (error) {
+            refreshError = errorMessage(error);
+          }
+        },
+        focus: focusInteractiveSubagent,
+        hasAttachedClient: interactiveSubagentHasAttachedClient,
+        view: async (state) => {
+          const capture = await captureInteractiveSubagent(state, {
+            maxBytes: SUPERVISOR_CAPTURE_MAX_BYTES,
+            maxLines: SUPERVISOR_CAPTURE_MAX_LINES,
+          });
+          const suffix = capture.truncated ? "\n… output truncated" : "";
           ctx.ui.notify(
-            "Native presentation is unavailable here; continuing with the portable Pi overlay.",
+            capture.output.length > 0
+              ? `${state.name} terminal output:\n${capture.output}${suffix}`
+              : `${state.name} has no captured terminal output yet.`,
             "info",
           );
-        }
-      },
-      cancelInProcess: (job) => {
-        if (!cancelInProcessFromSupervisor(job, sessionId)) return false;
-        updateRunningSubagentFooter(ctx.ui, owner());
-        return true;
-      },
-      cancelWorkflow: (job) => {
-        if (job.status !== "running") return false;
-        job.abort.abort();
-        job.status = "cancelled";
-        normalizeCancelledWorkflowState(job);
-        return true;
-      },
-      cancel: (id) => {
-        const direct = cancelInteractiveSubagent(id);
-        if (direct) {
-          updateRunningSubagentFooter(ctx.ui, owner());
-          return direct;
-        }
-        const item = projection?.items.find(
-          (candidate) => candidate.state.id === id,
-        );
-        if (!item?.actionable) return undefined;
-        cancelInteractiveDescendantByState(item.state);
-        updateRunningSubagentFooter(ctx.ui, owner());
-        return item.state;
-      },
-      cancelSubtree: async (state) => {
-        // Snapshot the tree BEFORE the confirm blocks for human time. The 1 Hz
-        // refresh reassigns `projection` while the dialog is open, so reading it
-        // afterwards acted on a newer tree than the one the user confirmed.
-        const snapshotRoot = projection?.nodes.get(state.id);
-        const snapshotManifests = projection?.manifests ?? [];
-        const snapshotTruncated = projection?.truncated === true;
-        const descendantCount = snapshotRoot
-          ? subtreeManifestIds(snapshotRoot, snapshotManifests).size - 1
-          : 0;
-        const truncationWarning = snapshotTruncated
-          ? " The lineage view is truncated, so the tree may be larger than shown."
-          : "";
-        const confirmed = await ctx.ui.confirm(
-          "Cancel interactive subagent subtree?",
-          `Cancel ${state.name} and its ${descendantCount} descendant${descendantCount === 1 ? "" : "s"}? This closes their mux panes but retains artifacts.${truncationWarning}`,
-        );
-        if (!confirmed) return;
-        if (!snapshotRoot) {
-          cancelInteractiveSubagent(state.id);
-          updateRunningSubagentFooter(ctx.ui, owner());
-          return;
-        }
-        const result = await cancelLineageSubtreeBestEffort(snapshotRoot, {
-          // The raw manifest set, so descendants past maxDepth or the node cap
-          // are cancelled instead of left running under a dead parent.
-          allManifests: snapshotManifests,
-          projectionTruncated: snapshotTruncated,
-          isStale: async (node) =>
-            node.state !== "actionable" ||
-            muxNameForManifest(node.manifest) === undefined,
-          isTerminal: async (node) => {
-            const direct = interactiveSubagentRegistry.get(
-              node.manifest.agentId,
+        },
+        nativeView: async (state) => {
+          const capture = await captureInteractiveSubagent(state, {
+            maxBytes: SUPERVISOR_CAPTURE_MAX_BYTES,
+            maxLines: SUPERVISOR_CAPTURE_MAX_LINES,
+          });
+          const opened = await showInteractiveSubagentNativeViewer(
+            state,
+            capture.output ||
+              `${state.name} has no captured terminal output yet.`,
+          );
+          if (!opened) {
+            ctx.ui.notify(
+              "Native presentation is unavailable here; continuing with the portable Pi overlay.",
+              "info",
             );
-            return direct
-              ? direct.status === "cancelled" || direct.status === "exited"
-              : false;
-          },
-          cancel: async (node) => {
-            const nodeState = stateForNode(node);
-            if (!nodeState) return;
-            if (!cancelInteractiveSubagent(nodeState.id)) {
-              cancelInteractiveDescendantByState(nodeState);
+          }
+        },
+        cancelInProcess: (job) => {
+          if (!cancelInProcessFromSupervisor(job, sessionId, activeOwner))
+            return false;
+          updateRunningSubagentFooter(ctx.ui, owner());
+          return true;
+        },
+        cancelWorkflow: (job) => {
+          if (job.status !== "running") return false;
+          job.abort.abort();
+          job.status = "cancelled";
+          normalizeCancelledWorkflowState(job);
+          return true;
+        },
+        cancel: (id) => {
+          const item = projection?.items.find(
+            (candidate) => candidate.state.id === id,
+          );
+          if (!item?.actionable) return undefined;
+          const direct = supervisorInteractiveStates(activeOwner).get(id);
+          if (direct === item.state) {
+            cancelInteractiveSubagent(
+              id,
+              "cancel_interactive_subagent",
+              direct,
+            );
+          } else {
+            cancelInteractiveDescendantByState(item.state);
+          }
+          updateRunningSubagentFooter(ctx.ui, owner());
+          return item.state;
+        },
+        cancelSubtree: async (state) => {
+          // Snapshot the tree BEFORE the confirm blocks for human time. The 1 Hz
+          // refresh reassigns `projection` while the dialog is open, so reading it
+          // afterwards acted on a newer tree than the one the user confirmed.
+          const snapshotRoot = projection?.nodes.get(state.id);
+          const snapshotManifests = projection?.manifests ?? [];
+          const snapshotTruncated = projection?.truncated === true;
+          const descendantCount = snapshotRoot
+            ? subtreeManifestIds(snapshotRoot, snapshotManifests).size - 1
+            : 0;
+          const truncationWarning = snapshotTruncated
+            ? " The lineage view is truncated, so the tree may be larger than shown."
+            : "";
+          const confirmed = await ctx.ui.confirm(
+            "Cancel interactive subagent subtree?",
+            `Cancel ${state.name} and its ${descendantCount} descendant${descendantCount === 1 ? "" : "s"}? This closes their mux panes but retains artifacts.${truncationWarning}`,
+          );
+          if (!confirmed) return;
+          if (!snapshotRoot) {
+            const direct = supervisorInteractiveStates(activeOwner).get(
+              state.id,
+            );
+            if (direct === state) {
+              cancelInteractiveSubagent(
+                state.id,
+                "cancel_interactive_subagent",
+                direct,
+              );
+            } else {
+              cancelInteractiveDescendantByState(state);
             }
-          },
-        });
-        updateRunningSubagentFooter(ctx.ui, owner());
-        ctx.ui.notify(
-          formatSubtreeCancellation(result),
-          result.failed.length > 0 ||
-            result.projectionTruncated ||
-            result.recovered.length > 0
-            ? "warning"
-            : "info",
-        );
+            updateRunningSubagentFooter(ctx.ui, owner());
+            return;
+          }
+          const result = await cancelLineageSubtreeBestEffort(snapshotRoot, {
+            // The raw manifest set, so descendants past maxDepth or the node cap
+            // are cancelled instead of left running under a dead parent.
+            allManifests: snapshotManifests,
+            projectionTruncated: snapshotTruncated,
+            isStale: async (node) =>
+              node.state !== "actionable" ||
+              muxNameForManifest(node.manifest) === undefined,
+            isTerminal: async (node) => {
+              const direct = supervisorInteractiveStates(activeOwner).get(
+                node.manifest.agentId,
+              );
+              return direct
+                ? direct.status === "cancelled" || direct.status === "exited"
+                : false;
+            },
+            cancel: async (node) => {
+              const nodeState = stateForNode(
+                node,
+                supervisorInteractiveStates(activeOwner),
+              );
+              if (!nodeState) return;
+              const direct = supervisorInteractiveStates(activeOwner).get(
+                nodeState.id,
+              );
+              if (direct === nodeState) {
+                cancelInteractiveSubagent(
+                  nodeState.id,
+                  "cancel_interactive_subagent",
+                  direct,
+                );
+              } else {
+                cancelInteractiveDescendantByState(nodeState);
+              }
+            },
+          });
+          updateRunningSubagentFooter(ctx.ui, owner());
+          ctx.ui.notify(
+            formatSubtreeCancellation(result),
+            result.failed.length > 0 ||
+              result.projectionTruncated ||
+              result.recovered.length > 0
+              ? "warning"
+              : "info",
+          );
+        },
       },
-    });
+      activeOwner,
+    );
   };
 
   if (typeof pi.registerShortcut === "function") {
@@ -672,6 +726,7 @@ function errorMessage(error: unknown): string {
 function cancelInProcessFromSupervisor(
   job: JobState,
   sessionId: string | undefined,
+  owner?: SessionOwnerToken,
 ): boolean {
   const info = {
     source: "supervisor" as const,
@@ -694,8 +749,8 @@ function cancelInProcessFromSupervisor(
     initiator: info.initiator,
     reason: info.reason,
   });
-  abortJobTree(job.id, info);
+  abortJobTree(job.id, info, owner);
   job.status = "cancelled";
-  scheduleJobCleanup(job.id, true);
+  scheduleJobCleanup(job.id, true, undefined, owner);
   return true;
 }

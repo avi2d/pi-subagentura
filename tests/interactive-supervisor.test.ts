@@ -41,6 +41,13 @@ import {
   workflowJobRegistry,
   type WorkflowJobState,
 } from "../src/workflow-jobs";
+import {
+  clearSessionScopes,
+  registerSessionScope,
+  sessionOwner,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "../src/session-scope";
 
 const tempDirs: string[] = [];
 const savedTmux = process.env.TMUX;
@@ -121,6 +128,17 @@ function workflowJob(
     ...overrides,
   };
 }
+function startedScope(
+  owner: SessionOwnerToken,
+  sessionId = `session-${owner.id}`,
+): SessionScope {
+  return registerSessionScope({
+    ...owner,
+    lifecycle: "started",
+    pi: {} as never,
+    sessionManager: { getSessionId: () => sessionId },
+  });
+}
 
 const savedLineageEnv: Record<string, string | undefined> = {};
 
@@ -172,7 +190,7 @@ async function lineageHarness(rootId: string) {
           backend: options.backend ?? "tmux",
           paneId: options.paneId,
         },
-        artifactDir: "unknown",
+        artifactDir: join(sessionRoot, "artifacts", agentId),
       });
     },
     async writeBroken(name: string) {
@@ -216,6 +234,7 @@ afterEach(() => {
   interactiveSubagentRegistry.clear();
   jobRegistry.clear();
   workflowJobRegistry.clear();
+  clearSessionScopes();
   __resetMuxInstances();
   __setTmuxMultiplexer(undefined);
   vi.useRealTimers();
@@ -393,42 +412,57 @@ describe("interactive supervisor", () => {
   });
 
   it("builds owner-scoped unified supervisor items", () => {
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope(
+      { id: 7, generation: 2 },
+      "owned-parent-session",
+    );
+    const otherScope = startedScope(
+      { id: 99, generation: 1 },
+      "other-parent-session",
+    );
+    const owner = sessionOwner(scope);
+    const otherOwner = sessionOwner(otherScope);
     const processJob = inProcessJob("owned-job", {
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     const otherProcessJob = inProcessJob("other-job", {
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: 99,
-        sessionContextGeneration: 1,
+        sessionScopeId: otherOwner.id,
+        sessionScopeGeneration: otherOwner.generation,
       },
     });
     const workflow = workflowJob("owned-workflow", {
       parentSessionOwner: owner,
     });
     const otherWorkflow = workflowJob("other-workflow", {
-      parentSessionOwner: { id: 99, generation: 1 },
+      parentSessionOwner: otherOwner,
     });
     jobRegistry.set(processJob.id, processJob);
     jobRegistry.set(otherProcessJob.id, otherProcessJob);
     workflowJobRegistry.set(workflow.id, workflow);
     workflowJobRegistry.set(otherWorkflow.id, otherWorkflow);
     const interactive = state("owned-interactive", {
+      sessionOwner: owner,
       parentSessionId: "owned-parent-session",
     });
     const otherInteractive = state("other-interactive", {
+      sessionOwner: otherOwner,
       parentSessionId: "other-parent-session",
     });
     interactiveSubagentRegistry.set(interactive.id, interactive);
     interactiveSubagentRegistry.set(otherInteractive.id, otherInteractive);
+    scope.inProcessJobs.set(processJob.id, processJob);
+    otherScope.inProcessJobs.set(otherProcessJob.id, otherProcessJob);
+    scope.interactiveStates.set(interactive.id, interactive);
+    otherScope.interactiveStates.set(otherInteractive.id, otherInteractive);
 
     const items = buildAsyncSupervisorItems(
-      directSupervisorItems("owned-parent-session"),
+      directSupervisorItems("owned-parent-session", owner),
       owner,
     );
 
@@ -462,7 +496,8 @@ describe("interactive supervisor", () => {
   });
 
   it("groups workflow children after their matching workflow root", () => {
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope({ id: 7, generation: 2 });
+    const owner = sessionOwner(scope);
     const workflowA = workflowJob("wf-a", {
       name: "alpha",
       parentSessionOwner: owner,
@@ -481,8 +516,8 @@ describe("interactive supervisor", () => {
       workflowId: workflowA.id,
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     const processB = inProcessJob("process-b", {
@@ -490,38 +525,42 @@ describe("interactive supervisor", () => {
       workflowId: workflowB.id,
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     const standalone = inProcessJob("standalone", {
       startedAt: 100,
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     jobRegistry.set(processA.id, processA);
     jobRegistry.set(processB.id, processB);
     jobRegistry.set(standalone.id, standalone);
+    scope.inProcessJobs.set(processA.id, processA);
+    scope.inProcessJobs.set(processB.id, processB);
+    scope.inProcessJobs.set(standalone.id, standalone);
 
     const interactiveA = state("interactive-a", {
       startedAt: 12,
       workflowId: workflowA.id,
-      supervisorOwner: owner,
+      sessionOwner: owner,
     });
     const interactiveB = state("interactive-b", {
       startedAt: 22,
       workflowId: workflowB.id,
-      supervisorOwner: owner,
+      sessionOwner: owner,
     });
     const standaloneInteractive = state("standalone-interactive", {
       startedAt: 101,
-      supervisorOwner: owner,
+      sessionOwner: owner,
     });
     for (const item of [interactiveA, interactiveB, standaloneInteractive]) {
       interactiveSubagentRegistry.set(item.id, item);
+      scope.interactiveStates.set(item.id, item);
     }
 
     const items = buildAsyncSupervisorItems(
@@ -549,17 +588,19 @@ describe("interactive supervisor", () => {
   });
 
   it("shows owner-scoped workflow interactive children", () => {
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope({ id: 7, generation: 2 });
+    const owner = sessionOwner(scope);
     const workflow = workflowJob("owned-workflow", {
       parentSessionOwner: owner,
     });
     workflowJobRegistry.set(workflow.id, workflow);
     const child = state("workflow-child", {
-      supervisorOwner: owner,
+      sessionOwner: owner,
       workflowId: workflow.id,
       completionOwner: "workflow",
     });
     interactiveSubagentRegistry.set(child.id, child);
+    scope.interactiveStates.set(child.id, child);
     const items = buildAsyncSupervisorItems(
       directSupervisorItems(undefined, owner),
       owner,
@@ -576,7 +617,8 @@ describe("interactive supervisor", () => {
   });
 
   it("flattens retained idle children of terminal workflow jobs", () => {
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope({ id: 7, generation: 2 });
+    const owner = sessionOwner(scope);
     const workflow = workflowJob("completed-workflow", {
       status: "done",
       parentSessionOwner: owner,
@@ -584,11 +626,12 @@ describe("interactive supervisor", () => {
     workflowJobRegistry.set(workflow.id, workflow);
     const child = state("retained-idle-child", {
       status: "idle",
-      supervisorOwner: owner,
+      sessionOwner: owner,
       workflowId: workflow.id,
       completionOwner: "workflow",
     });
     interactiveSubagentRegistry.set(child.id, child);
+    scope.interactiveStates.set(child.id, child);
 
     const items = buildAsyncSupervisorItems(
       directSupervisorItems(undefined, owner),
@@ -614,12 +657,13 @@ describe("interactive supervisor", () => {
   });
 
   it("flattens orphaned workflow children whose workflow row is gone", () => {
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope({ id: 7, generation: 2 });
+    const owner = sessionOwner(scope);
     // cleanupWorkflowJobsForOwner deletes the workflow job synchronously while its
     // children take a microtask or more to unwind. During that window the children
     // have no parent row above them and must not render indented.
     const orphanInteractive = state("orphan-interactive", {
-      supervisorOwner: owner,
+      sessionOwner: owner,
       workflowId: "wf-already-gone",
       completionOwner: "workflow",
     });
@@ -629,11 +673,13 @@ describe("interactive supervisor", () => {
       completionOwner: "workflow",
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     jobRegistry.set(orphanProcess.id, orphanProcess);
+    scope.interactiveStates.set(orphanInteractive.id, orphanInteractive);
+    scope.inProcessJobs.set(orphanProcess.id, orphanProcess);
 
     const items = buildAsyncSupervisorItems(
       directSupervisorItems(undefined, owner),
@@ -658,21 +704,24 @@ describe("interactive supervisor", () => {
     // order of non-workflow rows is unchanged from the pre-grouping return value
     // `[...processItems, ...workflowItems, ...normalizedInteractive]`: in-process
     // first, then interactive, each by ascending startedAt.
-    const owner = { id: 7, generation: 2 };
+    const scope = startedScope({ id: 7, generation: 2 });
+    const owner = sessionOwner(scope);
     const youngProcess = inProcessJob("process-young", {
       startedAt: 500,
       deliveryOwner: {
         pi: {} as never,
-        sessionContextId: owner.id,
-        sessionContextGeneration: owner.generation,
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
       },
     });
     jobRegistry.set(youngProcess.id, youngProcess);
     const oldInteractive = state("interactive-old", {
       startedAt: 1,
-      supervisorOwner: owner,
+      sessionOwner: owner,
     });
     interactiveSubagentRegistry.set(oldInteractive.id, oldInteractive);
+    scope.inProcessJobs.set(youngProcess.id, youngProcess);
+    scope.interactiveStates.set(oldInteractive.id, oldInteractive);
 
     const items = buildAsyncSupervisorItems(
       directSupervisorItems(undefined, owner),
@@ -912,6 +961,39 @@ describe("interactive supervisor", () => {
     await Promise.all([first, second]);
 
     expect(firstDone).toHaveBeenCalledWith({ kind: "close" });
+    expect(secondDone).toHaveBeenCalledWith({ kind: "close" });
+  });
+
+  it("closes only overlays owned by the exact session generation", async () => {
+    const firstDone = vi.fn();
+    const secondDone = vi.fn();
+    const releases: Array<() => void> = [];
+    const openOverlay = (
+      done: () => void,
+      owner: { id: number; generation: number },
+    ) =>
+      showInteractiveSupervisor(
+        {
+          custom: async (factory: Function) => {
+            factory({ requestRender: vi.fn() }, undefined, undefined, done);
+            await new Promise<void>((resolve) => releases.push(resolve));
+            return { kind: "close" };
+          },
+          notify: vi.fn(),
+        } as never,
+        {},
+        owner,
+      );
+
+    const first = openOverlay(firstDone, { id: 1, generation: 3 });
+    const second = openOverlay(secondDone, { id: 2, generation: 7 });
+    await Promise.resolve();
+    closeActiveInteractiveSupervisor({ id: 1, generation: 3 });
+    expect(firstDone).toHaveBeenCalledWith({ kind: "close" });
+    expect(secondDone).not.toHaveBeenCalled();
+    closeActiveInteractiveSupervisor({ id: 2, generation: 7 });
+    for (const release of releases) release();
+    await Promise.all([first, second]);
     expect(secondDone).toHaveBeenCalledWith({ kind: "close" });
   });
 

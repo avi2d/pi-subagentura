@@ -9,7 +9,10 @@ import {
   writeOutput,
 } from "../src/artifact";
 import { enqueueDelivery, flushDeliveries } from "../src/delivery";
-import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import {
+  interactiveSubagentRegistry,
+  registerInteractiveSubagentState,
+} from "../src/interactive-tmux";
 import { __setTmuxMultiplexer } from "../src/multiplexer";
 import {
   deliverNotification,
@@ -17,18 +20,26 @@ import {
 } from "../src/notifications";
 import { pollArtifactChanges } from "../src/artifact-poller";
 import { rehydrateInteractiveSubagents } from "../src/rehydrate";
-import { getSessionContextStack } from "../src/session-context";
+import {
+  getSessionScopes,
+  sessionOwner,
+  type SessionScope,
+} from "../src/session-scope";
 import { writeCliScript } from "../src/subagent-artifact-cli";
-import { createPiSessionHarness } from "./helpers/pi-session-harness";
+import {
+  createPiSessionHarness,
+  type PiSessionHarness,
+} from "./helpers/pi-session-harness";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { appendDeterministicTurn } from "./helpers/deterministic-artifacts";
+import { registerInProcessJob } from "../src/helpers";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
-const harnesses: Awaited<ReturnType<typeof createPiSessionHarness>>[] = [];
+const harnesses: PiSessionHarness[] = [];
 const artifactRoots: string[] = [];
 
 afterEach(() => {
@@ -37,11 +48,6 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   }
   interactiveSubagentRegistry.clear();
-  delete (globalThis as any).__piSubagenturaParentStreaming;
-  delete (globalThis as any).__piSubagenturaPiRef;
-  delete (globalThis as any).__piSubagenturaUi;
-  delete (globalThis as any).__piSubagenturaSessionManager;
-  delete (globalThis as any).__piSubagenturaPendingJobDeliveries;
   __setTmuxMultiplexer(undefined);
 });
 
@@ -50,23 +56,39 @@ function childArtifact() {
   artifactRoots.push(root);
   return artifactPath(root, "child0001");
 }
+function resolveHarnessScope(
+  harness: PiSessionHarness,
+  existingScopeIds: ReadonlySet<number>,
+): SessionScope {
+  const newScopes = getSessionScopes().filter(
+    (candidate) => !existingScopeIds.has(candidate.id),
+  );
+  const scope =
+    newScopes.find(
+      (candidate) => candidate.sessionManager === harness.sessionManager,
+    ) ?? (newScopes.length === 1 ? newScopes[0] : undefined);
+  if (!scope) throw new Error("harness extension has no exact SessionScope");
+  scope.lifecycle = "started";
+  scope.sessionManager = harness.sessionManager;
+  scope.ui = harness.session.extensionRunner.getUIContext();
+  return scope;
+}
+
+function flushHarnessDeliveries(scope: SessionScope): void {
+  flushDeliveries(scope.pi, scope.ui, sessionOwner(scope));
+}
 
 async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
-  (globalThis as any).__piSubagenturaPendingJobDeliveries = [];
+  const existingScopeIds = new Set(getSessionScopes().map(({ id }) => id));
   const harness = await createPiSessionHarness(repoRoot);
   harnesses.push(harness);
   expect(harness.session.hasExtensionHandlers("agent_start")).toBe(true);
   const notify = vi.fn();
   const ui = { notify } as any;
   harness.session.extensionRunner.setUIContext(ui);
-  const sessionContext = getSessionContextStack().at(-1);
-  if (sessionContext) {
-    sessionContext.ui = ui;
-    sessionContext.lifecycle = "started";
-    sessionContext.sessionManager = harness.sessionManager;
-  }
-  (globalThis as any).__piSubagenturaUi = ui;
-  const pi = (globalThis as any).__piSubagenturaPiRef;
+  const scope = resolveHarnessScope(harness, existingScopeIds);
+  scope.ui = ui;
+  const pi = scope.pi;
   const sendMessage = vi.fn(pi.sendMessage.bind(pi));
   pi.sendMessage = sendMessage;
   __setTmuxMultiplexer({
@@ -92,7 +114,7 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
     pendingDeliveries: [],
     deliveryReceipts: [],
   };
-  interactiveSubagentRegistry.set(state.id, state);
+  registerInteractiveSubagentState(state, scope);
   enqueueDelivery(state, {
     deliveryId: `${mode}-${triggerTurn}-${harnesses.length}`,
     subagentId: state.id,
@@ -105,17 +127,17 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
     message: `${mode} completion`,
     state: "queued",
   });
-  return { harness, notify, sendMessage, state };
+  return { harness, notify, sendMessage, state, scope };
 }
 
 describe("Pi session delivery integration", () => {
   it("idle notify persists a pointer without calling the provider", async () => {
-    const { harness, notify, sendMessage } = await setup("notify", false);
-
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
+    const { harness, notify, sendMessage, scope } = await setup(
+      "notify",
+      false,
     );
+
+    flushHarnessDeliveries(scope);
 
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -143,12 +165,9 @@ describe("Pi session delivery integration", () => {
   });
 
   it("idle inject triggers one attributed provider turn by default", async () => {
-    const { harness, notify } = await setup("inject", true);
+    const { harness, notify, scope } = await setup("inject", true);
 
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -170,20 +189,15 @@ describe("Pi session delivery integration", () => {
         ),
     ).toBe(true);
     harness.completeNext();
-    await vi.waitFor(() =>
-      expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
-    );
+    await vi.waitFor(() => expect(scope.parentStreaming).toBe(false));
     expect(harness.contexts).toHaveLength(1);
   });
 
   it("dispatches idle inject despite a stale streaming flag", async () => {
-    const { harness } = await setup("inject", true);
-    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const { harness, scope } = await setup("inject", true);
+    scope.parentStreaming = true;
 
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
 
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     harness.completeNext();
@@ -191,20 +205,13 @@ describe("Pi session delivery integration", () => {
   });
 
   it("queues one streaming inject before its provider turn", async () => {
-    const { harness, sendMessage, state } = await setup("inject", true);
+    const { harness, sendMessage, state, scope } = await setup("inject", true);
     const firstTurn = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
-    (globalThis as any).__piSubagenturaSessionManager = harness.sessionManager;
 
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     expect(sendMessage).toHaveBeenCalledOnce();
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(state.pendingDeliveries).toHaveLength(1);
     expect(harness.contexts).toHaveLength(1);
@@ -224,27 +231,23 @@ describe("Pi session delivery integration", () => {
         ),
     ).toHaveLength(1);
     harness.completeNext("follow-up done");
-    await vi.waitFor(() =>
-      expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
-    );
+    await vi.waitFor(() => expect(scope.parentStreaming).toBe(false));
     expect(harness.contexts).toHaveLength(2);
     await firstTurn;
   });
 
   it("streaming notify without trigger persists context after agent_settled", async () => {
-    const { harness, notify, sendMessage } = await setup("notify", false);
+    const { harness, notify, sendMessage, scope } = await setup(
+      "notify",
+      false,
+    );
     const firstTurn = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
 
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     expect(notify).not.toHaveBeenCalled();
     harness.completeNext();
-    await vi.waitFor(() =>
-      expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
-    );
+    await vi.waitFor(() => expect(scope.parentStreaming).toBe(false));
 
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -266,38 +269,33 @@ describe("Pi session delivery integration", () => {
   });
 
   it("streaming notify with trigger schedules exactly one follow-up provider call", async () => {
-    const { harness } = await setup("notify", true);
+    const { harness, scope } = await setup("notify", true);
     const firstTurn = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
 
     harness.completeNext();
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(2));
     harness.completeNext();
-    await vi.waitFor(() =>
-      expect((globalThis as any).__piSubagenturaParentStreaming).toBe(false),
-    );
+    await vi.waitFor(() => expect(scope.parentStreaming).toBe(false));
 
     expect(harness.contexts).toHaveLength(2);
     await firstTurn;
   });
 
   it("idle notify with trigger schedules one provider call", async () => {
-    const { harness } = await setup("notify", true);
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    const { harness, scope } = await setup("notify", true);
+    flushHarnessDeliveries(scope);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     harness.completeNext();
     await harness.session.waitForIdle();
   });
 
   it("idle inject with trigger=false enters context without a provider call", async () => {
-    const { harness, notify, sendMessage } = await setup("inject", false);
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
+    const { harness, notify, sendMessage, scope } = await setup(
+      "inject",
+      false,
     );
+    flushHarnessDeliveries(scope);
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(harness.contexts).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith(
@@ -312,13 +310,10 @@ describe("Pi session delivery integration", () => {
   });
 
   it("streaming inject with trigger=false waits then does not continue", async () => {
-    const { harness, state } = await setup("inject", false);
+    const { harness, state, scope } = await setup("inject", false);
     const first = harness.session.prompt("parent turn");
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     expect(state.pendingDeliveries).toHaveLength(1);
     harness.completeNext();
     await first;
@@ -332,21 +327,15 @@ describe("Pi session delivery integration", () => {
   });
 
   it("retries a synchronous sendMessage failure without losing the intent", async () => {
-    const { harness, sendMessage, state } = await setup("inject", true);
+    const { harness, sendMessage, state, scope } = await setup("inject", true);
     sendMessage.mockImplementationOnce(() => {
       throw new Error("synchronous dispatch failure");
     });
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     expect(state.pendingDeliveries).toEqual([
       expect.objectContaining({ state: "queued" }),
     ]);
-    flushDeliveries(
-      (globalThis as any).__piSubagenturaPiRef,
-      (globalThis as any).__piSubagenturaUi,
-    );
+    flushHarnessDeliveries(scope);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     harness.completeNext();
     await harness.session.waitForIdle();
@@ -360,13 +349,10 @@ describe("Pi session delivery integration", () => {
   ] as const)(
     "delivers one provider call for %s completion with output %s",
     async (status, message) => {
-      const { harness, state } = await setup("inject", true);
+      const { harness, state, scope } = await setup("inject", true);
       state.pendingDeliveries[0].status = status;
       state.pendingDeliveries[0].message = message;
-      flushDeliveries(
-        (globalThis as any).__piSubagenturaPiRef,
-        (globalThis as any).__piSubagenturaUi,
-      );
+      flushHarnessDeliveries(scope);
       await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
       harness.completeNext();
       await harness.session.waitForIdle();
@@ -375,14 +361,12 @@ describe("Pi session delivery integration", () => {
   );
 
   it("batches a triggering burst despite a stale streaming flag", async () => {
+    const existingScopeIds = new Set(getSessionScopes().map(({ id }) => id));
     const harness = await createPiSessionHarness(repoRoot);
     harnesses.push(harness);
-    const sessionContext = getSessionContextStack().at(-1);
-    if (sessionContext) {
-      sessionContext.lifecycle = "started";
-      sessionContext.sessionManager = harness.sessionManager;
-    }
-    (globalThis as any).__piSubagenturaParentStreaming = true;
+    const scope = resolveHarnessScope(harness, existingScopeIds);
+    const owner = sessionOwner(scope);
+    scope.parentStreaming = true;
     const result: any = {
       isError: false,
       output: "result",
@@ -400,15 +384,30 @@ describe("Pi session delivery integration", () => {
       notifyOnComplete: "inject",
       triggerTurnOnComplete: true,
       notificationDelivered: false,
+      deliveryOwner: {
+        pi: scope.pi,
+        sessionId: harness.sessionManager.getSessionId(),
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
+      },
     };
     const second: any = {
       id: "burst-second",
       notifyOnComplete: "inject",
       triggerTurnOnComplete: true,
       notificationDelivered: false,
+      deliveryOwner: {
+        pi: scope.pi,
+        sessionId: harness.sessionManager.getSessionId(),
+        sessionScopeId: owner.id,
+        sessionScopeGeneration: owner.generation,
+      },
     };
+    expect(registerInProcessJob(first, owner)).toBe(true);
+    expect(registerInProcessJob(second, owner)).toBe(true);
     deliverNotification(first, result);
     deliverNotification(second, result);
+    flushInProcessDeliveries(owner);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(
       harness.sessionManager
@@ -420,8 +419,11 @@ describe("Pi session delivery integration", () => {
   });
 
   it("delivers artifact completion through poller and broker", async () => {
+    const existingScopeIds = new Set(getSessionScopes().map(({ id }) => id));
     const harness = await createPiSessionHarness(repoRoot);
     harnesses.push(harness);
+    const scope = resolveHarnessScope(harness, existingScopeIds);
+    const owner = sessionOwner(scope);
     const art = childArtifact();
     const state: any = {
       id: art.id,
@@ -439,7 +441,7 @@ describe("Pi session delivery integration", () => {
       pendingDeliveries: [],
       deliveryReceipts: [],
     };
-    interactiveSubagentRegistry.set(state.id, state);
+    registerInteractiveSubagentState(state, scope);
     __setTmuxMultiplexer({
       getPaneLivenessAsync: async () => "alive",
       getPaneLiveness: () => "alive",
@@ -451,7 +453,7 @@ describe("Pi session delivery integration", () => {
       source: "explicit",
     });
 
-    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges(scope.pi, owner);
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(harness.contexts[0].messages.at(-1)).toMatchObject({ role: "user" });
     harness.completeNext();
@@ -720,36 +722,41 @@ describe("persisted delivery Pi session integration", () => {
         { deliveryIds: [deliveryId] },
       );
     }
+    const existingScopeIds = new Set(getSessionScopes().map(({ id }) => id));
     const harness = await createPiSessionHarness(cwd, {
       extensionRoot: repoRoot,
       sessionManager,
     });
     harnesses.push(harness);
-    rehydrateInteractiveSubagents(cwd, undefined, sessionManager.getEntries());
-    return { art, harness, deliveryId };
+    const scope = resolveHarnessScope(harness, existingScopeIds);
+    rehydrateInteractiveSubagents(
+      cwd,
+      undefined,
+      sessionManager.getEntries(),
+      scope,
+    );
+    return { art, harness, deliveryId, scope };
   }
 
   it("does not replay an acknowledged persisted delivery", async () => {
-    const { art, harness, deliveryId } = await persistedHarness(true);
-    expect(interactiveSubagentRegistry.get(art.id)?.deliveryReceipts).toContain(
+    const { art, harness, deliveryId, scope } = await persistedHarness(true);
+    expect(scope.interactiveStates.get(art.id)?.deliveryReceipts).toContain(
       deliveryId,
     );
 
-    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges(scope.pi, sessionOwner(scope));
 
     expect(harness.contexts).toHaveLength(0);
-    expect(interactiveSubagentRegistry.get(art.id)?.pendingDeliveries).toEqual(
-      [],
-    );
+    expect(scope.interactiveStates.get(art.id)?.pendingDeliveries).toEqual([]);
   });
 
   it("retries an unacknowledged persisted dispatchAttempted delivery", async () => {
-    const { art, harness } = await persistedHarness(false);
-    expect(interactiveSubagentRegistry.get(art.id)?.pendingDeliveries).toEqual([
+    const { art, harness, scope } = await persistedHarness(false);
+    expect(scope.interactiveStates.get(art.id)?.pendingDeliveries).toEqual([
       expect.objectContaining({ state: "queued" }),
     ]);
 
-    await pollArtifactChanges((globalThis as any).__piSubagenturaPiRef);
+    await pollArtifactChanges(scope.pi, sessionOwner(scope));
 
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
     expect(harness.contexts[0].messages.at(-1)).toMatchObject({ role: "user" });

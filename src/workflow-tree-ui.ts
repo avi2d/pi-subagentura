@@ -6,7 +6,7 @@ import {
   type WorkflowJobState,
 } from "./workflow-jobs";
 import { formatWorkflowUsage } from "./workflow-core";
-import type { ActiveSessionContextToken } from "./session-context";
+import type { SessionOwnerToken } from "./session-scope";
 
 const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
 
@@ -17,7 +17,7 @@ type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 
 interface WorkflowTreeOptions {
   done: WorkflowTreeDone;
-  owner?: ActiveSessionContextToken;
+  owner?: SessionOwnerToken;
   requestRender?: () => void;
   notify?: (message: string) => void;
 }
@@ -162,7 +162,7 @@ export class WorkflowTreeComponent {
 
 export async function showWorkflowTree(
   ui: ExtensionUIContext,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<WorkflowTreeAction> {
   const custom = (ui as any).custom;
   if (typeof custom !== "function") {
@@ -194,7 +194,7 @@ export async function showWorkflowTree(
   );
 }
 
-function selectableJobs(owner?: ActiveSessionContextToken): WorkflowJobState[] {
+function selectableJobs(owner?: SessionOwnerToken): WorkflowJobState[] {
   return workflowJobsForOwner(owner);
 }
 

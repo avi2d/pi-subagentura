@@ -10,8 +10,14 @@ import {
   appendEvent,
   appendInteractiveState,
   artifactPath,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
 } from "../src/artifact";
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import {
+  clearSessionScopes,
+  registerSessionScope,
+  setLegacyActiveSessionRefs,
+} from "../src/session-scope";
 import { importFresh } from "./test-utils";
 import { makeTmp } from "./subagent-rehydrate-helpers";
 
@@ -29,11 +35,13 @@ describe("rehydrateInteractiveSubagents", () => {
     }));
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    clearSessionScopes();
     g.__piSubagenturaPiRef = undefined;
   });
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
+    clearSessionScopes();
     vi.doUnmock("node:child_process");
   });
 
@@ -145,5 +153,148 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated).toBeDefined();
     expect(rehydrated?.name).toBe(id); // falls back to entry.id
     expect(rehydrated?.startedAt).toBe(0); // falls back to 0
+  });
+
+  it("rehydrates same-session artifacts into the current scope generation", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "generation-owned";
+    const artDir = join(cwd, id);
+    mkdirSync(artDir, { recursive: true });
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%101",
+      mux: "tmux",
+      artifactDir: artDir,
+      sessionFile: join(cwd, "child.jsonl"),
+      parentSessionId: "reload-parent",
+    });
+    const scope = registerSessionScope({
+      id: 710,
+      generation: 9,
+      lifecycle: "started",
+      pi: {} as never,
+      sessionManager: { getSessionId: () => "reload-parent" },
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent", [], scope);
+
+    const rehydrated = scope.interactiveStates.get(id);
+    expect(rehydrated).toBe(interactiveSubagentRegistry.get(id));
+    expect(rehydrated?.sessionOwner).toEqual({ id: 710, generation: 9 });
+    expect(rehydrated?.artifactDir).toBe(artDir);
+  });
+  it("requeues a rehydrated delivery using its own streaming state", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "rehydrated-delivery";
+    const artDir = join(cwd, id);
+    mkdirSync(artDir, { recursive: true });
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%102",
+      mux: "tmux",
+      artifactDir: artDir,
+      sessionFile: join(cwd, "child-delivery.jsonl"),
+      parentSessionId: "reload-parent",
+      eventByteCursor: 0,
+      sessionByteCursor: 0,
+      pendingDeliveries: [
+        {
+          deliveryId: "delivery-a",
+          subagentId: id,
+          turnId: "turn-a",
+          eventId: "event-a",
+          mode: "notify",
+          triggerTurn: false,
+          status: "done",
+          artifactDir: artDir,
+          state: "dispatchAttempted",
+        },
+      ],
+      deliveryReceipts: [],
+    });
+    const scope = registerSessionScope({
+      id: 720,
+      generation: 1,
+      lifecycle: "started",
+      pi: {} as never,
+      parentStreaming: false,
+      sessionManager: { getSessionId: () => "reload-parent" },
+    });
+    const peer = registerSessionScope({
+      id: 721,
+      generation: 1,
+      lifecycle: "started",
+      pi: {} as never,
+      parentStreaming: true,
+    });
+    setLegacyActiveSessionRefs(peer);
+
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent", [], scope);
+
+    expect(scope.interactiveStates.get(id)?.pendingDeliveries?.[0]?.state).toBe(
+      "queued",
+    );
+  });
+
+  it("rehydrates into the exact scope despite a stale aggregate id", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "colliding-state";
+    const artDir = join(cwd, id);
+    mkdirSync(artDir, { recursive: true });
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%103",
+      mux: "tmux",
+      artifactDir: artDir,
+      sessionFile: join(cwd, "child-collision.jsonl"),
+      parentSessionId: "reload-parent",
+    });
+    const scope = registerSessionScope({
+      id: 730,
+      generation: 1,
+      lifecycle: "started",
+      pi: {} as never,
+      sessionManager: { getSessionId: () => "reload-parent" },
+    });
+    const stale = {
+      id,
+      artifactDir: join(cwd, "stale", id),
+    } as never;
+    interactiveSubagentRegistry.set(id, stale);
+
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent", [], scope);
+
+    expect(scope.interactiveStates.get(id)).toBeDefined();
+    expect(scope.interactiveStates.get(id)).not.toBe(stale);
+  });
+  it("rejects a persisted entry with a foreign artifact marker", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "abababababababab";
+    const artDir = join(cwd, id);
+    mkdirSync(artDir, { recursive: true });
+    writeFileSync(join(artDir, INTERACTIVE_ARTIFACT_OWNER_FILE), "peer-parent");
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%104",
+      mux: "tmux",
+      artifactDir: artDir,
+      sessionFile: join(cwd, "child-foreign.jsonl"),
+      parentSessionId: "reload-parent",
+    });
+    const scope = registerSessionScope({
+      id: 740,
+      generation: 1,
+      lifecycle: "started",
+      pi: {} as never,
+      sessionManager: { getSessionId: () => "reload-parent" },
+    });
+
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent", [], scope);
+
+    expect(scope.interactiveStates.has(id)).toBe(false);
   });
 });

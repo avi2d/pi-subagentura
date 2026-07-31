@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrent parent sessions now keep in-process jobs, interactive sub-agents, delivery queues, streaming state, supervisor actions, and shutdown cleanup isolated by exact session generation.
+
 ## [3.1.0] - 2026-07-26
 
 ### Added

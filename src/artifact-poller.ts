@@ -36,7 +36,7 @@ import {
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
-import { debugLog, inProcessJobBelongsToOwner, jobRegistry } from "./helpers";
+import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import { formatWorkflowUsage } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
@@ -49,11 +49,10 @@ import {
   workflowJobRegistry,
 } from "./workflow-jobs";
 import {
-  getSessionContextStack,
-  interactiveStateBelongsToOwner,
-  type ActiveSessionContextToken,
-  resolveLiveSessionContext,
-} from "./session-context";
+  ownerlessEntitiesVisible,
+  type SessionOwnerToken,
+  resolveLiveSessionScope,
+} from "./session-scope";
 // ── Footer / Widget Status Keys ────────────────────────────────────────
 
 export const FOOTER_KEY = "subagentura-running";
@@ -65,77 +64,132 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
 type StatusUi = Pick<ExtensionUIContext, "setStatus">;
+interface WidgetSurfaceState {
+  contributions: Map<string, string[]>;
+  rendered: string[] | undefined;
+  painted: boolean;
+}
+interface FooterSurfaceState {
+  contributions: Map<string, string>;
+  rendered: string | undefined;
+  painted: boolean;
+}
 const widgetRowsByUi = new WeakMap<
   ExtensionUIContext,
-  Map<string, string[] | undefined>
+  Map<string, WidgetSurfaceState>
 >();
 const footerStatusesByUi = new WeakMap<
   StatusUi,
-  Map<string, string | undefined>
+  Map<string, FooterSurfaceState>
 >();
 
-/**
- * Owners whose sub-agents belong on the surfaces bound to `ui`.
- *
- * The footer and the activity widget are keyed per-ui, and nested sessions share
- * one `ExtensionUIContext`. Repainting a shared surface from a single owner's
- * point of view would erase its sibling context's rows (and undercount its
- * agents) on every other poll tick, so both surfaces project the union over every
- * live context bound to this ui. `[undefined]` means "unscoped": count everything.
- */
-function ownersPaintingInto(
-  ui: StatusUi,
-  owner: ActiveSessionContextToken | undefined,
-): (ActiveSessionContextToken | undefined)[] {
-  if (!owner) return [undefined];
-  const bound = getSessionContextStack()
-    .filter((context) => context.ui === ui)
-    .map((context) => ({ id: context.id, generation: context.generation }));
-  // A ui the context stack does not know (e.g. a tool ctx captured before
-  // session_start bound it) can only speak for the owner that was handed in.
-  return bound.length > 0 ? bound : [owner];
+function interactiveStatesForOwners(
+  owners: (SessionOwnerToken | undefined)[],
+): InteractiveSubagentState[] {
+  if (owners.some((owner) => owner === undefined)) {
+    return ownerlessEntitiesVisible()
+      ? [...interactiveSubagentRegistry.values()]
+      : [];
+  }
+  const states: InteractiveSubagentState[] = [];
+  for (const owner of owners) {
+    const scope = resolveLiveSessionScope(owner);
+    if (scope) states.push(...scope.interactiveStates.values());
+  }
+  return states;
 }
 
-function belongsToAnyOwner(
-  state: InteractiveSubagentState,
-  owners: (ActiveSessionContextToken | undefined)[],
-): boolean {
-  return owners.some((owner) => interactiveStateBelongsToOwner(state, owner));
+function inProcessJobsForOwners(
+  owners: (SessionOwnerToken | undefined)[],
+): JobState[] {
+  if (owners.some((owner) => owner === undefined)) {
+    return ownerlessEntitiesVisible() ? [...jobRegistry.values()] : [];
+  }
+  const jobs: JobState[] = [];
+  for (const owner of owners) {
+    const scope = resolveLiveSessionScope(owner);
+    if (scope) jobs.push(...scope.inProcessJobs.values());
+  }
+  return jobs;
 }
 
 function getRunningSubagentCount(
-  owners: (ActiveSessionContextToken | undefined)[],
+  owners: (SessionOwnerToken | undefined)[],
 ): number {
-  const inProcessCount = [...jobRegistry.values()].filter(
-    (job) =>
-      job.status === "running" &&
-      owners.some((owner) => inProcessJobBelongsToOwner(job, owner)),
+  const inProcessCount = inProcessJobsForOwners(owners).filter(
+    (job) => job.status === "running",
   ).length;
-  const interactiveCount = [...interactiveSubagentRegistry.values()].filter(
+  const interactiveCount = interactiveStatesForOwners(owners).filter(
     (state) =>
-      (state.status === "running" ||
-        state.status === "idle" ||
-        state.status === "unknown") &&
-      belongsToAnyOwner(state, owners),
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
   ).length;
   return inProcessCount + interactiveCount;
+}
+
+function mergeFooterContributions(
+  key: string,
+  contributions: Iterable<string>,
+): string | undefined {
+  let total = 0;
+  let count = 0;
+  let last: string | undefined;
+  for (const contribution of contributions) {
+    last = contribution;
+    count++;
+    const match = /^⚡ (\d+) /.exec(contribution);
+    if (match) total += Number(match[1]);
+  }
+  if (count === 0) return undefined;
+  if (count === 1 || total === 0) return last;
+  if (key === FOOTER_KEY) {
+    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} active`;
+  }
+  if (key === WORKFLOW_FOOTER_KEY) {
+    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running`;
+  }
+  return last;
 }
 
 function updateFooterStatus(
   ui: StatusUi,
   key: string,
   statusText: string | undefined,
+  owner?: SessionOwnerToken,
 ): void {
-  let statuses = footerStatusesByUi.get(ui);
-  const unchanged = statuses?.has(key) && statuses.get(key) === statusText;
-  if (unchanged) return;
-  try {
-    ui.setStatus(key, statusText);
-    if (!statuses) {
-      statuses = new Map();
-      footerStatusesByUi.set(ui, statuses);
+  let surfaces = footerStatusesByUi.get(ui);
+  if (!surfaces) {
+    surfaces = new Map();
+    footerStatusesByUi.set(ui, surfaces);
+  }
+  let surface = surfaces.get(key);
+  if (!surface) {
+    surface = { contributions: new Map(), rendered: undefined, painted: false };
+    surfaces.set(key, surface);
+  }
+  const contributionKey = pollOwnerKey(owner);
+  if (owner === undefined) surface.contributions.clear();
+  else if (resolveLiveSessionScope(owner)) {
+    surface.contributions.delete(pollOwnerKey(undefined));
+    const ownerPrefix = `${owner.id}:`;
+    for (const key of surface.contributions.keys()) {
+      if (key.startsWith(ownerPrefix) && key !== contributionKey) {
+        surface.contributions.delete(key);
+      }
     }
-    statuses.set(key, statusText);
+  }
+  if (statusText === undefined) surface.contributions.delete(contributionKey);
+  else surface.contributions.set(contributionKey, statusText);
+  const rendered = mergeFooterContributions(
+    key,
+    surface.contributions.values(),
+  );
+  if (surface.painted && surface.rendered === rendered) return;
+  try {
+    ui.setStatus(key, rendered);
+    surface.rendered = rendered;
+    surface.painted = true;
   } catch {
     /* ui stale */
   }
@@ -151,22 +205,16 @@ function updateFooterStatus(
  */
 export function updateRunningSubagentFooter(
   ui: StatusUi,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): void {
-  const ownerContext = resolveLiveSessionContext(owner);
-  // A live context that has not bound its sessionManager yet (pre-session_start)
-  // cannot map any parentSessionId back to itself, so scoping would report 0 for
-  // agents it really owns. Stay unscoped until the binding exists.
-  const scopedOwner = ownerContext?.sessionManager ? owner : undefined;
+  const ownerContext = resolveLiveSessionScope(owner);
   const runningCount =
-    owner !== undefined && !ownerContext
-      ? 0
-      : getRunningSubagentCount(ownersPaintingInto(ui, scopedOwner));
+    owner !== undefined && !ownerContext ? 0 : getRunningSubagentCount([owner]);
   const statusText =
     runningCount > 0
       ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
       : undefined;
-  updateFooterStatus(ui, FOOTER_KEY, statusText);
+  updateFooterStatus(ui, FOOTER_KEY, statusText, owner);
 }
 
 function widgetRowsEqual(
@@ -186,47 +234,66 @@ function updateWidgetRows(
   ui: ExtensionUIContext,
   key: string,
   rows: string[],
+  owner?: SessionOwnerToken,
 ): void {
-  const nextRows = rows.length > 0 ? rows : undefined;
-  let rowsByKey = widgetRowsByUi.get(ui);
-  const previousRows = rowsByKey?.get(key);
-  const unchanged =
-    rowsByKey?.has(key) && widgetRowsEqual(previousRows, nextRows);
-  if (unchanged) return;
-  try {
-    ui.setWidget(key, nextRows, { placement: "belowEditor" });
-    if (!rowsByKey) {
-      rowsByKey = new Map();
-      widgetRowsByUi.set(ui, rowsByKey);
+  let surfaces = widgetRowsByUi.get(ui);
+  if (!surfaces) {
+    surfaces = new Map();
+    widgetRowsByUi.set(ui, surfaces);
+  }
+  let surface = surfaces.get(key);
+  if (!surface) {
+    surface = { contributions: new Map(), rendered: undefined, painted: false };
+    surfaces.set(key, surface);
+  }
+  const contributionKey = pollOwnerKey(owner);
+  if (owner === undefined) surface.contributions.clear();
+  else if (resolveLiveSessionScope(owner)) {
+    surface.contributions.delete(pollOwnerKey(undefined));
+    const ownerPrefix = `${owner.id}:`;
+    for (const key of surface.contributions.keys()) {
+      if (key.startsWith(ownerPrefix) && key !== contributionKey) {
+        surface.contributions.delete(key);
+      }
     }
-    rowsByKey.set(key, nextRows ? [...nextRows] : undefined);
+  }
+  if (rows.length === 0) surface.contributions.delete(contributionKey);
+  else surface.contributions.set(contributionKey, [...rows]);
+  const renderedRows = [...surface.contributions.values()].flat();
+  const rendered = renderedRows.length > 0 ? renderedRows : undefined;
+  if (surface.painted && widgetRowsEqual(surface.rendered, rendered)) return;
+  try {
+    ui.setWidget(key, rendered, { placement: "belowEditor" });
+    surface.rendered = rendered ? [...rendered] : undefined;
+    surface.painted = true;
   } catch {
     /* ui stale */
   }
 }
+/** Withdraw one ended generation from every shared UI surface. */
+export function clearSessionScopeUiContributions(
+  ui: ExtensionUIContext,
+  owner: SessionOwnerToken,
+): void {
+  updateFooterStatus(ui, FOOTER_KEY, undefined, owner);
+  updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, undefined, owner);
+  updateWidgetRows(ui, WIDGET_KEY, [], owner);
+  updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, [], owner);
+}
 
-/**
- * Project current live rows after owner-scoped liveness processing completes.
- *
- * Ownership is answered by exactly one predicate — `interactiveStateBelongsToOwner`
- * — shared with the poller's own state filter, the footer count, delivery, and the
- * supervisor. The previous ui-identity + `parentSessionId` check was a second,
- * weaker ownership key that workflow children (which deliberately carry no
- * `parentSessionId`) could never satisfy, so they were invisible here.
- */
+/** Project current live rows from the exact owner scope after liveness processing. */
 function projectActivityWidgetRows(
   ui: ExtensionUIContext | undefined,
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
   now: number,
 ): string[] {
   if (!ui) return [];
-  const owners = ownersPaintingInto(ui, owner);
-  const states = [...interactiveSubagentRegistry.values()].filter(
+  const owners = [owner];
+  const states = interactiveStatesForOwners(owners).filter(
     (state) =>
-      (state.status === "running" ||
-        state.status === "idle" ||
-        state.status === "unknown") &&
-      belongsToAnyOwner(state, owners),
+      state.status === "running" ||
+      state.status === "idle" ||
+      state.status === "unknown",
   );
   return states.map((state) => formatActivityRow(state, now));
 }
@@ -262,7 +329,7 @@ function deliveryMessageFromEvent(ev: CompletionEvent): string | undefined {
 const pollsInFlight = new Map<string, Promise<void>>();
 // ── Poller ─────────────────────────────────────────────────────────────
 
-function pollOwnerKey(owner: ActiveSessionContextToken | undefined): string {
+function pollOwnerKey(owner: SessionOwnerToken | undefined): string {
   return owner ? `${owner.id}:${owner.generation}` : "unscoped";
 }
 
@@ -275,7 +342,7 @@ function pollOwnerKey(owner: ActiveSessionContextToken | undefined): string {
  */
 export function pollArtifactChanges(
   pi: ExtensionAPI,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<void> {
   const key = pollOwnerKey(owner);
   const inFlight = pollsInFlight.get(key);
@@ -289,7 +356,7 @@ export function pollArtifactChanges(
 
 async function runPollArtifactChanges(
   pi: ExtensionAPI,
-  owner?: ActiveSessionContextToken,
+  owner?: SessionOwnerToken,
 ): Promise<void> {
   // Top-level defensive try/catch: the poller runs from a setInterval, so any uncaught throw here
   // would crash the parent pi process. Better to swallow and let the next tick (with a refreshed
@@ -297,17 +364,18 @@ async function runPollArtifactChanges(
   try {
     const g2 = typeof global !== "undefined" ? global : globalThis;
     const initialPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
-    const ownerContext = owner ? resolveLiveSessionContext(owner) : undefined;
-    if (owner && !ownerContext) return;
+    const ownerContext = owner ? resolveLiveSessionScope(owner) : undefined;
+    if ((owner && !ownerContext) || (!owner && !ownerlessEntitiesVisible()))
+      return;
     const interactivePi =
       ownerContext?.pi ??
       (g2.__piSubagenturaPiRef as ExtensionAPI | undefined) ??
       pi;
     if (!interactivePi) return;
 
-    const states = [...interactiveSubagentRegistry.values()].filter((state) =>
-      interactiveStateBelongsToOwner(state, owner),
-    );
+    const stateMap =
+      ownerContext?.interactiveStates ?? interactiveSubagentRegistry;
+    const states = [...stateMap.values()];
     const liveness = await Promise.all(
       states.map(async (state) => {
         try {
@@ -321,7 +389,15 @@ async function runPollArtifactChanges(
         }
       }),
     );
-    if (owner && !resolveLiveSessionContext(owner)) return;
+    if (owner) {
+      const liveOwnerContext = resolveLiveSessionScope(owner);
+      if (
+        !liveOwnerContext ||
+        liveOwnerContext.interactiveStates !== stateMap
+      ) {
+        return;
+      }
+    }
     const currentPiRef = g2.__piSubagenturaPiRef as ExtensionAPI | undefined;
     if (
       !owner &&
@@ -334,7 +410,7 @@ async function runPollArtifactChanges(
       ownerContext?.ui ??
       (g2.__piSubagenturaUi as ExtensionUIContext | undefined);
     for (const [state, paneLiveness] of liveness) {
-      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
+      if (stateMap.get(state.id) !== state) continue;
       // Cancelled is terminal. Unknown means pane liveness is unavailable, so keep polling
       // the artifact log: a later done/error event must still reach the parent.
       // 'exited' is intentionally not skipped: a follow-up user entry can revive it to "running".
@@ -457,7 +533,7 @@ async function runPollArtifactChanges(
     const widgetRows = projectActivityWidgetRows(ui, owner, now);
     flushDeliveries(interactivePi, ui, owner);
     for (const state of states) {
-      if (interactiveSubagentRegistry.get(state.id) !== state) continue;
+      if (stateMap.get(state.id) !== state) continue;
       const terminal =
         state.status === "cancelled" || state.status === "exited";
       if (terminal) destroySessionParser(state);
@@ -484,7 +560,7 @@ async function runPollArtifactChanges(
     // Paint footer + widget. Both are TUI surfaces that never reach the LLM.
     if (ui) {
       updateRunningSubagentFooter(ui, owner);
-      updateWidgetRows(ui, WIDGET_KEY, widgetRows);
+      updateWidgetRows(ui, WIDGET_KEY, widgetRows, owner);
       // Workflow TUI footer + widget: show running async workflows.
       try {
         const wfCount = getRunningWorkflowCount(owner);
@@ -493,8 +569,8 @@ async function runPollArtifactChanges(
           wfCount > 0
             ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
             : undefined;
-        updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus);
-        updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows);
+        updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus, owner);
+        updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows, owner);
       } catch {
         /* ui stale */
       }
@@ -503,14 +579,13 @@ async function runPollArtifactChanges(
     debugLog("error", "poller_error", {
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
-      registryIds: [...interactiveSubagentRegistry.keys()],
     });
     /* defensive: never let one bad poll tick crash the parent process */
   }
 }
 
 function formatWorkflowWidgetRows(
-  owner: ActiveSessionContextToken | undefined,
+  owner: SessionOwnerToken | undefined,
   now: number,
 ): string[] {
   const rows: string[] = [];
@@ -626,10 +701,17 @@ function destroySessionParser(state: InteractiveSubagentState): void {
   }
 }
 
-/** Release every parser before the interactive registry is replaced or cleared. */
-export function clearSessionParsers(): void {
-  const parserStates = [...sessionParsers.values()];
-  for (const parserState of parserStates) {
+/** Release parsers for one exact live owner, or every parser for legacy callers. */
+export function clearSessionParsers(owner?: SessionOwnerToken): void {
+  if (owner) {
+    const scope = resolveLiveSessionScope(owner);
+    if (!scope) return;
+    for (const state of scope.interactiveStates.values()) {
+      destroySessionParser(state);
+    }
+    return;
+  }
+  for (const parserState of [...sessionParsers.values()]) {
     destroySessionParser(parserState.owner);
   }
 }

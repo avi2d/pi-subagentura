@@ -14,25 +14,36 @@ import {
   type WorkflowJobState,
 } from "../src/workflow";
 import {
-  getSessionContextStack,
-  registerSessionContext,
-  setActiveSessionRefs,
-  type ActiveSessionContextToken,
-  type SessionContextRef,
-} from "../src/session-context";
+  clearSessionScopes,
+  registerSessionScope,
+  getStartedSessionScopes,
+  removeSessionScope,
+  setLegacyActiveSessionRefs,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "../src/session-scope";
 
-function owner(id: number, generation: number): ActiveSessionContextToken {
+function owner(id: number, generation: number): SessionOwnerToken {
   return { id, generation };
 }
 
-function context(id: number, generation: number): SessionContextRef {
-  return { id, generation, lifecycle: "started", pi: {} as never };
+function context(id: number, generation: number): SessionScope {
+  return {
+    id,
+    generation,
+    lifecycle: "started",
+    pi: {} as never,
+    parentStreaming: false,
+    inProcessJobs: new Map(),
+    pendingInProcessDeliveries: [],
+    interactiveStates: new Map(),
+  };
 }
 
 function makeJob(
   id: string,
   status: WorkflowJobState["status"],
-  ownerRef: ActiveSessionContextToken,
+  ownerRef: SessionOwnerToken,
 ): WorkflowJobState {
   return {
     id,
@@ -70,8 +81,23 @@ function makeJob(
 describe("workflow parent session ownership", () => {
   beforeEach(() => {
     workflowJobRegistry.clear();
-    setActiveSessionRefs(undefined);
-    getSessionContextStack().length = 0;
+    setLegacyActiveSessionRefs(undefined);
+    clearSessionScopes();
+  });
+
+  it("defaults a complete registration to the started lifecycle", () => {
+    const scope = registerSessionScope({
+      id: 6,
+      generation: 1,
+      pi: {} as never,
+      parentStreaming: false,
+      inProcessJobs: new Map(),
+      pendingInProcessDeliveries: [],
+      interactiveStates: new Map(),
+    });
+
+    expect(scope.lifecycle).toBe("started");
+    expect(getStartedSessionScopes()).toEqual([scope]);
   });
 
   it("requires exact {id,generation}, treats wrong owners as missing, and cleans up only the owning lifecycle", () => {
@@ -89,7 +115,7 @@ describe("workflow parent session ownership", () => {
     workflowJobRegistry.set(wrongGeneration.id, wrongGeneration);
     workflowJobRegistry.set(wrongId.id, wrongId);
 
-    setActiveSessionRefs(context(7, 1));
+    setLegacyActiveSessionRefs(context(7, 1));
 
     expect(getWorkflowJobForActiveSession("owned")).toBe(owned);
     expect(getWorkflowJobForActiveSession("wrong-generation")).toBeUndefined();
@@ -118,7 +144,7 @@ describe("workflow parent session ownership", () => {
     }
     const otherTerminal = makeJob("other-terminal", "done", otherOwner);
     workflowJobRegistry.set(otherTerminal.id, otherTerminal);
-    setActiveSessionRefs(context(1, 1));
+    setLegacyActiveSessionRefs(context(1, 1));
 
     expect(() =>
       startWorkflowJob(
@@ -148,7 +174,7 @@ describe("workflow parent session ownership", () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const onComplete = vi.fn();
-    setActiveSessionRefs(context(3, 1));
+    setLegacyActiveSessionRefs(context(3, 1));
     const job = startWorkflowJob(
       "late-owner",
       `export const meta = { name: "late-owner", description: "d" };\nreturn await agent("x");`,
@@ -162,7 +188,7 @@ describe("workflow parent session ownership", () => {
       onComplete,
     );
 
-    setActiveSessionRefs(context(3, 2));
+    setLegacyActiveSessionRefs(context(3, 2));
     release();
     await job.promise;
     retryPendingWorkflowNotifications();
@@ -179,7 +205,7 @@ describe("workflow parent session ownership", () => {
     workflowJobRegistry.set(jobA.id, jobA);
     workflowJobRegistry.set(jobB.id, jobB);
 
-    setActiveSessionRefs(context(20, 1));
+    setLegacyActiveSessionRefs(context(20, 1));
 
     expect(getWorkflowJobForActiveSession("job-a")).toBeUndefined();
     expect(getWorkflowJobForOwner("job-a", ownerA)).toBe(jobA);
@@ -198,7 +224,7 @@ describe("workflow parent session ownership", () => {
   it("captures explicit start owner instead of the mutable active owner", () => {
     const ownerA = owner(30, 1);
     const ownerB = owner(40, 1);
-    setActiveSessionRefs(context(40, 1));
+    setLegacyActiveSessionRefs(context(40, 1));
 
     const started = startWorkflowJob(
       "owned-by-a",
@@ -229,9 +255,9 @@ describe("workflow parent session ownership", () => {
     const piB = { sendMessage: sendB } as any;
     const contextA = { ...context(50, 1), pi: piA };
     const contextB = { ...context(60, 1), pi: piB };
-    registerSessionContext(contextA);
-    registerSessionContext(contextB);
-    setActiveSessionRefs(contextB);
+    registerSessionScope(contextA);
+    registerSessionScope(contextB);
+    setLegacyActiveSessionRefs(contextB);
     registerWorkflowTool(piA, contextA);
     const workflow = tools.find((tool) => tool.name === "workflow");
 
@@ -250,5 +276,39 @@ describe("workflow parent session ownership", () => {
 
     expect(sendA).toHaveBeenCalledOnce();
     expect(sendB).not.toHaveBeenCalled();
+  });
+  it("rejects a workflow call after its registered scope shuts down", async () => {
+    const tools: any[] = [];
+    const pi = {
+      registerTool: vi.fn((tool) => tools.push(tool)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+      sendMessage: vi.fn(),
+    } as any;
+    const scope = { ...context(70, 1), pi };
+    registerSessionScope(scope);
+    registerWorkflowTool(pi, scope);
+    scope.lifecycle = "shutdown";
+    removeSessionScope(scope.id);
+
+    const workflow = tools.find((tool) => tool.name === "workflow");
+    const result = await workflow.execute(
+      "stale-call",
+      {
+        script:
+          'export const meta = { name: "stale", description: "d" };\nreturn "ok";',
+        async: false,
+      },
+      undefined,
+      vi.fn(),
+      { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: { status: "session_unavailable" },
+    });
+    expect(workflowJobRegistry.size).toBe(0);
   });
 });

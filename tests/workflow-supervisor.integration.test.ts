@@ -53,13 +53,13 @@ import {
 } from "../src/interactive-tmux";
 import { __resetMuxInstances, __setTmuxMultiplexer } from "../src/multiplexer";
 import {
-  advanceSessionContextGeneration,
-  getSessionContextStack,
-  registerSessionContext,
-  removeSessionContext,
-  setActiveSessionRefs,
-  type SessionContextRef,
-} from "../src/session-context";
+  advanceSessionScopeGeneration,
+  clearSessionScopes,
+  registerSessionScope,
+  removeSessionScope,
+  setLegacyActiveSessionRefs,
+  type SessionScope,
+} from "../src/session-scope";
 import {
   MAX_WORKFLOW_JOBS,
   workflowJobRegistry,
@@ -109,9 +109,9 @@ function liveSessionContext(options: {
   id: number;
   sessionId: string;
   ui?: ReturnType<typeof fakeUi>;
-}): { context: SessionContextRef; ui: ReturnType<typeof fakeUi> } {
+}): { context: SessionScope; ui: ReturnType<typeof fakeUi> } {
   const ui = options.ui ?? fakeUi();
-  const context: SessionContextRef = {
+  const context: SessionScope = {
     id: options.id,
     generation: 1,
     lifecycle: "started",
@@ -121,13 +121,17 @@ function liveSessionContext(options: {
       getSessionId: () => options.sessionId,
       getEntries: () => [],
     },
+    parentStreaming: false,
+    inProcessJobs: new Map(),
+    pendingInProcessDeliveries: [],
+    interactiveStates: new Map(),
   };
-  registerSessionContext(context);
-  setActiveSessionRefs(context);
+  registerSessionScope(context);
+  setLegacyActiveSessionRefs(context);
   return { context, ui };
 }
 
-function ownerOf(context: SessionContextRef) {
+function ownerOf(context: SessionScope) {
   return { id: context.id, generation: context.generation };
 }
 
@@ -204,8 +208,8 @@ const SINGLE_AGENT_SCRIPT = (name: string) =>
   'return await agent("inspect", { label: "reviewer" });';
 
 beforeEach(() => {
-  getSessionContextStack().length = 0;
-  setActiveSessionRefs(undefined);
+  clearSessionScopes();
+  setLegacyActiveSessionRefs(undefined);
   jobRegistry.clear();
   workflowJobRegistry.clear();
   interactiveSubagentRegistry.clear();
@@ -252,8 +256,8 @@ afterEach(() => {
   interactiveSubagentRegistry.clear();
   workflowJobRegistry.clear();
   jobRegistry.clear();
-  getSessionContextStack().length = 0;
-  setActiveSessionRefs(undefined);
+  clearSessionScopes();
+  setLegacyActiveSessionRefs(undefined);
   __resetMuxInstances();
   vi.clearAllMocks();
   for (const dir of tempDirs.splice(0)) {
@@ -334,11 +338,12 @@ describe("workflow supervisor integration", () => {
     const a = liveSessionContext({ id: 7, sessionId: "session-a" });
     const b = liveSessionContext({ id: 8, sessionId: "session-b" });
     const ownerA = ownerOf(a.context);
-    setActiveSessionRefs(a.context);
+    setLegacyActiveSessionRefs(a.context);
 
     // A sibling session's plain agent must NOT be counted or listed for A.
     const sibling = plainInteractiveState("sibling-agent", "session-b");
     interactiveSubagentRegistry.set(sibling.id, sibling);
+    b.context.interactiveStates.set(sibling.id, sibling);
 
     const { pi, findTool } = makePi();
     registerWorkflowTool(pi as never, a.context);
@@ -350,6 +355,9 @@ describe("workflow supervisor integration", () => {
       { cwd: "/tmp", modelRegistry: {} },
     );
     await vi.waitFor(() => expect(mockLaunch).toHaveBeenCalledOnce());
+    expect(a.context.interactiveStates.get("workflow-child")).toBe(
+      interactiveSubagentRegistry.get("workflow-child"),
+    );
 
     await pollArtifactChanges(a.context.pi, ownerA);
 
@@ -405,8 +413,8 @@ describe("workflow supervisor integration", () => {
     expect(childJob?.abort).toBeInstanceOf(AbortController);
     // Reachable by every owner-scoped sweep, including session_shutdown's drain.
     expect(childJob?.deliveryOwner).toMatchObject({
-      sessionContextId: owner.id,
-      sessionContextGeneration: owner.generation,
+      sessionScopeId: owner.id,
+      sessionScopeGeneration: owner.generation,
     });
     const workflow = [...workflowJobRegistry.values()].find(
       (job) => job.name === "fallback",
@@ -460,8 +468,8 @@ describe("workflow supervisor integration", () => {
     await vi.waitFor(() => expect(mockStartSubagentJob).toHaveBeenCalledOnce());
 
     // The parent session shuts down while startSubagentJob is still pending.
-    advanceSessionContextGeneration(context.id);
-    removeSessionContext(context.id);
+    advanceSessionScopeGeneration(context.id);
+    removeSessionScope(context.id);
     releaseSpawn({
       jobId: "escaped-child",
       jobPromise: new Promise(() => {}),
@@ -482,9 +490,8 @@ describe("workflow supervisor integration", () => {
   });
 
   it("leaves an unownable in-process child out of the registry", async () => {
-    // No session context at all: a deliveryOwner without a sessionContextId
-    // matches no owner-scoped sweep, so registering would create a row that is
-    // invisible in the supervisor AND skipped by session_shutdown's drain.
+    // With no session scope, the child cannot join an owner-scoped registry or
+    // shutdown sweep, so it must remain unregistered.
     const start = vi.fn();
     let releaseChild!: (result: SubagentResult) => void;
     mockLaunch.mockImplementationOnce(() => {

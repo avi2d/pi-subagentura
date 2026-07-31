@@ -6,12 +6,14 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import isPathInside from "is-path-inside";
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  INTERACTIVE_ARTIFACT_OWNER_FILE,
   isArtifactOutputSettled,
+  loadInteractiveStates,
   lastEvent,
   listOutputHistory,
   listOutputTurns,
@@ -38,7 +40,13 @@ import {
 } from "../notifications";
 import { InteractiveParams } from "../schemas";
 import { updateRunningSubagentFooter } from "../artifact-poller";
-import { getActiveSessionContextToken } from "../session-context";
+import {
+  getStartedSessionScopes,
+  resolveToolSessionScope,
+  sessionOwner,
+  type SessionScope,
+  type SessionToolToken,
+} from "../session-scope";
 
 const SUBAGENT_ID_INVALID_CHAR_RE = /[^a-f0-9]/;
 function isValidSubagentId(id: string): boolean {
@@ -113,7 +121,63 @@ function getArtifactForState(
   return artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 }
 
-export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
+function resolveInteractiveToolStates(token: SessionToolToken | undefined):
+  | {
+      scope?: SessionScope;
+      states: Map<string, InteractiveSubagentState>;
+    }
+  | undefined {
+  const scope = resolveToolSessionScope(token);
+  if (scope) return { scope, states: scope.interactiveStates };
+  if (!token && getStartedSessionScopes().length === 0) {
+    return { states: interactiveSubagentRegistry };
+  }
+  return undefined;
+}
+
+function findOwnedDiskArtifact(
+  cwd: string,
+  id: string,
+  scope: SessionScope | undefined,
+): SubagentArtifact | null {
+  if (!scope) return findArtifactById(id);
+  let parentSessionId: string | undefined;
+  try {
+    parentSessionId = scope.sessionManager?.getSessionId?.();
+  } catch {
+    return null;
+  }
+  if (!parentSessionId) return null;
+  const artifact = findArtifactById(id);
+  if (!artifact) return null;
+  try {
+    const persistedOwner = readFileSync(
+      join(artifact.dir, INTERACTIVE_ARTIFACT_OWNER_FILE),
+      "utf8",
+    );
+    return persistedOwner === parentSessionId ? artifact : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    // Older artifacts may still have exact evidence in the persisted state file.
+  }
+  const persisted = loadInteractiveStates(cwd)?.states[id];
+  if (!persisted || persisted.parentSessionId !== parentSessionId) return null;
+  try {
+    return realpathSync(persisted.artifactDir) === realpathSync(artifact.dir)
+      ? artifact
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function registerInteractiveSubagentTools(
+  pi: ExtensionAPI,
+  registrationScope?: SessionScope,
+): void {
+  const toolToken: SessionToolToken | undefined = registrationScope
+    ? { id: registrationScope.id }
+    : undefined;
   // ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
   pi.registerTool({
     name: "subagent_interactive",
@@ -131,6 +195,19 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     parameters: InteractiveParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const registration = resolveInteractiveToolStates(toolToken);
+      if (!registration) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "This interactive tool registration is no longer attached to a live session.",
+            },
+          ],
+          details: { status: "session_unavailable" },
+          isError: true,
+        };
+      }
       const completionMode = params.notifyOnComplete ?? "notify";
       const triggerTurn = completionTriggersTurn(
         completionMode,
@@ -177,8 +254,12 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
           thinkingLevel: params.thinkingLevel,
+          sessionScope: registration.scope,
         });
-        updateRunningSubagentFooter(ctx.ui, getActiveSessionContextToken());
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
 
         const displayMode = state.windowName
           ? "background (new window/tab)"
@@ -274,13 +355,22 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
-      pruneDeadInteractiveSubagents();
-      updateRunningSubagentFooter(ctx.ui, getActiveSessionContextToken());
+      const registration = resolveInteractiveToolStates(toolToken);
+      const visibleStates = registration?.states;
+      if (visibleStates) {
+        pruneDeadInteractiveSubagents(visibleStates.values());
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      }
       const states = params.jobId
-        ? [interactiveSubagentRegistry.get(params.jobId)].filter(
+        ? [visibleStates?.get(params.jobId)].filter(
             (s): s is InteractiveSubagentState => Boolean(s),
           )
-        : [...interactiveSubagentRegistry.values()];
+        : visibleStates
+          ? [...visibleStates.values()]
+          : [];
 
       if (states.length === 0) {
         return {
@@ -325,7 +415,15 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
-      const state = cancelInteractiveSubagent(params.jobId);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const ownedState = registration?.states.get(params.jobId);
+      const state = ownedState
+        ? cancelInteractiveSubagent(
+            params.jobId,
+            "cancel_interactive_subagent",
+            ownedState,
+          )
+        : undefined;
       let userNotification: string;
       if (!state) {
         return {
@@ -339,7 +437,10 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      updateRunningSubagentFooter(ctx.ui, getActiveSessionContextToken());
+      updateRunningSubagentFooter(
+        ctx.ui,
+        registration?.scope ? sessionOwner(registration.scope) : undefined,
+      );
       const snapshotText = state.cancellationSnapshot?.path
         ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}`
         : state.cancellationSnapshot?.error
@@ -453,7 +554,8 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      const state = interactiveSubagentRegistry.get(params.id);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const state = registration?.states.get(params.id);
       if (!state) {
         return {
           content: [
@@ -597,7 +699,7 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<any> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
       // Validate the id shape FIRST so a malformed id gets a precise error
       // instead of being collapsed into the generic "not found" message.
       if (!isValidSubagentId(params.id)) {
@@ -624,10 +726,15 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
           isError: true,
         };
       }
-      const state = interactiveSubagentRegistry.get(params.id);
+      const registration = resolveInteractiveToolStates(toolToken);
+      const state = registration?.states.get(params.id);
+      const foreignInMemoryState =
+        !state && interactiveSubagentRegistry.has(params.id);
       const art = state
         ? getArtifactForState(state)
-        : findArtifactById(params.id);
+        : registration && !foreignInMemoryState
+          ? findOwnedDiskArtifact(ctx.cwd, params.id, registration.scope)
+          : null;
       if (!art) {
         return {
           content: [
@@ -726,16 +833,23 @@ export function registerInteractiveSubagentTools(pi: ExtensionAPI): void {
     name: "list_subagent_artifacts",
     label: "List Subagent Artifacts",
     description: [
-      "List all known interactive sub-agents (in this session and from past sessions whose",
-      "artifacts are still on disk). Returns id, name, status, and last-update time. Use",
-      "read_subagent_artifact to fetch a specific one.",
+      "List interactive sub-agent artifacts visible to this parent session.",
+      "Returns id, name, status, and last-update time. Use read_subagent_artifact",
+      "to fetch a specific one.",
     ].join("\n"),
     parameters: Type.Object({}),
 
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx): Promise<any> {
-      pruneDeadInteractiveSubagents();
-      updateRunningSubagentFooter(ctx.ui, getActiveSessionContextToken());
-      const states = [...interactiveSubagentRegistry.values()];
+      const registration = resolveInteractiveToolStates(toolToken);
+      const visibleStates = registration?.states;
+      if (visibleStates) {
+        pruneDeadInteractiveSubagents(visibleStates.values());
+        updateRunningSubagentFooter(
+          ctx.ui,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      }
+      const states = visibleStates ? [...visibleStates.values()] : [];
       const summary = states.map((s) => {
         const art = getArtifactForState(s);
         const last = lastEvent(art);

@@ -82,11 +82,15 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 // ── Imports (after mocks, vitest resolves to mocked modules) ─────────
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
   type JobState,
   type SubagentResult,
+  inProcessJobsForOwner,
   jobRegistry,
+  pruneCompletedJobs,
+  registerInProcessJob,
 } from "../src/helpers";
 import {
   registerInProcessMaintenanceTools,
@@ -96,6 +100,13 @@ import {
   DEFAULT_MAX_ORCHESTRATION_DEPTH,
   withOrchestrationContext,
 } from "../src/orchestration-context";
+import {
+  clearSessionScopes,
+  registerSessionScope,
+  sessionOwner,
+  setLegacyActiveSessionRefs,
+  type SessionScope,
+} from "../src/session-scope";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -154,18 +165,37 @@ function createJobState(overrides: Partial<JobState> = {}): JobState {
   };
 }
 
-/** Build a mock ExtensionAPI, register the tools, and return the API handle. */
-function setupExtension() {
-  const api = {
+function createExtensionApi() {
+  return {
     registerTool: vi.fn(),
     registerMessageRenderer: vi.fn(),
     sendMessage: vi.fn(),
     sendUserMessage: vi.fn(),
     on: vi.fn(),
   };
-  registerInProcessSubagentTools(api as any);
-  registerInProcessMaintenanceTools(api as any);
+}
+
+/** Build a mock ExtensionAPI, register the tools, and return the API handle. */
+function setupExtension(scope?: SessionScope) {
+  const api = createExtensionApi();
+  const extensionApi = api as unknown as ExtensionAPI;
+  registerInProcessSubagentTools(extensionApi, scope);
+  registerInProcessMaintenanceTools(extensionApi, scope);
   return api;
+}
+
+function setupScopedExtension(id: number) {
+  const api = createExtensionApi();
+  const extensionApi = api as unknown as ExtensionAPI;
+  const scope = registerSessionScope({
+    id,
+    generation: 1,
+    lifecycle: "started",
+    pi: extensionApi,
+  });
+  registerInProcessSubagentTools(extensionApi, scope);
+  registerInProcessMaintenanceTools(extensionApi, scope);
+  return { api, scope };
 }
 
 /** Find a tool definition by name from the registered tools. */
@@ -215,6 +245,7 @@ const defaultStartSubagentJobResult = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  clearSessionScopes();
   jobRegistry.clear();
   mockStartSubagentJob.mockReset();
   mockStartSubagentJob.mockResolvedValue(defaultStartSubagentJobResult);
@@ -227,6 +258,170 @@ beforeEach(() => {
 
 afterEach(() => {
   jobRegistry.clear();
+  clearSessionScopes();
+});
+describe("peer session scope isolation", () => {
+  it("keeps an A spawn owned by A after B becomes the legacy active session", async () => {
+    const a = setupScopedExtension(801);
+    const b = setupScopedExtension(802);
+    setLegacyActiveSessionRefs(b.scope);
+    const ownerA = sessionOwner(a.scope);
+    const start = vi.fn();
+    const pending = new Promise<SubagentResult>(() => {});
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobId: "job-a",
+      jobPromise: pending,
+      start,
+      disposeBeforeStart: vi.fn(),
+    });
+
+    const spawnA = getToolDef(a.api, "subagent_isolated");
+    const result = await spawnA.execute(
+      "spawn-a",
+      { task: "owned by A" },
+      undefined,
+      undefined,
+      mockCtx({
+        sessionManager: {
+          getSessionId: () => "session-a",
+          getBranch: () => [],
+        },
+      }),
+    );
+
+    expect(result.details).toMatchObject({ status: "started", jobId: "job-a" });
+    expect(a.scope.inProcessJobs.has("job-a")).toBe(true);
+    expect(b.scope.inProcessJobs.has("job-a")).toBe(false);
+    expect(jobRegistry.get("job-a")?.deliveryOwner).toMatchObject({
+      sessionScopeId: ownerA.id,
+      sessionScopeGeneration: ownerA.generation,
+    });
+    expect(mockStartSubagentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ owner: ownerA }),
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("does not expose scoped jobs through ownerless helper operations", () => {
+    const a = setupScopedExtension(805);
+    setupScopedExtension(806);
+    const doneA = createJobState({
+      id: "done-a",
+      status: "done",
+      result: defaultSuccessResult,
+      deliveryOwner: {
+        pi: a.scope.pi,
+        sessionScopeId: a.scope.id,
+        sessionScopeGeneration: a.scope.generation,
+      },
+    });
+    registerInProcessJob(doneA, sessionOwner(a.scope));
+
+    expect([...inProcessJobsForOwner().keys()]).toEqual([]);
+    expect(pruneCompletedJobs()).toBe(0);
+    expect(a.scope.inProcessJobs.get(doneA.id)).toBe(doneA);
+    expect(jobRegistry.get(doneA.id)).toBe(doneA);
+  });
+
+  it("isolates status, result, cancel, and prune management paths", async () => {
+    const a = setupScopedExtension(811);
+    const b = setupScopedExtension(812);
+    const ownerA = sessionOwner(a.scope);
+    const ownerB = sessionOwner(b.scope);
+    const abortB = vi.fn().mockResolvedValue(undefined);
+    const runningB = createJobState({
+      id: "running-b",
+      session: { abort: abortB } as unknown as JobState["session"],
+      deliveryOwner: {
+        pi: b.scope.pi,
+        sessionScopeId: ownerB.id,
+        sessionScopeGeneration: ownerB.generation,
+      },
+    });
+    const doneA = createJobState({
+      id: "done-a",
+      status: "done",
+      result: defaultSuccessResult,
+      deliveryOwner: {
+        pi: a.scope.pi,
+        sessionScopeId: ownerA.id,
+        sessionScopeGeneration: ownerA.generation,
+      },
+    });
+    const doneB = createJobState({
+      id: "done-b",
+      status: "done",
+      result: defaultSuccessResult,
+      deliveryOwner: {
+        pi: b.scope.pi,
+        sessionScopeId: ownerB.id,
+        sessionScopeGeneration: ownerB.generation,
+      },
+    });
+    expect(registerInProcessJob(runningB, ownerB)).toBe(true);
+    expect(registerInProcessJob(doneA, ownerA)).toBe(true);
+    expect(registerInProcessJob(doneB, ownerB)).toBe(true);
+
+    const statusA = getToolDef(a.api, "get_subagent_status");
+    const resultA = getToolDef(a.api, "get_subagent_result");
+    const cancelA = getToolDef(a.api, "cancel_subagent");
+    const pruneA = getToolDef(a.api, "prune_subagent_jobs");
+    const statusB = getToolDef(b.api, "get_subagent_status");
+
+    expect(
+      (await statusA.execute("status", { jobId: "running-b" })).details.status,
+    ).toBe("not_found");
+    expect((await resultA.execute("result", { jobId: "done-b" })).isError).toBe(
+      true,
+    );
+    expect(
+      (
+        await cancelA.execute(
+          "cancel",
+          { jobId: "running-b" },
+          undefined,
+          undefined,
+          mockCtx(),
+        )
+      ).isError,
+    ).toBe(true);
+    expect(abortB).not.toHaveBeenCalled();
+    expect(
+      (await statusB.execute("status", { jobId: "running-b" })).details.status,
+    ).toBe("running");
+
+    const pruned = await pruneA.execute();
+    expect(pruned.details).toMatchObject({ removed: 1, before: 1, after: 0 });
+    expect(a.scope.inProcessJobs.has("done-a")).toBe(false);
+    expect(b.scope.inProcessJobs.has("done-b")).toBe(true);
+    expect(jobRegistry.has("done-a")).toBe(false);
+    expect(jobRegistry.has("done-b")).toBe(true);
+  });
+  it("fails a dead supplied tool token closed instead of falling back", async () => {
+    const a = setupScopedExtension(821);
+    const b = setupScopedExtension(822);
+    const ownerB = sessionOwner(b.scope);
+    const jobB = createJobState({
+      id: "fallback-target-b",
+      deliveryOwner: {
+        pi: b.scope.pi,
+        sessionScopeId: ownerB.id,
+        sessionScopeGeneration: ownerB.generation,
+      },
+    });
+    registerInProcessJob(jobB, ownerB);
+    a.scope.lifecycle = "shutdown";
+
+    const statusA = getToolDef(a.api, "get_subagent_status");
+    const response = await statusA.execute("status", {
+      jobId: "fallback-target-b",
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toMatch(/no longer active/i);
+    expect(b.scope.inProcessJobs.has(jobB.id)).toBe(true);
+  });
 });
 
 // ── subagent_with_context ────────────────────────────────────────────
@@ -877,7 +1072,12 @@ describe("cancel_subagent tool", () => {
     // session.abort was called
     expect(abortFn).toHaveBeenCalledTimes(1);
     // scheduleJobCleanup was called for immediate cleanup
-    expect(mockScheduleJobCleanup).toHaveBeenCalledWith(jobId, true);
+    expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
+      jobId,
+      true,
+      undefined,
+      undefined,
+    );
     // Footer was updated
     expect(ctx.ui.setStatus).toHaveBeenCalled();
   });
@@ -1835,6 +2035,7 @@ describe("async rejection settlement", () => {
       "default-job",
       false,
       undefined,
+      undefined,
     );
     expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
@@ -1900,6 +2101,7 @@ describe("async rejection settlement", () => {
     expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
       "default-job",
       false,
+      undefined,
       undefined,
     );
     expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
