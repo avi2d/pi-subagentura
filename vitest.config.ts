@@ -1,5 +1,7 @@
 import { defineConfig } from "vitest/config";
 
+// Tests must not inherit interactive child mode from a reviewer process.
+delete process.env.PI_SUBAGENTURA_CHILD;
 export default defineConfig({
   test: {
     testTimeout: 15_000,
