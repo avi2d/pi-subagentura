@@ -1,6 +1,6 @@
 import { defineConfig } from "vitest/config";
 
-// Tests must not inherit interactive child mode from a reviewer process.
+// Tests should not inherit interactive child mode from the invoking process.
 delete process.env.PI_SUBAGENTURA_CHILD;
 export default defineConfig({
   test: {
