@@ -179,7 +179,16 @@ describe("cancelled workflow snapshot normalization", () => {
     const cancel = workflowTools().cancel_workflow;
     await cancel.execute("cancel", { workflowId: job.id });
     expect(job.snapshot.liveUsage).toBeUndefined();
-    await expect(job.promise).rejects.toThrow(/aborted/i);
+    await expect(job.promise).rejects.toMatchObject({
+      message: expect.stringMatching(/aborted/i),
+      usage: {
+        input: 4,
+        output: 2,
+        totalTokens: 6,
+        costUsd: 0,
+        turns: 1,
+      },
+    });
     expect(job.snapshot.liveUsage).toBeUndefined();
   });
 
