@@ -123,7 +123,75 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+  /** Optional pricing provenance supplied by a provider or test adapter. */
+  costSource?: "provider" | "estimated" | "unavailable";
   turns: number;
+}
+
+function usageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/** Extract one provider assistant-message usage record without mutating it. */
+export function usageFromAssistantMessage(
+  message: unknown,
+  turns = 1,
+): Usage | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const candidate = message as { role?: unknown; usage?: any };
+  if (candidate.role !== "assistant" || !candidate.usage) return undefined;
+  const raw = candidate.usage;
+  const hasProviderCost =
+    raw.cost !== null &&
+    typeof raw.cost === "object" &&
+    typeof raw.cost.total === "number" &&
+    Number.isFinite(raw.cost.total);
+  const cost =
+    typeof raw.cost === "number" ? raw.cost : usageNumber(raw.cost?.total);
+  return {
+    input: usageNumber(raw.input),
+    output: usageNumber(raw.output),
+    cacheRead: usageNumber(raw.cacheRead),
+    cacheWrite: usageNumber(raw.cacheWrite),
+    cost,
+    ...(hasProviderCost ? { costSource: "provider" as const } : {}),
+    turns: Math.max(0, turns),
+  };
+}
+
+/** Aggregate assistant usage from a session, falling back to the live sample. */
+export function usageFromAssistantMessages(
+  messages: readonly unknown[],
+  fallback: Usage,
+): Usage {
+  const total = { ...zeroUsageShape() };
+  let found = false;
+  let providerReported = false;
+  for (const message of messages) {
+    const usage = usageFromAssistantMessage(message);
+    if (!usage) continue;
+    found = true;
+    providerReported ||= usage.costSource === "provider";
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cacheRead += usage.cacheRead;
+    total.cacheWrite += usage.cacheWrite;
+    total.cost += usage.cost;
+    total.turns += usage.turns;
+  }
+  if (!found) return { ...fallback };
+  return providerReported ? { ...total, costSource: "provider" } : total;
+}
+
+function zeroUsageShape(): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    turns: 0,
+  };
 }
 
 export type SubagentResult =
@@ -843,6 +911,12 @@ export async function startSubagentJob(
     }
   }
 
+  const updateLiveUsageFromMessage = (message: unknown): void => {
+    const usage = usageFromAssistantMessage(message, liveStatus.turn);
+    if (!usage) return;
+    liveStatus.usage = usage;
+  };
+
   // Wire session events
   unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     switch (event.type) {
@@ -875,6 +949,7 @@ export async function startSubagentJob(
         break;
       }
       case "turn_end": {
+        updateLiveUsageFromMessage((event as any).message);
         debugLog("info", "turn_end", {
           jobId,
           turn: liveStatus.turn,
@@ -906,6 +981,7 @@ export async function startSubagentJob(
           }),
           ...(evt.type === "toolcall_end" && { toolCallId: evt.toolCall?.id }),
         });
+        updateLiveUsageFromMessage((event as any).message);
         if (evt.type === "text_delta") {
           liveStatus.output += evt.delta;
           onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));
@@ -970,6 +1046,11 @@ export async function startSubagentJob(
     thinkingLevel: effectiveThinkingLevel,
     errorMessage: "No subagent result captured.",
   };
+  const currentSessionUsage = (): Usage =>
+    usageFromAssistantMessages(
+      session.agent.state.messages as readonly unknown[],
+      liveStatus.usage,
+    );
   const jobPromise = (async (): Promise<SubagentResult> => {
     try {
       await startGate;
@@ -1018,14 +1099,7 @@ export async function startSubagentJob(
           isError: false,
           cancelled: true,
           output: `Sub-agent cancelled before completion${info.reason ? `: ${info.reason}` : ""}.`,
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: 0,
-            turns: 0,
-          },
+          usage: currentSessionUsage(),
           model: session.model
             ? `${session.model.provider}/${session.model.id}`
             : undefined,
@@ -1066,24 +1140,7 @@ export async function startSubagentJob(
         }
       }
 
-      const usage = {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        turns: 0,
-      };
-      for (const msg of messages) {
-        if (msg.role === "assistant" && msg.usage) {
-          usage.turns++;
-          usage.input += msg.usage.input;
-          usage.output += msg.usage.output;
-          usage.cacheRead += msg.usage.cacheRead;
-          usage.cacheWrite += msg.usage.cacheWrite;
-          usage.cost += msg.usage.cost.total;
-        }
-      }
+      const usage = currentSessionUsage();
 
       if (session.agent.state.errorMessage) {
         result = attachWorkflowStructuredOutput({
@@ -1116,14 +1173,7 @@ export async function startSubagentJob(
       });
       result = attachWorkflowStructuredOutput({
         output: `Sub-agent crashed: ${msg}`,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          cost: 0,
-          turns: 0,
-        },
+        usage: currentSessionUsage(),
         model: undefined,
         thinkingLevel: effectiveThinkingLevel,
         isError: true,

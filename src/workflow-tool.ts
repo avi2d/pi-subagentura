@@ -27,6 +27,7 @@ import {
   type WorkflowRunResult,
   type WorkflowUsage,
   formatWorkflowUsage,
+  workflowUsageFromUsage,
 } from "./workflow-core";
 import {
   getWorkflowCompletionPresentation,
@@ -140,7 +141,7 @@ export function formatWorkflowNotificationSummary(
   if (run) {
     return (
       `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ` +
-      `${run.tokensSpent} output tokens${run.usage ? ` (${formatWorkflowUsage(run.usage)})` : ""}.`
+      `${run.usage ? formatWorkflowUsage(run.usage, { outputBudget: job.snapshot.budgetTotal }) : "usage unavailable"}.`
     );
   }
   const usage = presentWorkflowUsage(job.snapshot.usage);
@@ -183,11 +184,11 @@ export function registerWorkflowTool(
       let lastUpdateTs = 0;
       const THROTTLE_MS = 2000;
 
-      const maybeEmitUpdate = (msg: string) => {
+      const maybeEmitUpdate = (msg: string, liveUsage?: WorkflowUsage) => {
         const now = Date.now();
         if (now - lastUpdateTs >= THROTTLE_MS) {
           lastUpdateTs = now;
-          onProgress?.({ kind: "log", message: msg, label });
+          onProgress?.({ kind: "log", message: msg, label, liveUsage });
         }
       };
 
@@ -256,16 +257,19 @@ export function registerWorkflowTool(
         contextText: null,
         signal: abort.signal,
         onUpdate: (partial) => {
+          const liveUsage = workflowUsageFromUsage(
+            partial.details?.subagentStatus?.usage,
+          );
           const status = partial.details?.subagentStatus;
           if (status?.activeTool) {
-            maybeEmitUpdate(`⚙ ${status.activeTool.name}`);
+            maybeEmitUpdate(`⚙ ${status.activeTool.name}`, liveUsage);
           } else if (status?.output) {
             const preview = (status.output || "")
               .slice(0, 60)
               .replace(/\s+/g, " ")
               .trim();
-            if (preview) maybeEmitUpdate(`💭 ${preview}`);
-          }
+            if (preview) maybeEmitUpdate(`💭 ${preview}`, liveUsage);
+          } else if (liveUsage) maybeEmitUpdate("↻ usage", liveUsage);
         },
         defaultModel: ctx.model,
         parentModelRegistry: ctx.modelRegistry,
@@ -621,7 +625,7 @@ export function registerWorkflowTool(
           : "complete";
         const summary =
           `${completionPrefix}Workflow "${run.meta.name}" ${completionLabel} — ` +
-          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens (${formatWorkflowUsage(run.usage)}).`;
+          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${formatWorkflowUsage(run.usage, { outputBudget: job.snapshot.budgetTotal })}.`;
         return {
           content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
           details: {
@@ -658,7 +662,7 @@ export function registerWorkflowTool(
     name: "get_workflow_status",
     label: "Workflow Status",
     description:
-      "Poll a background workflow's live progress (agents spawned, errors, output tokens, total usage, current phase).",
+      "Poll a background workflow's live progress (agents, errors, canonical usage, output budget, and current phase). Usage icons: ↑ input, ↓ output, R/W cache, $ cost.",
     parameters: Type.Object({
       workflowId: Type.String({
         description: "Workflow ID returned by an async `workflow` spawn.",
@@ -690,9 +694,12 @@ export function registerWorkflowTool(
               (st.snapshot.runningCount && st.snapshot.runningCount > 0
                 ? `, ${st.snapshot.runningCount} running`
                 : "") +
-              `, ${errorCount} error(s), ${st.snapshot.tokensSpent} output tokens` +
+              `, ${errorCount} error(s)` +
               (st.snapshot.usage
-                ? ` (${formatWorkflowUsage(st.snapshot.usage)})`
+                ? `, ${formatWorkflowUsage(st.snapshot.usage, { outputBudget: st.snapshot.budgetTotal })}`
+                : ", usage unavailable") +
+              (st.snapshot.liveUsage
+                ? `, live ${formatWorkflowUsage(st.snapshot.liveUsage)}`
                 : "") +
               (st.snapshot.currentPhase
                 ? `, phase: ${st.snapshot.currentPhase}`
@@ -807,7 +814,7 @@ export function registerWorkflowTool(
               const label = presentation.icon ? presentation.label : "complete";
               return (
                 `${prefix}Workflow "${run.meta.name}" ${label} — ` +
-                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.tokensSpent} output tokens${run.usage ? ` (${formatWorkflowUsage(run.usage)})` : ""}.\n\n${resultText}`
+                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.usage ? formatWorkflowUsage(run.usage, { outputBudget: st.snapshot.budgetTotal }) : "usage unavailable"}.\n\n${resultText}`
               );
             })(),
           },
@@ -1218,7 +1225,7 @@ export function registerWorkflowTool(
 
     pi.registerCommand("workflow-status", {
       description:
-        "List running and completed workflow jobs with status, agent counts, output tokens, total usage, and elapsed time.",
+        "List running and completed workflow jobs with status, agent counts, canonical usage, output budget, and elapsed time.",
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
         const text = renderWorkflowJobs(owner());
         ctx.ui.notify("📋 Workflow status listed.");
@@ -1359,8 +1366,11 @@ export function registerWorkflowTool(
         parts.push(`⚡ ${s.runningCount} running`);
       }
       if (errorCount > 0) parts.push(`⚠ ${errorCount} error(s)`);
-      parts.push(`${s.tokensSpent} output tokens`);
-      if (s.usage) parts.push(formatWorkflowUsage(s.usage));
+      if (s.usage) {
+        parts.push(
+          formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal }),
+        );
+      }
       parts.push(elapsed);
       if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
       if (st.error) parts.push(`error: ${st.error}`);

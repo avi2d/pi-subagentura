@@ -132,4 +132,91 @@ describe("cancelled workflow snapshot normalization", () => {
     });
     expect(afterSettlementStatus.details.runningCount).toBe(0);
   });
+
+  it("clears live usage when cancellation makes the workflow terminal", async () => {
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => (entered = resolve));
+    const job = startWorkflowJob("cancel-live-usage", SCRIPT, {
+      runAgent: async ({ signal, onProgress }) => {
+        onProgress?.({
+          kind: "log",
+          message: "usage",
+          liveUsage: {
+            input: 4,
+            output: 2,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 6,
+            costUsd: 0,
+            turns: 1,
+            costSource: "provider",
+          },
+        });
+        entered();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          isError: true,
+          output: "",
+          usage: {
+            input: 4,
+            output: 2,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 1,
+          },
+          model: undefined,
+          errorMessage: "aborted",
+        } as any;
+      },
+    });
+    jobs.push(job);
+    await enteredPromise;
+    expect(job.snapshot.liveUsage).toBeDefined();
+    const cancel = workflowTools().cancel_workflow;
+    await cancel.execute("cancel", { workflowId: job.id });
+    expect(job.snapshot.liveUsage).toBeUndefined();
+    await expect(job.promise).rejects.toThrow(/aborted/i);
+    expect(job.snapshot.liveUsage).toBeUndefined();
+  });
+
+  it("clears live usage when the active agent finishes", async () => {
+    const job = startWorkflowJob("finish-live-usage", SCRIPT, {
+      runAgent: async ({ onProgress }) => {
+        onProgress?.({
+          kind: "log",
+          message: "usage",
+          liveUsage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            costUsd: 0.01,
+            turns: 1,
+            costSource: "provider",
+          },
+        });
+        return {
+          isError: false,
+          output: "ok",
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0.01,
+            turns: 1,
+          },
+          model: "test/model",
+        } as any;
+      },
+    });
+    jobs.push(job);
+    await job.promise;
+    expect(job.snapshot.liveUsage).toBeUndefined();
+  });
 });

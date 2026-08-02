@@ -9,6 +9,9 @@ import {
   deleteWorkflowScript,
   extractJson,
   formatWorkflowUsage,
+  formatWorkflowUsageLegend,
+  addWorkflowUsage,
+  workflowUsageFromUsage,
   getWorkflowCompletionPresentation,
   listSavedWorkflows,
   loadWorkflowScript,
@@ -29,7 +32,10 @@ import {
   workflowJobRegistry,
 } from "../src/workflow";
 import { withOrchestrationContext } from "../src/orchestration-context";
-import type { SubagentResult } from "../src/helpers";
+import {
+  usageFromAssistantMessages,
+  type SubagentResult,
+} from "../src/helpers";
 import {
   appendCompletionEvent,
   appendEvent,
@@ -1457,6 +1463,36 @@ describe("awaitInteractiveResult", () => {
     expect(res.isError).toBe(true);
     expect((res as any).errorMessage).toMatch(/aborted/);
   });
+
+  it("keeps process-session usage when cancellation arrives first", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-int-cancel-"));
+    const sessionFile = join(dir, "session.jsonl");
+    writeFileSync(
+      sessionFile,
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          usage: {
+            input: 12,
+            output: 6,
+            cacheRead: 2,
+            cacheWrite: 1,
+            cost: { total: 0.03 },
+          },
+        },
+      }) + "\n",
+    );
+    const state = fakeState(dir);
+    state.sessionFile = sessionFile;
+    const ac = new AbortController();
+    ac.abort();
+    const res = await awaitInteractiveResult(state, ac.signal, 5);
+    expect(res).toMatchObject({
+      isError: true,
+      usage: { input: 12, output: 6, cacheRead: 2, cost: 0.03 },
+    });
+  });
 });
 
 describe("abort signal propagation", () => {
@@ -1700,7 +1736,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 2 agent(s)");
     expect(result).toContain("⚡ 1 running");
-    expect(result).toContain("100 output tokens");
+    expect(result).not.toContain("output tokens");
     expect(result).toContain("◆ phase: Scanning");
   });
 
@@ -1716,7 +1752,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 3 agent(s)");
     expect(result).not.toContain("⚡");
-    expect(result).toContain("50 output tokens");
+    expect(result).not.toContain("output tokens");
     expect(result).toContain("hello");
   });
 
@@ -1815,7 +1851,7 @@ describe("renderProgress", () => {
     expect(result).toContain("⚡ 2 running");
     expect(result).toContain("⚠ 3 error(s)");
     expect(result).toContain("10 agent(s)");
-    expect(result).toContain("500 output tokens");
+    expect(result).not.toContain("output tokens");
   });
 });
 
@@ -2904,7 +2940,7 @@ it("formats USD usage without floating-point artifacts", () => {
     costUsd: 0.1 + 0.2,
     turns: 1,
   };
-  expect(formatWorkflowUsage(usage)).toBe("1 total tokens, $0.3");
+  expect(formatWorkflowUsage(usage)).toBe("↑0 ↓1 R0 W0 $0.3");
 });
 
 it("includes accumulated usage in async workflow error results", async () => {
@@ -2938,7 +2974,7 @@ it("includes accumulated usage in async workflow error results", async () => {
       costUsd: 0.125,
       turns: 2,
     });
-    expect(result.content[0].text).toContain("26 total tokens");
+    expect(result.content[0].text).toContain("↓7");
   } finally {
     workflowJobRegistry.delete(job.id);
   }
@@ -2954,7 +2990,7 @@ it("includes snapshot usage in failed completion notification summaries", async 
   try {
     await expect(job.promise).rejects.toThrow("later failure");
     expect(formatWorkflowNotificationSummary(job)).toContain(
-      "26 total tokens, $0.125",
+      "↑11 ↓7 R5 W3 $0.125",
     );
   } finally {
     workflowJobRegistry.delete(job.id);
@@ -3007,6 +3043,103 @@ it("preserves caller abort reason alongside accumulated usage", async () => {
   await expect(running).rejects.toMatchObject({
     cause: reason,
     usage: { totalTokens: 26 },
+  });
+});
+
+it("aggregates partial usage returned by an active runner on cancellation", async () => {
+  const controller = new AbortController();
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => (started = resolve));
+  const partial: SubagentResult = {
+    isError: true,
+    output: "partial",
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      cost: 0.02,
+      turns: 1,
+    },
+    model: undefined,
+    errorMessage: "aborted",
+  };
+  const running = runWorkflow(
+    `export const meta = { name: "cancel-usage", description: "d" };\n` +
+      `return await agent("in flight");`,
+    {
+      signal: controller.signal,
+      runAgent: async ({ signal }) => {
+        started();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return partial;
+      },
+    },
+  );
+  await startedPromise;
+  controller.abort(new Error("cancelled"));
+  await expect(running).rejects.toMatchObject({
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      costUsd: 0.02,
+      totalTokens: 10,
+      turns: 1,
+    },
+  });
+});
+
+it("aggregates live usage when a runner rejects during cancellation", async () => {
+  const controller = new AbortController();
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => (started = resolve));
+  const running = runWorkflow(
+    `export const meta = { name: "cancel-live-reject", description: "d" };\n` +
+      `return await agent("in flight");`,
+    {
+      signal: controller.signal,
+      runAgent: async ({ signal, onProgress }) => {
+        onProgress?.({
+          kind: "log",
+          message: "usage",
+          liveUsage: {
+            input: 4,
+            output: 3,
+            cacheRead: 2,
+            cacheWrite: 1,
+            totalTokens: 10,
+            costUsd: 0.02,
+            turns: 1,
+            costSource: "provider",
+          },
+        });
+        started();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new Error("aborted");
+      },
+    },
+  );
+  await startedPromise;
+  controller.abort(new Error("cancelled"));
+  await expect(running).rejects.toMatchObject({
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      costUsd: 0.02,
+      totalTokens: 10,
+      turns: 1,
+      costSource: "provider",
+    },
   });
 });
 
@@ -3090,5 +3223,207 @@ describe("workflow usage accounting", () => {
     } finally {
       workflowJobRegistry.delete(job.id);
     }
+  });
+});
+
+describe("canonical workflow usage formatting", () => {
+  it("uses icon-first compact accounting without a duplicate total", () => {
+    const usage: WorkflowUsage = {
+      input: 11,
+      output: 7,
+      cacheRead: 5,
+      cacheWrite: 3,
+      totalTokens: 26,
+      costUsd: 0.125,
+      turns: 2,
+    };
+    expect(formatWorkflowUsage(usage)).toBe("↑11 ↓7 R5 W3 $0.125");
+    expect(formatWorkflowUsage(usage, { outputBudget: 20 })).toContain("↓7/20");
+    expect(formatWorkflowUsage(usage)).not.toContain("total tokens");
+  });
+
+  it("labels unavailable and estimated pricing instead of showing $0", () => {
+    const unavailable = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 2,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      },
+    );
+    const estimated = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 2,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.01,
+        costSource: "estimated",
+        turns: 1,
+      },
+    );
+    expect(formatWorkflowUsage(unavailable)).toContain("$?");
+    expect(formatWorkflowUsage(estimated)).toContain("~$0.01");
+    expect(formatWorkflowUsage(unavailable, { expanded: true })).toContain(
+      "unavailable",
+    );
+  });
+
+  it("marks mixed pricing and provides an ASCII fallback legend", () => {
+    const base: WorkflowUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      turns: 0,
+    };
+    const mixed = addWorkflowUsage(
+      addWorkflowUsage(base, {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.01,
+        turns: 1,
+      }),
+      {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      },
+    );
+    expect(mixed.costSource).toBe("mixed");
+    expect(formatWorkflowUsage(mixed)).toContain("$? (mixed)");
+    expect(
+      formatWorkflowUsage(mixed, { expanded: true, ascii: true }),
+    ).toContain("input tokens");
+    expect(formatWorkflowUsageLegend(true)).toBe(
+      "Legend: input, output, cache-read, cache-write, cost",
+    );
+  });
+
+  it("preserves explicit free provider pricing and hides zero live samples", () => {
+    const providerFree = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 1,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        costSource: "provider",
+        turns: 1,
+      },
+    );
+    expect(providerFree.costSource).toBe("provider");
+    expect(formatWorkflowUsage(providerFree)).toContain("$0");
+    expect(
+      workflowUsageFromUsage({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("preserves partial assistant usage for cancellation accounting", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 10,
+            output: 4,
+            cacheRead: 2,
+            cacheWrite: 1,
+            cost: { total: 0.02 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+    expect(usage).toEqual({
+      input: 10,
+      output: 4,
+      cacheRead: 2,
+      cacheWrite: 1,
+      cost: 0.02,
+      costSource: "provider",
+      turns: 1,
+    });
+  });
+
+  it("preserves provider provenance for an explicitly free assistant turn", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 2,
+            output: 1,
+            cost: { total: 0 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+    expect(usage).toMatchObject({ cost: 0, costSource: "provider" });
+    expect(workflowUsageFromUsage(usage)).toMatchObject({
+      costUsd: 0,
+      costSource: "provider",
+    });
+    expect(
+      formatWorkflowUsage(workflowUsageFromUsage(usage) as WorkflowUsage),
+    ).toContain("$0");
   });
 });
