@@ -77,12 +77,11 @@ function usageCostSource(
     usage.output === 0 &&
     usage.cacheRead === 0 &&
     usage.cacheWrite === 0 &&
-    usage.cost === 0 &&
-    usage.turns === 0
+    usage.cost === 0
   ) {
     return undefined;
   }
-  return usage.cost > 0 ? "provider" : "unavailable";
+  return usage.cost > 0 ? "estimated" : "unavailable";
 }
 
 function mergeCostSource(
@@ -90,7 +89,7 @@ function mergeCostSource(
   next: WorkflowCostSource | undefined,
 ): WorkflowCostSource | undefined {
   const existing =
-    total.costSource ?? (total.costUsd > 0 ? "provider" : undefined);
+    total.costSource ?? (total.costUsd > 0 ? "estimated" : undefined);
   if (!next) return existing;
   if (!existing) return next;
   if (existing === next) return next;
@@ -108,12 +107,7 @@ export function addWorkflowUsage(
   const cacheWrite = total.cacheWrite + (usage?.cacheWrite ?? 0);
   const nextCostSource = usageCostSource(usage);
   const costSource = mergeCostSource(total, nextCostSource);
-  const hasExplicitProvenance =
-    usage?.costSource !== undefined || total.costSource !== undefined;
-  const provenance =
-    costSource && (hasExplicitProvenance || costSource === "mixed")
-      ? { costSource }
-      : {};
+  const provenance = costSource ? { costSource } : {};
   return {
     input,
     output,
@@ -163,7 +157,7 @@ export function formatWorkflowUsage(
   options: WorkflowUsageFormatOptions = {},
 ): string {
   const source =
-    usage.costSource ?? (usage.costUsd > 0 ? "provider" : "unavailable");
+    usage.costSource ?? (usage.costUsd > 0 ? "estimated" : "unavailable");
   const cost =
     source === "unavailable"
       ? "$?"

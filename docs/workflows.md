@@ -267,12 +267,12 @@ The `workflow` tool runs scripts inside a [`Worker` thread](../src/workflow-work
 Every `agent()`, `phase()`, and `log()` call emits a progress event. The parent pipes these through `renderProgress()` and streams them as `onUpdate` calls:
 
 ```
-● workflow — 4 agent(s), ⚡ 3 running, ↑1200 ↓120/5000 R0 W0 $?
+● workflow — 4 agent(s), ⚡ 3 running, 0 tokens
   → started verify:status-token-wrong-company
   → done verify:status-token-wrong-company
   → started verify:cached-status-token
 ◆ phase: Sweep
-● workflow — 4 agent(s), 0 running, ↑1200 ↓120/5000 R0 W0 $0.018
+● workflow — 4 agent(s), 0 running, 0 tokens
   → started sweep:ui-agents
   → started sweep:backend
   → done sweep:backend
@@ -283,7 +283,7 @@ Every `agent()`, `phase()`, and `log()` call emits a progress event. The parent 
 | Mode                      | How progress flows                                                           | TUI effect                                                                                                                          |
 | ------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | **Sync** (`async: false`) | `onProgress` → `onUpdate` per event                                          | Live stream in the reply; each `agent()`, `phase()`, and `log()` call fires an inline update.                                       |
-| **Async** (default)       | Written to `WorkflowJobState.snapshot`; artifact poller paints footer/widget | Footer shows `⚡ N workflow(s) running`; below-editor widget shows running workflow rows with phase/agent/usage/last-event summary. |
+| **Async** (default)       | Written to `WorkflowJobState.snapshot`; artifact poller paints footer/widget | Footer shows `⚡ N workflow(s) running`; below-editor widget shows running workflow rows with phase/agent/token/last-event summary. |
 
 ### Current visibility
 
@@ -293,31 +293,13 @@ Async workflows are discoverable without polling tools:
 
 ```
 ⚡ 2 workflows running
-◇ pr-review (wf_ab12): 3 agents · 2 running · ↑1200 ↓120 R0 W0 $? · 5s · phase: Review — → started tests
-◇ ralplan (wf_cd34): 1 agent · 1 running · ↑800 ↓80 R0 W0 ~$0.004 · 1m 12s · phase: Planner — ◆ phase: Planner
+◇ pr-review (wf_ab12): 3 agents · 2 running · 120 tokens · 5s · phase: Review — → started tests
+◇ ralplan (wf_cd34): 1 agent · 1 running · 80 tokens · 1m 12s · phase: Planner — ◆ phase: Planner
 ```
 
 The footer uses `subagentura-workflows`; the workflow widget uses
 `subagentura-workflow-activity` and is capped to 5 rows with an overflow row.
 Use `/workflow-status` for the full textual status dump, or `/workflow-tree` for an interactive drill-down overlay.
-
-#### Usage and pricing accounting
-
-Workflow surfaces use one canonical usage formatter. Compact views show:
-
-```text
-↑ input · ↓ output · R cache-read · W cache-write · $ cost
-```
-
-Expanded workflow-tree rows include explicit labels, a legend, turns, and
-per-agent/model usage when the runner provides it. ASCII-safe output is used for
-terminals that cannot render the icons.
-
-The `budget` value is a soft completed-output-token target. Parallel agents may
-overshoot it; it is not a USD budget. Provider-reported costs use `$`, estimates
-use `~$`, and unavailable or mixed pricing uses `$?` rather than implying that
-unknown pricing is free. Live usage is shown when the runner exposes progress
-usage; process-isolated agents may only provide final usage after completion.
 
 #### 2. Per-agent visibility
 

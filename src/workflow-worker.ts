@@ -127,9 +127,7 @@ function usageAsProjectUsage(usage: WorkflowUsage): Usage {
     cacheRead: usage.cacheRead,
     cacheWrite: usage.cacheWrite,
     cost: usage.costUsd,
-    ...(usage.costSource && usage.costSource !== "mixed"
-      ? { costSource: usage.costSource }
-      : {}),
+    ...(usage.costSource ? { costSource: usage.costSource } : {}),
     turns: usage.turns,
   };
 }
@@ -313,6 +311,7 @@ async function executeScript(
         engine.counters.runningCount++;
         let status: "done" | "error" = "done";
         let agentUsage: WorkflowUsage | undefined;
+        let finalModel = agentOpts.model;
         try {
           emit({
             kind: "agent_start",
@@ -372,6 +371,7 @@ async function executeScript(
           try {
             try {
               res = await agentRun;
+              finalModel = res.model ?? agentOpts.model;
             } catch (error) {
               const partialUsage =
                 (error as { usage?: Usage })?.usage ??
@@ -435,7 +435,7 @@ async function executeScript(
             kind: "agent_done",
             label: agentOpts.label,
             phase: resolvedPhase,
-            model: agentOpts.model,
+            model: finalModel,
             status,
             agentId,
             agentUsage,
@@ -816,6 +816,18 @@ export async function awaitInteractiveResult(
     } else {
       deadTicks = 0;
     }
-    await new Promise((r) => setTimeout(r, pollMs));
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, pollMs);
+      signal?.addEventListener("abort", finish, { once: true });
+      if (signal?.aborted) finish();
+    });
   }
 }

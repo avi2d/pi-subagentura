@@ -634,8 +634,7 @@ function formatWorkflowFooterUsage(
       cacheRead: usage.cacheRead,
       cacheWrite: usage.cacheWrite,
       cost: usage.costUsd,
-      costSource:
-        usage.costSource === "mixed" ? "unavailable" : usage.costSource,
+      costSource: usage.costSource,
       turns: usage.turns,
     });
     hasUsage = true;

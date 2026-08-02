@@ -123,8 +123,8 @@ export interface Usage {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
-  /** Optional pricing provenance supplied by a provider or test adapter. */
-  costSource?: "provider" | "estimated" | "unavailable";
+  /** Pricing provenance; "mixed" is used only for aggregated samples. */
+  costSource?: "provider" | "estimated" | "unavailable" | "mixed";
   turns: number;
 }
 
@@ -132,29 +132,78 @@ function usageNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-/** Extract one provider assistant-message usage record without mutating it. */
+type AssistantCostSource = Exclude<NonNullable<Usage["costSource"]>, "mixed">;
+
+function mergeUsageCostSource(
+  existing: Usage["costSource"],
+  next: Usage["costSource"],
+): Usage["costSource"] {
+  if (!next) return existing;
+  if (!existing) return next;
+  if (existing === next) return existing;
+  return "mixed";
+}
+
+function addUsageSamples(total: Usage, next: Usage): Usage {
+  const costSource = mergeUsageCostSource(total.costSource, next.costSource);
+  return {
+    input: total.input + next.input,
+    output: total.output + next.output,
+    cacheRead: total.cacheRead + next.cacheRead,
+    cacheWrite: total.cacheWrite + next.cacheWrite,
+    cost: total.cost + next.cost,
+    ...(costSource ? { costSource } : {}),
+    turns: total.turns + next.turns,
+  };
+}
+
+/** Extract one assistant-message usage record without mutating it. */
 export function usageFromAssistantMessage(
   message: unknown,
   turns = 1,
 ): Usage | undefined {
   if (!message || typeof message !== "object") return undefined;
-  const candidate = message as { role?: unknown; usage?: any };
-  if (candidate.role !== "assistant" || !candidate.usage) return undefined;
-  const raw = candidate.usage;
-  const hasProviderCost =
-    raw.cost !== null &&
-    typeof raw.cost === "object" &&
-    typeof raw.cost.total === "number" &&
-    Number.isFinite(raw.cost.total);
+  const candidate = message as { role?: unknown; usage?: unknown };
+  if (
+    candidate.role !== "assistant" ||
+    !candidate.usage ||
+    typeof candidate.usage !== "object"
+  ) {
+    return undefined;
+  }
+  const raw = candidate.usage as Record<string, unknown>;
+  const rawCost = raw.cost;
   const cost =
-    typeof raw.cost === "number" ? raw.cost : usageNumber(raw.cost?.total);
+    typeof rawCost === "number"
+      ? usageNumber(rawCost)
+      : rawCost && typeof rawCost === "object"
+        ? usageNumber((rawCost as Record<string, unknown>).total)
+        : 0;
+  const input = usageNumber(raw.input);
+  const output = usageNumber(raw.output);
+  const cacheRead = usageNumber(raw.cacheRead);
+  const cacheWrite = usageNumber(raw.cacheWrite);
+  const rawCostSource = raw.costSource;
+  const explicitSource: AssistantCostSource | undefined =
+    rawCostSource === "provider" ||
+    rawCostSource === "estimated" ||
+    rawCostSource === "unavailable"
+      ? rawCostSource
+      : undefined;
+  const costSource =
+    explicitSource ??
+    (cost > 0
+      ? "estimated"
+      : input + output + cacheRead + cacheWrite > 0
+        ? "unavailable"
+        : undefined);
   return {
-    input: usageNumber(raw.input),
-    output: usageNumber(raw.output),
-    cacheRead: usageNumber(raw.cacheRead),
-    cacheWrite: usageNumber(raw.cacheWrite),
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
     cost,
-    ...(hasProviderCost ? { costSource: "provider" as const } : {}),
+    ...(costSource ? { costSource } : {}),
     turns: Math.max(0, turns),
   };
 }
@@ -164,14 +213,14 @@ export function usageFromAssistantMessages(
   messages: readonly unknown[],
   fallback: Usage,
 ): Usage {
-  const total = { ...zeroUsageShape() };
+  const total = zeroUsageShape();
   let found = false;
-  let providerReported = false;
+  let costSource: Usage["costSource"];
   for (const message of messages) {
     const usage = usageFromAssistantMessage(message);
     if (!usage) continue;
     found = true;
-    providerReported ||= usage.costSource === "provider";
+    costSource = mergeUsageCostSource(costSource, usage.costSource);
     total.input += usage.input;
     total.output += usage.output;
     total.cacheRead += usage.cacheRead;
@@ -180,7 +229,8 @@ export function usageFromAssistantMessages(
     total.turns += usage.turns;
   }
   if (!found) return { ...fallback };
-  return providerReported ? { ...total, costSource: "provider" } : total;
+  if (costSource) total.costSource = costSource;
+  return total;
 }
 
 function zeroUsageShape(): Usage {
@@ -911,10 +961,11 @@ export async function startSubagentJob(
     }
   }
 
+  let completedLiveUsage = zeroUsageShape();
   const updateLiveUsageFromMessage = (message: unknown): void => {
-    const usage = usageFromAssistantMessage(message, liveStatus.turn);
-    if (!usage) return;
-    liveStatus.usage = usage;
+    const currentTurnUsage = usageFromAssistantMessage(message);
+    if (!currentTurnUsage) return;
+    liveStatus.usage = addUsageSamples(completedLiveUsage, currentTurnUsage);
   };
 
   // Wire session events
@@ -922,7 +973,10 @@ export async function startSubagentJob(
     switch (event.type) {
       case "turn_start": {
         liveStatus.turn++;
-        liveStatus.usage.turns = liveStatus.turn;
+        liveStatus.usage = {
+          ...completedLiveUsage,
+          turns: liveStatus.turn,
+        };
         liveStatus.output = "";
         debugLog("info", "turn_start", { jobId, turn: liveStatus.turn });
         onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));
@@ -949,7 +1003,10 @@ export async function startSubagentJob(
         break;
       }
       case "turn_end": {
-        updateLiveUsageFromMessage((event as any).message);
+        updateLiveUsageFromMessage(
+          "message" in event ? event.message : undefined,
+        );
+        completedLiveUsage = { ...liveStatus.usage };
         debugLog("info", "turn_end", {
           jobId,
           turn: liveStatus.turn,
@@ -981,7 +1038,9 @@ export async function startSubagentJob(
           }),
           ...(evt.type === "toolcall_end" && { toolCallId: evt.toolCall?.id }),
         });
-        updateLiveUsageFromMessage((event as any).message);
+        updateLiveUsageFromMessage(
+          "message" in event ? event.message : undefined,
+        );
         if (evt.type === "text_delta") {
           liveStatus.output += evt.delta;
           onUpdate?.(buildLiveUpdate(liveStatus, modelLabel));

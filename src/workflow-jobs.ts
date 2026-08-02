@@ -15,6 +15,7 @@ import {
   type WorkflowRunResult,
   type WorkflowRunResultWithUsage,
   type WorkflowUsage,
+  WorkflowExecutionError,
   MAX_WORKFLOW_AGENT_RECORDS,
   zeroWorkflowUsage,
 } from "./workflow-core";
@@ -44,7 +45,7 @@ export interface WorkflowJobState {
     /** Soft completed-output-token target, if configured. */
     budgetTotal?: number | null;
     usage?: WorkflowUsage;
-    /** Latest usage sample from an active agent, when supported. */
+    /** Aggregate usage from every active agent that reports a live sample. */
     liveUsage?: WorkflowUsage;
     phases: string[];
     lastMessage?: string;
@@ -255,6 +256,7 @@ export function startWorkflowJob(
     activeAgentRuns: new Set(),
     parentSessionOwner,
   };
+  const liveUsageByAgent = new Map<number, WorkflowUsage>();
   state.promise = runWorkflow(script, {
     ...opts,
     runAgent: (request) =>
@@ -266,9 +268,6 @@ export function startWorkflowJob(
       state.snapshot.tokensSpent = p.tokensSpent;
       state.snapshot.budgetTotal = p.budgetTotal ?? state.snapshot.budgetTotal;
       state.snapshot.usage = p.usage ? { ...p.usage } : state.snapshot.usage;
-      state.snapshot.liveUsage = p.liveUsage
-        ? { ...p.liveUsage }
-        : state.snapshot.liveUsage;
       state.snapshot.runningCount = p.runningCount;
       if (p.kind === "phase" && p.phase) {
         state.snapshot.currentPhase = p.phase;
@@ -280,14 +279,18 @@ export function startWorkflowJob(
         state.snapshot.lastMessage = `→ started${formatWorkflowAgentTag(p)}`;
       } else if (p.kind === "agent_done") {
         state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
-        state.snapshot.liveUsage = undefined;
       }
       if (p.kind === "agent_start" || p.kind === "agent_done") {
         recordWorkflowAgentProgress(state.snapshot, p);
       }
-      if (p.liveUsage && typeof p.agentId === "number") {
-        recordWorkflowAgentLiveUsage(state.snapshot, p.agentId, p.liveUsage);
+      if (typeof p.agentId === "number") {
+        if (p.liveUsage) {
+          liveUsageByAgent.set(p.agentId, { ...p.liveUsage });
+          recordWorkflowAgentLiveUsage(state.snapshot, p.agentId, p.liveUsage);
+        }
+        if (p.kind === "agent_done") liveUsageByAgent.delete(p.agentId);
       }
+      state.snapshot.liveUsage = aggregateWorkflowLiveUsage(liveUsageByAgent);
       opts.onProgress?.(p);
     },
     onCancellationSnapshot: (receipt) => {
@@ -298,6 +301,7 @@ export function startWorkflowJob(
       if (state.status === "running") state.status = "done";
       state.result = r;
       state.snapshot.liveUsage = undefined;
+      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       return r;
@@ -306,7 +310,12 @@ export function startWorkflowJob(
       const msg = err instanceof Error ? err.message : String(err);
       state.status = abort.signal.aborted ? "cancelled" : "error";
       state.error = msg;
+      if (err instanceof WorkflowExecutionError && err.usage) {
+        state.snapshot.usage = { ...err.usage };
+        state.snapshot.tokensSpent = err.usage.output;
+      }
       state.snapshot.liveUsage = undefined;
+      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       throw err;
@@ -462,6 +471,39 @@ function recordWorkflowAgentLiveUsage(
     (candidate) => candidate.agentId === agentId,
   );
   if (record?.status === "running") record.usage = { ...usage };
+}
+
+function aggregateWorkflowLiveUsage(
+  samples: ReadonlyMap<number, WorkflowUsage>,
+): WorkflowUsage | undefined {
+  if (samples.size === 0) return undefined;
+  const total = zeroWorkflowUsage();
+  let costSource: WorkflowUsage["costSource"];
+  for (const usage of samples.values()) {
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cacheRead += usage.cacheRead;
+    total.cacheWrite += usage.cacheWrite;
+    total.costUsd += usage.costUsd;
+    total.turns += usage.turns;
+    const nextSource =
+      usage.costSource ??
+      (usage.costUsd > 0
+        ? "estimated"
+        : usage.totalTokens > 0
+          ? "unavailable"
+          : undefined);
+    if (nextSource) {
+      costSource =
+        costSource === undefined || costSource === nextSource
+          ? nextSource
+          : "mixed";
+    }
+  }
+  total.totalTokens =
+    total.input + total.output + total.cacheRead + total.cacheWrite;
+  if (costSource) total.costSource = costSource;
+  return total;
 }
 
 function formatWorkflowAgentTag(p: WorkflowProgress): string {
