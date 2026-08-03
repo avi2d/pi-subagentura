@@ -962,9 +962,11 @@ export async function startSubagentJob(
   }
 
   let completedLiveUsage = zeroUsageShape();
+  let observedUsageEvent = false;
   const updateLiveUsageFromMessage = (message: unknown): void => {
     const currentTurnUsage = usageFromAssistantMessage(message);
     if (!currentTurnUsage) return;
+    observedUsageEvent = true;
     liveStatus.usage = addUsageSamples(completedLiveUsage, currentTurnUsage);
   };
 
@@ -1106,10 +1108,12 @@ export async function startSubagentJob(
     errorMessage: "No subagent result captured.",
   };
   const currentSessionUsage = (): Usage =>
-    usageFromAssistantMessages(
-      session.agent.state.messages as readonly unknown[],
-      liveStatus.usage,
-    );
+    observedUsageEvent
+      ? { ...liveStatus.usage }
+      : usageFromAssistantMessages(
+          session.agent.state.messages as readonly unknown[],
+          liveStatus.usage,
+        );
   const jobPromise = (async (): Promise<SubagentResult> => {
     try {
       await startGate;

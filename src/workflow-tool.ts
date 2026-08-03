@@ -27,6 +27,7 @@ import {
   type WorkflowRunResult,
   type WorkflowUsage,
   formatWorkflowUsage,
+  presentWorkflowUsage,
   workflowUsageFromUsage,
 } from "./workflow-core";
 import {
@@ -116,18 +117,6 @@ async function waitForCancellationReceipts(
   }
 }
 
-function presentWorkflowUsage(
-  usage: WorkflowUsage | undefined,
-): WorkflowUsage | undefined {
-  if (
-    !usage ||
-    (usage.totalTokens === 0 && usage.costUsd === 0 && usage.turns === 0)
-  ) {
-    return undefined;
-  }
-  return usage;
-}
-
 function workflowErrorUsage(error: unknown): WorkflowUsage | undefined {
   return error instanceof WorkflowExecutionError
     ? presentWorkflowUsage(error.usage)
@@ -139,13 +128,22 @@ export function formatWorkflowNotificationSummary(
 ): string {
   const run = job.result;
   if (run) {
-    return (
-      `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ` +
-      `${run.usage ? formatWorkflowUsage(run.usage, { outputBudget: job.snapshot.budgetTotal }) : "usage unavailable"}.`
-    );
+    const usage = presentWorkflowUsage(run.usage);
+    const usageSummary = usage
+      ? `, ${formatWorkflowUsage(usage, {
+          outputBudget: job.snapshot.budgetTotal,
+        })}`
+      : "";
+    return `${run.agentsSpawned} agent(s), ${run.errorCount} error(s)${usageSummary}.`;
   }
   const usage = presentWorkflowUsage(job.snapshot.usage);
-  return `${job.error ?? "Workflow did not produce a result."}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`;
+  return `${job.error ?? "Workflow did not produce a result."}${
+    usage
+      ? ` (${formatWorkflowUsage(usage, {
+          outputBudget: job.snapshot.budgetTotal,
+        })})`
+      : ""
+  }`;
 }
 
 export function registerWorkflowTool(
@@ -376,6 +374,7 @@ export function registerWorkflowTool(
             status: job.status,
             presentationStatus: presentation.label,
             usage: run?.usage ?? job.snapshot.usage,
+            budgetTotal: job.snapshot.budgetTotal,
           },
         },
         { deliverAs: "followUp", triggerTurn: true },
@@ -591,6 +590,7 @@ export function registerWorkflowTool(
                 errorCount: p.errorCount,
                 tokensSpent: p.tokensSpent,
                 usage: p.usage,
+                budgetTotal: p.budgetTotal,
               },
             });
           } catch {
@@ -623,9 +623,16 @@ export function registerWorkflowTool(
         const completionLabel = presentation.icon
           ? presentation.label
           : "complete";
+        const usage = presentWorkflowUsage(run.usage);
         const summary =
           `${completionPrefix}Workflow "${run.meta.name}" ${completionLabel} — ` +
-          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${formatWorkflowUsage(run.usage, { outputBudget: job.snapshot.budgetTotal })}.`;
+          `${run.agentsSpawned} agent(s), ${run.errorCount} error(s)${
+            usage
+              ? `, ${formatWorkflowUsage(usage, {
+                  outputBudget: job.snapshot.budgetTotal,
+                })}`
+              : ""
+          }.`;
         return {
           content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
           details: {
@@ -636,6 +643,7 @@ export function registerWorkflowTool(
             errorCount: run.errorCount,
             tokensSpent: run.tokensSpent,
             usage: run.usage,
+            budgetTotal: job.snapshot.budgetTotal,
             phases: run.phases,
           },
         };
@@ -643,14 +651,26 @@ export function registerWorkflowTool(
         const msg = err instanceof Error ? err.message : String(err);
         const usage = workflowErrorUsage(err);
         const usageDetails = usage ? { usage } : {};
+        const budgetTotal = params.budget ?? null;
         return {
           content: [
             {
               type: "text",
-              text: `Workflow failed: ${msg}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`,
+              text: `Workflow failed: ${msg}${
+                usage
+                  ? ` (${formatWorkflowUsage(usage, {
+                      outputBudget: budgetTotal,
+                    })})`
+                  : ""
+              }`,
             },
           ],
-          details: { status: "error", error: msg, ...usageDetails },
+          details: {
+            status: "error",
+            error: msg,
+            budgetTotal,
+            ...usageDetails,
+          },
           isError: true,
         };
       }
@@ -685,6 +705,8 @@ export function registerWorkflowTool(
         errorCount,
       );
       const statusPrefix = presentation.icon ? `${presentation.icon} ` : "";
+      const usage = presentWorkflowUsage(st.snapshot.usage);
+      const liveUsage = presentWorkflowUsage(st.snapshot.liveUsage);
       return {
         content: [
           {
@@ -695,12 +717,10 @@ export function registerWorkflowTool(
                 ? `, ${st.snapshot.runningCount} running`
                 : "") +
               `, ${errorCount} error(s)` +
-              (st.snapshot.usage
-                ? `, ${formatWorkflowUsage(st.snapshot.usage, { outputBudget: st.snapshot.budgetTotal })}`
-                : ", usage unavailable") +
-              (st.snapshot.liveUsage
-                ? `, live ${formatWorkflowUsage(st.snapshot.liveUsage)}`
+              (usage
+                ? `, ${formatWorkflowUsage(usage, { outputBudget: st.snapshot.budgetTotal })}`
                 : "") +
+              (liveUsage ? `, live ${formatWorkflowUsage(liveUsage)}` : "") +
               (st.snapshot.currentPhase
                 ? `, phase: ${st.snapshot.currentPhase}`
                 : "") +
@@ -781,18 +801,26 @@ export function registerWorkflowTool(
         // Non-abort errors preserve the original structured handling
         const msg = err instanceof Error ? err.message : String(err);
         const usage = presentWorkflowUsage(st.snapshot?.usage);
+        const outputBudget = st.snapshot?.budgetTotal;
         const usageDetails = usage ? { usage } : {};
         return {
           content: [
             {
               type: "text",
-              text: `Workflow ${st.id} ${st.status}: ${msg}${usage ? ` (${formatWorkflowUsage(usage)})` : ""}`,
+              text: `Workflow ${st.id} ${st.status}: ${msg}${
+                usage
+                  ? ` (${formatWorkflowUsage(usage, {
+                      outputBudget,
+                    })})`
+                  : ""
+              }`,
             },
           ],
           details: {
             status: st.status,
             workflowId: st.id,
             error: msg,
+            ...(outputBudget == null ? {} : { budgetTotal: outputBudget }),
             ...usageDetails,
           },
           isError: true,
@@ -805,6 +833,7 @@ export function registerWorkflowTool(
         "done",
         run.errorCount,
       );
+      const usage = presentWorkflowUsage(run.usage);
       return {
         content: [
           {
@@ -814,7 +843,13 @@ export function registerWorkflowTool(
               const label = presentation.icon ? presentation.label : "complete";
               return (
                 `${prefix}Workflow "${run.meta.name}" ${label} — ` +
-                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s), ${run.usage ? formatWorkflowUsage(run.usage, { outputBudget: st.snapshot.budgetTotal }) : "usage unavailable"}.\n\n${resultText}`
+                `${run.agentsSpawned} agent(s), ${run.errorCount} error(s)${
+                  usage
+                    ? `, ${formatWorkflowUsage(usage, {
+                        outputBudget: st.snapshot.budgetTotal,
+                      })}`
+                    : ""
+                }.\n\n${resultText}`
               );
             })(),
           },
@@ -828,6 +863,7 @@ export function registerWorkflowTool(
           errorCount: run.errorCount,
           tokensSpent: run.tokensSpent,
           usage: run.usage,
+          budgetTotal: st.snapshot.budgetTotal,
           phases: run.phases,
         },
       };
@@ -1366,10 +1402,9 @@ export function registerWorkflowTool(
         parts.push(`⚡ ${s.runningCount} running`);
       }
       if (errorCount > 0) parts.push(`⚠ ${errorCount} error(s)`);
-      if (s.usage) {
-        parts.push(
-          formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal }),
-        );
+      const usage = presentWorkflowUsage(s.usage);
+      if (usage) {
+        parts.push(formatWorkflowUsage(usage, { outputBudget: s.budgetTotal }));
       }
       parts.push(elapsed);
       if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);

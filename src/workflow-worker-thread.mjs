@@ -67,6 +67,7 @@ parentPort.on("message", (msg) => {
   if (typeof msg.id === "number" && pending.has(msg.id)) {
     const waiter = pending.get(msg.id);
     pending.delete(msg.id);
+    tokensSpent += typeof msg.tokensDelta === "number" ? msg.tokensDelta : 0;
     if (msg.ok) waiter.resolve(msg.value);
     else waiter.reject(new Error(String(msg.error || "Workflow RPC failed.")));
   }
@@ -106,13 +107,10 @@ async function executeBody(meta, body, args, depth) {
           ? String(opts.phase)
           : currentPhase;
       const callOpts = { ...opts, phase: resolvedPhase };
-      const res = await rpc("agent", {
+      return await rpc("agent", {
         prompt,
         opts: callOpts,
       });
-      tokensSpent +=
-        res && typeof res.tokensDelta === "number" ? res.tokensDelta : 0;
-      return res ? res.value : null;
     })();
     outstandingAgentCalls.add(call);
     void call.then(

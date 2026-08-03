@@ -67,6 +67,25 @@ export function zeroWorkflowUsage(): WorkflowUsage {
   };
 }
 
+export function hasWorkflowUsage(usage: WorkflowUsage | undefined): boolean {
+  return Boolean(
+    usage &&
+    (usage.input > 0 ||
+      usage.output > 0 ||
+      usage.cacheRead > 0 ||
+      usage.cacheWrite > 0 ||
+      usage.totalTokens > 0 ||
+      usage.costUsd > 0 ||
+      usage.costSource !== undefined),
+  );
+}
+
+export function presentWorkflowUsage(
+  usage: WorkflowUsage | undefined,
+): WorkflowUsage | undefined {
+  return hasWorkflowUsage(usage) ? usage : undefined;
+}
+
 function usageCostSource(
   usage: Usage | undefined,
 ): WorkflowCostSource | undefined {
@@ -89,7 +108,12 @@ function mergeCostSource(
   next: WorkflowCostSource | undefined,
 ): WorkflowCostSource | undefined {
   const existing =
-    total.costSource ?? (total.costUsd > 0 ? "estimated" : undefined);
+    total.costSource ??
+    (total.costUsd > 0
+      ? "estimated"
+      : hasWorkflowUsage(total)
+        ? "unavailable"
+        : undefined);
   if (!next) return existing;
   if (!existing) return next;
   if (existing === next) return next;
@@ -152,10 +176,10 @@ export interface WorkflowUsageFormatOptions {
   outputBudget?: number | null;
 }
 
-export function formatWorkflowUsage(
-  usage: WorkflowUsage,
-  options: WorkflowUsageFormatOptions = {},
-): string {
+function workflowCostPresentation(usage: WorkflowUsage): {
+  source: WorkflowCostSource;
+  cost: string;
+} {
   const source =
     usage.costSource ?? (usage.costUsd > 0 ? "estimated" : "unavailable");
   const cost =
@@ -166,29 +190,19 @@ export function formatWorkflowUsage(
         : source === "estimated"
           ? `~$${formatWorkflowCost(usage.costUsd)}`
           : `$${formatWorkflowCost(usage.costUsd)}`;
+  return { source, cost };
+}
+
+export function formatWorkflowUsageFields(
+  usage: WorkflowUsage,
+  options: WorkflowUsageFormatOptions = {},
+): string[] {
+  const { source, cost } = workflowCostPresentation(usage);
   const budget =
     options.outputBudget == null
       ? ""
       : `/${formatWorkflowCost(options.outputBudget)}`;
-  if (!options.expanded) {
-    const icons = options.ascii
-      ? [
-          `input=${usage.input}`,
-          `output=${usage.output}${budget}`,
-          `cache-read=${usage.cacheRead}`,
-          `cache-write=${usage.cacheWrite}`,
-          `cost=${cost}`,
-        ]
-      : [
-          `↑${usage.input}`,
-          `↓${usage.output}${budget}`,
-          `R${usage.cacheRead}`,
-          `W${usage.cacheWrite}`,
-          `${cost}`,
-        ];
-    return icons.join(" ");
-  }
-  const labels = options.ascii
+  return options.ascii
     ? [
         `input tokens: ${usage.input}`,
         `output tokens: ${usage.output}${budget}`,
@@ -205,7 +219,36 @@ export function formatWorkflowUsage(
         `$ cost: ${cost} (${source})`,
         `turns: ${usage.turns}`,
       ];
-  return labels.join("; ");
+}
+
+export function formatWorkflowUsage(
+  usage: WorkflowUsage,
+  options: WorkflowUsageFormatOptions = {},
+): string {
+  if (options.expanded) {
+    return formatWorkflowUsageFields(usage, options).join("; ");
+  }
+  const { cost } = workflowCostPresentation(usage);
+  const budget =
+    options.outputBudget == null
+      ? ""
+      : `/${formatWorkflowCost(options.outputBudget)}`;
+  const icons = options.ascii
+    ? [
+        `input=${usage.input}`,
+        `output=${usage.output}${budget}`,
+        `cache-read=${usage.cacheRead}`,
+        `cache-write=${usage.cacheWrite}`,
+        `cost=${cost}`,
+      ]
+    : [
+        `↑${usage.input}`,
+        `↓${usage.output}${budget}`,
+        `R${usage.cacheRead}`,
+        `W${usage.cacheWrite}`,
+        `${cost}`,
+      ];
+  return icons.join(" ");
 }
 
 export function formatWorkflowUsageLegend(ascii = false): string {

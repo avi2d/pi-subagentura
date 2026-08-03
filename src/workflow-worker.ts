@@ -229,13 +229,15 @@ export async function runWorkflow(
       phases: [...engine.phases],
     };
   } catch (error) {
-    if (abort.signal.aborted) await drainActiveAgentRuns(engine);
+    const cause = workflowFailureCause(error, engine, opts.signal);
+    if (!abort.signal.aborted) abort.abort(error);
+    await drainActiveAgentRuns(engine);
     if (error instanceof WorkflowExecutionError && error.usage) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new WorkflowExecutionError(
       message,
       usageIfPresent(engine.usage),
-      workflowFailureCause(error, engine, opts.signal),
+      cause,
     );
   } finally {
     opts.signal?.removeEventListener("abort", forwardAbort);
@@ -248,7 +250,18 @@ type WorkerRpcResponse = {
   ok: boolean;
   value?: unknown;
   error?: string;
+  tokensDelta: number;
 };
+
+class WorkerRpcFailure extends Error {
+  readonly tokensDelta: number;
+
+  constructor(error: unknown, tokensDelta: number) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "WorkerRpcFailure";
+    this.tokensDelta = tokensDelta;
+  }
+}
 
 async function executeScript(
   script: string,
@@ -378,6 +391,8 @@ async function executeScript(
                 (activeRun.liveUsage
                   ? usageAsProjectUsage(activeRun.liveUsage)
                   : undefined);
+              tokensDelta += partialUsage?.output ?? 0;
+              agentUsage = workflowUsageFromUsage(partialUsage);
               accountAgentUsage(engine, activeRun, partialUsage);
               status = "error";
               engine.failureCause = error;
@@ -448,6 +463,8 @@ async function executeScript(
         message: `agent(schema) failed after ${attempts} attempts: ${lastErr}`,
       });
       return { value: null, tokensDelta };
+    } catch (error) {
+      throw new WorkerRpcFailure(error, tokensDelta);
     } finally {
       sem.release();
     }
@@ -546,7 +563,14 @@ function runWorkflowWorker(
         runAgentCall,
       ).catch((err) => {
         const error = err instanceof Error ? err.message : String(err);
-        postWorkerResponse(worker, { id: msg.id, ok: false, error });
+        const tokensDelta =
+          err instanceof WorkerRpcFailure ? err.tokensDelta : 0;
+        postWorkerResponse(worker, {
+          id: msg.id,
+          ok: false,
+          error,
+          tokensDelta,
+        });
       });
     });
     worker.on("error", fail);
@@ -577,8 +601,13 @@ async function handleWorkerRpc(
   }) => Promise<{ value: unknown; tokensDelta: number }>,
 ): Promise<void> {
   if (msg.method === "agent") {
-    const value = await runAgentCall(msg.payload);
-    postWorkerResponse(worker, { id: msg.id, ok: true, value });
+    const response = await runAgentCall(msg.payload);
+    postWorkerResponse(worker, {
+      id: msg.id,
+      ok: true,
+      value: response.value,
+      tokensDelta: response.tokensDelta,
+    });
     return;
   }
   if (msg.method === "loadWorkflow") {
@@ -586,7 +615,12 @@ async function handleWorkerRpc(
     if (script == null && typeof msg.payload === "string") {
       throw new Error(`workflow(): no saved workflow named "${msg.payload}".`);
     }
-    postWorkerResponse(worker, { id: msg.id, ok: true, value: script });
+    postWorkerResponse(worker, {
+      id: msg.id,
+      ok: true,
+      value: script,
+      tokensDelta: 0,
+    });
     return;
   }
   throw new Error(`Unknown workflow worker RPC method: ${msg.method}`);
@@ -734,7 +768,6 @@ export async function awaitInteractiveResult(
         isError: true,
         output: "",
         usage: cancellationUsage,
-        model: undefined,
         errorMessage: "aborted",
       };
     }
@@ -751,7 +784,7 @@ export async function awaitInteractiveResult(
                 output:
                   readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
                 usage,
-                model: state.model ?? "process",
+                ...(state.model !== undefined ? { model: state.model } : {}),
               };
             case "error":
             case "cancelled":
@@ -760,7 +793,6 @@ export async function awaitInteractiveResult(
                 output:
                   readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
                 usage,
-                model: undefined,
                 errorMessage:
                   terminal.errorMessage ??
                   terminal.message ??
@@ -774,7 +806,7 @@ export async function awaitInteractiveResult(
             isError: false,
             output: readOutput(art) ?? "(no output)",
             usage,
-            model: state.model ?? "process",
+            ...(state.model !== undefined ? { model: state.model } : {}),
           };
         case "error":
         case "cancelled":
@@ -782,7 +814,6 @@ export async function awaitInteractiveResult(
             isError: true,
             output: readOutput(art) ?? "(no output)",
             usage,
-            model: undefined,
             errorMessage:
               terminal.message ?? `interactive sub-agent ${terminal.type}`,
           };
@@ -809,7 +840,6 @@ export async function awaitInteractiveResult(
           isError: true,
           output,
           usage: parseUsageFromSessionFile(state.sessionFile),
-          model: undefined,
           errorMessage: "interactive sub-agent pane exited before completing",
         };
       }

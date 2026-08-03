@@ -429,30 +429,31 @@ function recordWorkflowAgentProgress(
   if (typeof progress.agentId !== "number") return;
   const records = (snapshot.agentRecords ??= []);
   if (progress.kind === "agent_start") {
-    records.push({
+    const nextRecord: WorkflowAgentRecord = {
       agentId: progress.agentId,
       phase: progress.phase,
       label: progress.label,
-      model: progress.model,
       status: "running",
-    });
+    };
+    if (progress.model !== undefined) nextRecord.model = progress.model;
+    records.push(nextRecord);
   } else {
     const record = records.find(
       (candidate) => candidate.agentId === progress.agentId,
     );
     if (record) {
       record.status = progress.status ?? "done";
-      if (progress.agentUsage) record.usage = progress.agentUsage;
-      if (progress.model) record.model = progress.model;
+      if (progress.agentUsage) record.usage = { ...progress.agentUsage };
+      if (progress.model !== undefined) record.model = progress.model;
     } else {
       const nextRecord: WorkflowAgentRecord = {
         agentId: progress.agentId,
         phase: progress.phase,
         label: progress.label,
-        model: progress.model,
         status: progress.status ?? "done",
       };
-      if (progress.agentUsage) nextRecord.usage = progress.agentUsage;
+      if (progress.agentUsage) nextRecord.usage = { ...progress.agentUsage };
+      if (progress.model !== undefined) nextRecord.model = progress.model;
       records.push(nextRecord);
     }
   }
