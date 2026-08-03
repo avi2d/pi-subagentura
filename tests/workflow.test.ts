@@ -709,6 +709,74 @@ describe("agent() + budget", () => {
       workflowJobRegistry.delete(job.id);
     }
   });
+
+  it("falls back to live usage when rejected terminal usage is empty", async () => {
+    const prompts: string[] = [];
+    const liveUsage: WorkflowUsage = {
+      input: 12,
+      output: 100,
+      cacheRead: 4,
+      cacheWrite: 2,
+      totalTokens: 118,
+      costUsd: 0.5,
+      turns: 1,
+      costSource: "provider",
+    };
+    const emptyTerminalUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 0,
+    };
+    let failedEventUsage: WorkflowUsage | undefined;
+
+    const result = await runWorkflow(
+      meta +
+        `let rejected = false; ` +
+        `try { await agent("rejected"); } catch { rejected = true; } ` +
+        `let blocked = false; ` +
+        `try { await agent("blocked"); } catch { blocked = true; } ` +
+        `return { rejected, blocked, spent: budget.spent() };`,
+      {
+        budgetTotal: 100,
+        runAgent: async ({ prompt, onProgress }) => {
+          prompts.push(prompt);
+          if (prompt === "rejected") {
+            onProgress?.({
+              kind: "log",
+              message: "cumulative usage before rejection",
+              liveUsage,
+            });
+            throw Object.assign(new Error("empty terminal usage"), {
+              usage: emptyTerminalUsage,
+            });
+          }
+          return ok("unexpected");
+        },
+        onProgress: (progress) => {
+          if (
+            progress.kind === "agent_done" &&
+            progress.status === "error" &&
+            progress.agentUsage
+          ) {
+            failedEventUsage = { ...progress.agentUsage };
+          }
+        },
+      },
+    );
+
+    expect(prompts).toEqual(["rejected"]);
+    expect(result.result).toEqual({
+      rejected: true,
+      blocked: true,
+      spent: 100,
+    });
+    expect(result.tokensSpent).toBe(100);
+    expect(result.usage).toEqual(liveUsage);
+    expect(failedEventUsage).toEqual(liveUsage);
+  });
   it("allows parallel in-flight calls to overshoot the soft output target", async () => {
     let started = 0;
     let release!: () => void;
@@ -3429,6 +3497,99 @@ it("preserves non-abort cause identity alongside accumulated usage", async () =>
     usage: { totalTokens: 26 },
   });
   expect(calls).toBe(2);
+});
+
+it("correlates concurrent runner failures with the rejecting agent RPC", async () => {
+  const firstFailure = new Error("first runner failure");
+  const secondFailure = new Error("second runner failure");
+  let firstStarted!: () => void;
+  const firstStartedPromise = new Promise<void>(
+    (resolve) => (firstStarted = resolve),
+  );
+  let secondStarted!: () => void;
+  const secondStartedPromise = new Promise<void>(
+    (resolve) => (secondStarted = resolve),
+  );
+  let rejectFirst!: (reason: unknown) => void;
+  const firstResult = new Promise<SubagentResult>(
+    (_resolve, reject) => (rejectFirst = reject),
+  );
+  let rejectSecond!: (reason: unknown) => void;
+  const secondResult = new Promise<SubagentResult>(
+    (_resolve, reject) => (rejectSecond = reject),
+  );
+  let firstRejected!: () => void;
+  const firstRejectedPromise = new Promise<void>(
+    (resolve) => (firstRejected = resolve),
+  );
+
+  const running = runWorkflow(
+    `export const meta = { name: "rpc-cause", description: "d" };\n` +
+      `const first = agent("first");\n` +
+      `const second = agent("second");\n` +
+      `void first.catch(() => phase("first rejected"));\n` +
+      `try { await second; } catch {}\n` +
+      `await first;`,
+    {
+      processConcurrency: 2,
+      runAgent: ({ prompt }) => {
+        if (prompt === "first") {
+          firstStarted();
+          return firstResult;
+        }
+        secondStarted();
+        return secondResult;
+      },
+      onProgress: (progress) => {
+        if (progress.kind === "phase" && progress.phase === "first rejected") {
+          firstRejected();
+        }
+      },
+    },
+  );
+
+  await Promise.all([firstStartedPromise, secondStartedPromise]);
+  rejectFirst(firstFailure);
+  await firstRejectedPromise;
+  rejectSecond(secondFailure);
+
+  let failure: unknown;
+  try {
+    await running;
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(Error);
+  expect((failure as Error & { cause?: unknown }).cause).toBe(firstFailure);
+});
+
+it("does not trust workflow-visible rpcId properties for cause correlation", async () => {
+  const runnerFailure = new Error("runner failure");
+  const running = runWorkflow(
+    `export const meta = { name: "rpc-cause-forgery", description: "d" };\n` +
+      `let rpcId; ` +
+      `try { await agent("runner"); } catch (error) { rpcId = error.rpcId; } ` +
+      `const unrelated = new Error("script failure"); ` +
+      `unrelated.rpcId = rpcId; ` +
+      `throw unrelated;`,
+    {
+      runAgent: async () => {
+        throw runnerFailure;
+      },
+    },
+  );
+
+  let failure: unknown;
+  try {
+    await running;
+  } catch (error) {
+    failure = error;
+  }
+  const cause = (failure as Error & { cause?: unknown }).cause;
+  expect(cause).not.toBe(runnerFailure);
+  expect(cause).toMatchObject({
+    message: expect.stringContaining("script failure"),
+  });
 });
 
 it("preserves caller abort reason alongside accumulated usage", async () => {

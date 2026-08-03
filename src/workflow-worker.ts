@@ -82,7 +82,6 @@ interface Engine {
 
   usage: WorkflowUsage;
   activeAgentRuns: Set<ActiveAgentRun>;
-  failureCause?: unknown;
   phases: string[];
 }
 
@@ -165,17 +164,10 @@ async function drainActiveAgentRuns(engine: Engine): Promise<void> {
 
 function workflowFailureCause(
   error: unknown,
-  engine: Engine,
   signal: AbortSignal | undefined,
 ): unknown {
   if (signal?.aborted && signal.reason !== undefined) return signal.reason;
-  const candidate = engine.failureCause;
-  if (candidate !== undefined) {
-    const message =
-      candidate instanceof Error ? candidate.message : String(candidate);
-    if (error instanceof Error && error.message.includes(message))
-      return candidate;
-  }
+  if (error instanceof WorkerTerminalFailure) return error.originalCause;
   return error;
 }
 
@@ -229,7 +221,7 @@ export async function runWorkflow(
       phases: [...engine.phases],
     };
   } catch (error) {
-    const cause = workflowFailureCause(error, engine, opts.signal);
+    const cause = workflowFailureCause(error, opts.signal);
     if (!abort.signal.aborted) abort.abort(error);
     await drainActiveAgentRuns(engine);
     if (error instanceof WorkflowExecutionError && error.usage) throw error;
@@ -255,11 +247,27 @@ type WorkerRpcResponse = {
 
 class WorkerRpcFailure extends Error {
   readonly tokensDelta: number;
+  readonly runnerFailure: { cause: unknown } | undefined;
 
-  constructor(error: unknown, tokensDelta: number) {
+  constructor(
+    error: unknown,
+    tokensDelta: number,
+    runnerFailure?: { cause: unknown },
+  ) {
     super(error instanceof Error ? error.message : String(error));
     this.name = "WorkerRpcFailure";
     this.tokensDelta = tokensDelta;
+    this.runnerFailure = runnerFailure;
+  }
+}
+
+class WorkerTerminalFailure extends Error {
+  readonly originalCause: unknown;
+
+  constructor(message: string, originalCause: unknown) {
+    super(message);
+    this.name = "WorkerTerminalFailure";
+    this.originalCause = originalCause;
   }
 }
 
@@ -309,6 +317,7 @@ async function executeScript(
       agentOpts.phase != null ? String(agentOpts.phase) : undefined;
     await sem.acquire();
     let tokensDelta = 0;
+    let runnerFailure: { cause: unknown } | undefined;
     try {
       let lastErr = "";
       const attempts = hasSchema ? SCHEMA_RETRIES : 1;
@@ -386,16 +395,20 @@ async function executeScript(
               res = await agentRun;
               finalModel = res.model ?? agentOpts.model;
             } catch (error) {
+              const errorUsage = (error as { usage?: Usage } | null)?.usage;
+              const terminalAgentUsage = workflowUsageFromUsage(errorUsage);
               const partialUsage =
-                (error as { usage?: Usage })?.usage ??
-                (activeRun.liveUsage
-                  ? usageAsProjectUsage(activeRun.liveUsage)
-                  : undefined);
+                terminalAgentUsage !== undefined
+                  ? errorUsage
+                  : activeRun.liveUsage
+                    ? usageAsProjectUsage(activeRun.liveUsage)
+                    : undefined;
               tokensDelta += partialUsage?.output ?? 0;
-              agentUsage = workflowUsageFromUsage(partialUsage);
+              agentUsage =
+                terminalAgentUsage ?? workflowUsageFromUsage(partialUsage);
               accountAgentUsage(engine, activeRun, partialUsage);
               status = "error";
-              engine.failureCause = error;
+              runnerFailure = { cause: error };
               if (!engine.signal.aborted) engine.counters.errorCount++;
               throw error;
             }
@@ -464,7 +477,7 @@ async function executeScript(
       });
       return { value: null, tokensDelta };
     } catch (error) {
-      throw new WorkerRpcFailure(error, tokensDelta);
+      throw new WorkerRpcFailure(error, tokensDelta, runnerFailure);
     } finally {
       sem.release();
     }
@@ -494,6 +507,7 @@ function runWorkflowWorker(
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const runnerFailures = new Map<number, unknown>();
     const worker = new Worker(
       new URL("./workflow-worker-thread.mjs", import.meta.url),
     );
@@ -532,6 +546,7 @@ function runWorkflowWorker(
     const cleanup = () => {
       clearTimeout(timeout);
       engine.signal.removeEventListener("abort", onAbort);
+      runnerFailures.clear();
       worker.removeAllListeners();
     };
 
@@ -548,7 +563,14 @@ function runWorkflowWorker(
         return;
       }
       if (msg.type === "error") {
-        fail(new Error(String(msg.error ?? "Workflow worker failed.")));
+        const message = String(msg.error ?? "Workflow worker failed.");
+        if (typeof msg.rpcId === "number" && runnerFailures.has(msg.rpcId)) {
+          fail(
+            new WorkerTerminalFailure(message, runnerFailures.get(msg.rpcId)),
+          );
+        } else {
+          fail(new Error(message));
+        }
         return;
       }
       if (msg.type === "progress") {
@@ -562,6 +584,9 @@ function runWorkflowWorker(
         engine,
         runAgentCall,
       ).catch((err) => {
+        if (err instanceof WorkerRpcFailure && err.runnerFailure) {
+          runnerFailures.set(msg.id, err.runnerFailure.cause);
+        }
         const error = err instanceof Error ? err.message : String(err);
         const tokensDelta =
           err instanceof WorkerRpcFailure ? err.tokensDelta : 0;

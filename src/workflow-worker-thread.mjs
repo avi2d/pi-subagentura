@@ -23,6 +23,7 @@ let workerConfig = {
   cwd: "",
 };
 let tokensSpent = 0;
+const rpcErrorIds = new WeakMap();
 
 function rpc(method, payload) {
   if (aborted) return Promise.reject(new Error("Workflow aborted."));
@@ -31,6 +32,11 @@ function rpc(method, payload) {
     pending.set(id, { resolve, reject });
     parentPort.postMessage({ id, method, payload });
   });
+}
+
+function rpcIdFromError(error) {
+  if (error === null || typeof error !== "object") return undefined;
+  return rpcErrorIds.get(error);
 }
 
 parentPort.on("message", (msg) => {
@@ -55,12 +61,14 @@ parentPort.on("message", (msg) => {
     };
     executeScript(msg.script, msg.args, 0)
       .then((value) => parentPort.postMessage({ type: "result", value }))
-      .catch((err) =>
+      .catch((err) => {
+        const rpcId = rpcIdFromError(err);
         parentPort.postMessage({
           type: "error",
           error: err instanceof Error ? err.message : String(err),
-        }),
-      );
+          ...(rpcId === undefined ? {} : { rpcId }),
+        });
+      });
     return;
   }
 
@@ -68,8 +76,13 @@ parentPort.on("message", (msg) => {
     const waiter = pending.get(msg.id);
     pending.delete(msg.id);
     tokensSpent += typeof msg.tokensDelta === "number" ? msg.tokensDelta : 0;
-    if (msg.ok) waiter.resolve(msg.value);
-    else waiter.reject(new Error(String(msg.error || "Workflow RPC failed.")));
+    if (msg.ok) {
+      waiter.resolve(msg.value);
+    } else {
+      const error = new Error(String(msg.error || "Workflow RPC failed."));
+      rpcErrorIds.set(error, msg.id);
+      waiter.reject(error);
+    }
   }
 });
 
@@ -249,7 +262,10 @@ async function executeBody(meta, body, args, depth) {
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Workflow "${meta.name}" failed: ${msg}`);
+    const wrapped = new Error(`Workflow "${meta.name}" failed: ${msg}`);
+    const rpcId = rpcIdFromError(err);
+    if (rpcId !== undefined) rpcErrorIds.set(wrapped, rpcId);
+    throw wrapped;
   }
 }
 
