@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-05
+
+### Added
+
+- Workflow status, results, footers, widgets, trees, and supervisor views now share canonical input, output, cache-read, cache-write, and cost displays, with symbolic and ASCII forms ([#79](https://github.com/lmn451/pi-subagentura/pull/79)).
+- Pricing provenance now distinguishes provider-priced, estimated, unavailable, and mixed usage, rendering `$?` instead of a misleading `$0` when a reliable price is unavailable ([#79](https://github.com/lmn451/pi-subagentura/pull/79)).
+
+### Changed
+
+- Output-token budgets are unchanged and now appear consistently alongside output usage, separate from total and cache usage, including in budget-exhaustion messages ([#81](https://github.com/lmn451/pi-subagentura/issues/81), [#80](https://github.com/lmn451/pi-subagentura/pull/80)).
+
+### Fixed
+
+- Workflow aggregates and per-agent records retain accounting from rejected, retried, cancelled, and terminal attempts, enforce output budgets across every attempt, and preserve meaningful live usage when terminal samples are empty ([#80](https://github.com/lmn451/pi-subagentura/pull/80)).
+- Terminal workflow failures preserve the triggering cause while active children are cancelled and drained, including their latest available usage ([#80](https://github.com/lmn451/pi-subagentura/pull/80)).
+
 ## [3.2.0] - 2026-07-31
 
 ### Fixed
@@ -93,7 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workflow `runningCount` decremented on agent failure; timeout propagates abort to in-flight work.
 - Shared workflow script parsing (`workflow-script.mjs`) used by main thread and worker thread.
 
-[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.3.0...HEAD
+[3.3.0]: https://github.com/lmn451/pi-subagentura/compare/v3.2.0...v3.3.0
+[3.2.0]: https://github.com/lmn451/pi-subagentura/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/lmn451/pi-subagentura/compare/v3.0.3...v3.1.0
 [3.0.3]: https://github.com/lmn451/pi-subagentura/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/lmn451/pi-subagentura/compare/v3.0.1...v3.0.2
