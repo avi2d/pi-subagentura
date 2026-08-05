@@ -41,6 +41,9 @@ import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import {
   addWorkflowUsage,
   formatWorkflowUsage,
+  hasWorkflowUsage,
+  presentWorkflowUsage,
+  type WorkflowUsage,
   zeroWorkflowUsage,
 } from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
@@ -73,8 +76,19 @@ interface WidgetSurfaceState {
   rendered: string[] | undefined;
   painted: boolean;
 }
+interface SubagentFooterContribution {
+  kind: "subagent";
+  count: number;
+}
+interface WorkflowFooterContribution {
+  kind: "workflow";
+  count: number;
+  usage?: WorkflowUsage;
+}
+type FooterContribution =
+  SubagentFooterContribution | WorkflowFooterContribution;
 interface FooterSurfaceState {
-  contributions: Map<string, string>;
+  contributions: Map<string, FooterContribution>;
   rendered: string | undefined;
   painted: boolean;
 }
@@ -132,34 +146,55 @@ function getRunningSubagentCount(
   return inProcessCount + interactiveCount;
 }
 
+function addAggregateWorkflowUsage(
+  total: WorkflowUsage,
+  usage: WorkflowUsage | undefined,
+): WorkflowUsage {
+  if (!usage) return total;
+  return addWorkflowUsage(total, {
+    input: usage.input,
+    output: usage.output,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cost: usage.costUsd,
+    costSource: usage.costSource,
+    turns: usage.turns,
+  });
+}
+
 function mergeFooterContributions(
   key: string,
-  contributions: Iterable<string>,
+  contributions: Iterable<FooterContribution>,
 ): string | undefined {
-  let total = 0;
-  let count = 0;
-  let last: string | undefined;
-  for (const contribution of contributions) {
-    last = contribution;
-    count++;
-    const match = /^⚡ (\d+) /.exec(contribution);
-    if (match) total += Number(match[1]);
-  }
-  if (count === 0) return undefined;
-  if (count === 1 || total === 0) return last;
   if (key === FOOTER_KEY) {
+    let total = 0;
+    for (const contribution of contributions) {
+      if (contribution.kind === "subagent") total += contribution.count;
+    }
+    if (total === 0) return undefined;
     return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} active`;
   }
   if (key === WORKFLOW_FOOTER_KEY) {
-    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running`;
+    let total = 0;
+    let usage = zeroWorkflowUsage();
+    for (const contribution of contributions) {
+      if (contribution.kind !== "workflow") continue;
+      total += contribution.count;
+      usage = addAggregateWorkflowUsage(usage, contribution.usage);
+    }
+    if (total === 0) return undefined;
+    const presentedUsage = hasWorkflowUsage(usage)
+      ? ` · ${formatWorkflowUsage(usage)}`
+      : "";
+    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}`;
   }
-  return last;
+  return undefined;
 }
 
 function updateFooterStatus(
   ui: StatusUi,
   key: string,
-  statusText: string | undefined,
+  contribution: FooterContribution | undefined,
   owner?: SessionOwnerToken,
 ): void {
   let surfaces = footerStatusesByUi.get(ui);
@@ -183,8 +218,8 @@ function updateFooterStatus(
       }
     }
   }
-  if (statusText === undefined) surface.contributions.delete(contributionKey);
-  else surface.contributions.set(contributionKey, statusText);
+  if (contribution === undefined) surface.contributions.delete(contributionKey);
+  else surface.contributions.set(contributionKey, contribution);
   const rendered = mergeFooterContributions(
     key,
     surface.contributions.values(),
@@ -214,11 +249,9 @@ export function updateRunningSubagentFooter(
   const ownerContext = resolveLiveSessionScope(owner);
   const runningCount =
     owner !== undefined && !ownerContext ? 0 : getRunningSubagentCount([owner]);
-  const statusText =
-    runningCount > 0
-      ? `⚡ ${runningCount} sub-agent${runningCount > 1 ? "s" : ""} active`
-      : undefined;
-  updateFooterStatus(ui, FOOTER_KEY, statusText, owner);
+  const contribution: SubagentFooterContribution | undefined =
+    runningCount > 0 ? { kind: "subagent", count: runningCount } : undefined;
+  updateFooterStatus(ui, FOOTER_KEY, contribution, owner);
 }
 
 function widgetRowsEqual(
@@ -569,12 +602,20 @@ async function runPollArtifactChanges(
       try {
         const wfCount = getRunningWorkflowCount(owner);
         const workflowRows = formatWorkflowWidgetRows(owner, now);
-        const workflowUsage = formatWorkflowFooterUsage(owner);
-        const workflowStatus =
+        const workflowContribution: WorkflowFooterContribution | undefined =
           wfCount > 0
-            ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running${workflowUsage}`
+            ? {
+                kind: "workflow",
+                count: wfCount,
+                usage: aggregateWorkflowFooterUsage(owner),
+              }
             : undefined;
-        updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus, owner);
+        updateFooterStatus(
+          ui,
+          WORKFLOW_FOOTER_KEY,
+          workflowContribution,
+          owner,
+        );
         updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows, owner);
       } catch {
         /* ui stale */
@@ -598,13 +639,15 @@ function formatWorkflowWidgetRows(
     if (!workflowJobBelongsToOwner(st, owner)) continue;
     if (st.status !== "running") continue;
     const s = st.snapshot;
+    const usage = presentWorkflowUsage(s.usage);
+    const liveUsage = presentWorkflowUsage(s.liveUsage);
     const parts = [
       `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
       `${s.runningCount ?? 0} running`,
-      ...(s.usage
-        ? [formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal })]
+      ...(usage
+        ? [formatWorkflowUsage(usage, { outputBudget: s.budgetTotal })]
         : []),
-      ...(s.liveUsage ? [`live ${formatWorkflowUsage(s.liveUsage)}`] : []),
+      ...(liveUsage ? [`live ${formatWorkflowUsage(liveUsage)}`] : []),
       formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
@@ -619,35 +662,16 @@ function formatWorkflowWidgetRows(
   return rows;
 }
 
-function formatWorkflowFooterUsage(
+function aggregateWorkflowFooterUsage(
   owner: SessionOwnerToken | undefined,
-): string {
+): WorkflowUsage | undefined {
   let aggregate = zeroWorkflowUsage();
-  let hasUsage = false;
   for (const job of workflowJobRegistry.values()) {
     if (!workflowJobBelongsToOwner(job, owner)) continue;
-    if (job.status !== "running" || !job.snapshot.usage) continue;
-    const usage = job.snapshot.usage;
-    aggregate = addWorkflowUsage(aggregate, {
-      input: usage.input,
-      output: usage.output,
-      cacheRead: usage.cacheRead,
-      cacheWrite: usage.cacheWrite,
-      cost: usage.costUsd,
-      costSource: usage.costSource,
-      turns: usage.turns,
-    });
-    hasUsage = true;
+    if (job.status !== "running") continue;
+    aggregate = addAggregateWorkflowUsage(aggregate, job.snapshot.usage);
   }
-  if (!hasUsage) return "";
-  if (
-    aggregate.totalTokens === 0 &&
-    aggregate.costUsd === 0 &&
-    aggregate.turns === 0
-  ) {
-    return "";
-  }
-  return ` · ${formatWorkflowUsage(aggregate)}`;
+  return hasWorkflowUsage(aggregate) ? aggregate : undefined;
 }
 
 /** Coarse elapsed clock; see ACTIVITY_ELAPSED_BUCKET_MS for why it is bucketed. */

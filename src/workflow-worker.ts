@@ -82,7 +82,6 @@ interface Engine {
 
   usage: WorkflowUsage;
   activeAgentRuns: Set<ActiveAgentRun>;
-  failureCause?: unknown;
   phases: string[];
 }
 
@@ -138,8 +137,10 @@ function accountAgentUsage(
   usage: Usage | undefined,
 ): void {
   if (run.usageAccounted || !usage) return;
-  engine.usage = addWorkflowUsage(engine.usage, usage);
-  engine.counters.tokensSpent += usage.output;
+  const previousOutput = engine.usage.output;
+  const aggregate = addWorkflowUsage(engine.usage, usage);
+  engine.counters.tokensSpent += aggregate.output - previousOutput;
+  engine.usage = aggregate;
   run.usageAccounted = true;
 }
 
@@ -165,17 +166,10 @@ async function drainActiveAgentRuns(engine: Engine): Promise<void> {
 
 function workflowFailureCause(
   error: unknown,
-  engine: Engine,
   signal: AbortSignal | undefined,
 ): unknown {
   if (signal?.aborted && signal.reason !== undefined) return signal.reason;
-  const candidate = engine.failureCause;
-  if (candidate !== undefined) {
-    const message =
-      candidate instanceof Error ? candidate.message : String(candidate);
-    if (error instanceof Error && error.message.includes(message))
-      return candidate;
-  }
+  if (error instanceof WorkerTerminalFailure) return error.originalCause;
   return error;
 }
 
@@ -229,13 +223,15 @@ export async function runWorkflow(
       phases: [...engine.phases],
     };
   } catch (error) {
-    if (abort.signal.aborted) await drainActiveAgentRuns(engine);
+    const cause = workflowFailureCause(error, opts.signal);
+    if (!abort.signal.aborted) abort.abort(error);
+    await drainActiveAgentRuns(engine);
     if (error instanceof WorkflowExecutionError && error.usage) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new WorkflowExecutionError(
       message,
       usageIfPresent(engine.usage),
-      workflowFailureCause(error, engine, opts.signal),
+      cause,
     );
   } finally {
     opts.signal?.removeEventListener("abort", forwardAbort);
@@ -248,7 +244,34 @@ type WorkerRpcResponse = {
   ok: boolean;
   value?: unknown;
   error?: string;
+  tokensDelta: number;
 };
+
+class WorkerRpcFailure extends Error {
+  readonly tokensDelta: number;
+  readonly runnerFailure: { cause: unknown } | undefined;
+
+  constructor(
+    error: unknown,
+    tokensDelta: number,
+    runnerFailure?: { cause: unknown },
+  ) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "WorkerRpcFailure";
+    this.tokensDelta = tokensDelta;
+    this.runnerFailure = runnerFailure;
+  }
+}
+
+class WorkerTerminalFailure extends Error {
+  readonly originalCause: unknown;
+
+  constructor(message: string, originalCause: unknown) {
+    super(message);
+    this.name = "WorkerTerminalFailure";
+    this.originalCause = originalCause;
+  }
+}
 
 async function executeScript(
   script: string,
@@ -296,6 +319,7 @@ async function executeScript(
       agentOpts.phase != null ? String(agentOpts.phase) : undefined;
     await sem.acquire();
     let tokensDelta = 0;
+    let runnerFailure: { cause: unknown } | undefined;
     try {
       let lastErr = "";
       const attempts = hasSchema ? SCHEMA_RETRIES : 1;
@@ -373,23 +397,29 @@ async function executeScript(
               res = await agentRun;
               finalModel = res.model ?? agentOpts.model;
             } catch (error) {
+              const errorUsage = (error as { usage?: Usage } | null)?.usage;
+              const terminalAgentUsage = workflowUsageFromUsage(errorUsage);
               const partialUsage =
-                (error as { usage?: Usage })?.usage ??
-                (activeRun.liveUsage
-                  ? usageAsProjectUsage(activeRun.liveUsage)
-                  : undefined);
+                terminalAgentUsage !== undefined
+                  ? errorUsage
+                  : activeRun.liveUsage
+                    ? usageAsProjectUsage(activeRun.liveUsage)
+                    : undefined;
+              agentUsage =
+                terminalAgentUsage ?? workflowUsageFromUsage(partialUsage);
+              tokensDelta += agentUsage?.output ?? 0;
               accountAgentUsage(engine, activeRun, partialUsage);
               status = "error";
-              engine.failureCause = error;
+              runnerFailure = { cause: error };
               if (!engine.signal.aborted) engine.counters.errorCount++;
               throw error;
             }
           } finally {
             engine.activeAgentRuns.delete(activeRun);
           }
-          const outTokens = res.usage?.output ?? 0;
-          tokensDelta += outTokens;
           agentUsage = workflowUsageFromUsage(res.usage);
+          const outTokens = agentUsage?.output ?? 0;
+          tokensDelta += outTokens;
           accountAgentUsage(engine, activeRun, res.usage);
           if (res.isError) {
             status = "error";
@@ -448,6 +478,8 @@ async function executeScript(
         message: `agent(schema) failed after ${attempts} attempts: ${lastErr}`,
       });
       return { value: null, tokensDelta };
+    } catch (error) {
+      throw new WorkerRpcFailure(error, tokensDelta, runnerFailure);
     } finally {
       sem.release();
     }
@@ -477,6 +509,7 @@ function runWorkflowWorker(
 ): Promise<{ meta: WorkflowMeta; result: unknown }> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const runnerFailures = new Map<number, unknown>();
     const worker = new Worker(
       new URL("./workflow-worker-thread.mjs", import.meta.url),
     );
@@ -515,6 +548,7 @@ function runWorkflowWorker(
     const cleanup = () => {
       clearTimeout(timeout);
       engine.signal.removeEventListener("abort", onAbort);
+      runnerFailures.clear();
       worker.removeAllListeners();
     };
 
@@ -531,7 +565,14 @@ function runWorkflowWorker(
         return;
       }
       if (msg.type === "error") {
-        fail(new Error(String(msg.error ?? "Workflow worker failed.")));
+        const message = String(msg.error ?? "Workflow worker failed.");
+        if (typeof msg.rpcId === "number" && runnerFailures.has(msg.rpcId)) {
+          fail(
+            new WorkerTerminalFailure(message, runnerFailures.get(msg.rpcId)),
+          );
+        } else {
+          fail(new Error(message));
+        }
         return;
       }
       if (msg.type === "progress") {
@@ -545,8 +586,18 @@ function runWorkflowWorker(
         engine,
         runAgentCall,
       ).catch((err) => {
+        if (err instanceof WorkerRpcFailure && err.runnerFailure) {
+          runnerFailures.set(msg.id, err.runnerFailure.cause);
+        }
         const error = err instanceof Error ? err.message : String(err);
-        postWorkerResponse(worker, { id: msg.id, ok: false, error });
+        const tokensDelta =
+          err instanceof WorkerRpcFailure ? err.tokensDelta : 0;
+        postWorkerResponse(worker, {
+          id: msg.id,
+          ok: false,
+          error,
+          tokensDelta,
+        });
       });
     });
     worker.on("error", fail);
@@ -577,8 +628,13 @@ async function handleWorkerRpc(
   }) => Promise<{ value: unknown; tokensDelta: number }>,
 ): Promise<void> {
   if (msg.method === "agent") {
-    const value = await runAgentCall(msg.payload);
-    postWorkerResponse(worker, { id: msg.id, ok: true, value });
+    const response = await runAgentCall(msg.payload);
+    postWorkerResponse(worker, {
+      id: msg.id,
+      ok: true,
+      value: response.value,
+      tokensDelta: response.tokensDelta,
+    });
     return;
   }
   if (msg.method === "loadWorkflow") {
@@ -586,7 +642,12 @@ async function handleWorkerRpc(
     if (script == null && typeof msg.payload === "string") {
       throw new Error(`workflow(): no saved workflow named "${msg.payload}".`);
     }
-    postWorkerResponse(worker, { id: msg.id, ok: true, value: script });
+    postWorkerResponse(worker, {
+      id: msg.id,
+      ok: true,
+      value: script,
+      tokensDelta: 0,
+    });
     return;
   }
   throw new Error(`Unknown workflow worker RPC method: ${msg.method}`);
@@ -734,7 +795,6 @@ export async function awaitInteractiveResult(
         isError: true,
         output: "",
         usage: cancellationUsage,
-        model: undefined,
         errorMessage: "aborted",
       };
     }
@@ -751,7 +811,7 @@ export async function awaitInteractiveResult(
                 output:
                   readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
                 usage,
-                model: state.model ?? "process",
+                ...(state.model !== undefined ? { model: state.model } : {}),
               };
             case "error":
             case "cancelled":
@@ -760,7 +820,6 @@ export async function awaitInteractiveResult(
                 output:
                   readOutputForTurnId(art, terminal.turnId) ?? "(no output)",
                 usage,
-                model: undefined,
                 errorMessage:
                   terminal.errorMessage ??
                   terminal.message ??
@@ -774,7 +833,7 @@ export async function awaitInteractiveResult(
             isError: false,
             output: readOutput(art) ?? "(no output)",
             usage,
-            model: state.model ?? "process",
+            ...(state.model !== undefined ? { model: state.model } : {}),
           };
         case "error":
         case "cancelled":
@@ -782,7 +841,6 @@ export async function awaitInteractiveResult(
             isError: true,
             output: readOutput(art) ?? "(no output)",
             usage,
-            model: undefined,
             errorMessage:
               terminal.message ?? `interactive sub-agent ${terminal.type}`,
           };
@@ -809,7 +867,6 @@ export async function awaitInteractiveResult(
           isError: true,
           output,
           usage: parseUsageFromSessionFile(state.sessionFile),
-          model: undefined,
           errorMessage: "interactive sub-agent pane exited before completing",
         };
       }

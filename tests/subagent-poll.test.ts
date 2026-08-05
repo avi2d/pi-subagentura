@@ -322,6 +322,166 @@ describe("pollArtifactChanges", () => {
     expect(footerCalls.at(-1)?.[1]).toBe("⚡ 1 sub-agent active");
   });
 
+  it("aggregates workflow footer contributions across owners sharing one UI", async () => {
+    const mod = await importFresh<typeof import("../src/artifact-poller")>(
+      "../src/artifact-poller",
+    );
+    const { workflowJobRegistry } = await import("../src/workflow");
+    const sharedUi = {
+      notify: vi.fn(),
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+    };
+    const ownerA = { id: 509, generation: 1 };
+    const ownerB = { id: 510, generation: 1 };
+    registerSessionScope({
+      ...ownerA,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: sharedUi as any,
+      sessionManager: { getSessionId: () => "session-a" },
+    });
+    registerSessionScope({
+      ...ownerB,
+      pi: { sendMessage: vi.fn() } as any,
+      ui: sharedUi as any,
+      sessionManager: { getSessionId: () => "session-b" },
+    });
+    workflowJobRegistry.set("workflow-a", {
+      id: "workflow-a",
+      name: "flow-a",
+      status: "running",
+      startedAt: Date.now(),
+      promise: Promise.resolve({}) as any,
+      abort: new AbortController(),
+      parentSessionOwner: ownerA,
+      snapshot: {
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 2,
+        budgetTotal: 20,
+        usage: {
+          input: 4,
+          output: 2,
+          cacheRead: 1,
+          cacheWrite: 0,
+          totalTokens: 7,
+          costUsd: 0.01,
+          turns: 1,
+          costSource: "provider",
+        },
+        phases: [],
+        runningCount: 1,
+      },
+    });
+    workflowJobRegistry.set("workflow-b", {
+      id: "workflow-b",
+      name: "flow-b",
+      status: "running",
+      startedAt: Date.now(),
+      promise: Promise.resolve({}) as any,
+      abort: new AbortController(),
+      parentSessionOwner: ownerB,
+      snapshot: {
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 3,
+        budgetTotal: 30,
+        usage: {
+          input: 6,
+          output: 3,
+          cacheRead: 0,
+          cacheWrite: 2,
+          totalTokens: 11,
+          costUsd: 0.02,
+          turns: 1,
+          costSource: "provider",
+        },
+        phases: [],
+        runningCount: 1,
+      },
+    });
+
+    await mod.pollArtifactChanges({} as any, ownerA);
+    await mod.pollArtifactChanges({} as any, ownerB);
+
+    const workflowFooterCalls = sharedUi.setStatus.mock.calls.filter(
+      ([key]) => key === "subagentura-workflows",
+    );
+    expect(workflowFooterCalls.at(-1)?.[1]).toBe(
+      "⚡ 2 workflows running · ↑10 ↓5 R1 W2 $0.03",
+    );
+
+    mod.clearSessionScopeUiContributions(sharedUi as any, ownerA);
+    removeSessionScope(ownerA.id);
+
+    expect(
+      sharedUi.setStatus.mock.calls
+        .filter(([key]) => key === "subagentura-workflows")
+        .at(-1)?.[1],
+    ).toBe("⚡ 1 workflow running · ↑6 ↓3 R0 W2 $0.02");
+  });
+
+  it("omits provenance-free all-zero workflow usage from the footer", async () => {
+    const mod = await importFresh<typeof import("../src/artifact-poller")>(
+      "../src/artifact-poller",
+    );
+    const { workflowJobRegistry } = await import("../src/workflow");
+    workflowJobRegistry.set("zero-usage", {
+      id: "zero-usage",
+      name: "zero-flow",
+      status: "running",
+      startedAt: Date.now(),
+      promise: Promise.resolve({}) as any,
+      abort: new AbortController(),
+      snapshot: {
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 0,
+        budgetTotal: 99,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          costUsd: 0,
+          turns: 3,
+        },
+        liveUsage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          costUsd: 0,
+          turns: 1,
+        },
+        phases: [],
+        runningCount: 1,
+      },
+    });
+    const setStatus = vi.fn();
+    const setWidget = vi.fn();
+    (globalThis as any).__piSubagenturaUi = {
+      setStatus,
+      setWidget,
+    };
+
+    await mod.pollArtifactChanges({} as any);
+
+    expect(setStatus).toHaveBeenCalledWith(
+      "subagentura-workflows",
+      "⚡ 1 workflow running",
+    );
+    const workflowRows = setWidget.mock.calls
+      .filter(([key]) => key === "subagentura-workflow-activity")
+      .at(-1)?.[1] as string[];
+    expect(workflowRows).toHaveLength(1);
+    expect(workflowRows[0]).not.toContain("↑0");
+    expect(workflowRows[0]).not.toContain("$?");
+    expect(workflowRows[0]).not.toContain("live");
+  });
+
   it("shows workflow children on the owning session's widget and footer", async () => {
     // Workflow children are launched without a parentSessionId, so scoping either
     // surface on (ui identity + parentSessionId) makes them structurally

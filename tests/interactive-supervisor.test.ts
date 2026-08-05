@@ -309,6 +309,78 @@ describe("interactive supervisor", () => {
     );
   });
 
+  it("keeps every workflow total field on its own row at narrow widths", () => {
+    const workflow = workflowJob("wf-budget", {
+      snapshot: {
+        ...workflowJob("snapshot").snapshot,
+        budgetTotal: 20,
+        usage: {
+          input: 11,
+          output: 7,
+          cacheRead: 5,
+          cacheWrite: 3,
+          totalTokens: 26,
+          costUsd: 0.125,
+          turns: 2,
+          costSource: "provider",
+        },
+      },
+    });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        { kind: "workflow", job: workflow, depth: 0, actionable: true },
+      ],
+    });
+    component.handleInput("\r");
+    const lines = component.render(60);
+
+    expect(lines.some((line) => line.includes("input tokens: 11"))).toBe(true);
+    expect(lines.some((line) => line.includes("output tokens: 7/20"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cache-read tokens: 5"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cache-write tokens: 3"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cost: $0.125 (provider)"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("turns: 2"))).toBe(true);
+    expect(lines.every((line) => line.length <= 60)).toBe(true);
+  });
+
+  it("omits empty provenance-free workflow totals", () => {
+    const workflow = workflowJob("wf-empty", {
+      snapshot: {
+        ...workflowJob("snapshot").snapshot,
+        budgetTotal: 20,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          costUsd: 0,
+          turns: 0,
+        },
+      },
+    });
+    const component = new InteractiveSupervisorComponent({
+      done: vi.fn(),
+      items: () => [
+        { kind: "workflow", job: workflow, depth: 0, actionable: true },
+      ],
+    });
+    component.handleInput("\r");
+    const rendered = component.render(80).join("\n");
+
+    expect(rendered).not.toContain("$?");
+    expect(rendered).not.toContain("output tokens: 0/20");
+  });
+
   it("reports omitted workflow agent records", () => {
     const records = Array.from({ length: 25 }, (_, index) => ({
       agentId: index + 1,

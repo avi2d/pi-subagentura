@@ -154,6 +154,74 @@ describe("WorkflowTreeComponent", () => {
     expect(expanded).toContain("Legend: ↑ input");
   });
 
+  it("keeps every aggregate field on its own row at narrow widths", () => {
+    workflowJobRegistry.set(
+      "wf_test",
+      makeJob({
+        snapshot: {
+          ...makeJob().snapshot,
+          budgetTotal: 20,
+          usage: {
+            input: 11,
+            output: 7,
+            cacheRead: 5,
+            cacheWrite: 3,
+            totalTokens: 26,
+            costUsd: 0.125,
+            turns: 2,
+            costSource: "provider",
+          },
+        },
+      }),
+    );
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+    component.handleInput("\r");
+    const lines = component.render(60);
+
+    expect(lines.some((line) => line.includes("input tokens: 11"))).toBe(true);
+    expect(lines.some((line) => line.includes("output tokens: 7/20"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cache-read tokens: 5"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cache-write tokens: 3"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("cost: $0.125 (provider)"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("turns: 2"))).toBe(true);
+    expect(lines.every((line) => line.length <= 60)).toBe(true);
+  });
+
+  it("omits empty provenance-free workflow totals", () => {
+    workflowJobRegistry.set(
+      "wf_test",
+      makeJob({
+        snapshot: {
+          ...makeJob().snapshot,
+          budgetTotal: 20,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            costUsd: 0,
+            turns: 0,
+          },
+        },
+      }),
+    );
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+    component.handleInput("\r");
+    const rendered = component.render(100).join("\n");
+
+    expect(rendered).not.toContain("$?");
+    expect(rendered).not.toContain("output tokens: 0/20");
+  });
+
   it("handles legacy snapshots without agent records", () => {
     const job = makeJob();
     delete job.snapshot.agentRecords;

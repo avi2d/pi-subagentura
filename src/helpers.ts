@@ -129,7 +129,31 @@ export interface Usage {
 }
 
 function usageNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : 0;
+}
+
+export function normalizeUsage(usage: Usage | undefined): Usage | undefined {
+  if (!usage) return undefined;
+  const input = usageNumber(usage.input);
+  const output = usageNumber(usage.output);
+  const cacheRead = usageNumber(usage.cacheRead);
+  const cacheWrite = usageNumber(usage.cacheWrite);
+  const cost = usageNumber(usage.cost);
+  const hasAccounting =
+    input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0 || cost > 0;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    cost,
+    ...(hasAccounting && usage.costSource
+      ? { costSource: usage.costSource }
+      : {}),
+    turns: usageNumber(usage.turns),
+  };
 }
 
 type AssistantCostSource = Exclude<NonNullable<Usage["costSource"]>, "mixed">;
@@ -190,13 +214,11 @@ export function usageFromAssistantMessage(
     rawCostSource === "unavailable"
       ? rawCostSource
       : undefined;
-  const costSource =
-    explicitSource ??
-    (cost > 0
-      ? "estimated"
-      : input + output + cacheRead + cacheWrite > 0
-        ? "unavailable"
-        : undefined);
+  const hasAccounting =
+    input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0 || cost > 0;
+  const costSource = hasAccounting
+    ? (explicitSource ?? (cost > 0 ? "estimated" : "unavailable"))
+    : undefined;
   return {
     input,
     output,
@@ -962,9 +984,11 @@ export async function startSubagentJob(
   }
 
   let completedLiveUsage = zeroUsageShape();
+  let observedUsageEvent = false;
   const updateLiveUsageFromMessage = (message: unknown): void => {
     const currentTurnUsage = usageFromAssistantMessage(message);
     if (!currentTurnUsage) return;
+    observedUsageEvent = true;
     liveStatus.usage = addUsageSamples(completedLiveUsage, currentTurnUsage);
   };
 
@@ -1106,10 +1130,12 @@ export async function startSubagentJob(
     errorMessage: "No subagent result captured.",
   };
   const currentSessionUsage = (): Usage =>
-    usageFromAssistantMessages(
-      session.agent.state.messages as readonly unknown[],
-      liveStatus.usage,
-    );
+    observedUsageEvent
+      ? { ...liveStatus.usage }
+      : usageFromAssistantMessages(
+          session.agent.state.messages as readonly unknown[],
+          liveStatus.usage,
+        );
   const jobPromise = (async (): Promise<SubagentResult> => {
     try {
       await startGate;

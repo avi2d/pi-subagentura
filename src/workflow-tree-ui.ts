@@ -7,7 +7,9 @@ import {
 } from "./workflow-jobs";
 import {
   formatWorkflowUsage,
+  formatWorkflowUsageFields,
   formatWorkflowUsageLegend,
+  presentWorkflowUsage,
 } from "./workflow-core";
 import type { SessionOwnerToken } from "./session-scope";
 
@@ -217,8 +219,9 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
     `${s.runningCount ?? 0} running`,
   ];
   if (errorCount > 0) parts.push(`${errorCount} errors`);
-  if (s.usage) {
-    parts.push(formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal }));
+  const usage = presentWorkflowUsage(s.usage);
+  if (usage) {
+    parts.push(formatWorkflowUsage(usage, { outputBudget: s.budgetTotal }));
   }
   if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
   return parts.join(" · ");
@@ -226,13 +229,18 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
 
 function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
   const rows: WorkflowRow[] = [];
-  if (job.snapshot.usage) {
-    rows.push({
-      job,
-      depth: 1,
-      selectable: false,
-      text: formatWorkflowUsage(job.snapshot.usage, { expanded: true }),
-    });
+  const usage = presentWorkflowUsage(job.snapshot.usage);
+  if (usage) {
+    for (const field of formatWorkflowUsageFields(usage, {
+      outputBudget: job.snapshot.budgetTotal,
+    })) {
+      rows.push({
+        job,
+        depth: 1,
+        selectable: false,
+        text: field,
+      });
+    }
     rows.push({
       job,
       depth: 1,
@@ -273,13 +281,14 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
     const label = `${record.label ?? "agent"} #${record.agentId}`;
     const model = record.model ? ` @${record.model}` : "";
     const phase = record.phase ? ` (${record.phase})` : "";
+    const recordUsage = presentWorkflowUsage(record.usage);
     rows.push({
       job,
       depth: 1,
       selectable: false,
       text: `${marker} ${record.status} ${label}${model}${phase}${
-        record.usage
-          ? ` — ${formatWorkflowUsage(record.usage, { ascii: true })}`
+        recordUsage
+          ? ` — ${formatWorkflowUsage(recordUsage, { ascii: true })}`
           : ""
       }`,
     });
