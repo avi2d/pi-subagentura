@@ -118,6 +118,42 @@ describe("WorkflowTreeComponent", () => {
     expect(expanded).toContain("✗ error worker #2 @m-2");
   });
 
+  it("shows aggregate and per-agent usage attribution in expanded details", () => {
+    const usage = {
+      input: 11,
+      output: 7,
+      cacheRead: 5,
+      cacheWrite: 3,
+      totalTokens: 26,
+      costUsd: 0.125,
+      turns: 2,
+    };
+    workflowJobRegistry.set(
+      "wf_test",
+      makeJob({
+        snapshot: {
+          ...makeJob().snapshot,
+          usage,
+          agentRecords: [
+            {
+              agentId: 1,
+              label: "worker",
+              model: "m-1",
+              status: "done",
+              usage,
+            },
+          ],
+        },
+      }),
+    );
+    const component = new WorkflowTreeComponent({ done: vi.fn() });
+    component.handleInput("\r");
+    const expanded = component.render(240).join("\n");
+    expect(expanded).toContain("↑ input tokens: 11");
+    expect(expanded).toContain("input=11 output=7");
+    expect(expanded).toContain("Legend: ↑ input");
+  });
+
   it("handles legacy snapshots without agent records", () => {
     const job = makeJob();
     delete job.snapshot.agentRecords;

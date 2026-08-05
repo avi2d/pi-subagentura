@@ -238,7 +238,8 @@ Notable dependency facts:
 It registers `subagent_with_context`, `subagent_isolated`, `get_subagent_status`, `get_subagent_result`, `cancel_subagent`, `list_available_models`, `prune_subagent_jobs`, and artifact cleanup.
 
 `src/helpers.ts:startSubagentJob` is the execution kernel.
-It resolves Pi runtime compatibility, creates an in-memory `SessionManager` and `AgentSession`, subscribes to Pi events, builds the prompt, aggregates usage, and disposes the session.
+It resolves Pi runtime compatibility, creates an in-memory `SessionManager` and `AgentSession`, subscribes to Pi events, builds the prompt, maintains cumulative live usage across assistant turns, aggregates final usage, and disposes the session.
+A live sample combines completed turns with the current partial assistant message exactly once; the latest turn alone is never presented as the agent total.
 
 `src/orchestration-context.ts` carries nested `jobId`, depth, and root-session identity through `AsyncLocalStorage`.
 `src/session-scope.ts` supplies parent session scopes, ownership tokens, and generation fences.
@@ -794,8 +795,8 @@ Only structured-cloneable messages cross this boundary.
 Default isolation is `process`.
 The workflow host calls `launchInteractiveSubagent` in the parent process; the Worker itself does not launch tmux.
 `awaitInteractiveResult` then waits on artifact events for that one delegated turn, reads the selected immutable output or fallback output, and aggregates usage from the child session JSONL.
-It probes pane liveness with a bounded dead-pane grace.
-On abort it calls interactive cancellation and records any snapshot receipt.
+Its poll wait wakes immediately on abort, so cancellation can kill the pane and parse already-persisted session usage without waiting for the normal one-second interval.
+It probes pane liveness with a bounded dead-pane grace and returns parsed partial usage on cancellation or premature pane exit.
 If process launch fails, the adapter warns and falls back to in-process execution.
 
 Explicit `isolation: "in-process"` calls `startSubagentJob`, starts the gated session, and awaits its promise directly.
@@ -846,10 +847,23 @@ At capacity, only an eligible terminal job belonging to the requesting owner may
 `get_workflow_status` is nonblocking.
 `get_workflow_result` can wait on the existing promise; caller abort cancels only the wait.
 `cancel_workflow` aborts the job, normalizes state immediately, briefly waits for active runner cancellation receipts, posts worker abort, and terminates the worker.
+When execution rejects, `WorkflowExecutionError.usage` is copied into the job snapshot before cancellation normalization and completion callbacks, so status, result, notification, and tree consumers observe the same terminal accounting.
 
 On completion, `notifyWorkflowCompletion` sends `workflow-notify` as a Pi follow-up with `triggerTurn: true`.
 It sends a bounded summary and job pointer, not the potentially large result.
 Delivery is owner-fenced, guarded against reentrancy, retried a bounded number of times, and suppressed by owner cleanup.
+
+### 9.7 Usage accounting, pricing provenance, and live projection
+
+Usage tracks input, output, cache-read, cache-write, cost, and turns. The compatibility field `tokensSpent` and the workflow `budget` remain completed output-token values; the budget is a soft target that parallel agents may overshoot, never a USD limit.
+
+Pi SDK assistant-message `usage.cost` is calculated locally from model rates, so its object shape is not provider-billing evidence. Without explicit provenance, a positive calculated cost is `estimated`, zero cost with nonzero usage is `unavailable`, and an all-zero sample has no provenance. Explicit `provider`, `estimated`, or `unavailable` sources are retained; differing sources aggregate to `mixed`.
+
+Canonical displays render provider cost as `$`, estimates as `~$`, unavailable cost as `$?`, and mixed provenance as `$? (mixed)`. The same formatter feeds workflow progress, status, results, notifications, footer/widget rows, tree details, and supervisor details.
+
+Each runner attempt is accounted at most once, including returned errors, schema retries, thrown errors carrying usage, and bounded cancellation drains. Process cancellation uses the abort-responsive artifact wait; in-process cancellation aggregates the child session messages.
+
+Background jobs retain live samples by agent ID and aggregate only still-running agents that have reported a sample, so one parallel completion cannot erase another agent's sample. Terminal settlement clears live usage, while final agent records prefer the runner-reported model and fall back to the requested model.
 
 ---
 
@@ -901,19 +915,21 @@ Delivery is owner-fenced, guarded against reentrancy, retried a bounded number o
 
 ### 11.2 Authority table
 
-| Question                                        | Authoritative source                                                  | Explicit non-authorities                                    |
-| ----------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Is an in-process job running?                   | `JobState` in `jobRegistry` plus its signal/session                   | Interactive artifacts, UI footer                            |
-| What did a sync in-process job return?          | Direct settled `SubagentResult`                                       | Notification queue                                          |
-| Has an interactive turn completed?              | Completion record in physical `events.ndjson` order                   | Timestamp order, pane death, screen text, `output.md` alone |
-| What exact v2 bytes completed?                  | Contained regular immutable snapshot matching path, size, and SHA-256 | Mutable staging file, mux capture                           |
-| Is an interactive process alive?                | Recorded mux backend's liveness probe                                 | Last event timestamp                                        |
-| Was a parent delivery committed?                | Matching parent session custom entry with `details.deliveryIds`       | Successful `sendMessage` return, UI toast                   |
-| Where does artifact polling resume?             | Persisted physical byte cursor and partial-line replay boundary       | Event timestamp                                             |
-| Who owns a state?                               | Exact parent session ID plus live scope generation                    | Current top UI alone                                        |
-| What is interactive descendant topology?        | Validated lineage manifests                                           | Artifact event parent guesses                               |
-| What is a workflow job result?                  | Settled `WorkflowJobState` promise/result                             | Worker progress log, notification summary                   |
-| What usage did process workflow runner consume? | Aggregated assistant usage in child session JSONL                     | Artifact output byte size                                   |
+| Question                                        | Authoritative source                                                                               | Explicit non-authorities                                    |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Is an in-process job running?                   | `JobState` in `jobRegistry` plus its signal/session                                                | Interactive artifacts, UI footer                            |
+| What did a sync in-process job return?          | Direct settled `SubagentResult`                                                                    | Notification queue                                          |
+| Has an interactive turn completed?              | Completion record in physical `events.ndjson` order                                                | Timestamp order, pane death, screen text, `output.md` alone |
+| What exact v2 bytes completed?                  | Contained regular immutable snapshot matching path, size, and SHA-256                              | Mutable staging file, mux capture                           |
+| Is an interactive process alive?                | Recorded mux backend's liveness probe                                                              | Last event timestamp                                        |
+| Was a parent delivery committed?                | Matching parent session custom entry with `details.deliveryIds`                                    | Successful `sendMessage` return, UI toast                   |
+| Where does artifact polling resume?             | Persisted physical byte cursor and partial-line replay boundary                                    | Event timestamp                                             |
+| Who owns a state?                               | Exact parent session ID plus live scope generation                                                 | Current top UI alone                                        |
+| What is interactive descendant topology?        | Validated lineage manifests                                                                        | Artifact event parent guesses                               |
+| What is a workflow job result?                  | Settled `WorkflowJobState` promise/result                                                          | Worker progress log, notification summary                   |
+| What usage did process workflow runner consume? | Aggregated assistant usage in child session JSONL                                                  | Artifact output byte size                                   |
+| What does a workflow cost value mean?           | Numeric usage plus explicit `costSource`; Pi SDK-derived cost defaults to an estimate              | Object-shaped SDK cost, `$0` as proof of free pricing       |
+| What usage does a failed background job expose? | `WorkflowExecutionError.usage` mirrored into `WorkflowJobState.snapshot` before terminal consumers | Stale progress or the last live agent sample                |
 
 ---
 
@@ -1079,6 +1095,11 @@ The restrictive exports map matters: shipping all source files in `package.json#
 - [ ] Process and in-process runners use separate semaphores.
 - [ ] Schema retries consume the lifetime attempt cap and aggregate usage.
 - [ ] Process runner completion comes from artifact events; usage comes from child session JSONL.
+- [ ] Pi SDK cost object shape never implies provider-reported billing.
+- [ ] Output budget and `tokensSpent` remain completed output-token values, not USD.
+- [ ] Live usage is cumulative per agent and aggregates every still-running agent that has reported a live sample.
+- [ ] Cancellation/error usage reaches the terminal background snapshot before completion delivery.
+- [ ] Final per-agent model attribution prefers the runner result and falls back to the request.
 - [ ] Background workflow notification carries a pointer; explicit result retrieval returns the retained value.
 - [ ] Workflow state is never claimed to survive process restart.
 - [ ] Nested saved workflow execution reuses the same Worker and shared budgets.

@@ -38,7 +38,11 @@ import { shouldNotify } from "./notifications";
 import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
-import { formatWorkflowUsage } from "./workflow-core";
+import {
+  addWorkflowUsage,
+  formatWorkflowUsage,
+  zeroWorkflowUsage,
+} from "./workflow-core";
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import ndjson from "ndjson";
@@ -565,9 +569,10 @@ async function runPollArtifactChanges(
       try {
         const wfCount = getRunningWorkflowCount(owner);
         const workflowRows = formatWorkflowWidgetRows(owner, now);
+        const workflowUsage = formatWorkflowFooterUsage(owner);
         const workflowStatus =
           wfCount > 0
-            ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running`
+            ? `⚡ ${wfCount} workflow${wfCount > 1 ? "s" : ""} running${workflowUsage}`
             : undefined;
         updateFooterStatus(ui, WORKFLOW_FOOTER_KEY, workflowStatus, owner);
         updateWidgetRows(ui, WORKFLOW_WIDGET_KEY, workflowRows, owner);
@@ -596,8 +601,10 @@ function formatWorkflowWidgetRows(
     const parts = [
       `${s.agentsSpawned} agent${s.agentsSpawned === 1 ? "" : "s"}`,
       `${s.runningCount ?? 0} running`,
-      `${s.tokensSpent} output tokens`,
-      ...(s.usage ? [formatWorkflowUsage(s.usage)] : []),
+      ...(s.usage
+        ? [formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal })]
+        : []),
+      ...(s.liveUsage ? [`live ${formatWorkflowUsage(s.liveUsage)}`] : []),
       formatWorkflowElapsed(now - st.startedAt),
     ];
     if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
@@ -610,6 +617,37 @@ function formatWorkflowWidgetRows(
     rows.push(`… and ${extra} more workflow${extra === 1 ? "" : "s"}`);
   }
   return rows;
+}
+
+function formatWorkflowFooterUsage(
+  owner: SessionOwnerToken | undefined,
+): string {
+  let aggregate = zeroWorkflowUsage();
+  let hasUsage = false;
+  for (const job of workflowJobRegistry.values()) {
+    if (!workflowJobBelongsToOwner(job, owner)) continue;
+    if (job.status !== "running" || !job.snapshot.usage) continue;
+    const usage = job.snapshot.usage;
+    aggregate = addWorkflowUsage(aggregate, {
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      cost: usage.costUsd,
+      costSource: usage.costSource,
+      turns: usage.turns,
+    });
+    hasUsage = true;
+  }
+  if (!hasUsage) return "";
+  if (
+    aggregate.totalTokens === 0 &&
+    aggregate.costUsd === 0 &&
+    aggregate.turns === 0
+  ) {
+    return "";
+  }
+  return ` · ${formatWorkflowUsage(aggregate)}`;
 }
 
 /** Coarse elapsed clock; see ACTIVITY_ELAPSED_BUCKET_MS for why it is bucketed. */

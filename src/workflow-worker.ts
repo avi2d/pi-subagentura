@@ -10,7 +10,7 @@ import {
   type SubagentEvent,
   type TurnTerminalEvent,
 } from "./artifact";
-import { debugLog } from "./helpers";
+import { debugLog, usageFromAssistantMessages } from "./helpers";
 import type { SubagentResult, Usage } from "./helpers";
 import {
   INTERACTIVE_DEAD_GRACE_TICKS,
@@ -38,6 +38,7 @@ import {
   WorkflowExecutionError,
   type WorkflowUsage,
   addWorkflowUsage,
+  workflowUsageFromUsage,
   zeroUsage,
   zeroWorkflowUsage,
 } from "./workflow-core";
@@ -50,6 +51,12 @@ import {
 import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 
 // ── Engine (shared across nested workflows) ──────────────────────────
+
+interface ActiveAgentRun {
+  promise: Promise<SubagentResult>;
+  liveUsage?: WorkflowUsage;
+  usageAccounted: boolean;
+}
 
 interface Engine {
   runAgent: WorkflowAgentRunner;
@@ -67,13 +74,14 @@ interface Engine {
   counters: {
     agentsSpawned: number;
     errorCount: number;
-    /** @deprecated Output-token count; use usage.totalTokens. */
+    /** @deprecated Output-token count; use usage.output. */
     tokensSpent: number;
     runningCount: number;
   };
   nextAgentAttemptId: number;
 
   usage: WorkflowUsage;
+  activeAgentRuns: Set<ActiveAgentRun>;
   failureCause?: unknown;
   phases: string[];
 }
@@ -82,23 +90,77 @@ function withProgressCounters(
   progress: WorkflowProgressUpdate,
   counters: Engine["counters"],
   usage: WorkflowUsage,
+  budgetTotal: number | null,
 ): WorkflowProgress {
   switch (progress.kind) {
     case "phase":
     case "log":
     case "agent_start":
     case "agent_done":
-      return { ...progress, ...counters, usage: { ...usage } };
+      return {
+        ...progress,
+        ...counters,
+        budgetTotal,
+        usage: { ...usage },
+      };
     default:
       return assertNever(progress);
   }
 }
 
 function usageIfPresent(usage: WorkflowUsage): WorkflowUsage | undefined {
-  if (usage.totalTokens === 0 && usage.costUsd === 0 && usage.turns === 0) {
+  if (
+    usage.totalTokens === 0 &&
+    usage.costUsd === 0 &&
+    usage.turns === 0 &&
+    usage.costSource === undefined
+  ) {
     return undefined;
   }
   return { ...usage };
+}
+
+function usageAsProjectUsage(usage: WorkflowUsage): Usage {
+  return {
+    input: usage.input,
+    output: usage.output,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cost: usage.costUsd,
+    ...(usage.costSource ? { costSource: usage.costSource } : {}),
+    turns: usage.turns,
+  };
+}
+
+function accountAgentUsage(
+  engine: Engine,
+  run: ActiveAgentRun,
+  usage: Usage | undefined,
+): void {
+  if (run.usageAccounted || !usage) return;
+  engine.usage = addWorkflowUsage(engine.usage, usage);
+  engine.counters.tokensSpent += usage.output;
+  run.usageAccounted = true;
+}
+
+function captureActiveAgentUsage(engine: Engine): void {
+  for (const run of engine.activeAgentRuns) {
+    accountAgentUsage(
+      engine,
+      run,
+      run.liveUsage ? usageAsProjectUsage(run.liveUsage) : undefined,
+    );
+  }
+}
+
+async function drainActiveAgentRuns(engine: Engine): Promise<void> {
+  const pending = [...engine.activeAgentRuns].map((run) => run.promise);
+  if (pending.length === 0) return;
+  await Promise.race([
+    Promise.allSettled(pending),
+    new Promise<void>((resolve) => setTimeout(resolve, 250)),
+  ]);
+  captureActiveAgentUsage(engine);
 }
 
 function workflowFailureCause(
@@ -151,6 +213,7 @@ export async function runWorkflow(
     nextAgentAttemptId: 0,
 
     usage: zeroWorkflowUsage(),
+    activeAgentRuns: new Set(),
     workflowTimeoutMs: opts.workflowTimeoutMs ?? WORKFLOW_WALL_TIMEOUT_MS,
     phases: [],
   };
@@ -166,6 +229,7 @@ export async function runWorkflow(
       phases: [...engine.phases],
     };
   } catch (error) {
+    if (abort.signal.aborted) await drainActiveAgentRuns(engine);
     if (error instanceof WorkflowExecutionError && error.usage) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new WorkflowExecutionError(
@@ -197,7 +261,14 @@ async function executeScript(
     if (p.kind === "phase" && p.phase) {
       engine.phases.push(p.phase);
     }
-    engine.onProgress?.(withProgressCounters(p, engine.counters, engine.usage));
+    engine.onProgress?.(
+      withProgressCounters(
+        p,
+        engine.counters,
+        engine.usage,
+        engine.budgetTotal,
+      ),
+    );
   };
   const runAgentCall = async (payload: {
     prompt: unknown;
@@ -239,6 +310,8 @@ async function executeScript(
         const agentId = ++engine.nextAgentAttemptId;
         engine.counters.runningCount++;
         let status: "done" | "error" = "done";
+        let agentUsage: WorkflowUsage | undefined;
+        let finalModel = agentOpts.model;
         try {
           emit({
             kind: "agent_start",
@@ -258,8 +331,12 @@ async function executeScript(
               : buildInProcessSchemaPrompt(prompt, attempt, lastErr)
             : prompt;
           let res: SubagentResult;
-          try {
-            res = await engine.runAgent({
+          const activeRun: ActiveAgentRun = {
+            promise: undefined as unknown as Promise<SubagentResult>,
+            usageAccounted: false,
+          };
+          const agentRun = Promise.resolve().then(() =>
+            engine.runAgent({
               prompt: finalPrompt,
               persona: agentOpts.persona,
               model: agentOpts.model,
@@ -270,6 +347,7 @@ async function executeScript(
               onCancellationSnapshot: engine.onCancellationSnapshot,
               thinkingLevel: agentOpts.thinkingLevel,
               onProgress: (ev) => {
+                if (ev.liveUsage) activeRun.liveUsage = { ...ev.liveUsage };
                 if (ev.kind === "phase") {
                   if (ev.phase) {
                     emit({
@@ -286,17 +364,33 @@ async function executeScript(
                   agentId,
                 });
               },
-            });
-          } catch (error) {
-            status = "error";
-            engine.failureCause = error;
-            if (!engine.signal.aborted) engine.counters.errorCount++;
-            throw error;
+            }),
+          );
+          activeRun.promise = agentRun;
+          engine.activeAgentRuns.add(activeRun);
+          try {
+            try {
+              res = await agentRun;
+              finalModel = res.model ?? agentOpts.model;
+            } catch (error) {
+              const partialUsage =
+                (error as { usage?: Usage })?.usage ??
+                (activeRun.liveUsage
+                  ? usageAsProjectUsage(activeRun.liveUsage)
+                  : undefined);
+              accountAgentUsage(engine, activeRun, partialUsage);
+              status = "error";
+              engine.failureCause = error;
+              if (!engine.signal.aborted) engine.counters.errorCount++;
+              throw error;
+            }
+          } finally {
+            engine.activeAgentRuns.delete(activeRun);
           }
           const outTokens = res.usage?.output ?? 0;
           tokensDelta += outTokens;
-          engine.usage = addWorkflowUsage(engine.usage, res.usage);
-          engine.counters.tokensSpent += outTokens;
+          agentUsage = workflowUsageFromUsage(res.usage);
+          accountAgentUsage(engine, activeRun, res.usage);
           if (res.isError) {
             status = "error";
             engine.counters.errorCount++;
@@ -341,9 +435,10 @@ async function executeScript(
             kind: "agent_done",
             label: agentOpts.label,
             phase: resolvedPhase,
-            model: agentOpts.model,
+            model: finalModel,
             status,
             agentId,
+            agentUsage,
           });
         }
       }
@@ -563,26 +658,18 @@ function parseUsageFromSessionFile(sessionFile: string | undefined): Usage {
   try {
     if (!sessionFile || !existsSync(sessionFile)) return zeroUsage();
     const raw = readFileSync(sessionFile, "utf8");
-    const lines = raw.split("\n").filter((l) => l.trim());
-    const usage: Usage = { ...zeroUsage() };
-    for (const line of lines) {
+    const messages: unknown[] = [];
+    for (const line of raw.split("\n").filter((l) => l.trim())) {
       try {
         const entry = JSON.parse(line);
-        if (entry?.type !== "message") continue;
-        const msg = entry.message;
-        if (msg?.role !== "assistant" || !msg?.usage) continue;
-        const u = msg.usage;
-        usage.turns++;
-        usage.input += u.input ?? 0;
-        usage.output += u.output ?? 0;
-        usage.cacheRead += u.cacheRead ?? 0;
-        usage.cacheWrite += u.cacheWrite ?? 0;
-        if (u.cost?.total != null) usage.cost += u.cost.total;
+        if (entry?.type === "message" && entry.message) {
+          messages.push(entry.message);
+        }
       } catch {
         /* skip malformed lines */
       }
     }
-    return usage;
+    return usageFromAssistantMessages(messages, zeroUsage());
   } catch {
     return zeroUsage();
   }
@@ -642,10 +729,11 @@ export async function awaitInteractiveResult(
       } catch {
         /* best effort */
       }
+      const cancellationUsage = parseUsageFromSessionFile(state.sessionFile);
       return {
         isError: true,
         output: "",
-        usage: zeroUsage(),
+        usage: cancellationUsage,
         model: undefined,
         errorMessage: "aborted",
       };
@@ -720,7 +808,7 @@ export async function awaitInteractiveResult(
         return {
           isError: true,
           output,
-          usage: zeroUsage(),
+          usage: parseUsageFromSessionFile(state.sessionFile),
           model: undefined,
           errorMessage: "interactive sub-agent pane exited before completing",
         };
@@ -728,6 +816,18 @@ export async function awaitInteractiveResult(
     } else {
       deadTicks = 0;
     }
-    await new Promise((r) => setTimeout(r, pollMs));
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, pollMs);
+      signal?.addEventListener("abort", finish, { once: true });
+      if (signal?.aborted) finish();
+    });
   }
 }

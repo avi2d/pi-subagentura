@@ -9,6 +9,9 @@ import {
   deleteWorkflowScript,
   extractJson,
   formatWorkflowUsage,
+  formatWorkflowUsageLegend,
+  addWorkflowUsage,
+  workflowUsageFromUsage,
   getWorkflowCompletionPresentation,
   listSavedWorkflows,
   loadWorkflowScript,
@@ -29,7 +32,10 @@ import {
   workflowJobRegistry,
 } from "../src/workflow";
 import { withOrchestrationContext } from "../src/orchestration-context";
-import type { SubagentResult } from "../src/helpers";
+import {
+  usageFromAssistantMessages,
+  type SubagentResult,
+} from "../src/helpers";
 import {
   appendCompletionEvent,
   appendEvent,
@@ -1011,6 +1017,145 @@ describe("background workflow jobs", () => {
     ).toBe(true);
   });
 
+  it("keeps parallel live usage owned by every still-running agent", async () => {
+    const firstUsage: WorkflowUsage = {
+      input: 1,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3,
+      costUsd: 0.01,
+      turns: 1,
+      costSource: "provider",
+    };
+    const secondUsage: WorkflowUsage = {
+      input: 10,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 30,
+      costUsd: 0.2,
+      turns: 2,
+      costSource: "estimated",
+    };
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const secondGate = new Promise<void>(
+      (resolve) => (releaseSecond = resolve),
+    );
+    let started = 0;
+    let bothStarted!: () => void;
+    const bothStartedPromise = new Promise<void>(
+      (resolve) => (bothStarted = resolve),
+    );
+    const runAgent: WorkflowAgentRunner = async ({ prompt, onProgress }) => {
+      const sample = prompt === "first" ? firstUsage : secondUsage;
+      onProgress?.({ kind: "log", message: "usage", liveUsage: sample });
+      started++;
+      if (started === 2) bothStarted();
+      await (prompt === "first" ? firstGate : secondGate);
+      return {
+        isError: false,
+        output: prompt,
+        usage: {
+          input: sample.input,
+          output: sample.output,
+          cacheRead: sample.cacheRead,
+          cacheWrite: sample.cacheWrite,
+          cost: sample.costUsd,
+          costSource:
+            sample.costSource === "provider" ? "provider" : "estimated",
+          turns: sample.turns,
+        },
+        model: `runner/${prompt}`,
+      };
+    };
+    const script =
+      `export const meta = { name: "parallel-live", description: "d" };\n` +
+      `return await parallel([` +
+      `() => agent("first", { label: "first", isolation: "in-process" }),` +
+      `() => agent("second", { label: "second", isolation: "in-process" })]);`;
+    const job = startWorkflowJob("parallel-live", script, { runAgent });
+
+    await bothStartedPromise;
+    await vi.waitFor(() =>
+      expect(job.snapshot.liveUsage).toEqual({
+        input: 11,
+        output: 22,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 33,
+        costUsd: 0.21000000000000002,
+        turns: 3,
+        costSource: "mixed",
+      }),
+    );
+
+    releaseFirst();
+    await vi.waitFor(() => {
+      expect(
+        job.snapshot.agentRecords?.find((record) => record.label === "first")
+          ?.status,
+      ).toBe("done");
+      expect(
+        job.snapshot.agentRecords?.find((record) => record.label === "second")
+          ?.status,
+      ).toBe("running");
+    });
+    expect(job.snapshot.liveUsage).toEqual(secondUsage);
+
+    releaseSecond();
+    await job.promise;
+    expect(job.snapshot.liveUsage).toBeUndefined();
+    expect(job.snapshot.usage?.costSource).toBe("mixed");
+  });
+
+  it("attributes a completed agent to the runner-reported model", async () => {
+    const progress: WorkflowProgress[] = [];
+    const job = startWorkflowJob(
+      "runner-model",
+      `export const meta = { name: "runner-model", description: "d" };\n` +
+        `return await agent("model", { model: "requested/model" });`,
+      {
+        runAgent: async () => {
+          const result = ok("done");
+          if (result.isError)
+            throw new Error("expected successful test result");
+          return { ...result, model: "runner/reported-model" };
+        },
+        onProgress: (event) => progress.push(event),
+      },
+    );
+
+    await job.promise;
+
+    expect(progress.find((event) => event.kind === "agent_done")?.model).toBe(
+      "runner/reported-model",
+    );
+    expect(job.snapshot.agentRecords?.[0]?.model).toBe("runner/reported-model");
+  });
+
+  it("uses the requested model when the runner reports no final model", async () => {
+    const progress: WorkflowProgress[] = [];
+    const job = startWorkflowJob(
+      "requested-model-fallback",
+      `export const meta = { name: "requested-model-fallback", description: "d" };\n` +
+        `return await agent("model", { model: "requested/model" });`,
+      {
+        runAgent: async () => ({ ...ok("done"), model: undefined }),
+        onProgress: (event) => progress.push(event),
+      },
+    );
+
+    await job.promise;
+
+    expect(progress.find((event) => event.kind === "agent_done")?.model).toBe(
+      "requested/model",
+    );
+    expect(job.snapshot.agentRecords?.[0]?.model).toBe("requested/model");
+  });
+
   it("calls the completion hook after all agents finish", async () => {
     const onComplete = vi.fn();
     const script =
@@ -1131,7 +1276,7 @@ describe("background workflow jobs", () => {
     release();
     await job.promise;
     expect(job.snapshot.agentsSpawned).toBe(1);
-    expect(job.snapshot.lastMessage).toBe("→ done agent");
+    expect(job.snapshot.lastMessage).toBe("→ done agent @test/model");
   }, 10_000);
 
   it("clears runningCount when runAgent throws", async () => {
@@ -1457,6 +1602,89 @@ describe("awaitInteractiveResult", () => {
     expect(res.isError).toBe(true);
     expect((res as any).errorMessage).toMatch(/aborted/);
   });
+
+  it("wakes the default poll immediately on abort and captures session usage", async () => {
+    vi.useFakeTimers();
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "wf-int-abort-wake-"));
+      const sessionFile = join(dir, "session.jsonl");
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            usage: {
+              input: 8,
+              output: 5,
+              cacheRead: 1,
+              cacheWrite: 0,
+              cost: { total: 0.02 },
+            },
+          },
+        }) + "\n",
+      );
+      const state = fakeState(dir);
+      state.sessionFile = sessionFile;
+      const controller = new AbortController();
+      let result: SubagentResult | undefined;
+      const pending = awaitInteractiveResult(state, controller.signal).then(
+        (settled) => {
+          result = settled;
+        },
+      );
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(result).toBeDefined();
+      if (!result) return;
+      expect(result).toMatchObject({
+        isError: true,
+        usage: {
+          input: 8,
+          output: 5,
+          cacheRead: 1,
+          cost: 0.02,
+          costSource: "estimated",
+        },
+      });
+      await pending;
+    } finally {
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps process-session usage when cancellation arrives first", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wf-int-cancel-"));
+    const sessionFile = join(dir, "session.jsonl");
+    writeFileSync(
+      sessionFile,
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          usage: {
+            input: 12,
+            output: 6,
+            cacheRead: 2,
+            cacheWrite: 1,
+            cost: { total: 0.03 },
+          },
+        },
+      }) + "\n",
+    );
+    const state = fakeState(dir);
+    state.sessionFile = sessionFile;
+    const ac = new AbortController();
+    ac.abort();
+    const res = await awaitInteractiveResult(state, ac.signal, 5);
+    expect(res).toMatchObject({
+      isError: true,
+      usage: { input: 12, output: 6, cacheRead: 2, cost: 0.03 },
+    });
+  });
 });
 
 describe("abort signal propagation", () => {
@@ -1700,7 +1928,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 2 agent(s)");
     expect(result).toContain("⚡ 1 running");
-    expect(result).toContain("100 output tokens");
+    expect(result).not.toContain("output tokens");
     expect(result).toContain("◆ phase: Scanning");
   });
 
@@ -1716,7 +1944,7 @@ describe("renderProgress", () => {
     const result = renderProgress(p);
     expect(result).toContain("● workflow — 3 agent(s)");
     expect(result).not.toContain("⚡");
-    expect(result).toContain("50 output tokens");
+    expect(result).not.toContain("output tokens");
     expect(result).toContain("hello");
   });
 
@@ -1815,7 +2043,7 @@ describe("renderProgress", () => {
     expect(result).toContain("⚡ 2 running");
     expect(result).toContain("⚠ 3 error(s)");
     expect(result).toContain("10 agent(s)");
-    expect(result).toContain("500 output tokens");
+    expect(result).not.toContain("output tokens");
   });
 });
 
@@ -2872,6 +3100,7 @@ it("includes usage from returned error results", async () => {
     totalTokens: 39,
     costUsd: 0.375,
     turns: 3,
+    costSource: "estimated",
   });
 });
 
@@ -2884,6 +3113,7 @@ it("preserves accumulated usage when a later workflow error rejects", async () =
     totalTokens: 26,
     costUsd: 0.125,
     turns: 2,
+    costSource: "estimated",
   };
   const rejected = runWorkflow(
     `export const meta = { name: "late-error", description: "d" };\n` +
@@ -2904,7 +3134,7 @@ it("formats USD usage without floating-point artifacts", () => {
     costUsd: 0.1 + 0.2,
     turns: 1,
   };
-  expect(formatWorkflowUsage(usage)).toBe("1 total tokens, $0.3");
+  expect(formatWorkflowUsage(usage)).toBe("↑0 ↓1 R0 W0 ~$0.3");
 });
 
 it("includes accumulated usage in async workflow error results", async () => {
@@ -2937,8 +3167,9 @@ it("includes accumulated usage in async workflow error results", async () => {
       totalTokens: 26,
       costUsd: 0.125,
       turns: 2,
+      costSource: "estimated",
     });
-    expect(result.content[0].text).toContain("26 total tokens");
+    expect(result.content[0].text).toContain("↓7");
   } finally {
     workflowJobRegistry.delete(job.id);
   }
@@ -2954,7 +3185,7 @@ it("includes snapshot usage in failed completion notification summaries", async 
   try {
     await expect(job.promise).rejects.toThrow("later failure");
     expect(formatWorkflowNotificationSummary(job)).toContain(
-      "26 total tokens, $0.125",
+      "↑11 ↓7 R5 W3 ~$0.125",
     );
   } finally {
     workflowJobRegistry.delete(job.id);
@@ -3010,6 +3241,103 @@ it("preserves caller abort reason alongside accumulated usage", async () => {
   });
 });
 
+it("aggregates partial usage returned by an active runner on cancellation", async () => {
+  const controller = new AbortController();
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => (started = resolve));
+  const partial: SubagentResult = {
+    isError: true,
+    output: "partial",
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      cost: 0.02,
+      turns: 1,
+    },
+    model: undefined,
+    errorMessage: "aborted",
+  };
+  const running = runWorkflow(
+    `export const meta = { name: "cancel-usage", description: "d" };\n` +
+      `return await agent("in flight");`,
+    {
+      signal: controller.signal,
+      runAgent: async ({ signal }) => {
+        started();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return partial;
+      },
+    },
+  );
+  await startedPromise;
+  controller.abort(new Error("cancelled"));
+  await expect(running).rejects.toMatchObject({
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      costUsd: 0.02,
+      totalTokens: 10,
+      turns: 1,
+    },
+  });
+});
+
+it("aggregates live usage when a runner rejects during cancellation", async () => {
+  const controller = new AbortController();
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => (started = resolve));
+  const running = runWorkflow(
+    `export const meta = { name: "cancel-live-reject", description: "d" };\n` +
+      `return await agent("in flight");`,
+    {
+      signal: controller.signal,
+      runAgent: async ({ signal, onProgress }) => {
+        onProgress?.({
+          kind: "log",
+          message: "usage",
+          liveUsage: {
+            input: 4,
+            output: 3,
+            cacheRead: 2,
+            cacheWrite: 1,
+            totalTokens: 10,
+            costUsd: 0.02,
+            turns: 1,
+            costSource: "provider",
+          },
+        });
+        started();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new Error("aborted");
+      },
+    },
+  );
+  await startedPromise;
+  controller.abort(new Error("cancelled"));
+  await expect(running).rejects.toMatchObject({
+    usage: {
+      input: 4,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      costUsd: 0.02,
+      totalTokens: 10,
+      turns: 1,
+      costSource: "provider",
+    },
+  });
+});
+
 describe("workflow usage accounting", () => {
   it("keeps legacy result objects structurally compatible", () => {
     const legacyResult: WorkflowRunResult = {
@@ -3032,6 +3360,7 @@ describe("workflow usage accounting", () => {
     costUsd: 0.125,
     totalTokens: 26,
     turns: 2,
+    costSource: "estimated" as const,
   };
 
   it("does not add usage when a runner throws without a result", async () => {
@@ -3090,5 +3419,276 @@ describe("workflow usage accounting", () => {
     } finally {
       workflowJobRegistry.delete(job.id);
     }
+  });
+});
+
+describe("canonical workflow usage formatting", () => {
+  it("uses icon-first compact accounting without a duplicate total", () => {
+    const usage: WorkflowUsage = {
+      input: 11,
+      output: 7,
+      cacheRead: 5,
+      cacheWrite: 3,
+      totalTokens: 26,
+      costUsd: 0.125,
+      turns: 2,
+    };
+    expect(formatWorkflowUsage(usage)).toBe("↑11 ↓7 R5 W3 ~$0.125");
+    expect(formatWorkflowUsage(usage, { outputBudget: 20 })).toContain("↓7/20");
+    expect(formatWorkflowUsage(usage)).not.toContain("total tokens");
+  });
+
+  it("labels unavailable and estimated pricing instead of showing $0", () => {
+    const unavailable = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 2,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      },
+    );
+    const estimated = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 2,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.01,
+        costSource: "estimated",
+        turns: 1,
+      },
+    );
+    expect(formatWorkflowUsage(unavailable)).toContain("$?");
+    expect(formatWorkflowUsage(estimated)).toContain("~$0.01");
+    expect(formatWorkflowUsage(unavailable, { expanded: true })).toContain(
+      "unavailable",
+    );
+  });
+
+  it("marks mixed pricing and provides an ASCII fallback legend", () => {
+    const base: WorkflowUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      turns: 0,
+    };
+    const mixed = addWorkflowUsage(
+      addWorkflowUsage(base, {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0.01,
+        turns: 1,
+      }),
+      {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      },
+    );
+    expect(mixed.costSource).toBe("mixed");
+    expect(formatWorkflowUsage(mixed)).toContain("$? (mixed)");
+    expect(
+      formatWorkflowUsage(mixed, { expanded: true, ascii: true }),
+    ).toContain("input tokens");
+    expect(formatWorkflowUsageLegend(true)).toBe(
+      "Legend: input, output, cache-read, cache-write, cost",
+    );
+  });
+
+  it("preserves explicit free provider pricing and hides zero live samples", () => {
+    const providerFree = addWorkflowUsage(
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        costUsd: 0,
+        turns: 0,
+      },
+      {
+        input: 1,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        costSource: "provider",
+        turns: 1,
+      },
+    );
+    expect(providerFree.costSource).toBe("provider");
+    expect(formatWorkflowUsage(providerFree)).toContain("$0");
+    expect(
+      workflowUsageFromUsage({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 1,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("preserves partial assistant usage for cancellation accounting", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 10,
+            output: 4,
+            cacheRead: 2,
+            cacheWrite: 1,
+            cost: { total: 0.02 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+    expect(usage).toEqual({
+      input: 10,
+      output: 4,
+      cacheRead: 2,
+      cacheWrite: 1,
+      cost: 0.02,
+      costSource: "estimated",
+      turns: 1,
+    });
+  });
+
+  it("marks zero calculated SDK cost unavailable when tokens were used", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 2,
+            output: 1,
+            cost: { total: 0 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+    expect(usage).toMatchObject({ cost: 0, costSource: "unavailable" });
+    expect(workflowUsageFromUsage(usage)).toMatchObject({
+      costUsd: 0,
+      costSource: "unavailable",
+    });
+    expect(
+      formatWorkflowUsage(workflowUsageFromUsage(usage) as WorkflowUsage),
+    ).toContain("$?");
+  });
+
+  it("preserves explicit trusted provenance and mixed turn provenance", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 2,
+            output: 1,
+            cost: { total: 0.01 },
+            costSource: "provider",
+          },
+        },
+        {
+          role: "assistant",
+          usage: {
+            input: 3,
+            output: 2,
+            cost: { total: 0.02 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+
+    expect(usage).toMatchObject({
+      input: 5,
+      output: 3,
+      cost: 0.03,
+      costSource: "mixed",
+      turns: 2,
+    });
+    expect(workflowUsageFromUsage(usage)?.costSource).toBe("mixed");
+  });
+
+  it("keeps an all-zero assistant sample provenance-free", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: { total: 0 },
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+
+    expect(usage.costSource).toBeUndefined();
+    expect(workflowUsageFromUsage(usage)).toBeUndefined();
   });
 });

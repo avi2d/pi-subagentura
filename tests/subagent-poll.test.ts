@@ -876,6 +876,16 @@ describe("pollArtifactChanges", () => {
         agentsSpawned: 3,
         errorCount: 0,
         tokensSpent: 120,
+        usage: {
+          input: 4,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 6,
+          costUsd: 0.01,
+          turns: 1,
+          costSource: "mixed",
+        },
         phases: ["Scan"],
         currentPhase: "Scan",
         lastMessage: "→ started scout",
@@ -891,7 +901,7 @@ describe("pollArtifactChanges", () => {
 
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-workflows",
-      "⚡ 1 workflow running",
+      "⚡ 1 workflow running · ↑4 ↓2 R0 W0 $? (mixed)",
     );
     expect(setWidget).toHaveBeenCalledWith(
       "subagentura-workflow-activity",

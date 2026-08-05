@@ -40,6 +40,9 @@ export function zeroUsage(): Usage {
   };
 }
 
+export type WorkflowCostSource =
+  "provider" | "estimated" | "unavailable" | "mixed";
+
 export interface WorkflowUsage {
   input: number;
   output: number;
@@ -48,6 +51,8 @@ export interface WorkflowUsage {
   totalTokens: number;
   costUsd: number;
   turns: number;
+  /** Pricing provenance; omitted only for legacy/empty aggregates. */
+  costSource?: WorkflowCostSource;
 }
 
 export function zeroWorkflowUsage(): WorkflowUsage {
@@ -62,6 +67,35 @@ export function zeroWorkflowUsage(): WorkflowUsage {
   };
 }
 
+function usageCostSource(
+  usage: Usage | undefined,
+): WorkflowCostSource | undefined {
+  if (!usage) return undefined;
+  if (usage.costSource) return usage.costSource;
+  if (
+    usage.input === 0 &&
+    usage.output === 0 &&
+    usage.cacheRead === 0 &&
+    usage.cacheWrite === 0 &&
+    usage.cost === 0
+  ) {
+    return undefined;
+  }
+  return usage.cost > 0 ? "estimated" : "unavailable";
+}
+
+function mergeCostSource(
+  total: WorkflowUsage,
+  next: WorkflowCostSource | undefined,
+): WorkflowCostSource | undefined {
+  const existing =
+    total.costSource ?? (total.costUsd > 0 ? "estimated" : undefined);
+  if (!next) return existing;
+  if (!existing) return next;
+  if (existing === next) return next;
+  return "mixed";
+}
+
 /** Return a new aggregate; callers never share mutable accounting state. */
 export function addWorkflowUsage(
   total: WorkflowUsage,
@@ -71,6 +105,9 @@ export function addWorkflowUsage(
   const output = total.output + (usage?.output ?? 0);
   const cacheRead = total.cacheRead + (usage?.cacheRead ?? 0);
   const cacheWrite = total.cacheWrite + (usage?.cacheWrite ?? 0);
+  const nextCostSource = usageCostSource(usage);
+  const costSource = mergeCostSource(total, nextCostSource);
+  const provenance = costSource ? { costSource } : {};
   return {
     input,
     output,
@@ -79,7 +116,26 @@ export function addWorkflowUsage(
     totalTokens: input + output + cacheRead + cacheWrite,
     costUsd: total.costUsd + (usage?.cost ?? 0),
     turns: total.turns + (usage?.turns ?? 0),
+    ...provenance,
   };
+}
+
+export function workflowUsageFromUsage(
+  usage: Usage | undefined,
+): WorkflowUsage | undefined {
+  const source = usageCostSource(usage);
+  if (!usage || source === undefined) return undefined;
+  if (
+    usage.input === 0 &&
+    usage.output === 0 &&
+    usage.cacheRead === 0 &&
+    usage.cacheWrite === 0 &&
+    usage.cost === 0 &&
+    usage.costSource === undefined
+  ) {
+    return undefined;
+  }
+  return addWorkflowUsage(zeroWorkflowUsage(), usage);
 }
 
 function formatWorkflowCost(costUsd: number): string {
@@ -90,8 +146,72 @@ function formatWorkflowCost(costUsd: number): string {
   });
 }
 
-export function formatWorkflowUsage(usage: WorkflowUsage): string {
-  return `${usage.totalTokens} total tokens, $${formatWorkflowCost(usage.costUsd)}`;
+export interface WorkflowUsageFormatOptions {
+  expanded?: boolean;
+  ascii?: boolean;
+  outputBudget?: number | null;
+}
+
+export function formatWorkflowUsage(
+  usage: WorkflowUsage,
+  options: WorkflowUsageFormatOptions = {},
+): string {
+  const source =
+    usage.costSource ?? (usage.costUsd > 0 ? "estimated" : "unavailable");
+  const cost =
+    source === "unavailable"
+      ? "$?"
+      : source === "mixed"
+        ? "$? (mixed)"
+        : source === "estimated"
+          ? `~$${formatWorkflowCost(usage.costUsd)}`
+          : `$${formatWorkflowCost(usage.costUsd)}`;
+  const budget =
+    options.outputBudget == null
+      ? ""
+      : `/${formatWorkflowCost(options.outputBudget)}`;
+  if (!options.expanded) {
+    const icons = options.ascii
+      ? [
+          `input=${usage.input}`,
+          `output=${usage.output}${budget}`,
+          `cache-read=${usage.cacheRead}`,
+          `cache-write=${usage.cacheWrite}`,
+          `cost=${cost}`,
+        ]
+      : [
+          `↑${usage.input}`,
+          `↓${usage.output}${budget}`,
+          `R${usage.cacheRead}`,
+          `W${usage.cacheWrite}`,
+          `${cost}`,
+        ];
+    return icons.join(" ");
+  }
+  const labels = options.ascii
+    ? [
+        `input tokens: ${usage.input}`,
+        `output tokens: ${usage.output}${budget}`,
+        `cache-read tokens: ${usage.cacheRead}`,
+        `cache-write tokens: ${usage.cacheWrite}`,
+        `cost: ${cost} (${source})`,
+        `turns: ${usage.turns}`,
+      ]
+    : [
+        `↑ input tokens: ${usage.input}`,
+        `↓ output tokens: ${usage.output}${budget}`,
+        `R cache-read tokens: ${usage.cacheRead}`,
+        `W cache-write tokens: ${usage.cacheWrite}`,
+        `$ cost: ${cost} (${source})`,
+        `turns: ${usage.turns}`,
+      ];
+  return labels.join("; ");
+}
+
+export function formatWorkflowUsageLegend(ascii = false): string {
+  return ascii
+    ? "Legend: input, output, cache-read, cache-write, cost"
+    : "Legend: ↑ input · ↓ output · R cache-read · W cache-write · $ cost";
 }
 
 // ── Public types ─────────────────────────────────────────────────────
@@ -117,6 +237,8 @@ export type WorkflowAgentProgress =
       message?: string;
       label?: string;
       agentId?: number;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
     }
   | {
       kind: "log";
@@ -124,6 +246,8 @@ export type WorkflowAgentProgress =
       phase?: string;
       label?: string;
       agentId?: number;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
     };
 
 /** Injectable spawn function — wraps in-process or process-backed agents. */
@@ -164,9 +288,13 @@ export type WorkflowProgress =
       agentId?: number;
       agentsSpawned: number;
       errorCount: number;
-      /** @deprecated Output-token count; use usage.totalTokens. */
+      /** @deprecated Output-token count; use usage.output. */
       tokensSpent: number;
+      /** Soft completed-output-token target, if configured. */
+      budgetTotal?: number | null;
       usage?: WorkflowUsage;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -178,9 +306,12 @@ export type WorkflowProgress =
       agentId?: number;
       agentsSpawned: number;
       errorCount: number;
-      /** @deprecated Output-token count; use usage.totalTokens. */
+      /** @deprecated Output-token count; use usage.output. */
       tokensSpent: number;
+      budgetTotal?: number | null;
       usage?: WorkflowUsage;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -192,9 +323,12 @@ export type WorkflowProgress =
       agentId?: number;
       agentsSpawned: number;
       errorCount: number;
-      /** @deprecated Output-token count; use usage.totalTokens. */
+      /** @deprecated Output-token count; use usage.output. */
       tokensSpent: number;
+      budgetTotal?: number | null;
       usage?: WorkflowUsage;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
       runningCount: number;
       model?: string;
     }
@@ -207,11 +341,16 @@ export type WorkflowProgress =
       agentId?: number;
       agentsSpawned: number;
       errorCount: number;
-      /** @deprecated Output-token count; use usage.totalTokens. */
+      /** @deprecated Output-token count; use usage.output. */
       tokensSpent: number;
+      budgetTotal?: number | null;
       usage?: WorkflowUsage;
+      /** Latest live usage from the active agent, when available. */
+      liveUsage?: WorkflowUsage;
       runningCount: number;
       model?: string;
+      /** Usage attributed to this agent attempt, when available. */
+      agentUsage?: WorkflowUsage;
     };
 
 export interface WorkflowAgentRecord {
@@ -220,6 +359,8 @@ export interface WorkflowAgentRecord {
   label?: string;
   model?: string;
   status: "running" | "done" | "error" | "cancelled";
+  /** Usage attributed to this attempt; absent when the runner produced none. */
+  usage?: WorkflowUsage;
 }
 
 export const MAX_WORKFLOW_AGENT_RECORDS = 50;
@@ -227,7 +368,12 @@ export const MAX_WORKFLOW_AGENT_RECORDS = 50;
 export type WorkflowProgressUpdate = {
   [K in WorkflowProgress["kind"]]: Omit<
     Extract<WorkflowProgress, { kind: K }>,
-    "agentsSpawned" | "errorCount" | "tokensSpent" | "usage" | "runningCount"
+    | "agentsSpawned"
+    | "errorCount"
+    | "tokensSpent"
+    | "budgetTotal"
+    | "usage"
+    | "runningCount"
   >;
 }[WorkflowProgress["kind"]];
 
@@ -237,7 +383,7 @@ export interface WorkflowRunResult {
   result: unknown;
   agentsSpawned: number;
   errorCount: number;
-  /** @deprecated Output-token count; use usage.totalTokens. */
+  /** @deprecated Output-token count; use usage.output. */
   tokensSpent: number;
   usage?: WorkflowUsage;
   phases: string[];

@@ -14,6 +14,10 @@ import {
 } from "./interactive-tmux";
 import type { SessionOwnerToken } from "./session-scope";
 import type { WorkflowJobState } from "./workflow-jobs";
+import {
+  formatWorkflowUsage,
+  formatWorkflowUsageLegend,
+} from "./workflow-core";
 
 export const INTERACTIVE_SUPERVISOR_SHORTCUT = "ctrl+alt+a";
 const DEFAULT_REFRESH_INTERVAL_MS = 1_000;
@@ -700,13 +704,26 @@ function formatWorkflowDetails(job: WorkflowJobState, width: number): string[] {
   const omitted =
     (snapshot.agentRecordsOmitted ?? 0) +
     Math.max(0, allRecords.length - records.length);
+  const usage = snapshot.usage
+    ? formatWorkflowUsage(snapshot.usage, {
+        expanded: true,
+        ascii: true,
+        outputBudget: snapshot.budgetTotal,
+      })
+    : "unavailable";
   const fields = [
     `Workflow: ${job.name} (${job.id})`,
     `Phase: ${snapshot.currentPhase ?? "none"}`,
     `Agents: ${snapshot.agentsSpawned} total · ${snapshot.runningCount ?? 0} running`,
     `Errors: ${snapshot.errorCount}`,
-    `Output tokens: ${snapshot.tokensSpent}`,
+    `Usage: ${usage}`,
+    formatWorkflowUsageLegend(true),
     `Last activity: ${snapshot.lastMessage ?? "none yet"}`,
+    ...(snapshot.liveUsage
+      ? [
+          `Live usage: ${formatWorkflowUsage(snapshot.liveUsage, { ascii: true })}`,
+        ]
+      : []),
   ];
   if (omitted > 0) fields.push(`… ${omitted} older agent records omitted`);
   for (const record of records) {
@@ -714,7 +731,11 @@ function formatWorkflowDetails(job: WorkflowJobState, width: number): string[] {
     const model = record.model ? ` @${record.model}` : "";
     const phase = record.phase ? ` (${record.phase})` : "";
     fields.push(
-      `Agent: ${statusIcon(record.status)} ${record.status} ${label} #${record.agentId}${model}${phase}`,
+      `Agent: ${statusIcon(record.status)} ${record.status} ${label} #${record.agentId}${model}${phase}${
+        record.usage
+          ? ` — ${formatWorkflowUsage(record.usage, { ascii: true })}`
+          : ""
+      }`,
     );
   }
   return fields.map((field) => trunc(`│     ${field}`, width));

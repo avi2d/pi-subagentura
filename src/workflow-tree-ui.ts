@@ -5,7 +5,10 @@ import {
   workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
-import { formatWorkflowUsage } from "./workflow-core";
+import {
+  formatWorkflowUsage,
+  formatWorkflowUsageLegend,
+} from "./workflow-core";
 import type { SessionOwnerToken } from "./session-scope";
 
 const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
@@ -51,6 +54,7 @@ export class WorkflowTreeComponent {
         width,
       ),
     );
+    lines.push(trunc(`│ ${formatWorkflowUsageLegend()}`, width));
 
     if (rows.length === 0) {
       lines.push(trunc("│ No workflow jobs.", width));
@@ -213,14 +217,29 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
     `${s.runningCount ?? 0} running`,
   ];
   if (errorCount > 0) parts.push(`${errorCount} errors`);
-  parts.push(`${s.tokensSpent} output tokens`);
-  if (s.usage) parts.push(formatWorkflowUsage(s.usage));
+  if (s.usage) {
+    parts.push(formatWorkflowUsage(s.usage, { outputBudget: s.budgetTotal }));
+  }
   if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
   return parts.join(" · ");
 }
 
 function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
   const rows: WorkflowRow[] = [];
+  if (job.snapshot.usage) {
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: formatWorkflowUsage(job.snapshot.usage, { expanded: true }),
+    });
+    rows.push({
+      job,
+      depth: 1,
+      selectable: false,
+      text: formatWorkflowUsageLegend(),
+    });
+  }
   for (const phase of job.snapshot.phases) {
     rows.push({
       job,
@@ -258,7 +277,11 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
       job,
       depth: 1,
       selectable: false,
-      text: `${marker} ${record.status} ${label}${model}${phase}`,
+      text: `${marker} ${record.status} ${label}${model}${phase}${
+        record.usage
+          ? ` — ${formatWorkflowUsage(record.usage, { ascii: true })}`
+          : ""
+      }`,
     });
   }
   if (job.snapshot.lastMessage) {

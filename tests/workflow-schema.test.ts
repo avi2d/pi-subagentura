@@ -248,6 +248,7 @@ describe("workflow schema usage accounting", () => {
       totalTokens: 34,
       costUsd: 0.1,
       turns: 2,
+      costSource: "estimated",
     });
   });
 });
@@ -291,6 +292,7 @@ it("aggregates all failed schema attempts in result and progress", async () => {
     totalTokens: 30,
     costUsd: 0.1 * 3,
     turns: 3,
+    costSource: "estimated",
   });
   expect(progress.at(-1)?.usage).toEqual(result.usage);
 });

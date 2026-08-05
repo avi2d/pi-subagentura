@@ -6,8 +6,12 @@ export function renderProgress(p: WorkflowProgress): string {
   const parts = [`● workflow — ${p.agentsSpawned} agent(s)`];
   if (p.runningCount > 0) parts.push(`⚡ ${p.runningCount} running`);
   if (p.errorCount > 0) parts.push(`⚠ ${p.errorCount} error(s)`);
-  parts.push(`${p.tokensSpent} output tokens`);
-  if (p.usage) parts.push(formatWorkflowUsage(p.usage));
+  if (p.usage) {
+    parts.push(formatWorkflowUsage(p.usage, { outputBudget: p.budgetTotal }));
+  }
+  if (p.liveUsage) {
+    parts.push(`live ${formatWorkflowUsage(p.liveUsage)}`);
+  }
   const head = parts.join(", ");
   switch (p.kind) {
     case "phase":

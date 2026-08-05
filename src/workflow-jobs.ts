@@ -15,6 +15,7 @@ import {
   type WorkflowRunResult,
   type WorkflowRunResultWithUsage,
   type WorkflowUsage,
+  WorkflowExecutionError,
   MAX_WORKFLOW_AGENT_RECORDS,
   zeroWorkflowUsage,
 } from "./workflow-core";
@@ -39,9 +40,13 @@ export interface WorkflowJobState {
   snapshot: {
     agentsSpawned: number;
     errorCount: number;
-    /** @deprecated Output-token count; use usage.totalTokens. */
+    /** @deprecated Output-token count; use usage.output. */
     tokensSpent: number;
+    /** Soft completed-output-token target, if configured. */
+    budgetTotal?: number | null;
     usage?: WorkflowUsage;
+    /** Aggregate usage from every active agent that reports a live sample. */
+    liveUsage?: WorkflowUsage;
     phases: string[];
     lastMessage?: string;
     currentPhase?: string;
@@ -238,6 +243,7 @@ export function startWorkflowJob(
       agentsSpawned: 0,
       errorCount: 0,
       tokensSpent: 0,
+      budgetTotal: opts.budgetTotal ?? null,
       usage: zeroWorkflowUsage(),
       phases: [],
       agentRecords: [],
@@ -250,6 +256,7 @@ export function startWorkflowJob(
     activeAgentRuns: new Set(),
     parentSessionOwner,
   };
+  const liveUsageByAgent = new Map<number, WorkflowUsage>();
   state.promise = runWorkflow(script, {
     ...opts,
     runAgent: (request) =>
@@ -259,6 +266,7 @@ export function startWorkflowJob(
       state.snapshot.agentsSpawned = p.agentsSpawned;
       state.snapshot.errorCount = p.errorCount;
       state.snapshot.tokensSpent = p.tokensSpent;
+      state.snapshot.budgetTotal = p.budgetTotal ?? state.snapshot.budgetTotal;
       state.snapshot.usage = p.usage ? { ...p.usage } : state.snapshot.usage;
       state.snapshot.runningCount = p.runningCount;
       if (p.kind === "phase" && p.phase) {
@@ -275,6 +283,14 @@ export function startWorkflowJob(
       if (p.kind === "agent_start" || p.kind === "agent_done") {
         recordWorkflowAgentProgress(state.snapshot, p);
       }
+      if (typeof p.agentId === "number") {
+        if (p.liveUsage) {
+          liveUsageByAgent.set(p.agentId, { ...p.liveUsage });
+          recordWorkflowAgentLiveUsage(state.snapshot, p.agentId, p.liveUsage);
+        }
+        if (p.kind === "agent_done") liveUsageByAgent.delete(p.agentId);
+      }
+      state.snapshot.liveUsage = aggregateWorkflowLiveUsage(liveUsageByAgent);
       opts.onProgress?.(p);
     },
     onCancellationSnapshot: (receipt) => {
@@ -284,6 +300,8 @@ export function startWorkflowJob(
     .then((r) => {
       if (state.status === "running") state.status = "done";
       state.result = r;
+      state.snapshot.liveUsage = undefined;
+      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       return r;
@@ -292,6 +310,12 @@ export function startWorkflowJob(
       const msg = err instanceof Error ? err.message : String(err);
       state.status = abort.signal.aborted ? "cancelled" : "error";
       state.error = msg;
+      if (err instanceof WorkflowExecutionError && err.usage) {
+        state.snapshot.usage = { ...err.usage };
+        state.snapshot.tokensSpent = err.usage.output;
+      }
+      state.snapshot.liveUsage = undefined;
+      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       throw err;
@@ -380,6 +404,7 @@ export function retryPendingWorkflowNotifications(
 export function normalizeCancelledWorkflowState(state: WorkflowJobState): void {
   if (!state.snapshot) return;
   state.snapshot.runningCount = 0;
+  state.snapshot.liveUsage = undefined;
   for (const record of state.snapshot.agentRecords ?? []) {
     if (record.status === "running") record.status = "cancelled";
   }
@@ -417,20 +442,68 @@ function recordWorkflowAgentProgress(
     );
     if (record) {
       record.status = progress.status ?? "done";
+      if (progress.agentUsage) record.usage = progress.agentUsage;
+      if (progress.model) record.model = progress.model;
     } else {
-      records.push({
+      const nextRecord: WorkflowAgentRecord = {
         agentId: progress.agentId,
         phase: progress.phase,
         label: progress.label,
         model: progress.model,
         status: progress.status ?? "done",
-      });
+      };
+      if (progress.agentUsage) nextRecord.usage = progress.agentUsage;
+      records.push(nextRecord);
     }
   }
   while (records.length > MAX_WORKFLOW_AGENT_RECORDS) {
     records.shift();
     snapshot.agentRecordsOmitted = (snapshot.agentRecordsOmitted ?? 0) + 1;
   }
+}
+
+function recordWorkflowAgentLiveUsage(
+  snapshot: WorkflowJobState["snapshot"],
+  agentId: number,
+  usage: WorkflowUsage,
+): void {
+  const record = snapshot.agentRecords?.find(
+    (candidate) => candidate.agentId === agentId,
+  );
+  if (record?.status === "running") record.usage = { ...usage };
+}
+
+function aggregateWorkflowLiveUsage(
+  samples: ReadonlyMap<number, WorkflowUsage>,
+): WorkflowUsage | undefined {
+  if (samples.size === 0) return undefined;
+  const total = zeroWorkflowUsage();
+  let costSource: WorkflowUsage["costSource"];
+  for (const usage of samples.values()) {
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cacheRead += usage.cacheRead;
+    total.cacheWrite += usage.cacheWrite;
+    total.costUsd += usage.costUsd;
+    total.turns += usage.turns;
+    const nextSource =
+      usage.costSource ??
+      (usage.costUsd > 0
+        ? "estimated"
+        : usage.totalTokens > 0
+          ? "unavailable"
+          : undefined);
+    if (nextSource) {
+      costSource =
+        costSource === undefined || costSource === nextSource
+          ? nextSource
+          : "mixed";
+    }
+  }
+  total.totalTokens =
+    total.input + total.output + total.cacheRead + total.cacheWrite;
+  if (costSource) total.costSource = costSource;
+  return total;
 }
 
 function formatWorkflowAgentTag(p: WorkflowProgress): string {
