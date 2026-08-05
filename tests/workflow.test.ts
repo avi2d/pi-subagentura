@@ -38,6 +38,7 @@ import { withOrchestrationContext } from "../src/orchestration-context";
 import {
   usageFromAssistantMessages,
   type SubagentResult,
+  type Usage,
 } from "../src/helpers";
 import {
   appendCompletionEvent,
@@ -70,7 +71,7 @@ function ok(output: string, outTokens = 0): SubagentResult {
 
 function richOk(
   output: string,
-  usage = {
+  usage: Usage = {
     input: 11,
     output: 7,
     cacheRead: 5,
@@ -728,6 +729,7 @@ describe("agent() + budget", () => {
       cacheRead: 0,
       cacheWrite: 0,
       cost: 0,
+      costSource: "provider" as const,
       turns: 0,
     };
     let failedEventUsage: WorkflowUsage | undefined;
@@ -776,6 +778,38 @@ describe("agent() + budget", () => {
     expect(result.tokensSpent).toBe(100);
     expect(result.usage).toEqual(liveUsage);
     expect(failedEventUsage).toEqual(liveUsage);
+  });
+  it("clamps negative runner usage before budget accounting", async () => {
+    const result = await runWorkflow(
+      meta +
+        `await agent("negative"); ` +
+        `return { spent: budget.spent(), remaining: budget.remaining() };`,
+      {
+        budgetTotal: 10,
+        runAgent: async () =>
+          richOk("done", {
+            input: -2,
+            output: -5,
+            cacheRead: -3,
+            cacheWrite: -4,
+            cost: -1,
+            costSource: "provider",
+            turns: -1,
+          }),
+      },
+    );
+
+    expect(result.result).toEqual({ spent: 0, remaining: 10 });
+    expect(result.tokensSpent).toBe(0);
+    expect(result.usage).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      turns: 0,
+    });
   });
   it("allows parallel in-flight calls to overshoot the soft output target", async () => {
     let started = 0;
@@ -4144,6 +4178,42 @@ describe("canonical workflow usage formatting", () => {
     );
 
     expect(usage.costSource).toBeUndefined();
+    expect(workflowUsageFromUsage(usage)).toBeUndefined();
+  });
+
+  it("clamps negative assistant accounting to a zero sample", () => {
+    const usage = usageFromAssistantMessages(
+      [
+        {
+          role: "assistant",
+          usage: {
+            input: -2,
+            output: -5,
+            cacheRead: -3,
+            cacheWrite: -4,
+            cost: { total: -1 },
+            costSource: "provider",
+          },
+        },
+      ],
+      {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+      },
+    );
+
+    expect(usage).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      turns: 1,
+    });
     expect(workflowUsageFromUsage(usage)).toBeUndefined();
   });
 });

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { SubagentResult, Usage } from "./helpers";
+import { normalizeUsage, type SubagentResult, type Usage } from "./helpers";
 
 // ── Limits ───────────────────────────────────────────────────────────
 export const MAX_TOTAL_AGENTS = 1000;
@@ -125,11 +125,12 @@ export function addWorkflowUsage(
   total: WorkflowUsage,
   usage: Usage | undefined,
 ): WorkflowUsage {
-  const input = total.input + (usage?.input ?? 0);
-  const output = total.output + (usage?.output ?? 0);
-  const cacheRead = total.cacheRead + (usage?.cacheRead ?? 0);
-  const cacheWrite = total.cacheWrite + (usage?.cacheWrite ?? 0);
-  const nextCostSource = usageCostSource(usage);
+  const normalized = normalizeUsage(usage);
+  const input = total.input + (normalized?.input ?? 0);
+  const output = total.output + (normalized?.output ?? 0);
+  const cacheRead = total.cacheRead + (normalized?.cacheRead ?? 0);
+  const cacheWrite = total.cacheWrite + (normalized?.cacheWrite ?? 0);
+  const nextCostSource = usageCostSource(normalized);
   const costSource = mergeCostSource(total, nextCostSource);
   const provenance = costSource ? { costSource } : {};
   return {
@@ -138,8 +139,8 @@ export function addWorkflowUsage(
     cacheRead,
     cacheWrite,
     totalTokens: input + output + cacheRead + cacheWrite,
-    costUsd: total.costUsd + (usage?.cost ?? 0),
-    turns: total.turns + (usage?.turns ?? 0),
+    costUsd: total.costUsd + (normalized?.cost ?? 0),
+    turns: total.turns + (normalized?.turns ?? 0),
     ...provenance,
   };
 }
@@ -147,19 +148,10 @@ export function addWorkflowUsage(
 export function workflowUsageFromUsage(
   usage: Usage | undefined,
 ): WorkflowUsage | undefined {
-  const source = usageCostSource(usage);
-  if (!usage || source === undefined) return undefined;
-  if (
-    usage.input === 0 &&
-    usage.output === 0 &&
-    usage.cacheRead === 0 &&
-    usage.cacheWrite === 0 &&
-    usage.cost === 0 &&
-    usage.costSource === undefined
-  ) {
+  const normalized = normalizeUsage(usage);
+  if (!normalized || usageCostSource(normalized) === undefined)
     return undefined;
-  }
-  return addWorkflowUsage(zeroWorkflowUsage(), usage);
+  return addWorkflowUsage(zeroWorkflowUsage(), normalized);
 }
 
 function formatWorkflowCost(costUsd: number): string {

@@ -137,8 +137,10 @@ function accountAgentUsage(
   usage: Usage | undefined,
 ): void {
   if (run.usageAccounted || !usage) return;
-  engine.usage = addWorkflowUsage(engine.usage, usage);
-  engine.counters.tokensSpent += usage.output;
+  const previousOutput = engine.usage.output;
+  const aggregate = addWorkflowUsage(engine.usage, usage);
+  engine.counters.tokensSpent += aggregate.output - previousOutput;
+  engine.usage = aggregate;
   run.usageAccounted = true;
 }
 
@@ -403,9 +405,9 @@ async function executeScript(
                   : activeRun.liveUsage
                     ? usageAsProjectUsage(activeRun.liveUsage)
                     : undefined;
-              tokensDelta += partialUsage?.output ?? 0;
               agentUsage =
                 terminalAgentUsage ?? workflowUsageFromUsage(partialUsage);
+              tokensDelta += agentUsage?.output ?? 0;
               accountAgentUsage(engine, activeRun, partialUsage);
               status = "error";
               runnerFailure = { cause: error };
@@ -415,9 +417,9 @@ async function executeScript(
           } finally {
             engine.activeAgentRuns.delete(activeRun);
           }
-          const outTokens = res.usage?.output ?? 0;
-          tokensDelta += outTokens;
           agentUsage = workflowUsageFromUsage(res.usage);
+          const outTokens = agentUsage?.output ?? 0;
+          tokensDelta += outTokens;
           accountAgentUsage(engine, activeRun, res.usage);
           if (res.isError) {
             status = "error";
