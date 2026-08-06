@@ -298,7 +298,7 @@ describe("workflow owner namespace leases", () => {
       owner.projectKey,
       owner.piSessionKey,
     );
-    mkdirSync(join(namespace, "runs"), { recursive: true });
+    mkdirSync(join(namespace, "runs"), { recursive: true, mode: 0o700 });
     writeFileSync(join(namespace, "owner-lease.json"), "{}", { mode: 0o600 });
     let consulted = false;
     const store = new WorkflowRunStore({

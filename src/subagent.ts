@@ -30,6 +30,7 @@ import {
   type Usage,
 } from "./helpers";
 import { registerWorkflowTool } from "./workflow";
+import { registerWorkflowEagerRouting } from "./workflow-eager";
 import {
   registerInProcessMaintenanceTools,
   registerInProcessSubagentTools,
@@ -118,6 +119,7 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveSubagentTools(pi, sessionScope);
   registerInteractiveSupervisor(pi, sessionScope);
   registerWorkflowTool(pi, sessionScope);
+  registerWorkflowEagerRouting(pi, sessionScope);
   registerInProcessSubagentTools(pi, sessionScope);
   registerInProcessMaintenanceTools(pi, sessionScope);
   // ── Cancel-all-flows shortcut and command ──────────────────────
@@ -195,6 +197,7 @@ export {
   type DurableWorkflowPlanExecution,
   type DurableWorkflowPlanOpenResult,
   type DurableWorkflowPlanStartOptions,
+  type WorkflowApprovalRequestOptions,
 } from "./workflow-durable-plan";
 export {
   startDurableWorkflowPlanJob,

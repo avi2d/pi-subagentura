@@ -163,6 +163,26 @@ describe("WorkflowRunStore", () => {
     expect(other.projectKey).not.toBe(canonical.projectKey);
   });
 
+  it("hashes valid session IDs that exceed a portable path component", async () => {
+    const rawSessionId = "s".repeat(256);
+    const portable = await deriveDurableWorkflowOwner(cwd, rawSessionId);
+
+    expect(portable.piSessionKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(
+      Buffer.byteLength(portable.piSessionKey, "utf8"),
+    ).toBeLessThanOrEqual(255);
+    const lease = await store.acquireLease(portable, {
+      scopeId: 2,
+      generation: 1,
+    });
+    expect(
+      existsSync(
+        join(store.rootDirectory, portable.projectKey, portable.piSessionKey),
+      ),
+    ).toBe(true);
+    await lease.release();
+  });
+
   it("creates the owner layout with private modes and no-replace runs", async () => {
     const lease = await store.acquireLease(owner, {
       scopeId: 2,

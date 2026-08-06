@@ -71,6 +71,7 @@ const LEGAL_TRANSITIONS = new Set([
   "pending->cancelled",
   "running->succeeded",
   "running->failed",
+  "running->skipped",
   "running->cancelled",
   "blocked->pending",
   "blocked->skipped",

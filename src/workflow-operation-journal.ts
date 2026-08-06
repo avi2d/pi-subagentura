@@ -7,8 +7,6 @@ import {
 } from "./workflow-durable-value";
 import type {
   WorkflowOperationBlobCodec,
-  WorkflowOperationEventDraft,
-  WorkflowOperationGateEvent,
   WorkflowOperationJournal,
   WorkflowOperationJournalState,
 } from "./workflow-operation-gate";
@@ -32,6 +30,7 @@ import {
   WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
   createWorkflowAttemptId,
   createWorkflowAttemptNumber,
+  createWorkflowDispatchOrdinal,
   createWorkflowResponseOrdinal,
   durableWorkflowOwnerEquals,
   isWorkflowIdentifier,
@@ -49,34 +48,51 @@ import {
   type WorkflowRunEvent,
 } from "./workflow-run-types";
 
-const GATE_EVENT_TYPES: Readonly<
-  Record<WorkflowOperationGateEvent["type"], true>
-> = Object.freeze({
-  operation_prepared: true,
-  operation_dispatched: true,
-  operation_settled: true,
-  attempt_interrupted: true,
-  operation_replayed: true,
-  attempt_started: true,
-  attempt_usage_observed: true,
-  attempt_settled: true,
-  response_ready: true,
-});
-
 export type WorkflowOperationJournalIdGenerator = () => string;
 
-interface ReservedEvent {
-  readonly event: WorkflowOperationGateEvent;
-  readonly canonicalJson: string;
+export type WorkflowRunEventDraft<
+  Type extends WorkflowRunEvent["type"] = WorkflowRunEvent["type"],
+> = Type extends WorkflowRunEvent["type"]
+  ? Readonly<
+      Pick<Extract<WorkflowRunEvent, { type: Type }>, "type" | "payload">
+    >
+  : never;
+
+export interface WorkflowRunEventAppend<
+  Type extends WorkflowRunEvent["type"] = WorkflowRunEvent["type"],
+> {
+  readonly event: Extract<WorkflowRunEvent, { type: Type }>;
+  readonly receipt: WorkflowEventReceipt;
+}
+
+interface CoordinatorResponseReservation {
+  readonly request: WorkflowOperationRequest;
+  readonly responseOrdinal: WorkflowResponseOrdinal;
+  readonly generation: number;
+  readonly previous: Promise<void>;
+  readonly completion: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (reason: unknown) => void;
+  state: "reserved" | "committing" | "committed" | "abandoned";
 }
 
 interface JournalCoordinator {
   tail: Promise<void>;
-  nextSequence: number;
   readonly nextAttemptNumbers: Map<string, number>;
+  readonly attemptReservations: Map<
+    string,
+    Map<number, WorkflowOperationAttempt>
+  >;
+  readonly attemptRebaseFrom: Map<string, number>;
   readonly nextResponseOrdinals: Map<string, number>;
   readonly reservedAttemptIds: Set<string>;
-  readonly reservedEvents: Map<string, ReservedEvent>;
+  readonly responseCommitTails: Map<string, Promise<void>>;
+  readonly responseLaneFailures: Map<string, unknown>;
+  readonly responseLaneGenerations: Map<string, number>;
+  readonly responseReservations: Map<
+    string,
+    Map<number, CoordinatorResponseReservation>
+  >;
 }
 
 interface FoldedJournal {
@@ -97,8 +113,8 @@ export const durableWorkflowOperationBlobCodec: WorkflowOperationBlobCodec =
 
 /**
  * Durable operation-gate adapter over one current, leased run journal.
- * Complete physical event order is authoritative; allocation caches only reserve
- * values that have not reached the journal yet.
+ * Complete physical event order is authoritative. Event envelopes are
+ * allocated and appended inside the shared journal critical section.
  */
 export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
   readonly #journal: WorkflowRunJournal;
@@ -137,6 +153,49 @@ export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
     });
   }
 
+  prepareOperation(
+    fence: WorkflowRunEpochFence,
+    preparation: Omit<WorkflowOperationRequest, "dispatchOrdinal">,
+  ): Promise<WorkflowOperationRequest> {
+    return this.#serialized(async () => {
+      const { projection } = await this.#fold(fence);
+      const existing = projection.operations.find((candidate) =>
+        workflowOperationIdentityEquals(
+          candidate.identity,
+          preparation.identity,
+        ),
+      );
+      if (existing !== undefined) {
+        const expected = {
+          ...preparation,
+          dispatchOrdinal: existing.request.dispatchOrdinal,
+        };
+        if (!workflowOperationRequestMatches(existing.request, expected)) {
+          throw new WorkflowRunStoreError(
+            "immutable_conflict",
+            `Workflow operation ${preparation.identity.operationId} was reused with another request.`,
+          );
+        }
+        return existing.request;
+      }
+      const allocation = projection.ordinalAllocations.find(
+        (candidate) =>
+          candidate.definitionPath === preparation.identity.definitionPath,
+      );
+      const request: WorkflowOperationRequest = {
+        ...preparation,
+        dispatchOrdinal: createWorkflowDispatchOrdinal(
+          allocation?.nextDispatchOrdinal ?? 1,
+        ),
+      };
+      await this.#appendUnlocked(fence, {
+        type: "operation_prepared",
+        payload: { request },
+      });
+      return request;
+    });
+  }
+
   allocateAttempt(
     fence: WorkflowRunEpochFence,
     request: WorkflowOperationRequest,
@@ -144,7 +203,11 @@ export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
     return this.#serialized(async () => {
       const { projection } = await this.#fold(fence);
       const operation = preparedOperation(projection, request);
-      const key = `${request.identity.definitionPath}\u0000${request.identity.operationId}`;
+      const key = attemptLaneKey(request.identity);
+      const rebaseFrom = this.#coordinator.attemptRebaseFrom.get(key);
+      if (rebaseFrom !== undefined) {
+        this.#rebaseAttemptLane(key, rebaseFrom, operation);
+      }
       const nextNumber = Math.max(
         operation.nextAttemptNumber,
         this.#coordinator.nextAttemptNumbers.get(key) ?? 1,
@@ -172,6 +235,10 @@ export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
       };
       this.#coordinator.nextAttemptNumbers.set(key, nextNumber + 1);
       this.#coordinator.reservedAttemptIds.add(attemptId);
+      const reservations =
+        this.#coordinator.attemptReservations.get(key) ?? new Map();
+      reservations.set(nextNumber, attempt);
+      this.#coordinator.attemptReservations.set(key, reservations);
       return attempt;
     });
   }
@@ -183,110 +250,218 @@ export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
     return this.#serialized(async () => {
       const { projection } = await this.#fold(fence);
       preparedOperation(projection, request);
-      const key = request.identity.definitionPath;
+      const definitionPath = request.identity.definitionPath;
+      const key = responseLaneKey(fence, definitionPath);
       const foldedNext =
         projection.ordinalAllocations.find(
-          (allocation) => allocation.definitionPath === key,
+          (allocation) => allocation.definitionPath === definitionPath,
         )?.nextResponseOrdinal ?? 1;
+      if (this.#coordinator.responseLaneFailures.has(key)) {
+        this.#rebuildResponseLane(key, foldedNext);
+      }
       const nextOrdinal = Math.max(
         foldedNext,
         this.#coordinator.nextResponseOrdinals.get(key) ?? 1,
       );
-      this.#coordinator.nextResponseOrdinals.set(key, nextOrdinal + 1);
-      return createWorkflowResponseOrdinal(nextOrdinal);
-    });
-  }
-
-  createEvent(
-    fence: WorkflowRunEpochFence,
-    draft: WorkflowOperationEventDraft,
-  ): Promise<WorkflowOperationGateEvent> {
-    return this.#serialized(async () => {
-      const { events, projection } = await this.#fold(fence);
-      const eventId = this.#nextId("event");
-      if (
-        events.some((event) => event.eventId === eventId) ||
-        this.#coordinator.reservedEvents.has(eventId)
-      ) {
+      const responseOrdinal = createWorkflowResponseOrdinal(nextOrdinal);
+      const reservations =
+        this.#coordinator.responseReservations.get(key) ?? new Map();
+      if (reservations.has(responseOrdinal)) {
         throw new TypeError(
-          `Workflow event ID ${eventId} is already allocated.`,
+          `Workflow response ordinal ${responseOrdinal} is already reserved.`,
         );
       }
-      const sequence = Math.max(
-        projection.nextSequence,
-        this.#coordinator.nextSequence || 1,
-      );
-      const event = {
-        schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
-        eventId,
-        runId: fence.runId,
-        runEpoch: fence.runEpoch,
-        sequence,
-        type: draft.type,
-        payload: draft.payload,
-      } as WorkflowOperationGateEvent;
-      if (!isGateEvent(event)) {
-        throw new TypeError("Workflow operation event draft is invalid.");
-      }
-      const canonicalJson = encodeDurableValue(event).json;
-      this.#coordinator.nextSequence = sequence + 1;
-      this.#coordinator.reservedEvents.set(eventId, {
-        event,
-        canonicalJson,
+      let resolve!: () => void;
+      let reject!: (reason: unknown) => void;
+      const completion = new Promise<void>((complete, fail) => {
+        resolve = complete;
+        reject = fail;
       });
-      return event;
+      void completion.catch(() => undefined);
+      reservations.set(responseOrdinal, {
+        request,
+        generation: this.#coordinator.responseLaneGenerations.get(key) ?? 0,
+        responseOrdinal,
+        previous:
+          this.#coordinator.responseCommitTails.get(key) ?? Promise.resolve(),
+        completion,
+        resolve,
+        reject,
+        state: "reserved",
+      });
+      this.#coordinator.responseReservations.set(key, reservations);
+      this.#coordinator.responseCommitTails.set(key, completion);
+      this.#coordinator.nextResponseOrdinals.set(key, nextOrdinal + 1);
+      return responseOrdinal;
     });
   }
 
-  append(
+  async commitResponse<T>(
     fence: WorkflowRunEpochFence,
-    event: WorkflowOperationGateEvent,
-  ): Promise<WorkflowEventReceipt> {
+    request: WorkflowOperationRequest,
+    responseOrdinal: WorkflowResponseOrdinal,
+    commit: () => Promise<T>,
+  ): Promise<T> {
+    const key = responseLaneKey(fence, request.identity.definitionPath);
+    const reservation = this.#coordinator.responseReservations
+      .get(key)
+      ?.get(responseOrdinal);
+    if (
+      reservation === undefined ||
+      !workflowOperationRequestMatches(reservation.request, request)
+    ) {
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        "Workflow response commit does not match its reservation.",
+      );
+    }
+    if (this.#coordinator.responseLaneFailures.has(key)) {
+      throw this.#coordinator.responseLaneFailures.get(key);
+    }
+    if (reservation.state !== "reserved") {
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        `Workflow response ordinal ${responseOrdinal} was committed more than once.`,
+      );
+    }
+    reservation.state = "committing";
+    try {
+      await reservation.previous;
+      await this.revalidateFence(fence);
+      const result = await commit();
+      reservation.state = "committed";
+      reservation.resolve();
+      this.#coordinator.responseReservations.get(key)?.delete(responseOrdinal);
+      return result;
+    } catch (error) {
+      this.#closeResponseLane(
+        key,
+        responseOrdinal,
+        error,
+        reservation.generation,
+      );
+      throw error;
+    }
+  }
+
+  async abandonResponse(
+    fence: WorkflowRunEpochFence,
+    request: WorkflowOperationRequest,
+    responseOrdinal: WorkflowResponseOrdinal,
+    reason: unknown,
+  ): Promise<void> {
+    const key = responseLaneKey(fence, request.identity.definitionPath);
+    const reservation = this.#coordinator.responseReservations
+      .get(key)
+      ?.get(responseOrdinal);
+    if (reservation === undefined) {
+      if (this.#coordinator.responseLaneFailures.has(key)) return;
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        "Workflow response abandonment has no matching reservation.",
+      );
+    }
+    if (!workflowOperationRequestMatches(reservation.request, request)) {
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        "Workflow response abandonment does not match its reservation.",
+      );
+    }
+    await this.revalidateFence(fence);
+    this.#closeResponseLane(
+      key,
+      responseOrdinal,
+      reason,
+      reservation.generation,
+    );
+  }
+
+  appendEvent<Type extends WorkflowRunEvent["type"]>(
+    fence: WorkflowRunEpochFence,
+    draft: WorkflowRunEventDraft<Type>,
+  ): Promise<WorkflowRunEventAppend<Type>> {
+    if (draft.type === "response_ready") {
+      this.#validateResponseCommit(
+        fence,
+        draft as WorkflowRunEventDraft<"response_ready">,
+      );
+    }
     return this.#serialized(async () => {
-      const { events, projection } = await this.#fold(fence);
-      if (!isGateEvent(event)) {
-        throw new TypeError("Workflow operation event is invalid.");
-      }
-      if (event.runId !== fence.runId || event.runEpoch !== fence.runEpoch) {
-        throw new WorkflowRunStoreError(
-          "epoch_mismatch",
-          "Workflow operation event does not match the supplied fence.",
+      if (draft.type === "attempt_started") {
+        this.#validateAttemptStart(
+          (draft as WorkflowRunEventDraft<"attempt_started">).payload.attempt,
         );
       }
-      const canonicalJson = encodeDurableValue(event).json;
-      const committed = events.find(
-        (candidate) => candidate.eventId === event.eventId,
-      );
-      if (committed !== undefined) {
-        if (encodeDurableValue(committed).json !== canonicalJson) {
-          throw new WorkflowRunStoreError(
-            "event_mismatch",
-            "Workflow event ID names different authoritative bytes.",
+      try {
+        const appended = await this.#appendUnlocked(fence, draft);
+        if (draft.type === "attempt_started") {
+          this.#observeAttemptStarted(
+            (draft as WorkflowRunEventDraft<"attempt_started">).payload.attempt,
           );
         }
-        return this.#journal.append(event);
+        return appended;
+      } catch (error) {
+        if (draft.type === "attempt_started") {
+          this.#markAttemptLaneForRebase(
+            (draft as WorkflowRunEventDraft<"attempt_started">).payload.attempt,
+          );
+        }
+        throw error;
       }
-      const reserved = this.#coordinator.reservedEvents.get(event.eventId);
-      if (
-        reserved === undefined ||
-        reserved.event !== event ||
-        reserved.canonicalJson !== canonicalJson
-      ) {
-        throw new WorkflowRunStoreError(
-          "event_mismatch",
-          "Workflow operation event was not allocated by this journal.",
-        );
-      }
-      if (event.sequence !== projection.nextSequence) {
-        throw new WorkflowRunStoreError(
-          "sequence_mismatch",
-          "Workflow operation event does not extend the physical prefix.",
-        );
-      }
-      const receipt = await this.#journal.append(event);
-      this.#coordinator.reservedEvents.delete(event.eventId);
-      return receipt;
     });
+  }
+
+  async #appendUnlocked<Type extends WorkflowRunEvent["type"]>(
+    fence: WorkflowRunEpochFence,
+    draft: WorkflowRunEventDraft<Type>,
+  ): Promise<WorkflowRunEventAppend<Type>> {
+    await this.#assertFence(fence);
+    const { events } = await this.#journal.readEventLog();
+    const created = events[0];
+    if (created === undefined && draft.type !== "run_created") {
+      throw new WorkflowProjectionFoldError(
+        "invalid_sequence",
+        "The first workflow event must create the run.",
+      );
+    }
+    if (
+      created !== undefined &&
+      (created.type !== "run_created" ||
+        created.runId !== this.#journal.runId ||
+        !durableWorkflowOwnerEquals(
+          created.payload.durableOwner,
+          this.#journal.owner,
+        ))
+    ) {
+      throw new WorkflowProjectionFoldError(
+        "wrong_run",
+        "Workflow event prefix does not belong to the fenced journal.",
+      );
+    }
+    if (created !== undefined && draft.type === "run_created") {
+      throw new WorkflowProjectionFoldError(
+        "duplicate_event",
+        "A workflow run can only be created once.",
+      );
+    }
+    const eventId = this.#nextId("event");
+    if (events.some((event) => event.eventId === eventId)) {
+      throw new TypeError(`Workflow event ID ${eventId} is already allocated.`);
+    }
+    const event = {
+      schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
+      eventId,
+      runId: fence.runId,
+      runEpoch: fence.runEpoch,
+      sequence: (events.at(-1)?.sequence ?? 0) + 1,
+      type: draft.type,
+      payload: draft.payload,
+    } as Extract<WorkflowRunEvent, { type: Type }>;
+    if (!isWorkflowRunEvent(event) || event.type !== draft.type) {
+      throw new TypeError("Workflow event draft is invalid.");
+    }
+    const receipt = await this.#journal.append(event);
+    return { event, receipt };
   }
 
   putOutcomeBlob(
@@ -320,6 +495,142 @@ export class WorkflowRunOperationJournal implements WorkflowOperationJournal {
       await this.#journal.revalidateFence();
       return encodeDurableValue(value).json;
     });
+  }
+
+  #validateAttemptStart(attempt: WorkflowOperationAttempt): void {
+    const reservation = this.#coordinator.attemptReservations
+      .get(attemptLaneKey(attempt.operation))
+      ?.get(attempt.attemptNumber);
+    if (reservation?.attemptId !== attempt.attemptId) {
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        "Workflow attempt-start append does not match its reservation.",
+      );
+    }
+  }
+
+  #observeAttemptStarted(attempt: WorkflowOperationAttempt): void {
+    const key = attemptLaneKey(attempt.operation);
+    const reservations = this.#coordinator.attemptReservations.get(key);
+    if (
+      reservations?.get(attempt.attemptNumber)?.attemptId === attempt.attemptId
+    ) {
+      reservations.delete(attempt.attemptNumber);
+      if (reservations.size === 0) {
+        this.#coordinator.attemptReservations.delete(key);
+      }
+    }
+    this.#coordinator.reservedAttemptIds.delete(attempt.attemptId);
+  }
+
+  #markAttemptLaneForRebase(attempt: WorkflowOperationAttempt): void {
+    const key = attemptLaneKey(attempt.operation);
+    const current = this.#coordinator.attemptRebaseFrom.get(key);
+    this.#coordinator.attemptRebaseFrom.set(
+      key,
+      Math.min(current ?? attempt.attemptNumber, attempt.attemptNumber),
+    );
+  }
+
+  #rebaseAttemptLane(
+    key: string,
+    fromNumber: number,
+    operation: DurableWorkflowOperationProjection,
+  ): void {
+    const reservations = this.#coordinator.attemptReservations.get(key);
+    let highestReserved = 0;
+    if (reservations !== undefined) {
+      for (const [attemptNumber, attempt] of reservations) {
+        const observed = operation.attempts.some(
+          ({ attempt: durable }) => durable.attemptId === attempt.attemptId,
+        );
+        if (observed || attemptNumber >= fromNumber) {
+          reservations.delete(attemptNumber);
+          this.#coordinator.reservedAttemptIds.delete(attempt.attemptId);
+        } else {
+          highestReserved = Math.max(highestReserved, attemptNumber);
+        }
+      }
+      if (reservations.size === 0) {
+        this.#coordinator.attemptReservations.delete(key);
+      }
+    }
+    this.#coordinator.nextAttemptNumbers.set(
+      key,
+      Math.max(operation.nextAttemptNumber, highestReserved + 1),
+    );
+    this.#coordinator.attemptRebaseFrom.delete(key);
+  }
+
+  #rebuildResponseLane(key: string, foldedNext: number): void {
+    const failure = this.#coordinator.responseLaneFailures.get(key);
+    const reservations = this.#coordinator.responseReservations.get(key);
+    if (failure !== undefined && reservations !== undefined) {
+      for (const reservation of reservations.values()) {
+        if (reservation.state === "committed") continue;
+        reservation.state = "abandoned";
+        reservation.reject(failure);
+      }
+    }
+    this.#coordinator.responseReservations.delete(key);
+    this.#coordinator.responseLaneFailures.delete(key);
+    this.#coordinator.responseCommitTails.set(key, Promise.resolve());
+    this.#coordinator.nextResponseOrdinals.set(key, foldedNext);
+    this.#coordinator.responseLaneGenerations.set(
+      key,
+      (this.#coordinator.responseLaneGenerations.get(key) ?? 0) + 1,
+    );
+  }
+
+  #closeResponseLane(
+    key: string,
+    fromOrdinal: WorkflowResponseOrdinal,
+    reason: unknown,
+    generation: number,
+  ): void {
+    if (
+      generation !== (this.#coordinator.responseLaneGenerations.get(key) ?? 0)
+    ) {
+      return;
+    }
+    const existingFailure = this.#coordinator.responseLaneFailures.get(key);
+    const failure =
+      existingFailure ??
+      (reason instanceof Error
+        ? reason
+        : new Error(`Workflow response lane abandoned: ${String(reason)}`));
+    this.#coordinator.responseLaneFailures.set(key, failure);
+    const reservations = this.#coordinator.responseReservations.get(key);
+    if (reservations === undefined) return;
+    for (const [ordinal, reservation] of reservations) {
+      if (ordinal < fromOrdinal || reservation.state === "committed") continue;
+      reservation.state = "abandoned";
+      reservation.reject(failure);
+    }
+  }
+
+  #validateResponseCommit(
+    fence: WorkflowRunEpochFence,
+    draft: WorkflowRunEventDraft<"response_ready">,
+  ): void {
+    const { operation, dispatchOrdinal, responseOrdinal } = draft.payload;
+    const key = responseLaneKey(fence, operation.definitionPath);
+    const reservation = this.#coordinator.responseReservations
+      .get(key)
+      ?.get(responseOrdinal);
+    if (
+      reservation === undefined ||
+      reservation.state !== "committing" ||
+      reservation.generation !==
+        (this.#coordinator.responseLaneGenerations.get(key) ?? 0) ||
+      reservation.request.dispatchOrdinal !== dispatchOrdinal ||
+      !workflowOperationIdentityEquals(reservation.request.identity, operation)
+    ) {
+      throw new WorkflowRunStoreError(
+        "immutable_conflict",
+        "Workflow response-ready append is outside its ordered commit.",
+      );
+    }
   }
 
   #serialized<T>(action: () => Promise<T>): Promise<T> {
@@ -399,28 +710,43 @@ export class WorkflowRunBlobResolver implements WorkflowRecoveryBlobResolver {
   }
 }
 
+function responseLaneKey(
+  fence: WorkflowRunEpochFence,
+  definitionPath: string,
+): string {
+  return JSON.stringify([
+    fence.durableOwner.projectKey,
+    fence.durableOwner.piSessionKey,
+    fence.runId,
+    fence.runEpoch,
+    fence.scopeId,
+    fence.generation,
+    fence.leaseToken,
+    definitionPath,
+  ]);
+}
+
+function attemptLaneKey(operation: WorkflowOperationIdentity): string {
+  return `${operation.definitionPath}\u0000${operation.operationId}`;
+}
+
 function coordinatorFor(journal: WorkflowRunJournal): JournalCoordinator {
   const existing = journalCoordinators.get(journal);
   if (existing !== undefined) return existing;
   const coordinator: JournalCoordinator = {
     tail: Promise.resolve(),
-    nextSequence: 0,
     nextAttemptNumbers: new Map(),
+    attemptReservations: new Map(),
+    attemptRebaseFrom: new Map(),
     nextResponseOrdinals: new Map(),
     reservedAttemptIds: new Set(),
-    reservedEvents: new Map(),
+    responseCommitTails: new Map(),
+    responseLaneFailures: new Map(),
+    responseLaneGenerations: new Map(),
+    responseReservations: new Map(),
   };
   journalCoordinators.set(journal, coordinator);
   return coordinator;
-}
-
-function isGateEvent(
-  event: WorkflowRunEvent,
-): event is WorkflowOperationGateEvent {
-  return (
-    isWorkflowRunEvent(event) &&
-    GATE_EVENT_TYPES[event.type as WorkflowOperationGateEvent["type"]] === true
-  );
 }
 
 function preparedOperation(
@@ -460,6 +786,8 @@ function operationState(
     attempts: operation.attempts.map((attempt) => ({
       attempt: attempt.attempt,
       dispatched: attempt.dispatchedEventId !== undefined,
+      status: attempt.status,
+      ...(attempt.process === undefined ? {} : { process: attempt.process }),
       ...(attempt.usageEventIds.length === 0
         ? {}
         : { observedUsage: attempt.usageObserved }),

@@ -118,6 +118,52 @@ describe("workflow plan presentation", () => {
       taskRows.find((row) => row.taskId === "task-cancelled")!.text,
     ).toContain("reason: user stopped preview");
   });
+  it("removes terminal and bidi controls from untrusted plan text", () => {
+    const projection = makeProjection();
+    const bidiControls =
+      "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069";
+    const adversarial = {
+      ...projection,
+      definition: {
+        ...projection.definition,
+        name: `\u001b[31m发布${bidiControls}计划\u009b2J`,
+      },
+      phases: projection.phases.map((phase) => ({
+        ...phase,
+        definition: {
+          ...phase.definition,
+          name: `\u001b]0;owned\u0007阶段${bidiControls}Ω`,
+        },
+        tasks: phase.tasks.map((task) => ({
+          ...task,
+          definition: {
+            ...task.definition,
+            id: `${task.definition.id}\u202e]dehsiuf[\u202c`,
+            content: `任务${bidiControls}Ω\u001b[2J`,
+          },
+          reason: `等待\u2067]dehsiuf[\u2069批准\u009b2J`,
+          error: new Error(`失败\u202e]dehsius[\u202c原因\u001b[31m`),
+        })),
+      })),
+    } as WorkflowPlanProjection;
+
+    const rendered = [
+      formatWorkflowPlanSummary(adversarial),
+      ...formatWorkflowPlanRows(adversarial).map((row) => row.text),
+    ];
+    for (const row of rendered) {
+      expect(row).not.toMatch(
+        /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/,
+      );
+    }
+    const text = rendered.join("\n");
+    expect(text).toContain("发布计划");
+    expect(text).toContain("阶段Ω");
+    expect(text).toContain("任务Ω");
+    expect(text).toContain("等待]dehsiuf[批准");
+    expect(text).toContain("失败]dehsius[原因");
+  });
+
   it("summarizes the derived overall status without task output", () => {
     const summary = formatWorkflowPlanSummary(makeProjection());
     expect(summary).toContain("release plan");

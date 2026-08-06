@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -66,14 +66,18 @@ function sequentialPlan(isolation?: string): WorkflowPlanDefinition {
 
 function parallelPlan(): WorkflowPlanDefinition {
   return validateWorkflowPlan({
-    name: "parallel-preview",
-    description: "unsupported parallel plan",
+    name: "parallel-durable",
+    description: "parallel durable plan",
     phases: [
       {
         id: "parallel",
         name: "Parallel",
         mode: "parallel",
-        tasks: [{ id: "task-a", content: "Task A", instruction: "run-a" }],
+        tasks: [
+          { id: "task-a", content: "Task A", instruction: "run-a" },
+          { id: "task-b", content: "Task B", instruction: "run-b" },
+          { id: "task-c", content: "Task C", instruction: "run-c" },
+        ],
       },
     ],
   });
@@ -99,6 +103,7 @@ describe("DurableWorkflowPlanController", () => {
 
   function store(
     sync?: ConstructorParameters<typeof WorkflowRunStore>[0]["sync"],
+    io?: ConstructorParameters<typeof WorkflowRunStore>[0]["io"],
   ): WorkflowRunStore {
     processNumber++;
     return new WorkflowRunStore({
@@ -108,6 +113,7 @@ describe("DurableWorkflowPlanController", () => {
         processStartIdentity: `process-${processNumber}`,
       },
       sync,
+      io,
     });
   }
 
@@ -192,22 +198,108 @@ describe("DurableWorkflowPlanController", () => {
     await reopened.release();
   });
 
-  it("rejects parallel and process-isolated plans before creating or dispatching", async () => {
-    const runStore = store();
-    let calls = 0;
-    const durable = await controller(runStore, async () => {
-      calls++;
-      return success("unexpected");
+  it("dispatches explicit process isolation through the durable attempt protocol", async () => {
+    const isolations: Array<string | undefined> = [];
+    const durable = await controller(store(), async (request) => {
+      isolations.push(request.isolation);
+      const processAttempt = request.workflowProcessAttempt;
+      if (processAttempt !== undefined) {
+        const assignment = {
+          backend: "tmux" as const,
+          paneId: "%21",
+          windowName: "wf-process-attempt",
+          muxSession: "test-session",
+          artifactDir: "/tmp/wf-process-attempt",
+          sessionFile: "/tmp/wf-process-attempt/session.jsonl",
+          launchScriptFile: "/tmp/wf-process-attempt/launch.sh",
+        };
+        await processAttempt.paneAssigned(assignment);
+        await processAttempt.launchDispatched(assignment);
+        await processAttempt.childStarted({
+          schemaVersion: 1,
+          identity: processAttempt.manifest.identity,
+          launchMarker: processAttempt.manifest.launchMarker,
+        });
+        await processAttempt.terminal({
+          identity: processAttempt.manifest.identity,
+          status: "done",
+          artifactEventId: "completion-1",
+          exitCode: 0,
+        });
+      }
+      return success(`done:${request.prompt}`);
     });
 
-    await expect(
-      durable.startPlan({ plan: parallelPlan() }),
-    ).rejects.toMatchObject({ code: "invalid_plan" });
-    await expect(
-      durable.startPlan({ plan: sequentialPlan("process") }),
-    ).rejects.toMatchObject({ code: "invalid_plan" });
-    expect(calls).toBe(0);
-    expect(await runStore.listRunIds(owner)).toEqual([]);
+    const execution = await durable.startPlan({
+      plan: sequentialPlan("process"),
+    });
+    await expect(execution.completion).resolves.toMatchObject({
+      status: "done",
+    });
+    expect(isolations).toEqual(["process", "in-process"]);
+    expect(
+      (await durable.getProjection(execution.runId))?.operations[0]?.attempts[0]
+        ?.process,
+    ).toMatchObject({
+      effectiveIsolation: "process",
+      fallbackMode: "none",
+    });
+    await durable.release();
+  });
+
+  it("overlaps parallel tasks within the cap and preserves task authority and definition order", async () => {
+    const releases = new Map<string, () => void>();
+    const waits = new Map(
+      ["run-a", "run-b", "run-c"].map((prompt) => [
+        prompt,
+        new Promise<void>((resolve) => releases.set(prompt, resolve)),
+      ]),
+    );
+    let markInitialOverlap!: () => void;
+    const initialOverlap = new Promise<void>((resolve) => {
+      markInitialOverlap = resolve;
+    });
+    let markTaskCStarted!: () => void;
+    const taskCStarted = new Promise<void>((resolve) => {
+      markTaskCStarted = resolve;
+    });
+    const started: string[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    const durable = await controller(store(), async ({ prompt }) => {
+      started.push(prompt);
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      if (active === 2) markInitialOverlap();
+      if (prompt === "run-c") markTaskCStarted();
+      await waits.get(prompt);
+      active--;
+      return success(`done:${prompt}`, 2, 1);
+    });
+
+    const execution = await durable.startPlan({
+      plan: parallelPlan(),
+      concurrency: 2,
+    });
+    await initialOverlap;
+    expect(started).toEqual(["run-a", "run-b"]);
+    expect(maximumActive).toBe(2);
+
+    releases.get("run-b")?.();
+    await taskCStarted;
+    expect(started).toEqual(["run-a", "run-b", "run-c"]);
+    expect(active).toBe(2);
+    releases.get("run-c")?.();
+    releases.get("run-a")?.();
+
+    const result = await execution.completion;
+    expect(maximumActive).toBe(2);
+    expect(result.result).toMatchObject([
+      { id: "task-a", output: "done:run-a" },
+      { id: "task-b", output: "done:run-b" },
+      { id: "task-c", output: "done:run-c" },
+    ]);
+    expect(result.usage).toMatchObject({ input: 6, output: 3 });
     await durable.release();
   });
 
@@ -279,7 +371,7 @@ describe("DurableWorkflowPlanController", () => {
       firstCancellation,
       repeatedCancellation,
     ]);
-    expect(firstResult.status).toBe("cancelled");
+    expect(firstResult).toMatchObject({ status: "cancelled" });
     expect(repeatedResult).toEqual(firstResult);
     expect(await observedAbort).toContain("run_cancellation_requested");
     expect(await execution.completion).toEqual(firstResult);
@@ -323,6 +415,127 @@ describe("DurableWorkflowPlanController", () => {
       ),
     ).rejects.toMatchObject({ code: "run_not_found" });
     await durable.release();
+  });
+
+  it("preserves active agent count when cancellation falls back after a write failure", async () => {
+    const runId = createDurableWorkflowRunId("active-cancellation-fallback");
+    let failNextOutputWrite = false;
+    const runStore = store(undefined, {
+      before: (boundary, purpose) => {
+        if (
+          failNextOutputWrite &&
+          boundary === "temporary_write" &&
+          purpose === "output"
+        ) {
+          failNextOutputWrite = false;
+          throw new Error("injected post-cancellation output write failure");
+        }
+      },
+    });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const durable = await controller(runStore, async ({ signal }) => {
+      markStarted();
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      failNextOutputWrite = true;
+      return { ...success("cancelled", 3, 1), cancelled: true };
+    });
+    const execution = await durable.startPlan({
+      runId,
+      plan: sequentialPlan(),
+    });
+    const completion = execution.completion.catch((error) => error);
+    await started;
+
+    const cancelled = await durable.trustedCancel(runId, {
+      reason: "cancel with one-shot write failure",
+      trustedActorId: "human-a",
+    });
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      agentsSpawned: 1,
+    });
+    expect(await durable.getResult(runId)).toMatchObject({
+      status: "cancelled",
+      agentsSpawned: 1,
+    });
+    expect(await completion).toBeInstanceOf(Error);
+    await durable.release();
+  });
+
+  it("reports zero agents for cold cancellation after durable attempt history", async () => {
+    const runId = createDurableWorkflowRunId("cold-cancellation-accounting");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const first = await controller(store(), async ({ signal }) => {
+      markStarted();
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return success("historical-usage", 4, 2);
+    });
+    const execution = await first.startPlan({
+      runId,
+      plan: sequentialPlan(),
+    });
+    await started;
+    const interruption = first.interrupt("quit", runId);
+    await expect(execution.completion).rejects.toMatchObject({
+      code: "interrupted",
+    });
+    await interruption;
+    const historical = await first.getProjection(runId);
+    expect(
+      historical?.operations.reduce(
+        (total, operation) => total + operation.attempts.length,
+        0,
+      ),
+    ).toBe(1);
+    expect(historical).toMatchObject({
+      accounting: { usage: { input: 4, output: 2 } },
+    });
+    await first.release();
+
+    let coldCalls = 0;
+    const cold = await controller(
+      store(),
+      async () => {
+        coldCalls++;
+        throw new Error("cold cancellation must not dispatch");
+      },
+      2,
+    );
+    const opened = await cold.open("startup");
+    expect(opened.completions).toEqual([]);
+
+    const cancelled = await cold.trustedCancel(runId, {
+      reason: "cancel without resuming",
+      trustedActorId: "human-a",
+    });
+    expect(coldCalls).toBe(0);
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 2,
+      usage: { input: 4, output: 2 },
+    });
+    expect(await cold.getResult(runId)).toMatchObject({
+      status: "cancelled",
+      agentsSpawned: 0,
+      errorCount: 0,
+      tokensSpent: 2,
+      usage: { input: 4, output: 2 },
+    });
+    await cold.release();
   });
 
   it("requires trusted startup resume, replays committed A, retries B, and does not double usage", async () => {
@@ -425,6 +638,99 @@ describe("DurableWorkflowPlanController", () => {
     await second.release();
   });
 
+  it("reuses an attempt start that persisted before its acknowledgement failed", async () => {
+    const runId = createDurableWorkflowRunId("persisted-attempt-start");
+    let failPersistedStart = true;
+    const firstStore = store({
+      file: async (handle, purpose) => {
+        await handle.sync();
+        if (purpose !== "events" || !failPersistedStart) return;
+        const eventsPath = join(
+          home,
+          ".pi-subagentura",
+          "workflow-runs",
+          "v1",
+          owner.projectKey,
+          owner.piSessionKey,
+          "runs",
+          runId,
+          "events.ndjson",
+        );
+        const lastLine = readFileSync(eventsPath, "utf8")
+          .trimEnd()
+          .split("\n")
+          .at(-1);
+        if (!lastLine) return;
+        const lastEvent: unknown = JSON.parse(lastLine);
+        if (
+          lastEvent !== null &&
+          typeof lastEvent === "object" &&
+          "type" in lastEvent &&
+          lastEvent.type === "attempt_started"
+        ) {
+          failPersistedStart = false;
+          throw new Error("injected attempt start acknowledgement failure");
+        }
+      },
+    });
+    const firstCalls: string[] = [];
+    const first = await controller(firstStore, async ({ prompt }) => {
+      firstCalls.push(prompt);
+      return success(`unexpected:${prompt}`);
+    });
+    const initial = await first.startPlan({
+      runId,
+      plan: sequentialPlan(),
+      resumePolicy: "trusted_resume",
+    });
+    await expect(initial.completion).rejects.toMatchObject({
+      code: "interrupted",
+    });
+    expect(firstCalls).toEqual([]);
+    const interruptedAfterStart = await first.getProjection(runId);
+    expect(interruptedAfterStart).toMatchObject({
+      status: "interrupted",
+      operations: [{ attempts: [{ status: "started" }] }],
+    });
+    expect(
+      interruptedAfterStart?.operations[0]?.attempts[0]?.dispatchedEventId,
+    ).toBeUndefined();
+    await first.release();
+
+    const resumedCalls: string[] = [];
+    const second = await controller(
+      store(),
+      async ({ prompt }) => {
+        resumedCalls.push(prompt);
+        return success(`done:${prompt}`);
+      },
+      2,
+    );
+    await second.open("startup");
+    const interrupted = await second.getProjection(runId);
+    if (interrupted === undefined)
+      throw new Error("missing interrupted projection");
+    const resumed = await second.trustedResume(runId, {
+      trustedActorId: "human-a",
+      expectedOwner: owner,
+      expectedRunEpoch: interrupted.runEpoch,
+    });
+    await resumed.completion;
+
+    expect(resumedCalls).toEqual(["run-a", "run-b"]);
+    const projection = await second.getProjection(runId);
+    const operationA = projection?.operations.find(
+      (operation) => operation.identity.operationId === "task-a",
+    );
+    expect(operationA?.attempts).toHaveLength(1);
+    expect(operationA?.attempts[0]).toMatchObject({
+      dispatchedEventId: expect.any(String),
+      status: "settled",
+      attempt: { attemptNumber: 1 },
+    });
+    await second.release();
+  });
+
   it("automatically continues reload-eligible runs and exposes their completion", async () => {
     const runId = createDurableWorkflowRunId("automatic-reload");
     const firstStore = store();
@@ -473,6 +779,63 @@ describe("DurableWorkflowPlanController", () => {
     await second.release();
   });
 
+  it("recreates a missing result binding after terminal event commit", async () => {
+    const runId = createDurableWorkflowRunId("terminal-binding-crash");
+    let failResultPublish = true;
+    const firstStore = store(undefined, {
+      before: (boundary, purpose) => {
+        if (
+          failResultPublish &&
+          boundary === "temporary_write" &&
+          purpose === "result"
+        ) {
+          failResultPublish = false;
+          throw new Error("crash before result binding publish");
+        }
+      },
+    });
+    const first = await controller(firstStore, async ({ prompt }) =>
+      success(`done:${prompt}`, 1, 1),
+    );
+    const execution = await first.startPlan({
+      runId,
+      plan: sequentialPlan(),
+    });
+    await expect(execution.completion).rejects.toThrow(
+      "crash before result binding publish",
+    );
+    expect(await first.getProjection(runId)).toMatchObject({
+      status: "done",
+      terminal: { status: "done" },
+    });
+    expect(
+      await (await firstStore.openRun(owner, runId)).readResult(),
+    ).toBeUndefined();
+    await first.release();
+
+    const secondStore = store();
+    const second = await controller(
+      secondStore,
+      async () => {
+        throw new Error("terminal recovery must not dispatch");
+      },
+      2,
+    );
+    await second.open("startup");
+    expect(
+      await (await secondStore.openRun(owner, runId)).readResult(),
+    ).toMatchObject({
+      runId,
+      terminalEventId: expect.any(String),
+      result: expect.objectContaining({ sha256: expect.any(String) }),
+    });
+    expect(await second.getResult(runId)).toMatchObject({
+      status: "done",
+      usage: { input: 2, output: 2 },
+    });
+    await second.release();
+  });
+
   it("aborts active model work and leaves the attempt retryable on interruption", async () => {
     const runId = createDurableWorkflowRunId("interrupt-active");
     let markStarted!: () => void;
@@ -510,5 +873,63 @@ describe("DurableWorkflowPlanController", () => {
       status: "interrupted",
     });
     await active.release();
+  });
+  it("journals returned usage before a winning interruption and replays it once", async () => {
+    const runId = createDurableWorkflowRunId("interrupt-after-result");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let calls = 0;
+    const durable = await controller(store(), async ({ signal }) => {
+      calls += 1;
+      markStarted();
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return success("late-terminal-result", 2, 7);
+    });
+    const execution = await durable.startPlan({
+      runId,
+      plan: validateWorkflowPlan({
+        name: "interrupted-result",
+        description: "persist returned usage before interruption",
+        phases: [
+          {
+            id: "phase-a",
+            name: "Phase A",
+            mode: "sequence",
+            tasks: [{ id: "task-a", content: "Task A", instruction: "run-a" }],
+          },
+        ],
+      }),
+      resumePolicy: "trusted_resume",
+    });
+    await started;
+    const interruption = durable.interrupt("reload", runId);
+    await expect(execution.completion).rejects.toMatchObject({
+      code: "interrupted",
+    });
+    await interruption;
+
+    const interrupted = await durable.getProjection(runId);
+    expect(interrupted).toMatchObject({
+      status: "interrupted",
+      accounting: { usage: { input: 2, output: 7 } },
+    });
+    if (interrupted === undefined) throw new Error("missing projection");
+    const resumed = await durable.trustedResume(runId, {
+      trustedActorId: "human-resume",
+      expectedOwner: owner,
+      expectedRunEpoch: interrupted.runEpoch,
+    });
+    await resumed.completion;
+    expect(calls).toBe(1);
+    expect(await durable.getResult(runId)).toMatchObject({
+      status: "done",
+      usage: { input: 2, output: 7 },
+    });
+    await durable.release();
   });
 });

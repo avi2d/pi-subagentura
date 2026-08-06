@@ -1,15 +1,45 @@
 import { randomUUID } from "node:crypto";
-import type { SubagentResult } from "./helpers";
-import type { WorkflowAgentRunner, WorkflowProgress } from "./workflow-core";
+import type { SubagentResult, Usage } from "./helpers";
+import type {
+  WorkflowAgentRunner,
+  WorkflowProgress,
+  WorkflowRunResultWithUsage,
+} from "./workflow-core";
+import { WorkflowAgentDispatcher } from "./workflow-dispatcher";
 import {
   decodeDurableValue,
   encodeDurableValue,
   type DurableValue,
 } from "./workflow-durable-value";
 import {
+  createWorkflowApprovalPolicyHash,
+  pendingWorkflowApproval,
+  workflowApprovalFenceMismatch,
+  type WorkflowApprovalDecisionInput,
+  type WorkflowApprovalDecisionOutcome,
+  type WorkflowApprovalDenialPolicy,
+  type WorkflowApprovalKind,
+  type WorkflowApprovalSnapshot,
+} from "./workflow-approvals";
+import {
+  createDurableWorkflowDeliveryPayload,
+  decodeDurableWorkflowDeliveryPayload,
+  durableWorkflowDeliveryId,
+  durableWorkflowDeliveryIdsFromEntries,
+  durableWorkflowDeliveryMessage,
+  type DurableWorkflowDeliveryTransport,
+} from "./workflow-delivery";
+import {
+  DurableWorkflowScriptControllerAdapter,
+  decodeStoredDurableWorkflowScriptResult,
+  type DurableWorkflowScriptExecution,
+  type DurableWorkflowScriptStartOptions,
+} from "./workflow-durable-script";
+import {
   durableWorkflowOperationBlobCodec,
   WorkflowRunBlobResolver,
   WorkflowRunOperationJournal,
+  type WorkflowRunEventDraft,
 } from "./workflow-operation-journal";
 import {
   WorkflowOperationGate,
@@ -29,6 +59,12 @@ import {
   type WorkflowPlanEvent,
   type WorkflowPlanProjection,
 } from "./workflow-plan-state";
+import {
+  applyWorkflowPlanMutation,
+  createWorkflowPlanViewProjection,
+  type WorkflowPlanMutationRequest,
+  type WorkflowPlanViewProjection,
+} from "./workflow-plan-mutations";
 import {
   WorkflowProjectionFoldError,
   foldWorkflowRunEvents,
@@ -50,16 +86,17 @@ import {
 } from "./workflow-run-store";
 import {
   ROOT_WORKFLOW_DEFINITION_PATH,
-  WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
+  WORKFLOW_OUTBOX_SCHEMA_VERSION,
   WORKFLOW_RUN_SCHEMA_VERSION,
   createDurableWorkflowRunId,
   createWorkflowDefinitionDigest,
+  createWorkflowSha256Digest,
   createWorkflowDefinitionPath,
-  createWorkflowDispatchOrdinal,
   createWorkflowOperationIdentity,
   createWorkflowRequestDigest,
   durableWorkflowOwnerEquals,
   isDurableWorkflowRunId,
+  isDurableWorkflowOwner,
   isWorkflowIdentifier,
   type DurableWorkflowOwner,
   type DurableWorkflowResumePolicy,
@@ -78,11 +115,23 @@ export interface DurableWorkflowPlanControllerOptions extends WorkflowLeaseAcqui
   readonly owner: DurableWorkflowOwner;
   readonly repository?: WorkflowProjectionRepository;
   readonly runAgentForRun: (runId: DurableWorkflowRunId) => WorkflowAgentRunner;
+  /** Namespace-wide cap for in-process durable operation dispatches. */
+  readonly concurrency?: number;
+  /** Namespace-wide cap for process-backed durable operation dispatches. */
+  readonly processConcurrency?: number;
   readonly generateId?: () => string;
+  readonly onDeliveryReady?: (
+    runId: DurableWorkflowRunId,
+  ) => void | Promise<void>;
+  readonly onPlanMutationWake?: (
+    runId: DurableWorkflowRunId,
+  ) => void | Promise<void>;
 }
 
 export interface DurableWorkflowPlanExecutionOptions {
   readonly signal?: AbortSignal;
+  readonly concurrency?: number;
+  readonly budgetTotal?: number | null;
   readonly onProgress?: (progress: WorkflowProgress) => void;
   readonly onPlanEvent?: (event: WorkflowPlanEvent) => void;
 }
@@ -105,15 +154,32 @@ export interface DurableWorkflowPlanCancellationOptions {
   readonly expectedOwner?: DurableWorkflowOwner;
   readonly expectedRunEpoch?: number;
 }
+export interface WorkflowApprovalRequestOptions {
+  readonly approvalKind: WorkflowApprovalKind;
+  readonly description: string;
+  readonly denialPolicy: WorkflowApprovalDenialPolicy;
+  readonly subjectTaskId?: string | null;
+  readonly expectedOwner?: DurableWorkflowOwner;
+  readonly expectedOwnerGeneration?: number;
+  readonly expectedRunEpoch?: number;
+  readonly policy?: DurableValue;
+}
 
 export interface DurableWorkflowPlanExecution {
   readonly runId: DurableWorkflowRunId;
   readonly completion: Promise<WorkflowPlanRunResult>;
 }
 
+export type DurableWorkflowExecution =
+  DurableWorkflowPlanExecution | DurableWorkflowScriptExecution;
+
 export interface DurableWorkflowPlanOpenResult {
   readonly recovery: WorkflowOwnerRecovery;
-  readonly completions: readonly DurableWorkflowPlanExecution[];
+  readonly completions: readonly DurableWorkflowExecution[];
+}
+export interface DurableWorkflowDeliveryReconcileResult {
+  readonly intentsRecorded: number;
+  readonly receiptsRecorded: number;
 }
 
 export type DurableWorkflowPlanInterruptionReason =
@@ -131,7 +197,11 @@ export class DurableWorkflowPlanControllerError extends Error {
     | "terminal_run"
     | "resume_forbidden"
     | "trusted_resume_required"
-    | "interrupted";
+    | "interrupted"
+    | "invalid_approval"
+    | "stale_revision"
+    | "invalid_mutation"
+    | "awaiting_budget";
 
   constructor(
     code: DurableWorkflowPlanControllerError["code"],
@@ -146,26 +216,71 @@ export class DurableWorkflowPlanControllerError extends Error {
 interface ActiveExecution {
   readonly runId: DurableWorkflowRunId;
   readonly journal: WorkflowRunJournal;
-  readonly plan: WorkflowPlanDefinition;
-  readonly definitionDigest: WorkflowDefinitionDigest;
-  readonly dispatchOrdinals: ReadonlyMap<string, number>;
+  plan: WorkflowPlanDefinition;
+  definitionDigest: WorkflowDefinitionDigest;
+  planRevision: number;
   readonly abort: AbortController;
+  readonly concurrency?: number;
+  readonly budgetTotal: number | null;
+  readonly skipTaskIds: ReadonlySet<string>;
   readonly externalSignal?: AbortSignal;
   readonly onProgress?: (progress: WorkflowProgress) => void;
   readonly onPlanEvent?: (event: WorkflowPlanEvent) => void;
+  agentsSpawned: number;
   interruptionReason?: DurableWorkflowPlanInterruptionReason;
   cancellation?: {
     readonly reason: string;
     readonly trustedActorId: string;
     readonly persisted: Promise<void>;
   };
+  awaitingApprovalRequestId?: string;
   completion?: Promise<WorkflowPlanRunResult>;
+}
+interface PendingActivePlanCancellation {
+  readonly kind: "active_plan_cancellation";
+  readonly execution: ActiveExecution;
+}
+interface PendingApprovalDecision {
+  readonly kind: "pending_approval_decision";
+  readonly completion: Promise<WorkflowPlanRunResult>;
+}
+function isPendingActivePlanCancellation(
+  value:
+    | WorkflowPlanRunResult
+    | WorkflowRunResultWithUsage
+    | PendingActivePlanCancellation,
+): value is PendingActivePlanCancellation {
+  return "kind" in value && value.kind === "active_plan_cancellation";
+}
+
+function isPendingApprovalDecision(
+  value: WorkflowApprovalDecisionOutcome | PendingApprovalDecision,
+): value is PendingApprovalDecision {
+  return "kind" in value && value.kind === "pending_approval_decision";
 }
 
 interface DurablePlanLaunch {
   readonly executionKind: "plan";
   readonly plan: WorkflowPlanDefinition;
   readonly resumePolicy: DurableWorkflowResumePolicy;
+  readonly budgetTotal: number | null;
+}
+
+/** Non-settling control signal used to reselect from durable plan authority. */
+class WorkflowPlanReselectionError extends WorkflowOperationInterruptedError {
+  constructor(message: string, usage?: Usage) {
+    super("recovery", message, usage);
+    this.name = "WorkflowPlanReselectionError";
+  }
+}
+
+function isWorkflowPlanReselectionError(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    if (current instanceof WorkflowPlanReselectionError) return true;
+    current = current.cause;
+  }
+  return false;
 }
 
 const ROOT_DEFINITION_PATH = createWorkflowDefinitionPath(
@@ -187,41 +302,75 @@ export class DurableWorkflowPlanController {
 
   readonly #store: WorkflowRunStore;
   readonly #lease: WorkflowRunLease;
+  readonly #dispatcher: WorkflowAgentDispatcher;
   readonly #runAgentForRun: (
     runId: DurableWorkflowRunId,
   ) => WorkflowAgentRunner;
   readonly #generateId: () => string;
   readonly #recovery: WorkflowRecoveryService;
+  readonly #scripts: DurableWorkflowScriptControllerAdapter;
+  readonly #onDeliveryReady?: (
+    runId: DurableWorkflowRunId,
+  ) => void | Promise<void>;
+  readonly #onPlanMutationWake?: (
+    runId: DurableWorkflowRunId,
+  ) => void | Promise<void>;
   readonly #active = new Map<DurableWorkflowRunId, ActiveExecution>();
-  #directAppendTail: Promise<void> = Promise.resolve();
+  readonly #managementTails = new Map<DurableWorkflowRunId, Promise<void>>();
+  readonly #deferredPlanWakes = new Set<DurableWorkflowRunId>();
+  #deliveryTail: Promise<void> = Promise.resolve();
   #closed = false;
 
   private constructor(
     options: DurableWorkflowPlanControllerOptions,
     lease: WorkflowRunLease,
+    dispatcher: WorkflowAgentDispatcher,
   ) {
     this.#store = options.store;
     this.#lease = lease;
+    this.#dispatcher = dispatcher;
     this.owner = options.owner;
     this.repository =
       options.repository ?? new InMemoryWorkflowProjectionRepository();
     this.#runAgentForRun = options.runAgentForRun;
     this.#generateId = options.generateId ?? randomUUID;
+    this.#onDeliveryReady = options.onDeliveryReady;
+    this.#onPlanMutationWake = options.onPlanMutationWake;
     this.#recovery = new WorkflowRecoveryService(
       this.#store,
       this.repository,
       new WorkflowRunBlobResolver(this.#store),
     );
+    this.#scripts = new DurableWorkflowScriptControllerAdapter({
+      store: this.#store,
+      lease: this.#lease,
+      owner: this.owner,
+      repository: this.repository,
+      runAgentForRun: this.#runAgentForRun,
+      dispatcher: this.#dispatcher,
+      generateId: this.#generateId,
+    });
   }
 
   static async acquire(
     options: DurableWorkflowPlanControllerOptions,
   ): Promise<DurableWorkflowPlanController> {
-    const lease = await options.store.acquireLease(options.owner, {
-      scopeId: options.scopeId,
-      generation: options.generation,
+    const dispatcher = new WorkflowAgentDispatcher({
+      concurrency: options.concurrency,
+      processConcurrency: options.processConcurrency,
     });
-    return new DurableWorkflowPlanController(options, lease);
+    let lease: WorkflowRunLease | undefined;
+    try {
+      lease = await options.store.acquireLease(options.owner, {
+        scopeId: options.scopeId,
+        generation: options.generation,
+      });
+      return new DurableWorkflowPlanController(options, lease, dispatcher);
+    } catch (error) {
+      dispatcher.close();
+      await lease?.release().catch(() => undefined);
+      throw error;
+    }
   }
 
   async open(
@@ -229,22 +378,63 @@ export class DurableWorkflowPlanController {
   ): Promise<DurableWorkflowPlanOpenResult> {
     this.#assertOpen();
     const recovery = await this.#recovery.recoverOwner(this.owner, reason);
+    for (const recovered of recovery.runs) {
+      const projection = recovered.projection;
+      if (projection?.result === undefined) continue;
+      await this.#repairTerminalGap(projection, reason);
+    }
+    for (const recovered of recovery.runs) {
+      const projection =
+        recovered.projection === undefined
+          ? undefined
+          : await this.repository.get(this.owner, recovered.runId);
+      if (
+        projection?.executionKind !== "plan" ||
+        projection.terminal !== undefined ||
+        (projection.cancellationRequestedEventId === undefined &&
+          !projection.approvalRequests.some(
+            (request) => request.decision === "denied",
+          ))
+      ) {
+        continue;
+      }
+      await this.#repairHumanDecisionGap(projection, reason);
+    }
+    for (const recovered of recovery.runs) {
+      const projection =
+        recovered.projection === undefined
+          ? undefined
+          : await this.repository.get(this.owner, recovered.runId);
+      if (
+        projection?.terminal !== undefined ||
+        projection?.status !== "awaiting_budget"
+      ) {
+        continue;
+      }
+      const journal = await this.#lease.acquireRun(projection.runId, reason);
+      await this.#refresh(journal);
+    }
+    await this.reconcileDeliveries();
     if (reason === "startup") {
       return Object.freeze({ recovery, completions: Object.freeze([]) });
     }
 
-    const completions: DurableWorkflowPlanExecution[] = [];
+    const completions: DurableWorkflowExecution[] = [];
     for (const recovered of recovery.runs) {
-      if (
-        !recovered.automaticResumeEligible ||
+      if (!recovered.automaticResumeEligible) continue;
+      const projection =
         recovered.projection === undefined
-      ) {
+          ? undefined
+          : await this.repository.get(this.owner, recovered.runId);
+      if (projection === undefined || projection.terminal !== undefined) {
         continue;
       }
       completions.push(
-        await this.#resumePlan(recovered.projection, {
-          reason,
-        }),
+        projection.executionKind === "script"
+          ? this.#observeScriptExecution(
+              await this.#scripts.resumeRecovered(projection, reason),
+            )
+          : await this.#resumePlan(projection, { reason }),
       );
     }
     return Object.freeze({
@@ -279,11 +469,22 @@ export class DurableWorkflowPlanController {
         "Durable workflow resume policy is invalid.",
       );
     }
+    const budgetTotal = options.budgetTotal ?? null;
+    if (
+      budgetTotal !== null &&
+      (!Number.isFinite(budgetTotal) || budgetTotal <= 0)
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Durable workflow budget must be a positive finite number.",
+      );
+    }
 
     const launch: DurablePlanLaunch = {
       executionKind: "plan",
       plan,
       resumePolicy,
+      budgetTotal,
     };
     const journal = await this.#lease.createRun({ runId, launch });
     const fence = requiredFence(journal);
@@ -334,6 +535,7 @@ export class DurableWorkflowPlanController {
       journal,
       plan,
       definitionDigest,
+      1,
       options,
     );
     return this.#startExecution(execution);
@@ -344,11 +546,33 @@ export class DurableWorkflowPlanController {
   ): Promise<WorkflowPlanRunResult> {
     return (await this.startPlan(options)).completion;
   }
+  startScript(
+    options: DurableWorkflowScriptStartOptions,
+  ): Promise<DurableWorkflowScriptExecution> {
+    this.#assertOpen();
+    return this.#scripts
+      .startScript(options)
+      .then((execution) => this.#observeScriptExecution(execution));
+  }
+  #observeScriptExecution(
+    execution: DurableWorkflowScriptExecution,
+  ): DurableWorkflowScriptExecution {
+    const notify = async (): Promise<void> => {
+      try {
+        await this.#onDeliveryReady?.(execution.runId);
+      } catch {
+        // A terminal run remains in the durable outbox and is retried by the
+        // next reconciliation trigger.
+      }
+    };
+    void execution.completion.then(notify, notify);
+    return execution;
+  }
 
   async trustedResume(
     runId: DurableWorkflowRunId,
     options: DurableWorkflowPlanResumeOptions,
-  ): Promise<DurableWorkflowPlanExecution> {
+  ): Promise<DurableWorkflowExecution> {
     this.#assertOpen();
     if (!isWorkflowIdentifier(options.trustedActorId)) {
       throw new DurableWorkflowPlanControllerError(
@@ -383,6 +607,15 @@ export class DurableWorkflowPlanController {
         `Durable workflow run ${runId} cannot be resumed by policy.`,
       );
     }
+    if (projection.executionKind === "script") {
+      return this.#observeScriptExecution(
+        await this.#scripts.resumeRecovered(projection, "trusted_resume", {
+          signal: options.signal,
+          onProgress: options.onProgress,
+          trustedActorId: options.trustedActorId,
+        }),
+      );
+    }
     return this.#resumePlan(projection, {
       reason: "trusted_resume",
       trustedActorId: options.trustedActorId,
@@ -392,10 +625,333 @@ export class DurableWorkflowPlanController {
     });
   }
 
+  inspectApproval(
+    runId: DurableWorkflowRunId,
+  ): Promise<WorkflowApprovalSnapshot | undefined> {
+    this.#assertOpen();
+    return this.repository
+      .get(this.owner, runId)
+      .then((projection) =>
+        projection === undefined
+          ? undefined
+          : pendingWorkflowApproval(projection),
+      );
+  }
+
+  requestApproval(
+    runId: DurableWorkflowRunId,
+    options: WorkflowApprovalRequestOptions,
+  ): Promise<WorkflowApprovalSnapshot> {
+    return this.#serializeManagement(runId, () =>
+      this.#requestApproval(runId, options),
+    );
+  }
+
+  async #requestApproval(
+    runId: DurableWorkflowRunId,
+    options: WorkflowApprovalRequestOptions,
+  ): Promise<WorkflowApprovalSnapshot> {
+    this.#assertOpen();
+    if (
+      (options.approvalKind !== "budget" &&
+        options.approvalKind !== "plan_gate") ||
+      (options.denialPolicy !== "stop" && options.denialPolicy !== "skip") ||
+      (options.denialPolicy === "skip" &&
+        (options.subjectTaskId === undefined ||
+          options.subjectTaskId === null)) ||
+      typeof options.description !== "string" ||
+      options.description.length === 0 ||
+      options.description.length > 4_096 ||
+      (options.subjectTaskId !== undefined &&
+        options.subjectTaskId !== null &&
+        !isWorkflowIdentifier(options.subjectTaskId))
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Approval request fields are invalid.",
+      );
+    }
+    this.#assertExpectedOwner(options.expectedOwner);
+    let projection = await this.repository.get(this.owner, runId);
+    if (projection === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "run_not_found",
+        `Durable workflow run ${runId} is not recovered.`,
+      );
+    }
+    const existing = pendingWorkflowApproval(projection);
+    if (existing !== undefined) return existing;
+    if (
+      options.expectedOwnerGeneration !== undefined &&
+      options.expectedOwnerGeneration !== projection.ownerGeneration
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Approval request owner generation is stale.",
+      );
+    }
+    this.#assertExpectedEpoch(projection, options.expectedRunEpoch);
+    if (projection.terminal !== undefined || projection.status !== "running") {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        `Durable workflow run ${runId} cannot request approval while ${projection.status}.`,
+      );
+    }
+    const active = this.#active.get(runId);
+    const journal =
+      active?.journal ?? (await this.#lease.acquireRun(runId, "resume"));
+    projection = await this.#refresh(journal);
+    const afterAcquire = pendingWorkflowApproval(projection);
+    if (afterAcquire !== undefined) return afterAcquire;
+    if (projection.status !== "running" || projection.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Approval request state changed before it could be committed.",
+      );
+    }
+    const subjectTaskId = options.subjectTaskId ?? null;
+    const currentPlan =
+      active?.plan ?? (await this.#readCurrentPlan(journal, projection));
+    if (
+      subjectTaskId !== null &&
+      !currentPlan.phases
+        .flatMap((phase) => phase.tasks)
+        .some((task) => task.id === subjectTaskId)
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        `Approval subject task ${subjectTaskId} is not in the durable plan.`,
+      );
+    }
+    const fence = requiredFence(journal);
+    const version =
+      projection.approvalRequests.reduce(
+        (maximum, request) => Math.max(maximum, request.version),
+        0,
+      ) + 1;
+    const policyHash = createWorkflowApprovalPolicyHash(
+      options.policy ?? {
+        approvalKind: options.approvalKind,
+        description: options.description,
+        denialPolicy: options.denialPolicy,
+        subjectTaskId,
+        planRevision: projection.plan.revision,
+        revisionHash: projection.plan.revisionHash,
+      },
+    );
+    const budgetRequestId = `approval-${this.#generateId()}`;
+    await this.#appendEvent(journal, "budget_requested", {
+      budgetRequestId,
+      approvalKind: options.approvalKind,
+      reason: options.approvalKind === "budget" ? "token_limit" : "plan_gate",
+      description: options.description,
+      accounting: projection.accounting,
+      policyHash,
+      planRevision: projection.plan.revision,
+      ownerGeneration: fence.generation,
+      runEpoch: fence.runEpoch,
+      version,
+      denialPolicy: options.denialPolicy,
+      subjectTaskId,
+    });
+    const requestedProjection = await this.#refresh(journal);
+    const request = pendingWorkflowApproval(requestedProjection);
+    if (request === undefined || request.requestId !== budgetRequestId) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Committed approval request did not project as pending.",
+      );
+    }
+    if (active !== undefined) {
+      active.awaitingApprovalRequestId = request.requestId;
+    }
+    return request;
+  }
+
+  async trustedDecideApproval(
+    runId: DurableWorkflowRunId,
+    input: WorkflowApprovalDecisionInput,
+  ): Promise<WorkflowApprovalDecisionOutcome> {
+    let drained = false;
+    for (;;) {
+      const result = await this.#serializeManagement(runId, () =>
+        this.#trustedDecideApproval(runId, input, drained),
+      );
+      if (!isPendingApprovalDecision(result)) return result;
+      await result.completion.catch(() => undefined);
+      drained = true;
+    }
+  }
+
+  async #trustedDecideApproval(
+    runId: DurableWorkflowRunId,
+    input: WorkflowApprovalDecisionInput,
+    drained: boolean,
+  ): Promise<WorkflowApprovalDecisionOutcome | PendingApprovalDecision> {
+    this.#assertOpen();
+    if (
+      !isWorkflowIdentifier(input.trustedActorId) ||
+      (input.decision !== "approved" && input.decision !== "denied")
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Trusted approval decision requires a valid actor and decision.",
+      );
+    }
+    let projection = await this.repository.get(this.owner, runId);
+    if (projection === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "run_not_found",
+        `Durable workflow run ${runId} is not recovered.`,
+      );
+    }
+    let request = pendingWorkflowApproval(projection);
+    if (request === undefined) {
+      return { status: "no_op", reason: "not_pending" };
+    }
+    if (projection.plan?.revision !== request.planRevision) {
+      return { status: "no_op", reason: "plan_revision_mismatch", request };
+    }
+    let mismatch = workflowApprovalFenceMismatch(request, input);
+    if (mismatch !== undefined) {
+      return { status: "no_op", reason: mismatch, request };
+    }
+
+    const active = this.#active.get(runId);
+    if (!drained && active?.completion !== undefined) {
+      active.awaitingApprovalRequestId = request.requestId;
+      return {
+        kind: "pending_approval_decision",
+        completion: active.completion,
+      };
+    }
+    const journal =
+      active?.journal ?? (await this.#lease.acquireRun(runId, "resume"));
+    projection = await this.#refresh(journal);
+    if (
+      projection.terminal !== undefined ||
+      projection.cancellationRequestedEventId !== undefined
+    ) {
+      return { status: "no_op", reason: "not_pending" };
+    }
+    request = pendingWorkflowApproval(projection);
+    if (request === undefined) {
+      return { status: "no_op", reason: "not_pending" };
+    }
+    if (projection.plan?.revision !== request.planRevision) {
+      return { status: "no_op", reason: "plan_revision_mismatch", request };
+    }
+    mismatch = workflowApprovalFenceMismatch(request, input);
+    if (mismatch !== undefined) {
+      return { status: "no_op", reason: mismatch, request };
+    }
+    for (const operation of projection.operations) {
+      const attempt = operation.attempts.at(-1);
+      if (
+        attempt?.status !== "started" ||
+        (attempt.dispatchedEventId === undefined &&
+          attempt.process === undefined)
+      ) {
+        continue;
+      }
+      await this.#appendEvent(journal, "attempt_interrupted", {
+        attempt: attempt.attempt,
+        reason: "recovery",
+      });
+    }
+    projection = await this.#refresh(journal);
+    const current = pendingWorkflowApproval(projection);
+    if (current === undefined) {
+      return { status: "no_op", reason: "not_pending" };
+    }
+    if (projection.plan?.revision !== current.planRevision) {
+      return {
+        status: "no_op",
+        reason: "plan_revision_mismatch",
+        request: current,
+      };
+    }
+    mismatch = workflowApprovalFenceMismatch(current, input);
+    if (mismatch !== undefined) {
+      return { status: "no_op", reason: mismatch, request: current };
+    }
+    const fence = requiredFence(journal);
+    await this.#appendEvent(journal, "budget_decided", {
+      budgetRequestId: current.requestId,
+      requestEventId: current.requestEventId,
+      decision: input.decision,
+      trustedActorId: input.trustedActorId,
+      policyHash: current.policyHash,
+      planRevision: current.planRevision,
+      requestOwnerGeneration: current.requestOwnerGeneration,
+      requestRunEpoch: current.requestRunEpoch,
+      ownerGeneration: fence.generation,
+      runEpoch: fence.runEpoch,
+      version: current.version,
+    });
+    projection = await this.#refresh(journal);
+
+    if (input.decision === "denied") {
+      projection = await this.#completeDecidedDenials(journal, projection);
+      if (current.denialPolicy === "stop") {
+        return {
+          status: "accepted",
+          decision: input.decision,
+          request: current,
+        };
+      }
+    }
+
+    if (projection.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Approved durable workflow has no current plan definition.",
+      );
+    }
+    const plan = await this.#readCurrentPlan(journal, projection);
+    const execution = this.#newExecution(
+      journal,
+      plan,
+      projection.plan.definitionDigest,
+      projection.plan.revision,
+      {
+        budgetTotal: this.#readLaunchBudget(journal),
+      },
+      new Set(
+        projection.tasks
+          .filter((task) => task.status === "skipped")
+          .map((task) => task.taskId),
+      ),
+    );
+    const continued = this.#startExecution(execution);
+    return {
+      status: "accepted",
+      decision: input.decision,
+      request: current,
+      execution: continued,
+    };
+  }
+
   async trustedCancel(
     runId: DurableWorkflowRunId,
     options: DurableWorkflowPlanCancellationOptions,
-  ): Promise<WorkflowPlanRunResult> {
+  ): Promise<WorkflowPlanRunResult | WorkflowRunResultWithUsage> {
+    const result = await this.#serializeManagement(runId, () =>
+      this.#trustedCancel(runId, options),
+    );
+    return isPendingActivePlanCancellation(result)
+      ? this.#finishActiveCancellation(result.execution)
+      : result;
+  }
+
+  async #trustedCancel(
+    runId: DurableWorkflowRunId,
+    options: DurableWorkflowPlanCancellationOptions,
+  ): Promise<
+    | WorkflowPlanRunResult
+    | WorkflowRunResultWithUsage
+    | PendingActivePlanCancellation
+  > {
     this.#assertOpen();
     if (
       !isWorkflowIdentifier(options.trustedActorId) ||
@@ -417,6 +973,22 @@ export class DurableWorkflowPlanController {
       );
     }
     this.#assertExpectedEpoch(projection, options.expectedRunEpoch);
+    if (projection.executionKind === "script") {
+      if (projection.terminal !== undefined) {
+        if (projection.terminal.status === "cancelled") {
+          return requiredStoredScriptResult(await this.getResult(runId), runId);
+        }
+        throw new DurableWorkflowPlanControllerError(
+          "terminal_run",
+          `Durable workflow run ${runId} is already terminal.`,
+        );
+      }
+      return this.#scripts.trustedCancel(
+        projection,
+        options.reason,
+        options.trustedActorId,
+      );
+    }
     if (projection.terminal !== undefined) {
       if (projection.terminal.status === "cancelled") {
         return requiredStoredPlanResult(await this.getResult(runId), runId);
@@ -446,34 +1018,13 @@ export class DurableWorkflowPlanController {
           persisted,
         };
       }
-      await active.cancellation.persisted;
-      if (!active.abort.signal.aborted) {
-        active.abort.abort(active.cancellation.reason);
-      }
       if (active.completion === undefined) {
         throw new DurableWorkflowPlanControllerError(
           "run_active",
           `Durable workflow run ${runId} has not attached its completion.`,
         );
       }
-      try {
-        return await active.completion;
-      } catch (error) {
-        const cancelled = await this.#refresh(active.journal);
-        if (cancelled.terminal?.status === "cancelled") {
-          return requiredStoredPlanResult(await this.getResult(runId), runId);
-        }
-        if (
-          cancelled.terminal === undefined &&
-          cancelled.cancellationRequestedEventId !== undefined
-        ) {
-          return this.#cancelInactivePlan(
-            active.journal,
-            active.cancellation.reason,
-          );
-        }
-        throw error;
-      }
+      return { kind: "active_plan_cancellation", execution: active };
     }
 
     const journal = await this.#lease.acquireRun(runId, "resume");
@@ -503,15 +1054,143 @@ export class DurableWorkflowPlanController {
     return this.repository.get(this.owner, runId);
   }
 
+  isPlanExecutorActive(runId: DurableWorkflowRunId): boolean {
+    this.#assertOpen();
+    return this.#active.has(runId);
+  }
+
+  async getPlanView(
+    runId: DurableWorkflowRunId,
+  ): Promise<WorkflowPlanViewProjection> {
+    this.#assertOpen();
+    const projection = await this.repository.get(this.owner, runId);
+    if (
+      projection === undefined ||
+      projection.executionKind !== "plan" ||
+      projection.plan === undefined
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "run_not_found",
+        `Durable workflow plan ${runId} is not recovered.`,
+      );
+    }
+    const journal = await this.#store.openRun(this.owner, runId);
+    return this.#planView(journal, projection);
+  }
+
+  async listPlanViews(): Promise<readonly WorkflowPlanViewProjection[]> {
+    this.#assertOpen();
+    const projections = await this.repository.list(this.owner);
+    const views: WorkflowPlanViewProjection[] = [];
+    for (const projection of projections) {
+      if (
+        projection.executionKind !== "plan" ||
+        projection.plan === undefined
+      ) {
+        continue;
+      }
+      const journal = await this.#store.openRun(this.owner, projection.runId);
+      views.push(await this.#planView(journal, projection));
+    }
+    return Object.freeze(views);
+  }
+
+  mutatePlan(
+    runId: DurableWorkflowRunId,
+    request: WorkflowPlanMutationRequest,
+  ): Promise<WorkflowPlanViewProjection> {
+    this.#assertOpen();
+    return this.#serializeManagement(runId, () =>
+      this.#mutatePlan(runId, request),
+    );
+  }
+
+  wakePlan(runId: DurableWorkflowRunId): Promise<void> {
+    this.#assertOpen();
+    return this.#serializeManagement(runId, () => this.#wakePlan(runId));
+  }
+
   async getResult(
     runId: DurableWorkflowRunId,
   ): Promise<DurableValue | undefined> {
     this.#assertOpen();
     const journal = await this.#store.openRun(this.owner, runId);
+    const projection =
+      (await this.repository.get(this.owner, runId)) ??
+      foldWorkflowRunEvents(await journal.readEvents());
     const binding = await journal.readResult();
-    return binding === undefined
-      ? undefined
-      : journal.readOutput(binding.result);
+    const reference = binding?.result ?? projection.result?.result;
+    if (reference === undefined) return undefined;
+    const stored = await journal.readOutput(reference);
+    return projection.executionKind === "script"
+      ? (decodeStoredDurableWorkflowScriptResult(stored)
+          .result as unknown as DurableValue)
+      : stored;
+  }
+  reconcileDeliveries(
+    transport?: DurableWorkflowDeliveryTransport,
+  ): Promise<DurableWorkflowDeliveryReconcileResult> {
+    const operation = this.#deliveryTail.then(
+      () => this.#reconcileDeliveries(transport),
+      () => this.#reconcileDeliveries(transport),
+    );
+    this.#deliveryTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  async #reconcileDeliveries(
+    transport?: DurableWorkflowDeliveryTransport,
+  ): Promise<DurableWorkflowDeliveryReconcileResult> {
+    this.#assertOpen();
+    const existing = durableWorkflowDeliveryIdsFromEntries(
+      transport?.existingEntries?.() ?? [],
+    );
+    let intentsRecorded = 0;
+    let receiptsRecorded = 0;
+    for (const recovered of await this.repository.list(this.owner)) {
+      if (recovered.terminal === undefined) continue;
+      const journal = await this.#lease.openTerminalMaintenanceRun(
+        recovered.runId,
+      );
+      let projection = await this.#refresh(journal);
+      const ensured = await this.#ensureDeliveryIntent(journal, projection);
+      projection = ensured.projection;
+      if (ensured.recorded) intentsRecorded += 1;
+      if (ensured.delivery.state === "delivered") continue;
+      if (transport === undefined) continue;
+
+      let deliveredBy: "pi-session-entry" | "pi-send-message";
+      if (existing.has(ensured.delivery.deliveryId)) {
+        deliveredBy = "pi-session-entry";
+      } else {
+        const payload = decodeDurableWorkflowDeliveryPayload(
+          await journal.readOutput(ensured.delivery.payload),
+        );
+        if (
+          payload.deliveryId !== ensured.delivery.deliveryId ||
+          payload.runId !== projection.runId ||
+          payload.terminalEventId !== projection.terminal?.eventId
+        ) {
+          throw new DurableWorkflowPlanControllerError(
+            "invalid_plan",
+            "Durable workflow delivery payload does not match its terminal intent.",
+          );
+        }
+        transport.dispatch(durableWorkflowDeliveryMessage(payload));
+        deliveredBy = "pi-send-message";
+      }
+      await this.#appendEvent(journal, "delivery_receipt_recorded", {
+        outboxSchemaVersion: WORKFLOW_OUTBOX_SCHEMA_VERSION,
+        deliveryId: ensured.delivery.deliveryId,
+        intentEventId: ensured.delivery.intentEventId,
+        deliveredBy,
+      });
+      receiptsRecorded += 1;
+    }
+    return Object.freeze({ intentsRecorded, receiptsRecorded });
   }
 
   async interrupt(
@@ -543,13 +1222,19 @@ export class DurableWorkflowPlanController {
     await Promise.allSettled(
       executions.map((execution) => execution.completion),
     );
+    await this.#scripts.interrupt(reason, runId);
   }
 
   async release(): Promise<void> {
     this.#assertOpen();
-    await this.interrupt("quit");
-    await this.#lease.release();
-    this.#closed = true;
+    try {
+      await this.interrupt("quit");
+    } finally {
+      this.#dispatcher.close();
+      await this.#dispatcher.drain();
+      await this.#lease.release();
+      this.#closed = true;
+    }
   }
 
   async #resumePlan(
@@ -584,6 +1269,24 @@ export class DurableWorkflowPlanController {
         `Durable workflow run ${recovered.runId} became terminal.`,
       );
     }
+    projection = await this.#completeDecidedDenials(journal, projection);
+    if (projection.terminal !== undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "terminal_run",
+        `Durable workflow run ${recovered.runId} completed its persisted denial before resume.`,
+      );
+    }
+    if (projection.cancellationRequestedEventId !== undefined) {
+      const cancellationReason = await this.#cancellationReason(
+        journal,
+        projection,
+      );
+      await this.#cancelInactivePlan(journal, cancellationReason);
+      throw new DurableWorkflowPlanControllerError(
+        "terminal_run",
+        `Durable workflow run ${recovered.runId} completed its persisted cancellation instead of resuming.`,
+      );
+    }
     if (projection.status !== "interrupted") {
       await this.#appendEvent(journal, "run_interrupted", {
         reason: options.reason === "reload" ? "reload" : "process_crash",
@@ -592,19 +1295,32 @@ export class DurableWorkflowPlanController {
     }
     for (const operation of projection.operations) {
       const activeAttempt = operation.attempts.at(-1);
-      if (activeAttempt?.status !== "started") continue;
+      if (
+        activeAttempt?.status !== "started" ||
+        (activeAttempt.dispatchedEventId === undefined &&
+          activeAttempt.process === undefined)
+      ) {
+        continue;
+      }
+      if (
+        activeAttempt.process !== undefined &&
+        activeAttempt.process.effectiveIsolation === "process" &&
+        activeAttempt.process.fencedEventId === undefined
+      ) {
+        continue;
+      }
       await this.#appendEvent(journal, "attempt_interrupted", {
         attempt: activeAttempt.attempt,
         reason: "recovery",
       });
     }
-    const plan = await this.#readLaunchPlan(journal);
-    if (encodeDurableValue(plan).sha256 !== projection.rootDefinitionDigest) {
+    if (projection.plan === undefined) {
       throw new DurableWorkflowPlanControllerError(
         "invalid_plan",
-        "Persisted workflow launch does not match its immutable definition.",
+        "Recovered durable workflow has no current plan definition.",
       );
     }
+    const plan = await this.#readCurrentPlan(journal, projection);
     const resumeReason =
       options.reason === "trusted_resume"
         ? "trusted_resume"
@@ -618,11 +1334,26 @@ export class DurableWorkflowPlanController {
         : { trustedActorId: options.trustedActorId }),
     });
     projection = await this.#refresh(journal);
+    if (projection.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Resumed durable workflow has no current plan definition.",
+      );
+    }
     const execution = this.#newExecution(
       journal,
       plan,
-      projection.rootDefinitionDigest,
-      options,
+      projection.plan.definitionDigest,
+      projection.plan.revision,
+      {
+        ...options,
+        budgetTotal: this.#readLaunchBudget(journal),
+      },
+      new Set(
+        projection.tasks
+          .filter((task) => task.status === "skipped")
+          .map((task) => task.taskId),
+      ),
     );
     return this.#startExecution(execution);
   }
@@ -631,7 +1362,9 @@ export class DurableWorkflowPlanController {
     journal: WorkflowRunJournal,
     plan: WorkflowPlanDefinition,
     definitionDigest: WorkflowDefinitionDigest,
+    planRevision: number,
     options: DurableWorkflowPlanExecutionOptions,
+    skipTaskIds: ReadonlySet<string> = new Set(),
   ): ActiveExecution {
     const abort = new AbortController();
     if (options.signal?.aborted) abort.abort(options.signal.reason);
@@ -640,15 +1373,15 @@ export class DurableWorkflowPlanController {
       journal,
       plan,
       definitionDigest,
-      dispatchOrdinals: new Map(
-        plan.phases
-          .flatMap((phase) => phase.tasks)
-          .map((task, index) => [task.id, index + 1]),
-      ),
+      planRevision,
       abort,
+      concurrency: options.concurrency,
+      budgetTotal: options.budgetTotal ?? null,
+      skipTaskIds,
       externalSignal: options.signal,
       onProgress: options.onProgress,
       onPlanEvent: options.onPlanEvent,
+      agentsSpawned: 0,
       ...(options.signal?.aborted
         ? { interruptionReason: "owner_replaced" }
         : {}),
@@ -677,14 +1410,22 @@ export class DurableWorkflowPlanController {
       if (this.#active.get(execution.runId) === execution) {
         this.#active.delete(execution.runId);
       }
+      if (this.#deferredPlanWakes.delete(execution.runId) && !this.#closed) {
+        void this.wakePlan(execution.runId).catch((error) => {
+          console.error("[subagentura] deferred workflow wake failed", error);
+        });
+      }
     });
     execution.completion = completion;
     return Object.freeze({ runId: execution.runId, completion });
   }
 
-  async #execute(execution: ActiveExecution): Promise<WorkflowPlanRunResult> {
+  async #execute(
+    execution: ActiveExecution,
+    priorAgentsSpawned = 0,
+    priorPhases: readonly string[] = [],
+  ): Promise<WorkflowPlanRunResult> {
     const fence = requiredFence(execution.journal);
-    let currentDispatch: (() => Promise<SubagentResult>) | undefined;
     const durableJournal = new WorkflowRunOperationJournal(
       execution.journal,
       this.#generateId,
@@ -697,67 +1438,283 @@ export class DurableWorkflowPlanController {
         durableJournal.allocateAttempt(nextFence, request),
       allocateResponseOrdinal: (nextFence, request) =>
         durableJournal.allocateResponseOrdinal(nextFence, request),
-      createEvent: (nextFence, draft) =>
-        durableJournal.createEvent(nextFence, draft),
-      append: async (nextFence, event) => {
-        const receipt = await durableJournal.append(nextFence, event);
+      commitResponse: (nextFence, request, responseOrdinal, commit) =>
+        durableJournal.commitResponse(
+          nextFence,
+          request,
+          responseOrdinal,
+          commit,
+        ),
+      abandonResponse: (nextFence, request, responseOrdinal, reason) =>
+        durableJournal.abandonResponse(
+          nextFence,
+          request,
+          responseOrdinal,
+          reason,
+        ),
+      appendEvent: async (nextFence, draft) => {
+        const appended = await durableJournal.appendEvent(nextFence, draft);
         await this.#refresh(execution.journal);
-        return receipt;
+        return appended;
       },
       putOutcomeBlob: (nextFence, value) =>
         durableJournal.putOutcomeBlob(nextFence, value),
       readOutcomeBlob: (nextFence, reference) =>
         durableJournal.readOutcomeBlob(nextFence, reference),
     };
-    const gate = new WorkflowOperationGate({
-      journal: operationJournal,
-      blobCodec: durableWorkflowOperationBlobCodec,
-      dispatcher: {
-        run: async () => {
-          if (currentDispatch === undefined) {
-            throw new DurableWorkflowPlanControllerError(
-              "run_active",
-              "Durable operation dispatched outside its plan task authority.",
-            );
-          }
-          try {
-            const result = await currentDispatch();
-            await execution.cancellation?.persisted;
-            if (execution.interruptionReason !== undefined) {
-              throw operationInterruption(execution.interruptionReason);
-            }
-            return result;
-          } catch (error) {
-            await execution.cancellation?.persisted;
-            if (
-              execution.interruptionReason !== undefined &&
-              !(error instanceof WorkflowOperationInterruptedError)
-            ) {
-              throw operationInterruption(execution.interruptionReason);
-            }
-            throw error;
-          }
-        },
-      },
-    });
     const runAgent = this.#runAgentForRun(execution.runId);
+    const durableProjection = await this.#refresh(execution.journal);
+    let schedulerRevision =
+      durableProjection.plan?.revision ?? execution.planRevision;
+    const initialTaskStatuses: Record<string, WorkflowPlanTaskStatus> =
+      Object.create(null);
+    for (const task of durableProjection.tasks) {
+      if (task.status === "blocked" || task.status === "skipped") {
+        initialTaskStatuses[task.taskId] = task.status;
+      }
+    }
     let result: WorkflowPlanRunResult;
     try {
       result = await runWorkflowPlan(execution.plan, {
         runAgent,
-        concurrency: 1,
+        concurrency: execution.concurrency,
+        dispatcher: this.#dispatcher,
         signal: execution.abort.signal,
-        appendEvent: (event) => this.#appendPlanEvent(execution, event),
-        onProgress: execution.onProgress,
-        dispatchTask: async (input) => {
-          if (execution.interruptionReason !== undefined) {
-            throw operationInterruption(execution.interruptionReason);
+        onProgress: (progress) => {
+          if (progress.kind === "agent_start") execution.agentsSpawned += 1;
+          execution.onProgress?.(progress);
+        },
+        appendEvent: (event) =>
+          this.#appendPlanEvent(execution, event, schedulerRevision),
+        skipTask: (task) =>
+          execution.skipTaskIds.has(task.definition.id)
+            ? "Skipped by a trusted approval denial."
+            : undefined,
+        initialTaskStatuses,
+        refreshPlan: async () => {
+          const projection = await this.#refresh(execution.journal);
+          schedulerRevision = projection.plan?.revision ?? schedulerRevision;
+          if (projection.plan === undefined) {
+            throw new DurableWorkflowPlanControllerError(
+              "invalid_plan",
+              `Durable workflow run ${execution.runId} lost its plan projection.`,
+            );
           }
-          const request = this.#operationRequest(execution, input);
-          currentDispatch = input.dispatch;
+          const taskStatuses: Record<string, WorkflowPlanTaskStatus> =
+            Object.create(null);
+          for (const task of projection.tasks) {
+            taskStatuses[task.taskId] = task.status;
+          }
+          return {
+            definition: await this.#readCurrentPlan(
+              execution.journal,
+              projection,
+            ),
+            taskStatuses,
+          };
+        },
+        dispatchTask: async (input) => {
+          if (
+            execution.interruptionReason !== undefined ||
+            execution.cancellation !== undefined
+          ) {
+            throw operationInterruption(
+              execution.interruptionReason ?? "owner_replaced",
+            );
+          }
+          await this.#ensureDispatchBudget(execution, input);
+          const prepared = await this.#serializeManagement(
+            execution.runId,
+            async () => {
+              const projection = await this.#refresh(execution.journal);
+              const pending = pendingWorkflowApproval(projection);
+              if (pending !== undefined) {
+                execution.awaitingApprovalRequestId = pending.requestId;
+                throw new DurableWorkflowPlanControllerError(
+                  "awaiting_budget",
+                  `Durable workflow run ${execution.runId} is awaiting trusted approval.`,
+                );
+              }
+              if (
+                projection.terminal !== undefined ||
+                projection.cancellationRequestedEventId !== undefined ||
+                execution.interruptionReason !== undefined ||
+                execution.cancellation !== undefined
+              ) {
+                throw operationInterruption(
+                  execution.interruptionReason ?? "owner_replaced",
+                );
+              }
+              const taskId = input.task.definition.id;
+              const status = projection.taskStates[taskId]?.status ?? "pending";
+              const committedReplay = projection.operations.some(
+                (operation) =>
+                  operation.identity.definitionPath === ROOT_DEFINITION_PATH &&
+                  operation.identity.operationId === taskId &&
+                  operation.settlement !== undefined,
+              );
+              if (
+                (!committedReplay && status !== "running") ||
+                projection.plan === undefined
+              ) {
+                schedulerRevision = -1;
+                throw new DurableWorkflowPlanControllerError(
+                  "stale_revision",
+                  `Durable workflow task ${taskId} is no longer eligible to dispatch.`,
+                );
+              }
+              const plan = await this.#readCurrentPlan(
+                execution.journal,
+                projection,
+              );
+              const currentTask = plan.phases
+                .flatMap((phase) => phase.tasks)
+                .find((task) => task.id === taskId);
+              if (currentTask === undefined) {
+                schedulerRevision = -1;
+                throw new DurableWorkflowPlanControllerError(
+                  "stale_revision",
+                  `Durable workflow task ${taskId} is absent from the current revision.`,
+                );
+              }
+              schedulerRevision = projection.plan.revision;
+              const agent = currentTask.agent;
+              const dispatchRequest = {
+                ...input.request,
+                prompt: currentTask.instruction,
+                persona: agent?.persona,
+                model: agent?.model,
+                isolation: agent?.isolation ?? "process",
+                label: currentTask.content,
+                schema: agent?.schema,
+                thinkingLevel: agent?.thinkingLevel,
+              };
+              const currentInput: WorkflowPlanTaskDispatch = {
+                ...input,
+                task: { ...input.task, definition: currentTask },
+                request: dispatchRequest,
+              };
+              return {
+                dispatchRequest,
+                taskDefinitionDigest: encodeDurableValue(currentTask).sha256,
+                request: await this.#operationRequest(
+                  execution,
+                  currentInput,
+                  durableJournal,
+                  fence,
+                ),
+              };
+            },
+          );
+          const gate = new WorkflowOperationGate({
+            journal: operationJournal,
+            blobCodec: durableWorkflowOperationBlobCodec,
+            dispatcher: {
+              run: async (dispatchRequest) => {
+                const launched = input.dispatch(dispatchRequest, async () => {
+                  await this.#serializeManagement(execution.runId, async () => {
+                    await execution.journal.revalidateFence();
+                    const projection = await this.#refresh(execution.journal);
+                    if (
+                      projection.terminal !== undefined ||
+                      projection.cancellationRequestedEventId !== undefined ||
+                      execution.interruptionReason !== undefined ||
+                      execution.cancellation !== undefined
+                    ) {
+                      throw operationInterruption(
+                        execution.interruptionReason ?? "owner_replaced",
+                      );
+                    }
+                    const taskId = input.task.definition.id;
+                    if (
+                      projection.plan === undefined ||
+                      projection.taskStates[taskId]?.status !== "running"
+                    ) {
+                      schedulerRevision = -1;
+                      throw new WorkflowPlanReselectionError(
+                        `Durable workflow task ${taskId} changed before dispatch.`,
+                      );
+                    }
+                    const plan = await this.#readCurrentPlan(
+                      execution.journal,
+                      projection,
+                    );
+                    const currentTask = plan.phases
+                      .flatMap((phase) => phase.tasks)
+                      .find((task) => task.id === taskId);
+                    if (
+                      currentTask === undefined ||
+                      encodeDurableValue(currentTask).sha256 !==
+                        prepared.taskDefinitionDigest
+                    ) {
+                      schedulerRevision = -1;
+                      throw new WorkflowPlanReselectionError(
+                        `Durable workflow task ${taskId} definition changed before dispatch.`,
+                      );
+                    }
+                    // A running task is mutation-immutable; revision-only drift
+                    // affects future scheduler selections, not this dispatch.
+                    schedulerRevision = projection.plan.revision;
+                  });
+                });
+                try {
+                  const result = await launched;
+                  if (
+                    isWorkflowPlanReselectionError(
+                      dispatchRequest.signal?.reason,
+                    )
+                  ) {
+                    throw new WorkflowPlanReselectionError(
+                      "Durable workflow plan changed before sibling work completed.",
+                      result.usage,
+                    );
+                  }
+                  if (
+                    result.cancelled &&
+                    execution.interruptionReason !== undefined &&
+                    execution.cancellation === undefined
+                  ) {
+                    throw operationInterruption(
+                      execution.interruptionReason,
+                      result.usage,
+                    );
+                  }
+                  return result;
+                } catch (error) {
+                  if (
+                    isWorkflowPlanReselectionError(
+                      dispatchRequest.signal?.reason,
+                    )
+                  ) {
+                    if (error instanceof WorkflowPlanReselectionError) {
+                      throw error;
+                    }
+                    throw new WorkflowPlanReselectionError(
+                      "Durable workflow plan changed before sibling work completed.",
+                      (error as { usage?: Usage } | null)?.usage,
+                    );
+                  }
+                  if (
+                    execution.interruptionReason !== undefined &&
+                    !(error instanceof WorkflowOperationInterruptedError)
+                  ) {
+                    throw operationInterruption(execution.interruptionReason);
+                  }
+                  throw error;
+                }
+              },
+            },
+          });
           try {
-            const outcome = await gate.execute(fence, request, input.request);
+            const outcome = await gate.execute(
+              fence,
+              prepared.request,
+              prepared.dispatchRequest,
+            );
             await this.#refresh(execution.journal);
+            if (execution.interruptionReason !== undefined) {
+              throw operationInterruption(execution.interruptionReason);
+            }
             return requiredPlanResult(outcome);
           } catch (error) {
             try {
@@ -768,6 +1725,7 @@ export class DurableWorkflowPlanController {
               );
               if (
                 operation?.settlement === undefined &&
+                !isWorkflowPlanReselectionError(error) &&
                 execution.interruptionReason === undefined &&
                 execution.cancellation === undefined
               ) {
@@ -783,21 +1741,53 @@ export class DurableWorkflowPlanController {
               }
             }
             throw error;
-          } finally {
-            currentDispatch = undefined;
           }
         },
       });
+      result = {
+        ...result,
+        agentsSpawned: priorAgentsSpawned + result.agentsSpawned,
+        phases: [...new Set([...priorPhases, ...result.phases])],
+      };
+      const projection = await this.#refresh(execution.journal);
+      if (
+        projection.status === "awaiting_budget" ||
+        execution.awaitingApprovalRequestId !== undefined
+      ) {
+        throw new DurableWorkflowPlanControllerError(
+          "awaiting_budget",
+          `Durable workflow run ${execution.runId} is awaiting trusted approval.`,
+        );
+      }
     } catch (error) {
+      if (
+        isWorkflowPlanReselectionError(error) &&
+        execution.interruptionReason === undefined &&
+        execution.cancellation === undefined
+      ) {
+        const projection = await this.#refresh(execution.journal);
+        if (
+          projection.plan !== undefined &&
+          projection.terminal === undefined &&
+          projection.cancellationRequestedEventId === undefined &&
+          projection.status !== "interrupted" &&
+          projection.status !== "awaiting_budget"
+        ) {
+          execution.plan = await this.#readCurrentPlan(
+            execution.journal,
+            projection,
+          );
+          execution.definitionDigest = projection.plan.definitionDigest;
+          execution.planRevision = projection.plan.revision;
+          return this.#execute(execution, priorAgentsSpawned, priorPhases);
+        }
+      }
       if (execution.interruptionReason !== undefined) {
         await this.#finishInterruption(execution);
       }
       throw error;
     }
 
-    if (execution.interruptionReason !== undefined) {
-      await this.#finishInterruption(execution);
-    }
     if (execution.cancellation !== undefined) {
       await execution.cancellation.persisted;
       result =
@@ -810,27 +1800,135 @@ export class DurableWorkflowPlanController {
         result,
         "cancelled",
         execution.cancellation.reason,
+        execution.agentsSpawned,
       );
     }
-    await this.#reconcileTaskStatuses(execution, result);
-    return this.#recordResult(
+
+    const finalized = await this.#serializeManagement(
+      execution.runId,
+      async (): Promise<WorkflowPlanRunResult | undefined> => {
+        const projection = await this.#refresh(execution.journal);
+        if (projection.plan?.revision !== schedulerRevision) return undefined;
+        if (
+          projection.status === "awaiting_budget" ||
+          execution.awaitingApprovalRequestId !== undefined
+        ) {
+          throw new DurableWorkflowPlanControllerError(
+            "awaiting_budget",
+            `Durable workflow run ${execution.runId} is awaiting trusted approval.`,
+          );
+        }
+        if (execution.interruptionReason !== undefined) {
+          await this.#finishInterruption(execution);
+        }
+        await this.#reconcileTaskStatuses(execution, result);
+        if (result.status === "blocked") {
+          const blocked = await this.#refresh(execution.journal);
+          if (blocked.status === "blocked") {
+            return withDurablePlanAccounting(
+              result,
+              blocked,
+              execution.agentsSpawned,
+            );
+          }
+          const blockedTaskIds = blocked.tasks
+            .filter((task) => task.status === "blocked")
+            .map((task) => task.taskId);
+          if (blockedTaskIds.length === 0) {
+            throw new DurableWorkflowPlanControllerError(
+              "invalid_plan",
+              "Blocked workflow result has no durable blocked task.",
+            );
+          }
+          await this.#appendEvent(execution.journal, "run_blocked", {
+            blockedTaskIds,
+          });
+          return withDurablePlanAccounting(
+            result,
+            blocked,
+            execution.agentsSpawned,
+          );
+        }
+        return this.#recordResult(
+          execution.journal,
+          result,
+          result.status === "done" ? "done" : "error",
+          undefined,
+          execution.agentsSpawned,
+        );
+      },
+    );
+    if (finalized !== undefined) return finalized;
+    execution.plan = await this.#readCurrentPlan(
       execution.journal,
-      result,
-      result.status === "done" ? "done" : "error",
+      await this.#refresh(execution.journal),
+    );
+    return this.#execute(execution, result.agentsSpawned, result.phases);
+  }
+
+  async #ensureDispatchBudget(
+    execution: ActiveExecution,
+    input: WorkflowPlanTaskDispatch,
+  ): Promise<void> {
+    let projection = await this.#refresh(execution.journal);
+    const pending = pendingWorkflowApproval(projection);
+    if (pending !== undefined) {
+      execution.awaitingApprovalRequestId = pending.requestId;
+      throw new DurableWorkflowPlanControllerError(
+        "awaiting_budget",
+        `Durable workflow run ${execution.runId} is awaiting trusted approval.`,
+      );
+    }
+    if (execution.budgetTotal === null) return;
+    const approvedWindows = projection.approvalRequests.filter(
+      (request) =>
+        request.approvalKind === "budget" && request.decision === "approved",
+    ).length;
+    const threshold = execution.budgetTotal * (approvedWindows + 1);
+    if (projection.accounting.usage.output < threshold) return;
+    const request = await this.requestApproval(execution.runId, {
+      approvalKind: "budget",
+      description:
+        `Output-token budget ${threshold} was exhausted before task ` +
+        `${input.task.definition.id}.`,
+      denialPolicy: "stop",
+      subjectTaskId: input.task.definition.id,
+      expectedOwner: this.owner,
+      expectedOwnerGeneration: projection.ownerGeneration,
+      expectedRunEpoch: projection.runEpoch,
+      policy: {
+        kind: "output_token_budget",
+        budgetTotal: execution.budgetTotal,
+        approvedWindows,
+        threshold,
+        taskId: input.task.definition.id,
+        planRevision: projection.plan?.revision ?? 1,
+        revisionHash: projection.plan?.revisionHash ?? null,
+      },
+    });
+    projection = await this.#refresh(execution.journal);
+    if (
+      projection.status !== "awaiting_budget" ||
+      pendingWorkflowApproval(projection)?.requestId !== request.requestId
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_approval",
+        "Budget approval request lost its pending state.",
+      );
+    }
+    execution.awaitingApprovalRequestId = request.requestId;
+    throw new DurableWorkflowPlanControllerError(
+      "awaiting_budget",
+      `Durable workflow run ${execution.runId} exhausted its budget.`,
     );
   }
 
-  #operationRequest(
+  async #operationRequest(
     execution: ActiveExecution,
     input: WorkflowPlanTaskDispatch,
-  ): WorkflowOperationRequest {
-    const ordinal = execution.dispatchOrdinals.get(input.task.definition.id);
-    if (ordinal === undefined) {
-      throw new DurableWorkflowPlanControllerError(
-        "invalid_plan",
-        `Task ${input.task.definition.id} has no stable dispatch ordinal.`,
-      );
-    }
+    journal: WorkflowRunOperationJournal,
+    fence: WorkflowRunEpochFence,
+  ): Promise<WorkflowOperationRequest> {
     const requestSettings = encodeDurableValue({
       prompt: input.request.prompt,
       persona: input.request.persona ?? null,
@@ -839,58 +1937,116 @@ export class DurableWorkflowPlanController {
       schema: input.request.schema ?? null,
       thinkingLevel: input.request.thinkingLevel ?? null,
     });
-    return {
+    const identity = createWorkflowOperationIdentity(
+      execution.runId,
+      ROOT_DEFINITION_PATH,
+      input.task.definition.id,
+    );
+    const existing = await journal.readOperation(fence, identity);
+    const definitionDigest =
+      existing.request?.definitionDigest ??
+      createWorkflowDefinitionDigest(
+        encodeDurableValue(input.task.definition).sha256,
+      );
+    const request = await journal.prepareOperation(fence, {
       schemaVersion: WORKFLOW_RUN_SCHEMA_VERSION,
-      identity: createWorkflowOperationIdentity(
-        execution.runId,
-        ROOT_DEFINITION_PATH,
-        input.task.definition.id,
-      ),
+      identity,
       requestDigest: createWorkflowRequestDigest(requestSettings.sha256),
-      definitionDigest: execution.definitionDigest,
-      dispatchOrdinal: createWorkflowDispatchOrdinal(ordinal),
-    };
+      definitionDigest,
+    });
+    await this.#refresh(execution.journal);
+    return request;
   }
 
   async #appendPlanEvent(
     execution: ActiveExecution,
     event: WorkflowPlanEvent,
+    schedulerRevision: number,
   ): Promise<void> {
-    if (execution.interruptionReason !== undefined) return;
-    if (event.type === "run_cancelled") {
+    await this.#serializeManagement(execution.runId, async () => {
+      if (execution.interruptionReason !== undefined) return;
+      if (event.type === "run_cancelled") {
+        execution.onPlanEvent?.(event);
+        return;
+      }
+      const projection = await this.#refresh(execution.journal);
+      const taskId = event.taskId;
+      const current = projection.taskStates[taskId]?.status ?? "pending";
+      const target = planEventTarget(event);
+      if (target === "running") {
+        if (
+          projection.terminal !== undefined ||
+          projection.cancellationRequestedEventId !== undefined ||
+          projection.status === "interrupted" ||
+          execution.cancellation !== undefined
+        ) {
+          throw operationInterruption(
+            execution.interruptionReason ?? "owner_replaced",
+          );
+        }
+        const committedReplay =
+          current === "succeeded" &&
+          projection.operations.some(
+            (operation) =>
+              operation.identity.definitionPath === ROOT_DEFINITION_PATH &&
+              operation.identity.operationId === taskId &&
+              operation.settlement !== undefined,
+          );
+        if (
+          projection.plan?.revision !== schedulerRevision ||
+          (current !== "pending" && current !== "running" && !committedReplay)
+        ) {
+          throw new WorkflowPlanReselectionError(
+            `Durable workflow task ${taskId} changed after scheduler selection.`,
+          );
+        }
+      }
+      if (
+        target === undefined ||
+        current === target ||
+        isTerminalTaskStatus(current)
+      ) {
+        return;
+      }
+      if (
+        projection.status === "awaiting_budget" &&
+        target === "failed" &&
+        pendingWorkflowApproval(projection)?.subjectTaskId === taskId &&
+        !projection.operations.some(
+          (operation) => operation.identity.operationId === taskId,
+        )
+      ) {
+        return;
+      }
+      const unsettledAttempt =
+        target === "failed"
+          ? projection.operations
+              .find(
+                (operation) =>
+                  operation.identity.operationId === taskId &&
+                  operation.settlement === undefined,
+              )
+              ?.attempts.at(-1)
+          : undefined;
+      if (
+        unsettledAttempt?.status === "interrupted" &&
+        projection.plan?.revision !== schedulerRevision &&
+        execution.cancellation === undefined
+      ) {
+        throw new WorkflowPlanReselectionError(
+          `Durable workflow task ${taskId} became stale before dispatch.`,
+        );
+      }
+      if (unsettledAttempt?.status === "started") return;
+      await this.#appendEvent(execution.journal, "task_transitioned", {
+        definitionPath: ROOT_DEFINITION_PATH,
+        taskId,
+        planRevision: projection.plan?.revision ?? 1,
+        from: current,
+        to: target,
+      });
       execution.onPlanEvent?.(event);
-      return;
-    }
-    const projection = await this.#refresh(execution.journal);
-    const taskId = event.taskId;
-    const current = projection.taskStates[taskId]?.status ?? "pending";
-    const target = planEventTarget(event);
-    if (
-      target === undefined ||
-      current === target ||
-      isTerminalTaskStatus(current)
-    ) {
-      return;
-    }
-    if (
-      target === "failed" &&
-      projection.operations.some(
-        (operation) =>
-          operation.identity.operationId === taskId &&
-          operation.settlement === undefined &&
-          operation.attempts.at(-1)?.status === "started",
-      )
-    ) {
-      return;
-    }
-    await this.#appendEvent(execution.journal, "task_transitioned", {
-      definitionPath: ROOT_DEFINITION_PATH,
-      taskId,
-      planRevision: 1,
-      from: current,
-      to: target,
     });
-    execution.onPlanEvent?.(event);
   }
 
   async #reconcileTaskStatuses(
@@ -912,7 +2068,7 @@ export class DurableWorkflowPlanController {
         await this.#appendEvent(execution.journal, "task_transitioned", {
           definitionPath: ROOT_DEFINITION_PATH,
           taskId: task.id,
-          planRevision: 1,
+          planRevision: projection.plan?.revision ?? execution.planRevision,
           from: "pending",
           to: "running",
         });
@@ -923,11 +2079,231 @@ export class DurableWorkflowPlanController {
       await this.#appendEvent(execution.journal, "task_transitioned", {
         definitionPath: ROOT_DEFINITION_PATH,
         taskId: task.id,
-        planRevision: 1,
+        planRevision: projection.plan?.revision ?? execution.planRevision,
         from: next,
         to: task.status,
       });
     }
+  }
+
+  async #repairTerminalGap(
+    recovered: DurableWorkflowProjection,
+    reason: WorkflowRecoveryReason,
+  ): Promise<void> {
+    const journal =
+      recovered.terminal === undefined
+        ? await this.#lease.acquireRun(recovered.runId, reason)
+        : await this.#lease.openTerminalMaintenanceRun(recovered.runId);
+    let projection = await this.#refresh(journal);
+    if (projection.result === undefined) return;
+    const resultProjection = projection.result;
+    const rawStored = await journal.readOutput(resultProjection.result);
+    let terminalStatus: "done" | "error" | "cancelled";
+    if (projection.executionKind === "script") {
+      const stored = decodeStoredDurableWorkflowScriptResult(rawStored);
+      requiredStoredScriptResult(
+        stored.result as unknown as DurableValue,
+        recovered.runId,
+      );
+      terminalStatus = stored.terminalStatus;
+    } else {
+      const stored = requiredStoredPlanResult(rawStored, recovered.runId);
+      if (
+        stored.status !== "done" &&
+        stored.status !== "error" &&
+        stored.status !== "cancelled"
+      ) {
+        return;
+      }
+      terminalStatus = stored.status;
+    }
+    if (projection.terminal !== undefined) {
+      if (
+        projection.terminal.status !== terminalStatus ||
+        projection.terminal.resultEventId !== resultProjection.eventId
+      ) {
+        throw new DurableWorkflowPlanControllerError(
+          "invalid_plan",
+          "Persisted workflow terminal metadata does not match its result.",
+        );
+      }
+      if ((await journal.readResult()) === undefined) {
+        await journal.writeResult({
+          terminalEventId: projection.terminal.eventId,
+          baseEventByteEndExclusive: (await journal.readEventLog())
+            .completeBytes,
+          result: resultProjection.result,
+        });
+      }
+      await this.#ensureDeliveryIntent(journal, projection);
+      return;
+    }
+    if (terminalStatus === "cancelled" && projection.status !== "cancelled") {
+      if (projection.cancellationRequestedEventId === undefined) {
+        throw new DurableWorkflowPlanControllerError(
+          "invalid_cancellation",
+          "A persisted cancelled result lacks its durable cancellation request.",
+        );
+      }
+      await this.#appendEvent(journal, "run_cancelled", {
+        reason: "Recovered cancellation after terminal commit gap.",
+        accounting: resultProjection.accounting,
+      });
+      projection = await this.#refresh(journal);
+    }
+    const terminal = await this.#appendEvent(journal, "run_terminal", {
+      status: terminalStatus,
+      accounting: resultProjection.accounting,
+      resultEventId: resultProjection.eventId,
+    });
+    await journal.writeResult({
+      terminalEventId: terminal.eventId,
+      baseEventByteEndExclusive: terminal.receipt.byteEndExclusive,
+      result: resultProjection.result,
+    });
+    const terminalProjection = await this.#refresh(journal);
+    await this.#ensureDeliveryIntent(journal, terminalProjection);
+  }
+
+  async #repairHumanDecisionGap(
+    recovered: DurableWorkflowProjection,
+    reason: WorkflowRecoveryReason,
+  ): Promise<void> {
+    const journal = await this.#lease.acquireRun(recovered.runId, reason);
+    let projection = await this.#refresh(journal);
+    projection = await this.#completeDecidedDenials(journal, projection);
+    if (
+      projection.terminal !== undefined ||
+      projection.cancellationRequestedEventId === undefined
+    ) {
+      return;
+    }
+    await this.#cancelInactivePlan(
+      journal,
+      await this.#cancellationReason(journal, projection),
+    );
+  }
+
+  async #completeDecidedDenials(
+    journal: WorkflowRunJournal,
+    initial: DurableWorkflowProjection,
+  ): Promise<DurableWorkflowProjection> {
+    let projection = initial;
+    for (const request of projection.approvalRequests) {
+      if (request.decision !== "denied") continue;
+      if (
+        request.trustedActorId === undefined ||
+        !isWorkflowIdentifier(request.trustedActorId)
+      ) {
+        throw new DurableWorkflowPlanControllerError(
+          "invalid_approval",
+          `Denied approval ${request.requestId} has no trusted actor.`,
+        );
+      }
+      if (request.denialPolicy === "stop") {
+        const denialReason =
+          `Approval ${request.requestId} was denied by ` +
+          `${request.trustedActorId}.`;
+        if (projection.cancellationRequestedEventId === undefined) {
+          await this.#appendEvent(journal, "run_cancellation_requested", {
+            reason: denialReason,
+            trustedActorId: request.trustedActorId,
+          });
+          projection = await this.#refresh(journal);
+        }
+        if (projection.terminal === undefined) {
+          await this.#cancelInactivePlan(journal, denialReason);
+          projection = await this.#refresh(journal);
+        }
+        return projection;
+      }
+      const subjectTaskId = request.subjectTaskId;
+      if (subjectTaskId === null) {
+        throw new DurableWorkflowPlanControllerError(
+          "invalid_approval",
+          "Skip denial requires a bound subject task.",
+        );
+      }
+      const current = projection.taskStates[subjectTaskId]?.status ?? "pending";
+      if (!isTerminalTaskStatus(current)) {
+        await this.#appendEvent(journal, "task_transitioned", {
+          definitionPath: ROOT_DEFINITION_PATH,
+          taskId: subjectTaskId,
+          planRevision: request.planRevision,
+          from: current,
+          to: "skipped",
+        });
+        projection = await this.#refresh(journal);
+      }
+    }
+    return projection;
+  }
+
+  async #cancellationReason(
+    journal: WorkflowRunJournal,
+    projection: DurableWorkflowProjection,
+  ): Promise<string> {
+    const eventId = projection.cancellationRequestedEventId;
+    const request = (await journal.readEvents()).find(
+      (event) =>
+        event.eventId === eventId &&
+        event.type === "run_cancellation_requested",
+    );
+    if (request?.type !== "run_cancellation_requested") {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_cancellation",
+        "Persisted workflow cancellation request is missing.",
+      );
+    }
+    return request.payload.reason;
+  }
+
+  async #ensureDeliveryIntent(
+    journal: WorkflowRunJournal,
+    projection: DurableWorkflowProjection,
+  ): Promise<{
+    readonly projection: DurableWorkflowProjection;
+    readonly delivery: DurableWorkflowProjection["deliveries"][number];
+    readonly recorded: boolean;
+  }> {
+    const terminal = projection.terminal;
+    if (terminal === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "terminal_run",
+        "A durable delivery intent requires a terminal workflow run.",
+      );
+    }
+    const deliveryId = durableWorkflowDeliveryId(
+      projection.owner,
+      projection.runId,
+      terminal.eventId,
+    );
+    const existing = projection.deliveries.find(
+      (delivery) => delivery.deliveryId === deliveryId,
+    );
+    if (existing !== undefined) {
+      return { projection, delivery: existing, recorded: false };
+    }
+
+    const payload = createDurableWorkflowDeliveryPayload(projection);
+    const payloadReference = await journal.writeOutput(payload);
+    await this.#appendEvent(journal, "delivery_intent_recorded", {
+      outboxSchemaVersion: WORKFLOW_OUTBOX_SCHEMA_VERSION,
+      deliveryId,
+      terminalEventId: terminal.eventId,
+      payload: payloadReference,
+    });
+    const refreshed = await this.#refresh(journal);
+    const delivery = refreshed.deliveries.find(
+      (candidate) => candidate.deliveryId === deliveryId,
+    );
+    if (delivery === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Durable workflow delivery intent was not projected after append.",
+      );
+    }
+    return { projection: refreshed, delivery, recorded: true };
   }
 
   async #recordResult(
@@ -935,9 +2311,15 @@ export class DurableWorkflowPlanController {
     result: WorkflowPlanRunResult,
     status: "done" | "error" | "cancelled",
     cancellationReason?: string,
+    agentsSpawned = result.agentsSpawned,
   ): Promise<WorkflowPlanRunResult> {
     const projection = await this.#refresh(journal);
-    const resultReference = await journal.writeOutput(result);
+    const authoritativeResult = withDurablePlanAccounting(
+      result,
+      projection,
+      agentsSpawned,
+    );
+    const resultReference = await journal.writeOutput(authoritativeResult);
     const resultEvent = await this.#appendEvent(
       journal,
       "run_result_recorded",
@@ -962,8 +2344,65 @@ export class DurableWorkflowPlanController {
       baseEventByteEndExclusive: terminal.receipt.byteEndExclusive,
       result: resultReference,
     });
-    await this.#refresh(journal);
-    return result;
+    const terminalProjection = await this.#refresh(journal);
+    await this.#ensureDeliveryIntent(journal, terminalProjection);
+    if (this.#onDeliveryReady !== undefined) {
+      try {
+        await this.#onDeliveryReady(journal.runId);
+      } catch {
+        // The durable pending intent is the retry authority; dispatch failure
+        // must not turn a committed terminal workflow into a failed Promise.
+      }
+    }
+    return authoritativeResult;
+  }
+  async #finishActiveCancellation(
+    execution: ActiveExecution,
+  ): Promise<WorkflowPlanRunResult> {
+    const cancellation = execution.cancellation;
+    const completion = execution.completion;
+    if (cancellation === undefined || completion === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "run_active",
+        `Durable workflow run ${execution.runId} lost its cancellation continuation.`,
+      );
+    }
+    try {
+      await cancellation.persisted;
+    } catch (error) {
+      const projection = await this.#refresh(execution.journal);
+      if (projection.cancellationRequestedEventId === undefined) {
+        if (execution.cancellation === cancellation) {
+          execution.cancellation = undefined;
+        }
+        throw error;
+      }
+    }
+    if (!execution.abort.signal.aborted) {
+      execution.abort.abort(cancellation.reason);
+    }
+    try {
+      return await completion;
+    } catch (error) {
+      const projection = await this.#refresh(execution.journal);
+      if (projection.terminal?.status === "cancelled") {
+        return requiredStoredPlanResult(
+          await this.getResult(execution.runId),
+          execution.runId,
+        );
+      }
+      if (
+        projection.terminal === undefined &&
+        projection.cancellationRequestedEventId !== undefined
+      ) {
+        return this.#cancelInactivePlan(
+          execution.journal,
+          cancellation.reason,
+          execution.agentsSpawned,
+        );
+      }
+      throw error;
+    }
   }
 
   async #persistActiveCancellation(
@@ -971,35 +2410,38 @@ export class DurableWorkflowPlanController {
     reason: string,
     trustedActorId: string,
   ): Promise<void> {
-    for (;;) {
+    await this.#serializeManagement(execution.runId, async () => {
       const projection = await this.#refresh(execution.journal);
       if (projection.cancellationRequestedEventId !== undefined) return;
-      const dispatchedAttempt = projection.operations.some(
-        (operation) =>
-          operation.attempts.at(-1)?.status === "started" &&
-          operation.attempts.at(-1)?.dispatchedEventId !== undefined,
-      );
-      if (
-        dispatchedAttempt ||
-        this.#active.get(execution.runId) !== execution
-      ) {
-        await this.#appendEvent(
-          execution.journal,
-          "run_cancellation_requested",
-          { reason, trustedActorId },
-        );
-        return;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    }
+      await this.#appendEvent(execution.journal, "run_cancellation_requested", {
+        reason,
+        trustedActorId,
+      });
+    });
   }
 
   async #cancelInactivePlan(
     journal: WorkflowRunJournal,
     reason: string,
+    agentsSpawned = 0,
   ): Promise<WorkflowPlanRunResult> {
-    const plan = await this.#readLaunchPlan(journal);
     let projection = await this.#refresh(journal);
+    if (projection.terminal !== undefined) {
+      if (projection.terminal.status === "cancelled") {
+        return requiredStoredPlanResult(
+          await this.getResult(journal.runId),
+          journal.runId,
+        );
+      }
+      throw new DurableWorkflowPlanControllerError(
+        "terminal_run",
+        `Durable workflow run ${journal.runId} is already terminal.`,
+      );
+    }
+    const plan =
+      projection.plan === undefined
+        ? await this.#readLaunchPlan(journal)
+        : await this.#readCurrentPlan(journal, projection);
     for (const operation of projection.operations) {
       const attempt = operation.attempts.at(-1);
       if (attempt?.status !== "started") continue;
@@ -1015,13 +2457,13 @@ export class DurableWorkflowPlanController {
       await this.#appendEvent(journal, "task_transitioned", {
         definitionPath: ROOT_DEFINITION_PATH,
         taskId: task.id,
-        planRevision: 1,
+        planRevision: projection.plan?.revision ?? 1,
         from: current,
         to: "cancelled",
       });
       projection = await this.#refresh(journal);
     }
-    const result = cancelledPlanResult(plan, projection, reason);
+    const result = cancelledPlanResult(plan, projection, reason, agentsSpawned);
     return this.#recordResult(journal, result, "cancelled", reason);
   }
 
@@ -1037,7 +2479,13 @@ export class DurableWorkflowPlanController {
     }
     for (const operation of projection.operations) {
       const attempt = operation.attempts.at(-1);
-      if (attempt?.status !== "started") continue;
+      if (
+        attempt?.status !== "started" ||
+        (attempt.dispatchedEventId === undefined &&
+          attempt.process === undefined)
+      ) {
+        continue;
+      }
       await this.#appendEvent(execution.journal, "attempt_interrupted", {
         attempt: attempt.attempt,
         reason: "process_exit",
@@ -1047,6 +2495,267 @@ export class DurableWorkflowPlanController {
       "interrupted",
       `Durable workflow run ${execution.runId} was interrupted (${reason}).`,
     );
+  }
+
+  async #readCurrentPlan(
+    journal: WorkflowRunJournal,
+    projection: DurableWorkflowProjection,
+  ): Promise<WorkflowPlanDefinition> {
+    if (projection.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        `Durable workflow run ${projection.runId} has no plan projection.`,
+      );
+    }
+    const source = await journal.readDefinition(projection.plan.definition);
+    const plan = validateDurableWorkflowPlan(
+      validateWorkflowPlan(decodeDurableValue(source)),
+    );
+    if (encodeDurableValue(plan).sha256 !== projection.plan.definitionDigest) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Current workflow plan definition does not match its durable digest.",
+      );
+    }
+    return plan;
+  }
+
+  async #planView(
+    journal: WorkflowRunJournal,
+    projection: DurableWorkflowProjection,
+  ): Promise<WorkflowPlanViewProjection> {
+    if (projection.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        `Durable workflow run ${projection.runId} has no plan projection.`,
+      );
+    }
+    const plan = await this.#readCurrentPlan(journal, projection);
+    const taskStates: Record<string, WorkflowPlanTaskStatus> =
+      Object.create(null);
+    for (const task of projection.tasks) taskStates[task.taskId] = task.status;
+    const view = createWorkflowPlanViewProjection({
+      runId: projection.runId,
+      owner: projection.owner,
+      runEpoch: projection.runEpoch,
+      revision: projection.plan.revision,
+      revisionHash: projection.plan.revisionHash,
+      definitionHash: projection.plan.definitionDigest,
+      status: projection.status,
+      plan,
+      taskStates,
+    });
+    if (
+      view.status === "running" &&
+      view.runningTaskIds.length === 0 &&
+      view.blockedTaskIds.length > 0 &&
+      view.nextTaskIds.length === 0
+    ) {
+      return Object.freeze({ ...view, status: "blocked" });
+    }
+    return view;
+  }
+
+  async #mutatePlan(
+    runId: DurableWorkflowRunId,
+    request: WorkflowPlanMutationRequest,
+  ): Promise<WorkflowPlanViewProjection> {
+    const exactOwner =
+      isDurableWorkflowOwner(request.expectedOwner) &&
+      durableWorkflowOwnerEquals(request.expectedOwner, this.owner);
+    if (!exactOwner) {
+      throw new DurableWorkflowPlanControllerError(
+        "wrong_owner",
+        "Workflow plan mutation owner does not match this controller.",
+      );
+    }
+    if (
+      !isDurableWorkflowRunId(runId) ||
+      !Number.isSafeInteger(request.expectedRunEpoch) ||
+      request.expectedRunEpoch <= 0 ||
+      !Number.isSafeInteger(request.baseRevision) ||
+      request.baseRevision <= 0 ||
+      (request.actor.kind !== "model" && request.actor.kind !== "human") ||
+      !isWorkflowIdentifier(request.actor.id)
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_mutation",
+        "Workflow plan mutation requires an exact epoch, base revision, and actor.",
+      );
+    }
+    const recovered = await this.repository.get(this.owner, runId);
+    if (recovered === undefined || recovered.plan === undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "run_not_found",
+        `Durable workflow plan ${runId} is not recovered.`,
+      );
+    }
+    if (recovered.runEpoch !== request.expectedRunEpoch) {
+      throw new DurableWorkflowPlanControllerError(
+        "epoch_mismatch",
+        `Durable workflow run epoch ${request.expectedRunEpoch} is stale.`,
+      );
+    }
+    if (recovered.plan.revision !== request.baseRevision) {
+      throw new DurableWorkflowPlanControllerError(
+        "stale_revision",
+        `Workflow plan base revision ${request.baseRevision} is stale; current revision is ${recovered.plan.revision}.`,
+      );
+    }
+    if (recovered.terminal !== undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "terminal_run",
+        `Durable workflow run ${runId} is already terminal.`,
+      );
+    }
+
+    const readOnlyJournal = await this.#store.openRun(this.owner, runId);
+    const recoveredPlan = await this.#readCurrentPlan(
+      readOnlyJournal,
+      recovered,
+    );
+    const recoveredStates: Record<string, WorkflowPlanTaskStatus> =
+      Object.create(null);
+    for (const task of recovered.tasks) {
+      recoveredStates[task.taskId] = task.status;
+    }
+    applyWorkflowPlanMutation(
+      recoveredPlan,
+      recoveredStates,
+      request.mutation,
+      request.actor,
+    );
+
+    const active = this.#active.get(runId);
+    const journal =
+      active?.journal ?? (await this.#lease.acquireRun(runId, "resume"));
+    const current = await this.#refresh(journal);
+    if (current.plan === undefined || current.terminal !== undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        current.terminal === undefined ? "invalid_plan" : "terminal_run",
+        `Durable workflow run ${runId} cannot accept a plan mutation.`,
+      );
+    }
+    if (pendingWorkflowApproval(current) !== undefined) {
+      throw new DurableWorkflowPlanControllerError(
+        "awaiting_budget",
+        `Durable workflow run ${runId} cannot revise a pending approval fence.`,
+      );
+    }
+    if (active !== undefined && current.runEpoch !== request.expectedRunEpoch) {
+      throw new DurableWorkflowPlanControllerError(
+        "epoch_mismatch",
+        `Durable workflow run epoch ${request.expectedRunEpoch} is stale.`,
+      );
+    }
+    if (current.plan.revision !== request.baseRevision) {
+      throw new DurableWorkflowPlanControllerError(
+        "stale_revision",
+        `Workflow plan base revision ${request.baseRevision} is stale; current revision is ${current.plan.revision}.`,
+      );
+    }
+    const plan = await this.#readCurrentPlan(journal, current);
+    const taskStates: Record<string, WorkflowPlanTaskStatus> =
+      Object.create(null);
+    for (const task of current.tasks) taskStates[task.taskId] = task.status;
+    const applied = applyWorkflowPlanMutation(
+      plan,
+      taskStates,
+      request.mutation,
+      request.actor,
+    );
+    const revisedPlan = validateDurableWorkflowPlan(applied.plan);
+    const canonical = encodeDurableValue(revisedPlan);
+    const definition = await journal.writeDefinition(canonical.json);
+    const definitionDigest = createWorkflowDefinitionDigest(canonical.sha256);
+    if (definition.sha256 !== definitionDigest) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Revised workflow plan definition does not match its durable digest.",
+      );
+    }
+    const revision = current.plan.revision + 1;
+    const revisionHash = createWorkflowSha256Digest(
+      encodeDurableValue({
+        previousRevisionHash: current.plan.revisionHash,
+        revision,
+        definitionDigest,
+        audit: applied.audit,
+      }).sha256,
+    );
+    await this.#appendEvent(journal, "plan_revised", {
+      previousRevision: current.plan.revision,
+      revision,
+      previousRevisionHash: current.plan.revisionHash,
+      revisionHash,
+      previousDefinitionDigest: current.plan.definitionDigest,
+      definitionDigest,
+      definition,
+      audit: applied.audit,
+    });
+    const revised = await this.#refresh(journal);
+    if (active !== undefined) {
+      active.plan = revisedPlan;
+      active.definitionDigest = definitionDigest;
+      active.planRevision = revision;
+    }
+    if (applied.wakeEligible && active !== undefined) {
+      this.#deferredPlanWakes.add(runId);
+    }
+    if (applied.wakeEligible && this.#onPlanMutationWake !== undefined) {
+      void Promise.resolve(this.#onPlanMutationWake(runId)).catch((error) => {
+        console.error("[subagentura] workflow plan wake failed", error);
+      });
+    }
+    return this.#planView(journal, revised);
+  }
+
+  async #wakePlan(runId: DurableWorkflowRunId): Promise<void> {
+    if (this.#active.has(runId)) {
+      this.#deferredPlanWakes.add(runId);
+      return;
+    }
+    const recovered = await this.repository.get(this.owner, runId);
+    if (
+      recovered === undefined ||
+      recovered.plan === undefined ||
+      recovered.terminal !== undefined ||
+      recovered.status === "interrupted" ||
+      recovered.status === "awaiting_budget" ||
+      recovered.cancellationRequestedEventId !== undefined
+    ) {
+      return;
+    }
+    const journal = await this.#lease.acquireRun(runId, "resume");
+    const projection = await this.#refresh(journal);
+    if (
+      projection.plan === undefined ||
+      projection.terminal !== undefined ||
+      projection.status === "interrupted" ||
+      projection.status === "awaiting_budget" ||
+      projection.cancellationRequestedEventId !== undefined
+    ) {
+      return;
+    }
+    if (this.#active.has(runId)) {
+      this.#deferredPlanWakes.add(runId);
+      return;
+    }
+    const plan = await this.#readCurrentPlan(journal, projection);
+    const execution = this.#newExecution(
+      journal,
+      plan,
+      projection.plan.definitionDigest,
+      projection.plan.revision,
+      { budgetTotal: this.#readLaunchBudget(journal) },
+      new Set(
+        projection.tasks
+          .filter((task) => task.status === "skipped")
+          .map((task) => task.taskId),
+      ),
+    );
+    const started = this.#startExecution(execution);
+    void started.completion.catch(() => undefined);
   }
 
   async #readLaunchPlan(
@@ -1070,6 +2779,29 @@ export class DurableWorkflowPlanController {
     );
   }
 
+  #readLaunchBudget(journal: WorkflowRunJournal): number | null {
+    const launch = journal.readLaunch();
+    if (
+      !isDurableRecord(launch) ||
+      launch.executionKind !== "plan" ||
+      !Object.hasOwn(launch, "budgetTotal")
+    ) {
+      return null;
+    }
+    if (launch.budgetTotal === null) return null;
+    if (
+      typeof launch.budgetTotal !== "number" ||
+      !Number.isFinite(launch.budgetTotal) ||
+      launch.budgetTotal <= 0
+    ) {
+      throw new DurableWorkflowPlanControllerError(
+        "invalid_plan",
+        "Persisted durable workflow budget is invalid.",
+      );
+    }
+    return launch.budgetTotal;
+  }
+
   async #refresh(
     journal: WorkflowRunJournal,
   ): Promise<DurableWorkflowProjection> {
@@ -1087,27 +2819,31 @@ export class DurableWorkflowPlanController {
     readonly eventId: string;
     readonly receipt: WorkflowEventReceipt;
   }> {
-    const operation = this.#directAppendTail.then(async () => {
-      const fence = requiredFence(journal);
-      const events = await journal.readEvents();
-      const event = {
-        schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
-        eventId: `${type}-${this.#generateId()}`,
-        runId: journal.runId,
-        runEpoch: fence.runEpoch,
-        sequence: (events.at(-1)?.sequence ?? 0) + 1,
-        type,
-        payload,
-      } as Extract<WorkflowRunEvent, { type: Type }>;
-      const receipt = await journal.append(event);
-      if (refresh) await this.#refresh(journal);
-      return { eventId: event.eventId, receipt };
-    });
-    this.#directAppendTail = operation.then(
+    const fence = requiredFence(journal);
+    const { event, receipt } = await new WorkflowRunOperationJournal(
+      journal,
+      this.#generateId,
+    ).appendEvent(fence, { type, payload } as WorkflowRunEventDraft<Type>);
+    if (refresh) await this.#refresh(journal);
+    return { eventId: event.eventId, receipt };
+  }
+
+  #serializeManagement<Result>(
+    runId: DurableWorkflowRunId,
+    action: () => Promise<Result>,
+  ): Promise<Result> {
+    const previous = this.#managementTails.get(runId) ?? Promise.resolve();
+    const operation = previous.then(action, action);
+    const tail = operation.then(
       () => undefined,
       () => undefined,
     );
-    return operation;
+    this.#managementTails.set(runId, tail);
+    return operation.finally(() => {
+      if (this.#managementTails.get(runId) === tail) {
+        this.#managementTails.delete(runId);
+      }
+    });
   }
 
   #assertExpectedOwner(expected: DurableWorkflowOwner | undefined): void {
@@ -1155,20 +2891,15 @@ export function validateDurableWorkflowPlan(
 ): WorkflowPlanDefinition {
   const validated = validateWorkflowPlan(input);
   for (const phase of validated.phases) {
-    if (phase.mode !== "sequence") {
-      throw new DurableWorkflowPlanControllerError(
-        "invalid_plan",
-        "Durable workflow preview supports sequential phases only.",
-      );
-    }
     for (const task of phase.tasks) {
       if (
         task.agent?.isolation !== undefined &&
-        task.agent.isolation !== "in-process"
+        task.agent.isolation !== "in-process" &&
+        task.agent.isolation !== "process"
       ) {
         throw new DurableWorkflowPlanControllerError(
           "invalid_plan",
-          `Durable workflow task ${task.id} requests unsupported process isolation.`,
+          `Durable workflow task ${task.id} requests unsupported isolation ${task.agent.isolation}.`,
         );
       }
     }
@@ -1184,7 +2915,10 @@ export function validateDurableWorkflowPlan(
         id: task.id,
         content: task.content,
         instruction: task.instruction,
-        agent: { ...task.agent, isolation: "in-process" },
+        agent: {
+          ...task.agent,
+          isolation: task.agent?.isolation ?? "in-process",
+        },
       })),
     })),
   };
@@ -1193,10 +2927,26 @@ export function validateDurableWorkflowPlan(
   );
 }
 
+function withDurablePlanAccounting(
+  result: WorkflowPlanRunResult,
+  durable: DurableWorkflowProjection,
+  agentsSpawned = result.agentsSpawned,
+): WorkflowPlanRunResult {
+  const usage = { ...durable.accounting.usage };
+  return {
+    ...result,
+    agentsSpawned,
+    errorCount: durable.tasks.filter((task) => task.status === "failed").length,
+    tokensSpent: usage.output,
+    usage,
+  };
+}
+
 function cancelledPlanResult(
   plan: WorkflowPlanDefinition,
   durable: DurableWorkflowProjection,
   reason: string,
+  agentsSpawned: number,
 ): WorkflowPlanRunResult {
   const planProjection: WorkflowPlanProjection = {
     definition: plan,
@@ -1237,10 +2987,7 @@ function cancelledPlanResult(
       })),
     ),
     projection: planProjection,
-    agentsSpawned: durable.operations.reduce(
-      (total, operation) => total + operation.attempts.length,
-      0,
-    ),
+    agentsSpawned,
     errorCount: durable.tasks.filter((task) => task.status === "failed").length,
     tokensSpent: usage.output,
     usage,
@@ -1274,6 +3021,30 @@ function requiredStoredPlanResult(
   return value as unknown as WorkflowPlanRunResult;
 }
 
+function requiredStoredScriptResult(
+  value: DurableValue | undefined,
+  runId: DurableWorkflowRunId,
+): WorkflowRunResultWithUsage {
+  if (
+    value === undefined ||
+    !isDurableRecord(value) ||
+    !Object.hasOwn(value, "result") ||
+    !isDurableRecord(value.meta) ||
+    !isDurableRecord(value.usage) ||
+    !Array.isArray(value.phases) ||
+    !value.phases.every((phase) => typeof phase === "string") ||
+    typeof value.agentsSpawned !== "number" ||
+    typeof value.errorCount !== "number" ||
+    typeof value.tokensSpent !== "number"
+  ) {
+    throw new DurableWorkflowPlanControllerError(
+      "invalid_plan",
+      `Durable workflow run ${runId} has no valid stored script result.`,
+    );
+  }
+  return value as unknown as WorkflowRunResultWithUsage;
+}
+
 function requiredFence(journal: WorkflowRunJournal): WorkflowRunEpochFence {
   if (journal.fence === undefined) {
     throw new DurableWorkflowPlanControllerError(
@@ -1296,6 +3067,7 @@ function requiredPlanResult(result: SubagentResult | null): SubagentResult {
 
 function operationInterruption(
   reason: DurableWorkflowPlanInterruptionReason,
+  usage?: Usage,
 ): WorkflowOperationInterruptedError {
   const attemptReason =
     reason === "process_crash" || reason === "quit"
@@ -1304,6 +3076,7 @@ function operationInterruption(
   return new WorkflowOperationInterruptedError(
     attemptReason,
     `Durable workflow operation interrupted (${reason}).`,
+    usage,
   );
 }
 

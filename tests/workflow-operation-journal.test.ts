@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeDurableValue } from "../src/workflow-durable-value";
 import type {
   WorkflowOperationEventDraft,
@@ -76,9 +76,37 @@ async function appendDraft(
   fence: WorkflowRunEpochFence,
   draft: WorkflowOperationEventDraft,
 ): Promise<WorkflowOperationGateEvent> {
-  const event = await adapter.createEvent(fence, draft);
-  await adapter.append(fence, event);
-  return event;
+  return (await adapter.appendEvent(fence, draft)).event;
+}
+
+async function settleRequest(
+  adapter: WorkflowRunOperationJournal,
+  fence: WorkflowRunEpochFence,
+  request: WorkflowOperationRequest,
+): Promise<string> {
+  const attempt = await adapter.allocateAttempt(fence, request);
+  await appendDraft(adapter, fence, {
+    type: "attempt_started",
+    payload: { attempt },
+  });
+  await appendDraft(adapter, fence, {
+    type: "operation_dispatched",
+    payload: { attempt },
+  });
+  const outcome = {
+    status: "cancelled",
+    reason: "test completion",
+  } as const;
+  await appendDraft(adapter, fence, {
+    type: "attempt_settled",
+    payload: { attempt, outcome, accounting: ACCOUNTING },
+  });
+  return (
+    await appendDraft(adapter, fence, {
+      type: "operation_settled",
+      payload: { attempt, outcome, accounting: ACCOUNTING },
+    })
+  ).eventId;
 }
 
 function outputPath(
@@ -199,14 +227,16 @@ describe("WorkflowRunOperationJournal", () => {
       fence,
       request,
     );
-    await appendDraft(adapter, fence, {
-      type: "response_ready",
-      payload: {
-        operation: request.identity,
-        dispatchOrdinal: request.dispatchOrdinal,
-        responseOrdinal,
-        settlementEventId: operationSettled.eventId,
-      },
+    await adapter.commitResponse(fence, request, responseOrdinal, async () => {
+      await appendDraft(adapter, fence, {
+        type: "response_ready",
+        payload: {
+          operation: request.identity,
+          dispatchOrdinal: request.dispatchOrdinal,
+          responseOrdinal,
+          settlementEventId: operationSettled.eventId,
+        },
+      });
     });
 
     const state = await adapter.readOperation(fence, request.identity);
@@ -215,6 +245,7 @@ describe("WorkflowRunOperationJournal", () => {
       {
         attempt,
         dispatched: true,
+        status: "settled",
         observedUsage: USAGE,
         settlement: {
           eventId: attemptSettled.eventId,
@@ -262,11 +293,321 @@ describe("WorkflowRunOperationJournal", () => {
     expect(responses).toEqual([1, 2, 3]);
   });
 
-  it("serializes concurrent event allocation without sequence collisions", async () => {
+  it.each([
+    { failurePoint: "before append", persisted: false, expectedAttempt: 1 },
+    { failurePoint: "after append", persisted: true, expectedAttempt: 2 },
+  ])(
+    "rebases attempt reservations from durable events after failure $failurePoint",
+    async ({ persisted, expectedAttempt }) => {
+      let id = 0;
+      const nextId = () => `attempt-rebase-${++id}`;
+      const adapter = new WorkflowRunOperationJournal(journal, nextId);
+      const request = requestFor(runId, "a", 1);
+      await appendDraft(adapter, fence, {
+        type: "operation_prepared",
+        payload: { request },
+      });
+      const failedAttempt = await adapter.allocateAttempt(fence, request);
+      const append = journal.append.bind(journal);
+      const failure = new Error("injected attempt append failure");
+      vi.spyOn(journal, "append").mockImplementationOnce(async (event) => {
+        if (persisted) await append(event);
+        throw failure;
+      });
+
+      await expect(
+        appendDraft(adapter, fence, {
+          type: "attempt_started",
+          payload: { attempt: failedAttempt },
+        }),
+      ).rejects.toBe(failure);
+      if (persisted) {
+        expect(
+          (await adapter.readOperation(fence, request.identity)).attempts.at(-1)
+            ?.status,
+        ).toBe("started");
+        await appendDraft(adapter, fence, {
+          type: "attempt_interrupted",
+          payload: { attempt: failedAttempt, reason: "owner_replaced" },
+        });
+      }
+
+      const resumed = new WorkflowRunOperationJournal(journal, nextId);
+      const retry = await resumed.allocateAttempt(fence, request);
+      expect(retry.attemptNumber).toBe(expectedAttempt);
+      await appendDraft(resumed, fence, {
+        type: "attempt_started",
+        payload: { attempt: retry },
+      });
+      expect(
+        (await resumed.readOperation(fence, request.identity)).attempts.map(
+          ({ attempt }) => attempt.attemptNumber,
+        ),
+      ).toEqual(persisted ? [1, 2] : [1]);
+    },
+  );
+
+  it("commits reserved responses in completion order across adapters", async () => {
+    const firstAdapter = new WorkflowRunOperationJournal(journal);
+    const secondAdapter = new WorkflowRunOperationJournal(journal);
+    const firstRequest = requestFor(runId, "a", 1);
+    const secondRequest = requestFor(runId, "b", 2);
+    const settlementIds = new Map<string, string>();
+    for (const [adapter, request] of [
+      [firstAdapter, firstRequest],
+      [secondAdapter, secondRequest],
+    ] as const) {
+      await appendDraft(adapter, fence, {
+        type: "operation_prepared",
+        payload: { request },
+      });
+      const attempt = await adapter.allocateAttempt(fence, request);
+      await appendDraft(adapter, fence, {
+        type: "attempt_started",
+        payload: { attempt },
+      });
+      await appendDraft(adapter, fence, {
+        type: "operation_dispatched",
+        payload: { attempt },
+      });
+      const outcome = {
+        status: "cancelled",
+        reason: "test completion",
+      } as const;
+      await appendDraft(adapter, fence, {
+        type: "attempt_settled",
+        payload: { attempt, outcome, accounting: ACCOUNTING },
+      });
+      const settlement = await appendDraft(adapter, fence, {
+        type: "operation_settled",
+        payload: { attempt, outcome, accounting: ACCOUNTING },
+      });
+      settlementIds.set(request.identity.operationId, settlement.eventId);
+    }
+    const firstOrdinal = await firstAdapter.allocateResponseOrdinal(
+      fence,
+      firstRequest,
+    );
+    const secondOrdinal = await secondAdapter.allocateResponseOrdinal(
+      fence,
+      secondRequest,
+    );
+    let secondCommitEntered = false;
+    const secondCommit = secondAdapter.commitResponse(
+      fence,
+      secondRequest,
+      secondOrdinal,
+      async () => {
+        secondCommitEntered = true;
+        await appendDraft(secondAdapter, fence, {
+          type: "response_ready",
+          payload: {
+            operation: secondRequest.identity,
+            dispatchOrdinal: secondRequest.dispatchOrdinal,
+            responseOrdinal: secondOrdinal,
+            settlementEventId: settlementIds.get("b")!,
+          },
+        });
+      },
+    );
+    await Promise.resolve();
+    expect(secondCommitEntered).toBe(false);
+
+    const firstCommit = firstAdapter.commitResponse(
+      fence,
+      firstRequest,
+      firstOrdinal,
+      async () => {
+        await appendDraft(firstAdapter, fence, {
+          type: "response_ready",
+          payload: {
+            operation: firstRequest.identity,
+            dispatchOrdinal: firstRequest.dispatchOrdinal,
+            responseOrdinal: firstOrdinal,
+            settlementEventId: settlementIds.get("a")!,
+          },
+        });
+      },
+    );
+    await Promise.all([firstCommit, secondCommit]);
+
+    expect(
+      (await firstAdapter.readOperation(fence, firstRequest.identity))
+        .settlement?.responseOrdinal,
+    ).toBe(1);
+    expect(
+      (await secondAdapter.readOperation(fence, secondRequest.identity))
+        .settlement?.responseOrdinal,
+    ).toBe(2);
+  });
+
+  it.each([
+    { failurePoint: "before response append", persisted: false },
+    { failurePoint: "after response append", persisted: true },
+  ])(
+    "rebuilds a failed response lane from durable events $failurePoint",
+    async ({ persisted }) => {
+      const adapter = new WorkflowRunOperationJournal(journal);
+      const firstRequest = requestFor(runId, "a", 1);
+      const secondRequest = requestFor(runId, "b", 2);
+      const settlementIds: Record<string, string> = {};
+      for (const request of [firstRequest, secondRequest]) {
+        await appendDraft(adapter, fence, {
+          type: "operation_prepared",
+          payload: { request },
+        });
+        settlementIds[request.identity.operationId] = await settleRequest(
+          adapter,
+          fence,
+          request,
+        );
+      }
+      const failedOrdinal = await adapter.allocateResponseOrdinal(
+        fence,
+        firstRequest,
+      );
+      const staleLaterOrdinal = await adapter.allocateResponseOrdinal(
+        fence,
+        secondRequest,
+      );
+      const failure = new Error("injected response persistence failure");
+
+      await expect(
+        adapter.commitResponse(fence, firstRequest, failedOrdinal, async () => {
+          if (persisted) {
+            await appendDraft(adapter, fence, {
+              type: "response_ready",
+              payload: {
+                operation: firstRequest.identity,
+                dispatchOrdinal: firstRequest.dispatchOrdinal,
+                responseOrdinal: failedOrdinal,
+                settlementEventId: settlementIds.a,
+              },
+            });
+          }
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      let staleCommitEntered = false;
+      await expect(
+        adapter.commitResponse(
+          fence,
+          secondRequest,
+          staleLaterOrdinal,
+          async () => {
+            staleCommitEntered = true;
+          },
+        ),
+      ).rejects.toBe(failure);
+      expect(staleCommitEntered).toBe(false);
+
+      const resumed = new WorkflowRunOperationJournal(journal);
+      if (!persisted) {
+        const firstOrdinal = await resumed.allocateResponseOrdinal(
+          fence,
+          firstRequest,
+        );
+        expect(firstOrdinal).toBe(1);
+        await resumed.commitResponse(
+          fence,
+          firstRequest,
+          firstOrdinal,
+          async () => {
+            await appendDraft(resumed, fence, {
+              type: "response_ready",
+              payload: {
+                operation: firstRequest.identity,
+                dispatchOrdinal: firstRequest.dispatchOrdinal,
+                responseOrdinal: firstOrdinal,
+                settlementEventId: settlementIds.a,
+              },
+            });
+          },
+        );
+      }
+      const secondOrdinal = await resumed.allocateResponseOrdinal(
+        fence,
+        secondRequest,
+      );
+      expect(secondOrdinal).toBe(2);
+      await resumed.commitResponse(
+        fence,
+        secondRequest,
+        secondOrdinal,
+        async () => {
+          await appendDraft(resumed, fence, {
+            type: "response_ready",
+            payload: {
+              operation: secondRequest.identity,
+              dispatchOrdinal: secondRequest.dispatchOrdinal,
+              responseOrdinal: secondOrdinal,
+              settlementEventId: settlementIds.b,
+            },
+          });
+        },
+      );
+
+      expect(
+        (await journal.readEventLog()).events.flatMap((event) =>
+          event.type === "response_ready"
+            ? [event.payload.responseOrdinal]
+            : [],
+        ),
+      ).toEqual([1, 2]);
+    },
+  );
+
+  it("abandons pending response reservations until the lane is rebuilt", async () => {
+    const firstAdapter = new WorkflowRunOperationJournal(journal);
+    const secondAdapter = new WorkflowRunOperationJournal(journal);
+    const firstRequest = requestFor(runId, "a", 1);
+    const secondRequest = requestFor(runId, "b", 2);
+    await appendDraft(firstAdapter, fence, {
+      type: "operation_prepared",
+      payload: { request: firstRequest },
+    });
+    await appendDraft(secondAdapter, fence, {
+      type: "operation_prepared",
+      payload: { request: secondRequest },
+    });
+    const firstOrdinal = await firstAdapter.allocateResponseOrdinal(
+      fence,
+      firstRequest,
+    );
+    const secondOrdinal = await secondAdapter.allocateResponseOrdinal(
+      fence,
+      secondRequest,
+    );
+    const failure = new Error("first completion could not persist");
+    await firstAdapter.abandonResponse(
+      fence,
+      firstRequest,
+      firstOrdinal,
+      failure,
+    );
+    let laterCommitEntered = false;
+
+    await expect(
+      secondAdapter.commitResponse(
+        fence,
+        secondRequest,
+        secondOrdinal,
+        async () => {
+          laterCommitEntered = true;
+        },
+      ),
+    ).rejects.toBe(failure);
+    expect(laterCommitEntered).toBe(false);
+    await expect(
+      secondAdapter.allocateResponseOrdinal(fence, secondRequest),
+    ).resolves.toBe(1);
+  });
+
+  it("serializes concurrent event appends without sequence collisions", async () => {
     const adapter = new WorkflowRunOperationJournal(journal);
-    const events = await Promise.all(
+    const appended = await Promise.all(
       Array.from({ length: 20 }, (_, index) =>
-        adapter.createEvent(fence, {
+        adapter.appendEvent(fence, {
           type: "operation_prepared",
           payload: {
             request: requestFor(
@@ -278,6 +619,7 @@ describe("WorkflowRunOperationJournal", () => {
         }),
       ),
     );
+    const events = appended.map(({ event }) => event);
     const sequences = events.map(({ sequence }) => sequence);
     expect(new Set(sequences).size).toBe(events.length);
     expect(sequences).toEqual(

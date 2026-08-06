@@ -20,6 +20,7 @@ import {
   type WorkflowRunEvent,
   type WorkflowUsageAccounting,
 } from "../src/workflow-run-types";
+import { createWorkflowProcessAttemptManifest } from "../src/workflow-process-attempt";
 import {
   InMemoryWorkflowProjectionRepository,
   WorkflowProjectionFoldError,
@@ -319,6 +320,16 @@ describe("foldWorkflowRunEvents", () => {
     ];
     expectFoldCode(afterTerminal, "terminal_immutable");
 
+    const duplicateTerminal = [
+      ...committedRun(),
+      event("run_terminal", 16, {
+        status: "done",
+        accounting: exact,
+        resultEventId: "event-14",
+      }),
+    ];
+    expectFoldCode(duplicateTerminal, "terminal_immutable");
+
     const mismatchedResult = committedRun();
     mismatchedResult[14] = event("run_terminal", 15, {
       status: "done",
@@ -326,6 +337,25 @@ describe("foldWorkflowRunEvents", () => {
       resultEventId: "unknown-result-event",
     });
     expectFoldCode(mismatchedResult, "result_mismatch");
+  });
+
+  it("persists coordinator-authoritative blocked run state", () => {
+    const projection = foldWorkflowRunEvents([
+      ...prefix(),
+      event("task_transitioned", 5, {
+        definitionPath: rootPath,
+        taskId: "task-a",
+        planRevision: 1,
+        from: "pending",
+        to: "blocked",
+      }),
+      event("run_blocked", 6, { blockedTaskIds: ["task-a"] }),
+    ]);
+
+    expect(projection.status).toBe("blocked");
+    expect(projection.taskStates["task-a"]).toMatchObject({
+      status: "blocked",
+    });
   });
 
   it("retains committed replay data, task state, plan state, and allocation counters", () => {
@@ -385,6 +415,76 @@ describe("foldWorkflowRunEvents", () => {
     });
   });
 
+  it("counts cumulative retry settlement accounting only once", () => {
+    const priorUsage: DurableWorkflowUsage = {
+      ...usage,
+      input: 2,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3,
+      costUsd: 0.003,
+    };
+    const cumulativeUsage: DurableWorkflowUsage = {
+      ...usage,
+      input: 7,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 12,
+      costUsd: 0.012,
+      turns: 2,
+    };
+    const cumulativeAccounting: WorkflowUsageAccounting = {
+      completeness: "lower_bound",
+      reason: "ambiguous_dispatch",
+      usage: cumulativeUsage,
+    };
+    const retryAttempt: WorkflowOperationAttempt = {
+      ...attempt,
+      attemptId: createWorkflowAttemptId("attempt-2"),
+      attemptNumber: createWorkflowAttemptNumber(2),
+    };
+    const outcome = {
+      status: "succeeded" as const,
+      value: { sha256: outputDigest, sizeBytes: 50 },
+    };
+
+    const events = [
+      ...prefix(),
+      event("operation_prepared", 5, { request }),
+      event("attempt_started", 6, { attempt }),
+      event("operation_dispatched", 7, { attempt }),
+      event("attempt_usage_observed", 8, {
+        attempt,
+        usageDelta: priorUsage,
+      }),
+      event("attempt_interrupted", 9, {
+        attempt,
+        reason: "process_exit",
+      }),
+      event("attempt_started", 10, { attempt: retryAttempt }),
+      event("operation_dispatched", 11, { attempt: retryAttempt }),
+      event("attempt_settled", 12, {
+        attempt: retryAttempt,
+        outcome,
+        accounting: cumulativeAccounting,
+      }),
+      event("operation_settled", 13, {
+        attempt: retryAttempt,
+        outcome,
+        accounting: cumulativeAccounting,
+      }),
+    ];
+
+    expect(foldWorkflowRunEvents(events).accounting).toEqual(
+      cumulativeAccounting,
+    );
+    expect(foldWorkflowRunEvents(events.slice(0, -1)).accounting).toEqual(
+      cumulativeAccounting,
+    );
+  });
+
   it("projects interruption and only resumes through a legal journal transition", () => {
     const interrupted = [
       ...prefix(),
@@ -405,6 +505,34 @@ describe("foldWorkflowRunEvents", () => {
       }),
     ];
     expect(foldWorkflowRunEvents(resumed).status).toBe("running");
+  });
+  it("surfaces the persisted effective isolation fallback on the attempt", () => {
+    const manifest = createWorkflowProcessAttemptManifest(
+      attempt,
+      1,
+      "nonce_1234567890abcdef",
+      "process",
+    );
+    const projection = foldWorkflowRunEvents([
+      ...prefix(),
+      event("operation_prepared", 5, { request }),
+      event("attempt_started", 6, { attempt }),
+      event("process_launch_prepared", 7, { manifest }),
+      event("operation_dispatched", 8, { attempt }),
+      event("process_isolation_resolved", 9, {
+        identity: manifest.identity,
+        effectiveIsolation: "in-process",
+        fallbackMode: "process_unavailable",
+        fallbackReason: "no deterministic multiplexer lookup",
+      }),
+    ]);
+
+    expect(projection.operations[0]?.attempts[0]?.process).toMatchObject({
+      stage: "fallback",
+      effectiveIsolation: "in-process",
+      fallbackMode: "process_unavailable",
+      fallbackReason: "no deterministic multiplexer lookup",
+    });
   });
 });
 

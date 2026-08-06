@@ -1,4 +1,16 @@
-import type { SubagentResult } from "./helpers";
+import { randomUUID } from "node:crypto";
+import {
+  createWorkflowProcessAttemptManifest,
+  WorkflowProcessAttemptFencedError,
+  type WorkflowProcessAttemptDispatch,
+  type WorkflowProcessAttemptIdentity,
+  type WorkflowProcessChildStartedEvidence,
+  type WorkflowProcessPaneAssignment,
+  type WorkflowProcessTerminalEvidence,
+} from "./workflow-process-attempt";
+import type { DurableWorkflowProcessAttemptProjection } from "./workflow-projection-repository";
+
+import type { SubagentResult, Usage } from "./helpers";
 import type { WorkflowAgentRunner, WorkflowUsage } from "./workflow-core";
 import type { WorkflowAgentDispatcher } from "./workflow-dispatcher";
 import type { EncodedDurableValue } from "./workflow-durable-value";
@@ -29,6 +41,14 @@ import {
   type WorkflowAttemptSettledEvent,
   type WorkflowAttemptUsageObservedEvent,
   type WorkflowUsageAccounting,
+  type WorkflowProcessAdoptedEvent,
+  type WorkflowProcessChildStartedEvent,
+  type WorkflowProcessFencedEvent,
+  type WorkflowProcessIsolationResolvedEvent,
+  type WorkflowProcessLaunchDispatchedEvent,
+  type WorkflowProcessLaunchPreparedEvent,
+  type WorkflowProcessPaneAssignedEvent,
+  type WorkflowProcessTerminalEvent,
 } from "./workflow-run-types";
 
 export type WorkflowAgentDispatchRequest = Parameters<WorkflowAgentRunner>[0];
@@ -43,7 +63,15 @@ export type WorkflowOperationGateEvent =
   | WorkflowAttemptStartedEvent
   | WorkflowAttemptUsageObservedEvent
   | WorkflowAttemptSettledEvent
-  | WorkflowResponseReadyEvent;
+  | WorkflowResponseReadyEvent
+  | WorkflowProcessLaunchPreparedEvent
+  | WorkflowProcessPaneAssignedEvent
+  | WorkflowProcessLaunchDispatchedEvent
+  | WorkflowProcessChildStartedEvent
+  | WorkflowProcessTerminalEvent
+  | WorkflowProcessAdoptedEvent
+  | WorkflowProcessFencedEvent
+  | WorkflowProcessIsolationResolvedEvent;
 
 export type WorkflowOperationEventDraft<
   Event extends WorkflowOperationGateEvent = WorkflowOperationGateEvent,
@@ -63,6 +91,8 @@ export interface WorkflowOperationAttemptState {
   readonly dispatched: boolean;
   readonly observedUsage?: DurableWorkflowUsage;
   readonly settlement?: WorkflowOperationAttemptSettlement;
+  readonly status?: "started" | "settled" | "interrupted" | "cancelled";
+  readonly process?: DurableWorkflowProcessAttemptProjection;
 }
 
 export interface WorkflowOperationSettlementState {
@@ -81,22 +111,21 @@ export interface WorkflowOperationJournalState {
 }
 
 /**
- * Event IDs and sequence numbers are allocated by the journal implementation.
- * The gate never receives paths and never constructs persisted event metadata.
+ * Event IDs and sequence numbers are allocated and durably appended by the
+ * journal implementation in one critical section. The gate never receives
+ * paths or constructs persisted event metadata.
  */
-export interface WorkflowOperationEventFactory {
-  createEvent(
-    fence: WorkflowRunEpochFence,
-    draft: WorkflowOperationEventDraft,
-  ): Promise<WorkflowOperationGateEvent>;
+export interface WorkflowOperationEventAppend {
+  readonly event: WorkflowOperationGateEvent;
+  readonly receipt: WorkflowEventReceipt;
 }
 
-export interface WorkflowOperationEventSink extends WorkflowOperationEventFactory {
+export interface WorkflowOperationEventSink {
   revalidateFence(fence: WorkflowRunEpochFence): Promise<void>;
-  append(
+  appendEvent(
     fence: WorkflowRunEpochFence,
-    event: WorkflowOperationGateEvent,
-  ): Promise<WorkflowEventReceipt>;
+    draft: WorkflowOperationEventDraft,
+  ): Promise<WorkflowOperationEventAppend>;
 }
 
 /**
@@ -117,6 +146,18 @@ export interface WorkflowOperationJournal extends WorkflowOperationEventSink {
     fence: WorkflowRunEpochFence,
     request: WorkflowOperationRequest,
   ): Promise<WorkflowResponseOrdinal>;
+  commitResponse<T>(
+    fence: WorkflowRunEpochFence,
+    request: WorkflowOperationRequest,
+    responseOrdinal: WorkflowResponseOrdinal,
+    commit: () => Promise<T>,
+  ): Promise<T>;
+  abandonResponse(
+    fence: WorkflowRunEpochFence,
+    request: WorkflowOperationRequest,
+    responseOrdinal: WorkflowResponseOrdinal,
+    reason: unknown,
+  ): Promise<void>;
   putOutcomeBlob(
     fence: WorkflowRunEpochFence,
     value: EncodedDurableValue,
@@ -136,6 +177,7 @@ export interface WorkflowOperationGateOptions {
   readonly journal: WorkflowOperationJournal;
   readonly blobCodec: WorkflowOperationBlobCodec;
   readonly dispatcher: Pick<WorkflowAgentDispatcher, "run">;
+  readonly generateProcessNonce?: () => string;
 }
 
 export type WorkflowOperationGateErrorCode =
@@ -153,14 +195,17 @@ export class WorkflowOperationGateError extends Error {
 
 export class WorkflowOperationInterruptedError extends Error {
   readonly reason: WorkflowAttemptInterruptedEvent["payload"]["reason"];
+  readonly usage?: Usage;
 
   constructor(
     reason: WorkflowAttemptInterruptedEvent["payload"]["reason"],
     message = "Durable workflow operation interrupted.",
+    usage?: Usage,
   ) {
     super(message);
     this.name = "WorkflowOperationInterruptedError";
     this.reason = reason;
+    this.usage = usage;
   }
 }
 
@@ -191,7 +236,12 @@ interface SerializedThrownError {
   readonly code?: string | number;
 }
 
+interface ProcessDispatchAuthority {
+  readonly dispatch: WorkflowProcessAttemptDispatch;
+  readonly priorAttempts: readonly WorkflowOperationAttemptState[];
+}
 const RESOLVED = Promise.resolve();
+const MAX_PROCESS_FENCE_REDISPATCHES = 3;
 
 /** Parent-owned durable replay and commit-before-return boundary. */
 export class WorkflowOperationGate {
@@ -199,12 +249,14 @@ export class WorkflowOperationGate {
   readonly #blobCodec: WorkflowOperationBlobCodec;
   readonly #dispatcher: Pick<WorkflowAgentDispatcher, "run">;
   readonly #mutexTails = new Map<string, Promise<void>>();
+  readonly #generateProcessNonce: () => string;
   readonly #inFlight = new Map<string, InFlightOperation>();
 
   constructor(options: WorkflowOperationGateOptions) {
     this.#journal = options.journal;
     this.#blobCodec = options.blobCodec;
     this.#dispatcher = options.dispatcher;
+    this.#generateProcessNonce = options.generateProcessNonce ?? randomUUID;
   }
 
   execute(
@@ -299,21 +351,93 @@ export class WorkflowOperationGate {
       });
     }
 
-    const attempt = await this.#journal.allocateAttempt(fence, request);
-    this.#validateAllocatedAttempt(attempt, request, state.attempts);
-    await this.#append(fence, {
-      type: "attempt_started",
-      payload: { attempt },
-    });
-    await this.#append(fence, {
-      type: "operation_dispatched",
-      payload: { attempt },
-    });
+    let activeProcessAttempt = state.attempts.at(-1);
+    if (
+      activeProcessAttempt?.status === "started" &&
+      activeProcessAttempt.settlement === undefined &&
+      activeProcessAttempt.process?.fencedEventId !== undefined
+    ) {
+      await this.#append(fence, {
+        type: "attempt_interrupted",
+        payload: { attempt: activeProcessAttempt.attempt, reason: "recovery" },
+      });
+      state = await this.#journal.readOperation(fence, request.identity);
+      activeProcessAttempt = state.attempts.at(-1);
+    }
+    let attempt: WorkflowOperationAttempt;
+    let processAuthority: ProcessDispatchAuthority | undefined;
+    let recoveredPriorAttempts:
+      readonly WorkflowOperationAttemptState[] | undefined;
+    if (
+      activeProcessAttempt?.status === "started" &&
+      activeProcessAttempt.settlement === undefined &&
+      activeProcessAttempt.process !== undefined &&
+      activeProcessAttempt.process.effectiveIsolation === "process" &&
+      activeProcessAttempt.process.fencedEventId === undefined
+    ) {
+      attempt = activeProcessAttempt.attempt;
+      processAuthority = this.#processDispatchAuthority(
+        fence,
+        activeProcessAttempt.process,
+        "adopt",
+        state.attempts.slice(0, -1),
+      );
+    } else {
+      const recoverableAttempt =
+        activeProcessAttempt?.status === "started" &&
+        activeProcessAttempt.settlement === undefined &&
+        !activeProcessAttempt.dispatched &&
+        activeProcessAttempt.process === undefined
+          ? activeProcessAttempt
+          : undefined;
+      if (recoverableAttempt !== undefined) {
+        attempt = recoverableAttempt.attempt;
+        recoveredPriorAttempts = state.attempts.slice(0, -1);
+      } else {
+        attempt = await this.#journal.allocateAttempt(fence, request);
+        this.#validateAllocatedAttempt(attempt, request, state.attempts);
+        await this.#append(fence, {
+          type: "attempt_started",
+          payload: { attempt },
+        });
+      }
+      if (dispatchRequest.isolation !== "in-process") {
+        const manifest = createWorkflowProcessAttemptManifest(
+          attempt,
+          fence.runEpoch,
+          this.#generateProcessNonce(),
+          dispatchRequest.isolation ?? "process",
+        );
+        await this.#append(fence, {
+          type: "process_launch_prepared",
+          payload: { manifest },
+        });
+        processAuthority = this.#processDispatchAuthority(
+          fence,
+          {
+            manifest,
+            stage: "prepared",
+            launchPreparedEventId: "",
+            effectiveIsolation: "process",
+            fallbackMode: "none",
+          },
+          "launch",
+          recoveredPriorAttempts ?? state.attempts,
+        );
+      }
+      await this.#append(fence, {
+        type: "operation_dispatched",
+        payload: { attempt },
+      });
+    }
 
     let observedUsage: WorkflowUsage | undefined;
     const originalProgress = dispatchRequest.onProgress;
     const requestWithUsageEvidence: WorkflowAgentDispatchRequest = {
       ...dispatchRequest,
+      ...(processAuthority === undefined
+        ? {}
+        : { workflowProcessAttempt: processAuthority.dispatch }),
       onProgress: (event) => {
         if (event.liveUsage !== undefined) observedUsage = event.liveUsage;
         originalProgress?.(event);
@@ -332,6 +456,36 @@ export class WorkflowOperationGate {
       thrown = error;
     }
 
+    if (thrown instanceof WorkflowProcessAttemptFencedError) {
+      const fencedUsage = durableUsageFromUnknown(thrown, observedUsage);
+      if (dispatchRequest.signal?.aborted) {
+        returned = cancelledResult(
+          abortSignalReason(dispatchRequest.signal),
+          fencedUsage,
+        );
+        thrown = undefined;
+        didThrow = false;
+      } else if (
+        state.attempts.filter(
+          ({ process, settlement }) =>
+            settlement === undefined && process?.fencedEventId !== undefined,
+        ).length < MAX_PROCESS_FENCE_REDISPATCHES
+      ) {
+        await this.#append(fence, {
+          type: "attempt_usage_observed",
+          payload: { attempt, usageDelta: fencedUsage },
+        });
+        await this.#append(fence, {
+          type: "attempt_interrupted",
+          payload: { attempt, reason: "recovery" },
+        });
+        const refreshed = await this.#journal.readOperation(
+          fence,
+          request.identity,
+        );
+        return this.#dispatchFresh(fence, request, dispatchRequest, refreshed);
+      }
+    }
     if (thrown instanceof WorkflowOperationInterruptedError) {
       const currentUsage = durableUsageFromUnknown(thrown, observedUsage);
       await this.#append(fence, {
@@ -349,49 +503,141 @@ export class WorkflowOperationGate {
     const currentUsage = didThrow
       ? durableUsageFromUnknown(thrown, observedUsage)
       : durableUsageFromUnknown(returned, observedUsage);
-    const accounting = accountingForAttempt(state.attempts, currentUsage);
-    const persisted = await this.#persistDispatch(
-      fence,
-      returned,
-      thrown,
-      didThrow,
-      accounting,
-    );
-    await this.#append(fence, {
-      type: "attempt_usage_observed",
-      payload: { attempt, usageDelta: currentUsage },
-    });
-
-    await this.#append(fence, {
-      type: "attempt_settled",
-      payload: {
+    const priorAttempts =
+      processAuthority?.priorAttempts ??
+      recoveredPriorAttempts ??
+      state.attempts;
+    const accounting = accountingForAttempt(priorAttempts, currentUsage);
+    await this.#commitResponse(fence, request, async (responseOrdinal) => {
+      const persisted = await this.#persistDispatch(
+        fence,
+        returned,
+        thrown,
+        didThrow,
+        accounting,
+      );
+      await this.#append(fence, {
+        type: "attempt_usage_observed",
+        payload: { attempt, usageDelta: currentUsage },
+      });
+      await this.#append(fence, {
+        type: "attempt_settled",
+        payload: {
+          attempt,
+          outcome: persisted.outcome,
+          accounting: persisted.accounting,
+        },
+      });
+      const operationSettlement = await this.#append(fence, {
+        type: "operation_settled",
+        payload: {
+          attempt,
+          outcome: persisted.outcome,
+          accounting: persisted.accounting,
+        },
+      });
+      await this.#appendResponseReady(
+        fence,
         attempt,
-        outcome: persisted.outcome,
-        accounting: persisted.accounting,
-      },
+        responseOrdinal,
+        operationSettlement.eventId,
+      );
+      await this.#journal.revalidateFence(fence);
     });
-    const operationSettlement = await this.#append(fence, {
-      type: "operation_settled",
-      payload: {
-        attempt,
-        outcome: persisted.outcome,
-        accounting: persisted.accounting,
-      },
-    });
-    const responseOrdinal = await this.#journal.allocateResponseOrdinal(
-      fence,
-      request,
-    );
-    await this.#appendResponseReady(
-      fence,
-      attempt,
-      responseOrdinal,
-      operationSettlement.eventId,
-    );
-    await this.#journal.revalidateFence(fence);
 
     if (didThrow) throw thrown;
     return returned as WorkflowOperationDispatchResult;
+  }
+
+  #processDispatchAuthority(
+    fence: WorkflowRunEpochFence,
+    process: DurableWorkflowProcessAttemptProjection,
+    mode: "launch" | "adopt",
+    priorAttempts: readonly WorkflowOperationAttemptState[],
+  ): ProcessDispatchAuthority {
+    const { manifest } = process;
+    const appendIdentityEvent = async (
+      identity: WorkflowProcessAttemptIdentity,
+      draft: WorkflowOperationEventDraft,
+    ): Promise<void> => {
+      if (
+        identity.runId !== manifest.identity.runId ||
+        identity.definitionPath !== manifest.identity.definitionPath ||
+        identity.operationId !== manifest.identity.operationId ||
+        identity.attemptId !== manifest.identity.attemptId ||
+        identity.attemptNumber !== manifest.identity.attemptNumber ||
+        identity.runEpoch !== manifest.identity.runEpoch ||
+        identity.nonce !== manifest.identity.nonce
+      ) {
+        throw invalidState("runner reported stale workflow process evidence");
+      }
+      await this.#append(fence, draft);
+    };
+    const dispatch: WorkflowProcessAttemptDispatch = Object.freeze({
+      mode,
+      manifest,
+      ...(process.assignment === undefined
+        ? {}
+        : { assignment: process.assignment }),
+      launchDispatchedPersisted: process.launchDispatchedEventId !== undefined,
+      childStartedPersisted: process.childStartedEventId !== undefined,
+      terminalPersisted: process.terminalEventId !== undefined,
+      adoptedPersisted: process.adoptedEventId !== undefined,
+      paneAssigned: (assignment: WorkflowProcessPaneAssignment) =>
+        appendIdentityEvent(manifest.identity, {
+          type: "process_pane_assigned",
+          payload: { identity: manifest.identity, assignment },
+        }),
+      launchDispatched: (assignment: WorkflowProcessPaneAssignment) =>
+        appendIdentityEvent(manifest.identity, {
+          type: "process_launch_dispatched",
+          payload: { identity: manifest.identity, assignment },
+        }),
+      childStarted: (evidence: WorkflowProcessChildStartedEvidence) =>
+        appendIdentityEvent(evidence.identity, {
+          type: "process_child_started",
+          payload: { evidence },
+        }),
+      terminal: (evidence: WorkflowProcessTerminalEvidence) =>
+        appendIdentityEvent(evidence.identity, {
+          type: "process_terminal",
+          payload: { evidence },
+        }),
+      adopted: (evidence: "live" | "terminal") =>
+        appendIdentityEvent(manifest.identity, {
+          type: "process_adopted",
+          payload: { identity: manifest.identity, evidence },
+        }),
+      fenced: (
+        reason:
+          | "orphan_before_assignment"
+          | "ambiguous_dispatch"
+          | "multiple_marker_matches"
+          | "stale_evidence",
+        assignment: WorkflowProcessPaneAssignment | undefined,
+        probeCount: number,
+      ) =>
+        appendIdentityEvent(manifest.identity, {
+          type: "process_fenced",
+          payload: {
+            identity: manifest.identity,
+            reason,
+            ...(assignment === undefined ? {} : { assignment }),
+            probeCount,
+          },
+        }),
+      fallback: (fallbackReason: string) =>
+        appendIdentityEvent(manifest.identity, {
+          type: "process_isolation_resolved",
+          payload: {
+            identity: manifest.identity,
+            effectiveIsolation: "in-process",
+            fallbackMode: "process_unavailable",
+            fallbackReason,
+          },
+        }),
+    });
+    return { dispatch, priorAttempts };
   }
 
   async #persistDispatch(
@@ -455,25 +701,23 @@ export class WorkflowOperationGate {
       settlement.outcome,
       settlement.accounting,
     );
-    const operationSettlement = await this.#append(fence, {
-      type: "operation_settled",
-      payload: {
+    await this.#commitResponse(fence, request, async (responseOrdinal) => {
+      const operationSettlement = await this.#append(fence, {
+        type: "operation_settled",
+        payload: {
+          attempt,
+          outcome: settlement.outcome,
+          accounting: settlement.accounting,
+        },
+      });
+      await this.#appendResponseReady(
+        fence,
         attempt,
-        outcome: settlement.outcome,
-        accounting: settlement.accounting,
-      },
+        responseOrdinal,
+        operationSettlement.eventId,
+      );
+      await this.#journal.revalidateFence(fence);
     });
-    const responseOrdinal = await this.#journal.allocateResponseOrdinal(
-      fence,
-      request,
-    );
-    await this.#appendResponseReady(
-      fence,
-      attempt,
-      responseOrdinal,
-      operationSettlement.eventId,
-    );
-    await this.#journal.revalidateFence(fence);
     return deliver(delivery);
   }
 
@@ -487,17 +731,15 @@ export class WorkflowOperationGate {
       settlement.outcome,
       settlement.accounting,
     );
-    const responseOrdinal = await this.#journal.allocateResponseOrdinal(
-      fence,
-      request,
-    );
-    await this.#appendResponseReady(
-      fence,
-      settlement.attempt,
-      responseOrdinal,
-      settlement.eventId,
-    );
-    await this.#journal.revalidateFence(fence);
+    await this.#commitResponse(fence, request, async (responseOrdinal) => {
+      await this.#appendResponseReady(
+        fence,
+        settlement.attempt,
+        responseOrdinal,
+        settlement.eventId,
+      );
+      await this.#journal.revalidateFence(fence);
+    });
     return deliver(delivery);
   }
 
@@ -551,6 +793,30 @@ export class WorkflowOperationGate {
     return { kind: "return", value: decoded };
   }
 
+  async #commitResponse<T>(
+    fence: WorkflowRunEpochFence,
+    request: WorkflowOperationRequest,
+    commit: (responseOrdinal: WorkflowResponseOrdinal) => Promise<T>,
+  ): Promise<T> {
+    const responseOrdinal = await this.#journal.allocateResponseOrdinal(
+      fence,
+      request,
+    );
+    try {
+      return await this.#journal.commitResponse(
+        fence,
+        request,
+        responseOrdinal,
+        () => commit(responseOrdinal),
+      );
+    } catch (error) {
+      await this.#journal
+        .abandonResponse(fence, request, responseOrdinal, error)
+        .catch(() => undefined);
+      throw error;
+    }
+  }
+
   async #appendResponseReady(
     fence: WorkflowRunEpochFence,
     attempt: WorkflowOperationAttempt,
@@ -572,7 +838,7 @@ export class WorkflowOperationGate {
     fence: WorkflowRunEpochFence,
     draft: WorkflowOperationEventDraft,
   ): Promise<WorkflowOperationGateEvent> {
-    const event = await this.#journal.createEvent(fence, draft);
+    const { event, receipt } = await this.#journal.appendEvent(fence, draft);
     if (
       !isWorkflowRunEvent(event) ||
       !isGateEvent(event) ||
@@ -580,9 +846,8 @@ export class WorkflowOperationGate {
       event.runId !== fence.runId ||
       event.runEpoch !== fence.runEpoch
     ) {
-      throw invalidState("journal created an invalid operation event");
+      throw invalidState("journal appended an invalid operation event");
     }
-    const receipt = await this.#journal.append(fence, event);
     this.#validateReceipt(receipt, event, fence);
     return event;
   }
@@ -717,6 +982,15 @@ function operationKey(
   ]);
 }
 
+function abortSignalReason(signal: AbortSignal): string {
+  const { reason } = signal;
+  if (reason instanceof Error && reason.message.length > 0) {
+    return reason.message;
+  }
+  if (typeof reason === "string" && reason.length > 0) return reason;
+  return "Workflow operation aborted.";
+}
+
 function isGateEvent(
   event: WorkflowRunEvent,
 ): event is WorkflowOperationGateEvent {
@@ -729,7 +1003,15 @@ function isGateEvent(
     event.type === "attempt_started" ||
     event.type === "attempt_usage_observed" ||
     event.type === "attempt_settled" ||
-    event.type === "response_ready"
+    event.type === "response_ready" ||
+    event.type === "process_launch_prepared" ||
+    event.type === "process_pane_assigned" ||
+    event.type === "process_launch_dispatched" ||
+    event.type === "process_child_started" ||
+    event.type === "process_terminal" ||
+    event.type === "process_adopted" ||
+    event.type === "process_fenced" ||
+    event.type === "process_isolation_resolved"
   );
 }
 
@@ -931,7 +1213,7 @@ function accountingForAttempt(
     ? {
         completeness: "lower_bound",
         usage,
-        reason: "provider_work_not_settled",
+        reason: "ambiguous_dispatch",
       }
     : { completeness: "exact", usage };
 }
