@@ -211,6 +211,120 @@ describe("DurableWorkflowPlanController", () => {
     await durable.release();
   });
 
+  it("persists trusted cancellation before abort and keeps one terminal cancelled result queryable", async () => {
+    const runStore = store();
+    const runId = createDurableWorkflowRunId("trusted-cancellation");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let markObservedAbort!: (events: string[]) => void;
+    const observedAbort = new Promise<string[]>((resolve) => {
+      markObservedAbort = resolve;
+    });
+    const durable = await controller(runStore, async ({ signal }) => {
+      markStarted();
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            void (async () => {
+              const events = await (
+                await runStore.openRun(owner, runId)
+              ).readEvents();
+              markObservedAbort(events.map((event) => event.type));
+              resolve();
+            })();
+          },
+          { once: true },
+        );
+      });
+      return {
+        ...success("cancelled", 4, 2),
+        cancelled: true,
+      };
+    });
+    const execution = await durable.startPlan({
+      runId,
+      plan: sequentialPlan(),
+    });
+    await started;
+    await expect(
+      durable.trustedCancel(runId, {
+        reason: "wrong owner",
+        trustedActorId: "human-a",
+        expectedOwner: { ...owner, piSessionKey: "other-session" },
+      }),
+    ).rejects.toMatchObject({ code: "wrong_owner" });
+    await expect(
+      durable.trustedCancel(runId, {
+        reason: "invalid actor",
+        trustedActorId: "",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_cancellation" });
+
+    const firstCancellation = durable.trustedCancel(runId, {
+      reason: "user requested cancellation",
+      trustedActorId: "human-a",
+      expectedOwner: owner,
+      expectedRunEpoch: 1,
+    });
+    const repeatedCancellation = durable.trustedCancel(runId, {
+      reason: "duplicate request is idempotent",
+      trustedActorId: "human-a",
+      expectedOwner: owner,
+      expectedRunEpoch: 1,
+    });
+    const [firstResult, repeatedResult] = await Promise.all([
+      firstCancellation,
+      repeatedCancellation,
+    ]);
+    expect(firstResult.status).toBe("cancelled");
+    expect(repeatedResult).toEqual(firstResult);
+    expect(await observedAbort).toContain("run_cancellation_requested");
+    expect(await execution.completion).toEqual(firstResult);
+
+    const events = await (await runStore.openRun(owner, runId)).readEvents();
+    expect(
+      events.filter((event) => event.type === "run_cancellation_requested"),
+    ).toHaveLength(1);
+    const eventTypes = events.map((event) => event.type);
+    expect(eventTypes.indexOf("run_cancellation_requested")).toBeLessThan(
+      eventTypes.indexOf("run_cancelled"),
+    );
+    expect(eventTypes.indexOf("run_cancelled")).toBeLessThan(
+      eventTypes.indexOf("run_terminal"),
+    );
+    expect(await durable.getProjection(runId)).toMatchObject({
+      status: "cancelled",
+      terminal: { status: "cancelled" },
+      accounting: {
+        completeness: "exact",
+        usage: { input: 4, output: 2 },
+      },
+    });
+    expect(await durable.getResult(runId)).toMatchObject({
+      status: "cancelled",
+      usage: { input: 4, output: 2 },
+    });
+    expect(
+      await durable.trustedCancel(runId, {
+        reason: "terminal duplicate",
+        trustedActorId: "human-a",
+      }),
+    ).toEqual(firstResult);
+    await expect(
+      durable.trustedCancel(
+        createDurableWorkflowRunId("wrong-or-missing-run"),
+        {
+          reason: "not found",
+          trustedActorId: "human-a",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "run_not_found" });
+    await durable.release();
+  });
+
   it("requires trusted startup resume, replays committed A, retries B, and does not double usage", async () => {
     let failNextEventSync = false;
     const firstStore = store({

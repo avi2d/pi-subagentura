@@ -29,6 +29,7 @@
  *   - `MAX_INJECT`
  *   - `pollArtifactChanges`
  *   - `findArtifactById`
+ *   - durable workflow runtime/controller/job seams (Milestone 2 test access)
  *
  * If you add a new export to src/subagent.ts you MUST add it to the
  * set below (and document why it's needed there).  Tests that verify new
@@ -61,6 +62,14 @@ import type {
   WorkflowPlanTaskDefinition,
   WorkflowPlanTaskResult,
 } from "../src/subagent";
+import type {
+  DurableWorkflowPlanCancellationOptions,
+  DurableWorkflowPlanExecution,
+  DurableWorkflowPlanOpenResult,
+  DurableWorkflowPlanStartOptions,
+  DurableWorkflowRunAgentFactory,
+  StartDurableWorkflowPlanJobOptions,
+} from "../src/subagent";
 
 function _typeExportGuard(
   _a: JobState,
@@ -77,6 +86,12 @@ function _typeExportGuard(
   _runOptions: RunWorkflowPlanOptions,
   _runResult: WorkflowPlanRunResult,
   _taskResult: WorkflowPlanTaskResult,
+  _durableCancel: DurableWorkflowPlanCancellationOptions,
+  _durableExecution: DurableWorkflowPlanExecution,
+  _durableOpen: DurableWorkflowPlanOpenResult,
+  _durableStart: DurableWorkflowPlanStartOptions,
+  _durableFactory: DurableWorkflowRunAgentFactory,
+  _durableJob: StartDurableWorkflowPlanJobOptions,
 ): void {}
 
 // ── Expected export inventory ──────────────────────────────────────────
@@ -86,12 +101,16 @@ const RUNTIME_EXPORTS = [
   "ACTIVE_TOOL_DEBOUNCE_MS",
   "MAX_INJECT",
   "MAX_REGISTRY_SIZE",
+  "DurableWorkflowPlanController",
+  "DurableWorkflowPlanControllerError",
   "WorkflowAgentDispatcher",
   "SubagentLiveStatus",
   "SubagentResult",
   "findArtifactById",
+  "createDurableWorkflowPlanRunId",
   "formatUsage",
   "getInjectCount",
+  "getDurableWorkflowPlanController",
   "interactiveSubagentRegistry",
   "jobRegistry",
   "pollArtifactChanges",
@@ -99,9 +118,14 @@ const RUNTIME_EXPORTS = [
   "pruneOldestJob",
   "rehydrateInteractiveSubagents",
   "scheduleJobCleanup",
+  "registerDurableWorkflowRunAgentFactory",
   "runWorkflowPlan",
   "startSubagentJob",
+  "startDurableWorkflowPlanJob",
+  "startDurableWorkflowSession",
   "validateWorkflowPlan",
+  "stopDurableWorkflowSession",
+  "validateDurableWorkflowPlan",
 ] as const;
 
 // (b) Type-only exports (export type …, erased at runtime)
@@ -120,6 +144,12 @@ const TYPE_ONLY_EXPORTS = [
   "RunWorkflowPlanOptions",
   "WorkflowPlanRunResult",
   "WorkflowPlanTaskResult",
+  "DurableWorkflowPlanCancellationOptions",
+  "DurableWorkflowPlanExecution",
+  "DurableWorkflowPlanOpenResult",
+  "DurableWorkflowPlanStartOptions",
+  "DurableWorkflowRunAgentFactory",
+  "StartDurableWorkflowPlanJobOptions",
 ] as const;
 
 // ── Tests ──────────────────────────────────────────────────────────────

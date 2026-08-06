@@ -2,19 +2,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SubagentResult } from "../src/helpers";
 import {
   clearSessionScopes,
+  registerSessionScope,
   setLegacyActiveSessionRefs,
   type SessionOwnerToken,
 } from "../src/session-scope";
 import type { WorkflowPlanDefinition } from "../src/workflow-plan";
+import type { WorkflowPlanRunResult } from "../src/workflow-plan-runner";
 
 const {
   mockAwaitInteractiveResult,
+  mockGetDurableWorkflowPlanController,
   mockLaunchInteractiveSubagent,
   mockLoadWorkflowScript,
+  mockRegisterDurableWorkflowRunAgentFactory,
 } = vi.hoisted(() => ({
   mockAwaitInteractiveResult: vi.fn(),
+  mockGetDurableWorkflowPlanController: vi.fn(),
   mockLaunchInteractiveSubagent: vi.fn(),
   mockLoadWorkflowScript: vi.fn(),
+  mockRegisterDurableWorkflowRunAgentFactory: vi.fn(),
 }));
 
 vi.mock("../src/interactive-tmux", async (importOriginal) => {
@@ -37,15 +43,32 @@ vi.mock("../src/workflow-core", async (importOriginal) => {
   return { ...actual, loadWorkflowScript: mockLoadWorkflowScript };
 });
 
+vi.mock("../src/workflow-durable-runtime", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/workflow-durable-runtime")>();
+  return {
+    ...actual,
+    getDurableWorkflowPlanController: mockGetDurableWorkflowPlanController,
+    registerDurableWorkflowRunAgentFactory:
+      mockRegisterDurableWorkflowRunAgentFactory,
+  };
+});
+
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
 import {
   MAX_WORKFLOW_JOBS,
+  cleanupWorkflowJobsForOwner,
   getWorkflowJobForOwner,
   startWorkflowPlanJob,
   workflowJobRegistry,
   type WorkflowJobState,
 } from "../src/workflow-jobs";
 import { registerWorkflowTool } from "../src/workflow-tool";
+import {
+  applyPlanEvent,
+  createPlanProjection,
+  type WorkflowPlanEvent,
+} from "../src/workflow-plan-state";
 
 const ZERO_USAGE = {
   input: 0,
@@ -53,6 +76,16 @@ const ZERO_USAGE = {
   cacheRead: 0,
   cacheWrite: 0,
   cost: 0,
+  turns: 0,
+};
+
+const PLAN_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  costUsd: 0,
   turns: 0,
 };
 
@@ -128,6 +161,202 @@ function makePi() {
   return { pi, tools };
 }
 
+function makeScopedPi(controller: any) {
+  const tools = new Map<string, any>();
+  const pi = {
+    registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+    sendMessage: vi.fn(),
+  };
+  const scope = registerSessionScope({
+    id: 1,
+    generation: 1,
+    lifecycle: "started",
+    pi: pi as never,
+  });
+  mockGetDurableWorkflowPlanController.mockReturnValue(controller);
+  registerWorkflowTool(pi as never, scope);
+  return { pi, scope, tools };
+}
+
+function durableControllerHarness(settleImmediately = false) {
+  const projections = new Map<string, any>();
+  const results = new Map<string, WorkflowPlanRunResult>();
+  const active = new Map<
+    string,
+    {
+      plan: WorkflowPlanDefinition;
+      projection: ReturnType<typeof createPlanProjection>;
+      options: any;
+      resolve: (result: WorkflowPlanRunResult) => void;
+    }
+  >();
+
+  const durableProjection = (
+    runId: string,
+    run: WorkflowPlanRunResult,
+    terminal: boolean,
+  ) => ({
+    runId,
+    status: terminal ? run.status : "running",
+    runEpoch: 1,
+    accounting: { completeness: "exact", usage: { ...PLAN_USAGE } },
+    tasks: run.projection.phases.flatMap((phase) =>
+      phase.tasks.map((task) => ({
+        definitionPath: "root",
+        taskId: task.definition.id,
+        planRevision: 1,
+        status: task.status,
+        transitionEventIds: [],
+      })),
+    ),
+    taskStates: Object.fromEntries(
+      run.projection.phases.flatMap((phase) =>
+        phase.tasks.map((task) => [
+          task.definition.id,
+          {
+            definitionPath: "root",
+            taskId: task.definition.id,
+            planRevision: 1,
+            status: task.status,
+            transitionEventIds: [],
+          },
+        ]),
+      ),
+    ),
+    ...(terminal
+      ? {
+          terminal: {
+            eventId: "terminal",
+            status: run.status,
+            accounting: { completeness: "exact", usage: { ...PLAN_USAGE } },
+            resultEventId: "result",
+          },
+        }
+      : {}),
+  });
+
+  const settle = (runId: string, status: "done" | "cancelled") => {
+    const execution = active.get(runId);
+    if (!execution) throw new Error(`missing durable execution ${runId}`);
+    const emit = (event: WorkflowPlanEvent) => {
+      execution.options.onPlanEvent?.(event);
+      execution.projection = applyPlanEvent(execution.projection, event);
+    };
+    if (status === "cancelled") {
+      emit({ type: "run_cancelled", reason: "cancelled by test" });
+    } else {
+      for (const phase of execution.projection.phases) {
+        for (const task of phase.tasks) {
+          if (task.status === "pending") {
+            emit({ type: "task_started", taskId: task.definition.id });
+          }
+          emit({
+            type: "task_succeeded",
+            taskId: task.definition.id,
+            result: `done:${task.definition.id}`,
+          });
+        }
+      }
+    }
+    const run: WorkflowPlanRunResult = {
+      meta: {
+        name: execution.plan.name,
+        description: execution.plan.description,
+        phases: execution.plan.phases.map((phase) => ({
+          title: phase.name,
+          detail: phase.id,
+        })),
+      },
+      status,
+      result: execution.projection.phases.flatMap((phase) =>
+        phase.tasks.map((task) => ({
+          id: task.definition.id,
+          phaseId: task.phaseId,
+          content: task.definition.content,
+          status: task.status,
+          ...(task.status === "succeeded"
+            ? { output: `done:${task.definition.id}` }
+            : {}),
+        })),
+      ),
+      projection: execution.projection,
+      agentsSpawned: status === "done" ? 2 : 1,
+      errorCount: 0,
+      tokensSpent: 0,
+      usage: { ...PLAN_USAGE },
+      phases: execution.plan.phases.map((phase) => phase.id),
+    };
+    results.set(runId, run);
+    projections.set(runId, durableProjection(runId, run, true));
+    active.delete(runId);
+    execution.resolve(run);
+    return run;
+  };
+
+  const controller = {
+    owner: { projectKey: "a".repeat(64), piSessionKey: "test-session" },
+    startPlan: vi.fn(async (options: any) => {
+      let projection = createPlanProjection(options.plan);
+      const firstTask = projection.phases[0]!.tasks[0]!;
+      const startedEvent: WorkflowPlanEvent = {
+        type: "task_started",
+        taskId: firstTask.definition.id,
+      };
+      options.onPlanEvent?.(startedEvent);
+      projection = applyPlanEvent(projection, startedEvent);
+      options.onProgress?.({
+        kind: "agent_start",
+        phase: firstTask.phaseId,
+        label: firstTask.definition.content,
+        agentId: 1,
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 0,
+        budgetTotal: null,
+        usage: { ...PLAN_USAGE },
+        runningCount: 1,
+      });
+      let resolve!: (result: WorkflowPlanRunResult) => void;
+      const completion = new Promise<WorkflowPlanRunResult>((next) => {
+        resolve = next;
+      });
+      const running: WorkflowPlanRunResult = {
+        meta: {
+          name: options.plan.name,
+          description: options.plan.description,
+        },
+        status: "running",
+        result: [],
+        projection,
+        agentsSpawned: 1,
+        errorCount: 0,
+        tokensSpent: 0,
+        usage: { ...PLAN_USAGE },
+        phases: [projection.phases[0]!.definition.id],
+      };
+      active.set(options.runId, {
+        plan: options.plan,
+        projection,
+        options,
+        resolve,
+      });
+      projections.set(
+        options.runId,
+        durableProjection(options.runId, running, false),
+      );
+      if (settleImmediately) settle(options.runId, "done");
+      return { runId: options.runId, completion };
+    }),
+    getProjection: vi.fn(async (runId: string) => projections.get(runId)),
+    getResult: vi.fn(async (runId: string) => results.get(runId)),
+    trustedCancel: vi.fn(async (runId: string) => {
+      const existing = results.get(runId);
+      return existing ?? settle(runId, "cancelled");
+    }),
+  };
+  return { controller, projections, results, settle };
+}
+
 function toolContext() {
   return { cwd: "/tmp", model: "test/model", modelRegistry: {} };
 }
@@ -160,6 +389,9 @@ describe("declarative workflow tool preview", () => {
     setLegacyActiveSessionRefs(undefined);
     workflowJobRegistry.clear();
     interactiveSubagentRegistry.clear();
+    mockGetDurableWorkflowPlanController.mockReset();
+    mockGetDurableWorkflowPlanController.mockReturnValue(undefined);
+    mockRegisterDurableWorkflowRunAgentFactory.mockReset();
     mockLoadWorkflowScript.mockReset();
     mockLoadWorkflowScript.mockReturnValue(null);
     mockAwaitInteractiveResult.mockReset();
@@ -210,6 +442,18 @@ describe("declarative workflow tool preview", () => {
     expect(parameters.properties.durable.type).toBe("boolean");
   });
 
+  it("builds a restart runner from the current session context before any tool call", () => {
+    const harness = durableControllerHarness();
+    makeScopedPi(harness.controller);
+    const factory =
+      mockRegisterDurableWorkflowRunAgentFactory.mock.calls[0]?.[1];
+
+    expect(typeof factory).toBe("function");
+    expect(factory("wfr-v1-recovery-run", toolContext())).toBeTypeOf(
+      "function",
+    );
+  });
+
   it("requires exactly one of script, name, and plan before loading or dispatching", async () => {
     const { tools } = makePi();
     const workflow = tools.get("workflow");
@@ -237,7 +481,7 @@ describe("declarative workflow tool preview", () => {
     expect(workflowJobRegistry.size).toBe(0);
   });
 
-  it("rejects invalid, unknown, runtime, and durable plan fields before runner work", async () => {
+  it("rejects invalid, unknown, and runtime plan fields before runner work", async () => {
     const { tools } = makePi();
     const workflow = tools.get("workflow");
     const duplicateTaskPlan = {
@@ -266,7 +510,6 @@ describe("declarative workflow tool preview", () => {
       { plan: duplicateTaskPlan },
       { plan: { ...BASE_PLAN, unknown: true } },
       { plan: runtimePlan },
-      { plan: BASE_PLAN, durable: true },
     ]) {
       const result = await workflow.execute(
         "invalid-plan",
@@ -278,6 +521,58 @@ describe("declarative workflow tool preview", () => {
       expect(result.isError).toBe(true);
     }
 
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+    expect(workflowJobRegistry.size).toBe(0);
+  });
+
+  it("rejects script/name durability and unsupported durable plans before run creation or dispatch", async () => {
+    const harness = durableControllerHarness();
+    const { tools } = makeScopedPi(harness.controller);
+    const workflow = tools.get("workflow");
+    const processPlan = {
+      ...BASE_PLAN,
+      phases: BASE_PLAN.phases.map((phase, phaseIndex) => ({
+        ...phase,
+        tasks: phase.tasks.map((task, taskIndex) =>
+          phaseIndex === 0 && taskIndex === 0
+            ? { ...task, agent: { isolation: "process" } }
+            : task,
+        ),
+      })),
+    };
+    const parallelPlan = {
+      ...BASE_PLAN,
+      phases: BASE_PLAN.phases.map((phase, index) =>
+        index === 0 ? { ...phase, mode: "parallel" } : phase,
+      ),
+    };
+    const invalidPlan = {
+      ...BASE_PLAN,
+      phases: BASE_PLAN.phases.map((phase) => ({
+        ...phase,
+        tasks: phase.tasks.map((task) => ({ ...task, id: "duplicate" })),
+      })),
+    };
+
+    for (const params of [
+      { script: LEGACY_SCRIPT("durable-script"), durable: true },
+      { name: "saved", durable: true },
+      { plan: processPlan, durable: true },
+      { plan: parallelPlan, durable: true },
+      { plan: invalidPlan, durable: true },
+    ]) {
+      const response = await workflow.execute(
+        "durable-rejection",
+        params,
+        undefined,
+        vi.fn(),
+        toolContext(),
+      );
+      expect(response.isError).toBe(true);
+    }
+
+    expect(mockLoadWorkflowScript).not.toHaveBeenCalled();
+    expect(harness.controller.startPlan).not.toHaveBeenCalled();
     expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
     expect(workflowJobRegistry.size).toBe(0);
   });
@@ -351,6 +646,221 @@ describe("declarative workflow tool preview", () => {
       "SECRET",
     );
     expect(result.content[0].text).toContain(secretOutput);
+  });
+
+  it("starts explicit durable plans, reports live/terminal status, and queries results after adapter removal", async () => {
+    const harness = durableControllerHarness();
+    const { pi, tools } = makeScopedPi(harness.controller);
+    const workflow = tools.get("workflow");
+    const started = await workflow.execute(
+      "durable-async",
+      { plan: BASE_PLAN, durable: true },
+      undefined,
+      vi.fn(),
+      toolContext(),
+    );
+
+    expect(started.details).toMatchObject({
+      status: "started",
+      kind: "plan",
+      durable: true,
+      name: "preview",
+    });
+    expect(started.details.workflowId).toMatch(/^wfr-v1-plan-/);
+    expect(harness.controller.startPlan).toHaveBeenCalledTimes(1);
+    expect(
+      harness.controller.startPlan.mock.calls[0]![0].plan.phases[0].tasks[0]
+        .agent.isolation,
+    ).toBe("in-process");
+
+    const running = await tools.get("get_workflow_status").execute("status", {
+      workflowId: started.details.workflowId,
+    });
+    expect(running.details).toMatchObject({
+      status: "running",
+      kind: "plan",
+      durable: true,
+      planProjection: {
+        rows: expect.arrayContaining([
+          expect.objectContaining({ taskId: "inspect", status: "running" }),
+        ]),
+      },
+    });
+
+    harness.settle(started.details.workflowId, "done");
+    const job = workflowJobRegistry.get(started.details.workflowId)!;
+    await job.promise;
+    const completed = await tools
+      .get("get_workflow_status")
+      .execute("status", { workflowId: started.details.workflowId });
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(completed.details).toMatchObject({
+      status: "done",
+      durable: true,
+    });
+
+    workflowJobRegistry.delete(started.details.workflowId);
+    const recoveredStatus = await tools
+      .get("get_workflow_status")
+      .execute("status", { workflowId: started.details.workflowId });
+    expect(recoveredStatus.details).toMatchObject({
+      status: "done",
+      kind: "plan",
+      durable: true,
+      accountingCompleteness: "exact",
+    });
+    const recoveredResult = await tools
+      .get("get_workflow_result")
+      .execute("result", { workflowId: started.details.workflowId });
+    expect(recoveredResult.details).toMatchObject({
+      status: "done",
+      kind: "plan",
+      durable: true,
+      name: "preview",
+    });
+    expect(recoveredResult.content[0].text).toContain("done:inspect");
+
+    for (const workflowId of ["wf_missing", "wfr-v1-plan-does-not-exist"]) {
+      for (const toolName of [
+        "get_workflow_status",
+        "get_workflow_result",
+        "cancel_workflow",
+      ]) {
+        const missing = await tools
+          .get(toolName)
+          .execute("missing", { workflowId });
+        expect(missing.details).toEqual({ status: "not_found", workflowId });
+        expect(missing.isError).toBe(true);
+      }
+    }
+  });
+
+  it("returns the synchronous durable plan shape and removes only its live adapter", async () => {
+    const harness = durableControllerHarness(true);
+    const { tools } = makeScopedPi(harness.controller);
+    const result = await tools
+      .get("workflow")
+      .execute(
+        "durable-sync",
+        { plan: BASE_PLAN, durable: true, async: false },
+        undefined,
+        vi.fn(),
+        toolContext(),
+      );
+
+    expect(result.details).toMatchObject({
+      status: "done",
+      kind: "plan",
+      durable: true,
+      name: "preview",
+    });
+    expect(workflowJobRegistry.size).toBe(0);
+    const runId = harness.controller.startPlan.mock.calls[0]![0].runId;
+    const queried = await tools
+      .get("get_workflow_result")
+      .execute("result", { workflowId: runId });
+    expect(queried.details).toMatchObject({
+      status: "done",
+      durable: true,
+    });
+  });
+
+  it("terminal-cancels durable jobs and keeps cancelled results queryable", async () => {
+    const harness = durableControllerHarness();
+    const { tools } = makeScopedPi(harness.controller);
+    const started = await tools
+      .get("workflow")
+      .execute(
+        "durable-cancel",
+        { plan: BASE_PLAN, durable: true },
+        undefined,
+        vi.fn(),
+        toolContext(),
+      );
+    const workflowId = started.details.workflowId;
+
+    const cancelled = await tools
+      .get("cancel_workflow")
+      .execute("cancel", { workflowId });
+    expect(cancelled.details).toMatchObject({
+      status: "cancelled",
+      durable: true,
+      cancelled: true,
+    });
+    expect(harness.controller.trustedCancel).toHaveBeenCalledWith(
+      workflowId,
+      expect.objectContaining({
+        trustedActorId: "workflow-tool",
+        expectedOwner: harness.controller.owner,
+      }),
+    );
+    await workflowJobRegistry.get(workflowId)!.promise;
+    workflowJobRegistry.delete(workflowId);
+
+    const result = await tools
+      .get("get_workflow_result")
+      .execute("result", { workflowId });
+    expect(result.details).toMatchObject({
+      status: "cancelled",
+      durable: true,
+    });
+    expect(result.isError).toBe(true);
+    const repeated = await tools
+      .get("cancel_workflow")
+      .execute("cancel-again", { workflowId });
+    expect(repeated.details).toMatchObject({
+      status: "cancelled",
+      durable: true,
+      cancelled: true,
+    });
+    expect(harness.controller.trustedCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the live job cap before creating a durable run", async () => {
+    const harness = durableControllerHarness();
+    const { tools } = makeScopedPi(harness.controller);
+    const owner = { id: 1, generation: 1 };
+    for (let index = 0; index < MAX_WORKFLOW_JOBS; index++) {
+      const job = runningScriptJob(`occupied-${index}`, owner);
+      workflowJobRegistry.set(job.id, job);
+    }
+
+    const response = await tools
+      .get("workflow")
+      .execute(
+        "durable-cap",
+        { plan: BASE_PLAN, durable: true },
+        undefined,
+        vi.fn(),
+        toolContext(),
+      );
+    expect(response.isError).toBe(true);
+    expect(response.details.error).toContain(
+      `${MAX_WORKFLOW_JOBS} workflow jobs already running`,
+    );
+    expect(harness.controller.startPlan).not.toHaveBeenCalled();
+  });
+
+  it("treats durable live-adapter cleanup as interruption rather than terminal cancellation", async () => {
+    const harness = durableControllerHarness();
+    const { tools } = makeScopedPi(harness.controller);
+    const started = await tools
+      .get("workflow")
+      .execute(
+        "durable-cleanup",
+        { plan: BASE_PLAN, durable: true },
+        undefined,
+        vi.fn(),
+        toolContext(),
+      );
+    const startOptions = harness.controller.startPlan.mock.calls[0]![0];
+    expect(startOptions.signal.aborted).toBe(false);
+
+    cleanupWorkflowJobsForOwner({ id: 1, generation: 1 });
+
+    expect(startOptions.signal.aborted).toBe(true);
+    expect(workflowJobRegistry.has(started.details.workflowId)).toBe(false);
+    expect(harness.controller.trustedCancel).not.toHaveBeenCalled();
   });
 
   it("streams synchronous plan progress and returns the final task results", async () => {

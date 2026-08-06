@@ -178,3 +178,25 @@ export { interactiveSubagentRegistry } from "./interactive-tmux";
 export { pollArtifactChanges } from "./artifact-poller";
 /** @internal Interactive-artifact lookup; exported for test access */
 export { findArtifactById } from "./tools/interactive";
+/** @internal Durable workflow lifecycle/controller seams used by integration tests. */
+export {
+  getDurableWorkflowPlanController,
+  registerDurableWorkflowRunAgentFactory,
+  startDurableWorkflowSession,
+  stopDurableWorkflowSession,
+  type DurableWorkflowRunAgentFactory,
+} from "./workflow-durable-runtime";
+export {
+  DurableWorkflowPlanController,
+  DurableWorkflowPlanControllerError,
+  createDurableWorkflowPlanRunId,
+  validateDurableWorkflowPlan,
+  type DurableWorkflowPlanCancellationOptions,
+  type DurableWorkflowPlanExecution,
+  type DurableWorkflowPlanOpenResult,
+  type DurableWorkflowPlanStartOptions,
+} from "./workflow-durable-plan";
+export {
+  startDurableWorkflowPlanJob,
+  type StartDurableWorkflowPlanJobOptions,
+} from "./workflow-jobs";
