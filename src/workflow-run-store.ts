@@ -2946,8 +2946,23 @@ export class WorkflowRunLease {
 
   async release(): Promise<void> {
     this.#assertOpen();
-    await this.#store._releaseLease(this.#lease, this.#ownerPaths);
     this.#released = true;
+    await this.#store._withOwnerMutation(this.owner, async () => {
+      try {
+        await this.#store._releaseLease(this.#lease, this.#ownerPaths);
+      } catch (error) {
+        try {
+          await this.#store._assertNamespaceFence(
+            this.#lease,
+            this.#ownerPaths,
+          );
+        } catch {
+          throw error;
+        }
+        this.#released = false;
+        throw error;
+      }
+    });
   }
 
   #assertOpen(): void {
@@ -3031,10 +3046,9 @@ export class WorkflowRunJournal {
   }
 
   append(event: WorkflowRunEvent): Promise<WorkflowEventReceipt> {
-    const operation = this.#appendTail.then(() =>
-      this.#store._withOwnerMutation(this.owner, () =>
-        this.#store._append(this, event),
-      ),
+    const appendTail = this.#appendTail;
+    const operation = this.#store._withOwnerMutation(this.owner, () =>
+      appendTail.then(() => this.#store._append(this, event)),
     );
     this.#appendTail = operation.then(
       () => undefined,

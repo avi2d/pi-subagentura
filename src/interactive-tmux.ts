@@ -75,6 +75,7 @@ import {
   isWorkflowProcessAttemptManifest,
   workflowProcessManifestPath,
   writeWorkflowProcessAttemptManifest,
+  type WorkflowProcessAttemptIdentity,
   type WorkflowProcessAttemptManifest,
   type WorkflowProcessPaneAssignment,
 } from "./workflow-process-attempt";
@@ -201,7 +202,7 @@ export interface InteractiveSubagentState {
    * session_start. Optional for tests that don't care about reload semantics.
    */
   parentSessionId?: string;
-  /** Live supervisor owner; intentionally not persisted for workflow children. */
+  /** Live supervisor token; runtime-only, unlike persisted workflow completion ownership. */
   supervisorOwner?: SessionOwnerToken;
   /** Exact runtime session generation that owns this state; never persisted. */
   sessionOwner?: SessionOwnerToken;
@@ -209,6 +210,8 @@ export interface InteractiveSubagentState {
   workflowId?: string;
   /** Completion is delivered standalone or consumed by a workflow aggregate. */
   completionOwner?: "standalone" | "workflow";
+  /** Durable process-attempt identity when this workflow child has a manifest. */
+  workflowProcessIdentity?: WorkflowProcessAttemptIdentity;
   /** Workflow-runner acknowledgement that this child's result was consumed; runtime-only and intentionally not persisted. */
   workflowResultConsumed?: boolean;
   model?: string;
@@ -554,6 +557,20 @@ export function launchInteractiveSubagent(params: {
   // recover the shadowed agent.
   const id =
     params.workflowProcessAttempt?.agentId ?? randomBytes(8).toString("hex");
+  if (
+    params.workflowProcessAttempt !== undefined &&
+    params.completionOwner !== "workflow"
+  ) {
+    throw new Error(
+      "Workflow process attempts require workflow completion ownership.",
+    );
+  }
+  if (
+    params.completionOwner === "workflow" &&
+    (!params.workflowId || params.workflowId.length === 0)
+  ) {
+    throw new Error("Workflow completion ownership requires a workflow id.");
+  }
   const cwd = resolve(params.cwd);
   const stateCwd = params.parentCwd ? resolve(params.parentCwd) : cwd;
   const artifactOwnerSessionId =
@@ -727,6 +744,18 @@ export function launchInteractiveSubagent(params: {
         notifyOnComplete: params.notifyOnComplete ?? "inject",
         triggerTurnOnComplete: params.triggerTurnOnComplete,
         parentSessionId: params.parentSessionId,
+        completionOwner: params.completionOwner ?? "standalone",
+        ...(params.completionOwner === "workflow"
+          ? {
+              workflowId: params.workflowId!,
+              ...(params.workflowProcessAttempt === undefined
+                ? {}
+                : {
+                    workflowProcessIdentity:
+                      params.workflowProcessAttempt.identity,
+                  }),
+            }
+          : {}),
         eventByteCursor: 0,
         sessionByteCursor: 0,
         pendingDeliveries: [],
@@ -878,8 +907,13 @@ export function launchInteractiveSubagent(params: {
     triggerTurnOnComplete: params.triggerTurnOnComplete,
     parentSessionId: params.parentSessionId,
     supervisorOwner: params.supervisorOwner,
-    workflowId: params.workflowId,
-    completionOwner: params.completionOwner,
+    ...(params.completionOwner === "workflow"
+      ? {
+          workflowId: params.workflowId,
+          workflowProcessIdentity: params.workflowProcessAttempt?.identity,
+        }
+      : {}),
+    completionOwner: params.completionOwner ?? "standalone",
     eventByteCursor: 0,
     pendingDeliveries: [],
     deliveryReceipts: [],
@@ -975,6 +1009,7 @@ export function adoptWorkflowProcessSubagent(params: {
     supervisorOwner: params.supervisorOwner,
     workflowId: params.workflowId,
     completionOwner: "workflow",
+    workflowProcessIdentity: params.manifest.identity,
     eventByteCursor: 0,
     pendingDeliveries: [],
     deliveryReceipts: [],
@@ -1011,6 +1046,7 @@ export function recoverWorkflowProcessPaneAssignment(
     let mux: Multiplexer;
     try {
       mux = getMux({ preference: backend });
+      if (!mux.isAvailable()) continue;
       if (mux.findPanesByWindowName === undefined) {
         throw new Error(`${backend} has no deterministic pane lookup`);
       }

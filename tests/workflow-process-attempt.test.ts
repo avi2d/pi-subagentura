@@ -124,6 +124,7 @@ function inspector(
 interface PaneLookupHarness {
   readonly mux: Multiplexer;
   readonly live: Set<string>;
+  readonly isAvailable: () => boolean;
   readonly findPanesByWindowName: (windowName: string) => readonly PaneRef[];
   readonly killPane: (paneId: string, session?: string) => void;
 }
@@ -131,24 +132,36 @@ interface PaneLookupHarness {
 function paneLookupHarness(
   name: MuxName,
   matches: readonly PaneRef[],
+  options: {
+    readonly available?: boolean;
+    readonly lookupError?: Error;
+  } = {},
 ): PaneLookupHarness {
   const keyFor = (paneId: string, session?: string) =>
     `${session ?? ""}\0${paneId}`;
   const live = new Set(
     matches.map((match) => keyFor(match.paneId, match.session)),
   );
-  const findPanesByWindowName = vi.fn(() => matches);
+  const isAvailable = vi.fn(() => options.available ?? true);
+  const findPanesByWindowName = vi.fn(() => {
+    if (!(options.available ?? true)) {
+      throw new Error(`${name} is unavailable`);
+    }
+    if (options.lookupError !== undefined) throw options.lookupError;
+    return matches;
+  });
   const killPane = vi.fn((paneId: string, session?: string) => {
     live.delete(keyFor(paneId, session));
   });
   const mux = {
     name,
+    isAvailable,
     findPanesByWindowName,
     killPane,
     getPaneLiveness: (paneId: string, session?: string) =>
       live.has(keyFor(paneId, session)) ? "alive" : "dead",
   } as unknown as Multiplexer;
-  return { mux, live, findPanesByWindowName, killPane };
+  return { mux, live, isAvailable, findPanesByWindowName, killPane };
 }
 
 describe("workflow process attempt protocol", () => {
@@ -473,6 +486,76 @@ describe("workflow process attempt protocol", () => {
         process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionRoot;
       }
       rmSync(temporaryRoot, { recursive: true, force: true });
+    });
+
+    it("adopts a unique tmux pane when zellij is unavailable", () => {
+      const manifest = createWorkflowProcessAttemptManifest(
+        operationAttempt(),
+        3,
+        "nonce_1234567890abcdef",
+        "process",
+      );
+      const ownerCwd = join(temporaryRoot, "owner");
+      const paths = createInteractiveSubagentPaths({
+        id: manifest.agentId,
+        name: manifest.paneName,
+        cwd: ownerCwd,
+        deterministicSessionFile: true,
+      });
+      writeWorkflowProcessAttemptManifest(paths.artifactDir, manifest);
+      const tmux = paneLookupHarness("tmux", [
+        {
+          paneId: "%17",
+          windowName: manifest.paneName,
+          session: "tmux-owner",
+        },
+      ]);
+      const zellij = paneLookupHarness("zellij", [], { available: false });
+      __setTmuxMultiplexer(tmux.mux);
+      __setZellijMultiplexer(zellij.mux);
+
+      const recovered = recoverWorkflowProcessPaneAssignment(
+        manifest,
+        ownerCwd,
+      );
+
+      expect(recovered).toEqual({
+        backend: "tmux",
+        paneId: "%17",
+        windowName: manifest.paneName,
+        muxSession: "tmux-owner",
+        artifactDir: paths.artifactDir,
+        sessionFile: paths.sessionFile,
+        launchScriptFile: paths.launchScriptFile,
+      });
+      expect(tmux.isAvailable).toHaveBeenCalledOnce();
+      expect(zellij.isAvailable).toHaveBeenCalledOnce();
+      expect(zellij.findPanesByWindowName).not.toHaveBeenCalled();
+      expect(tmux.killPane).not.toHaveBeenCalled();
+    });
+
+    it("fails conservatively when an available backend pane lookup errors", () => {
+      const manifest = createWorkflowProcessAttemptManifest(
+        operationAttempt(),
+        3,
+        "nonce_1234567890abcdef",
+        "process",
+      );
+      const ownerCwd = join(temporaryRoot, "owner");
+      const tmux = paneLookupHarness("tmux", [], {
+        available: true,
+        lookupError: new Error("tmux server lookup failed"),
+      });
+      const zellij = paneLookupHarness("zellij", [], { available: false });
+      __setTmuxMultiplexer(tmux.mux);
+      __setZellijMultiplexer(zellij.mux);
+
+      expect(() =>
+        recoverWorkflowProcessPaneAssignment(manifest, ownerCwd),
+      ).toThrow("Workflow tmux pane lookup was unavailable during recovery.");
+      expect(tmux.findPanesByWindowName).toHaveBeenCalledWith(
+        manifest.paneName,
+      );
     });
 
     it("adopts the existing zellij pane after a crash before interactive state append", () => {

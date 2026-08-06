@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   appendFileSync,
   mkdirSync,
@@ -14,6 +14,7 @@ import {
   type WorkflowLeaseLiveness,
   type WorkflowRunJournal,
 } from "../src/workflow-run-store";
+import { foldWorkflowRunEvents } from "../src/workflow-projection-repository";
 import {
   WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
   createDurableWorkflowRunId,
@@ -287,6 +288,122 @@ describe("workflow owner namespace leases", () => {
     });
     const nextJournal = await nextLease.acquireRun(runId, "startup");
     expect(nextJournal.runEpoch).toBe(2);
+  });
+
+  it("drains an in-flight epoch append before releasing the lease to its successor", async () => {
+    let blockNextEventAppend = false;
+    let markAppendEntered!: () => void;
+    const appendEntered = new Promise<void>((resolve) => {
+      markAppendEntered = resolve;
+    });
+    let resumeAppend!: () => void;
+    const appendMayWrite = new Promise<void>((resolve) => {
+      resumeAppend = resolve;
+    });
+    firstStore = new WorkflowRunStore({
+      homeDir: home,
+      processIdentity: { pid: 301, processStartIdentity: "process-301" },
+      io: {
+        before: async (boundary, purpose) => {
+          if (
+            blockNextEventAppend &&
+            boundary === "append" &&
+            purpose === "events"
+          ) {
+            blockNextEventAppend = false;
+            markAppendEntered();
+            await appendMayWrite;
+          }
+        },
+      },
+    });
+    const first = await firstStore.acquireLease(owner, {
+      scopeId: 1,
+      generation: 1,
+    });
+    const runId = createDurableWorkflowRunId("release-drains-append");
+    const epochOne = await first.createRun({ runId, launch: {} });
+    await epochOne.append(created(epochOne, owner));
+    const epochOneFence = epochOne.fence;
+    if (epochOneFence === undefined) throw new Error("leased journal required");
+    await epochOne.append({
+      schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
+      eventId: "epoch-one-acquired",
+      runId,
+      runEpoch: leasedEpoch(epochOne),
+      sequence: 2,
+      type: "run_epoch_acquired",
+      payload: {
+        fence: epochOneFence,
+        previousRunEpoch: null,
+        reason: "created",
+      },
+    });
+
+    blockNextEventAppend = true;
+    const epochOneAppend = epochOne.append(
+      interrupted(epochOne, "epoch-one-in-flight", 3),
+    );
+    await appendEntered;
+
+    const namespaceFenceChecks = vi.spyOn(firstStore, "_assertNamespaceFence");
+    const checksBeforeRelease = namespaceFenceChecks.mock.calls.length;
+    const release = first.release();
+    const releaseEnteredBeforeAppendDrained =
+      namespaceFenceChecks.mock.calls.length > checksBeforeRelease;
+    const successorStore = contender(home, "ambiguous", 302);
+    const successorJournal = release.then(async () => {
+      const successor = await successorStore.acquireLease(owner, {
+        scopeId: 2,
+        generation: 2,
+      });
+      return successor.acquireRun(runId, "startup");
+    });
+
+    let successorAcquiredBeforeAppendDrained = false;
+    if (releaseEnteredBeforeAppendDrained) {
+      await successorJournal;
+      successorAcquiredBeforeAppendDrained = true;
+    }
+    resumeAppend();
+    const epochOneAppendOutcome = await epochOneAppend.then(
+      () => "fulfilled" as const,
+      (error: unknown) => error,
+    );
+    const epochTwo = await successorJournal;
+    const afterTakeover = await epochTwo.readEventLog();
+    const epochTwoReceipt = await epochTwo.append({
+      schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
+      eventId: "epoch-two-after-release",
+      runId,
+      runEpoch: leasedEpoch(epochTwo),
+      sequence: 5,
+      type: "run_resumed",
+      payload: {
+        reason: "trusted_resume",
+        trustedActorId: "lease-handoff-test",
+      },
+    });
+    const finalLog = await epochTwo.readEventLog();
+
+    expect(releaseEnteredBeforeAppendDrained).toBe(false);
+    expect(successorAcquiredBeforeAppendDrained).toBe(false);
+    expect(epochOneAppendOutcome).toBe("fulfilled");
+    expect(afterTakeover.tornTailBytes).toBe(0);
+    expect(() => foldWorkflowRunEvents(afterTakeover.events)).not.toThrow();
+    expect(epochTwoReceipt).toMatchObject({
+      eventId: "epoch-two-after-release",
+      runEpoch: 2,
+    });
+    expect(finalLog.events.map((event) => event.type)).toEqual([
+      "run_created",
+      "run_epoch_acquired",
+      "run_interrupted",
+      "run_epoch_acquired",
+      "run_resumed",
+    ]);
+    expect(finalLog.tornTailBytes).toBe(0);
+    expect(() => foldWorkflowRunEvents(finalLog.events)).not.toThrow();
   });
 
   it("does not consult liveness for a corrupt complete lease record", async () => {
