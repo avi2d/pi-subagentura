@@ -124,6 +124,15 @@ export default function (pi: ExtensionAPI) {
   registerCancelAllFlows(pi, sessionScope);
 }
 
+export {
+  validateWorkflowPlan,
+  type WorkflowPlanAgentDefinition,
+  type WorkflowPlanDefinition,
+  type WorkflowPlanMode,
+  type WorkflowPlanPhaseDefinition,
+  type WorkflowPlanTaskDefinition,
+} from "./workflow-plan";
+
 /**
  * ── Internal helpers (re-exported for test access) ──
  *
