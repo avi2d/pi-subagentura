@@ -101,6 +101,7 @@ function ownedWorkflow(scope: SessionScope, id: string) {
   const abort = new AbortController();
   const workflow = {
     id,
+    kind: "script",
     status: "running",
     abort,
     parentSessionOwner: sessionOwner(scope),

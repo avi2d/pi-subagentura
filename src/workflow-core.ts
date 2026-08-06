@@ -10,6 +10,7 @@ import {
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { normalizeUsage, type SubagentResult, type Usage } from "./helpers";
+import type { WorkflowAgentDispatcher } from "./workflow-dispatcher";
 
 // ── Limits ───────────────────────────────────────────────────────────
 export const MAX_TOTAL_AGENTS = 1000;
@@ -453,6 +454,8 @@ export interface RunWorkflowOptions {
   ) => void;
   concurrency?: number;
   processConcurrency?: number;
+  /** Shared process/in-process concurrency boundary. */
+  dispatcher?: WorkflowAgentDispatcher;
   /** Resolve a saved workflow script by name, for `workflow(name, args)` composition. */
   loadWorkflow?: (name: string) => string | null;
   /** Hard wall-clock cap for the workflow VM worker. Defaults to 30 minutes. */

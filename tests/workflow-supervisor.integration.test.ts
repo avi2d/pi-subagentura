@@ -574,6 +574,7 @@ describe("workflow supervisor integration", () => {
       const id = `saturating-${index}`;
       workflowJobRegistry.set(id, {
         id,
+        kind: "script",
         name: id,
         status: "running",
         startedAt: Date.now(),

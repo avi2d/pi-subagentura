@@ -21,14 +21,10 @@ import {
   SCHEMA_RETRIES,
   WORKFLOW_SYNC_TIMEOUT_MS,
   WORKFLOW_WALL_TIMEOUT_MS,
-  createSemaphore,
-  defaultConcurrency,
-  defaultProcessConcurrency,
   extractJson,
   validateSchemaDefinition,
   validateSchema,
   type RunWorkflowOptions,
-  type Semaphore,
   type WorkflowAgentOpts,
   type WorkflowAgentRunner,
   type WorkflowMeta,
@@ -49,6 +45,7 @@ import {
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
+import { WorkflowAgentDispatcher } from "./workflow-dispatcher";
 
 // ── Engine (shared across nested workflows) ──────────────────────────
 
@@ -65,8 +62,8 @@ interface Engine {
   closed: boolean;
   onProgress?: (p: WorkflowProgress) => void;
   onCancellationSnapshot?: RunWorkflowOptions["onCancellationSnapshot"];
-  sem: Semaphore;
-  processSem: Semaphore;
+  dispatcher: WorkflowAgentDispatcher;
+  ownsDispatcher: boolean;
   loadWorkflow?: (name: string) => string | null;
   cwd: string;
   budgetTotal: number | null;
@@ -184,6 +181,12 @@ export async function runWorkflow(
   } else {
     opts.signal?.addEventListener("abort", forwardAbort, { once: true });
   }
+  const dispatcher =
+    opts.dispatcher ??
+    new WorkflowAgentDispatcher({
+      concurrency: opts.concurrency,
+      processConcurrency: opts.processConcurrency,
+    });
   const engine: Engine = {
     runAgent: opts.runAgent,
     abort,
@@ -191,10 +194,8 @@ export async function runWorkflow(
     closed: false,
     onProgress: opts.onProgress,
     onCancellationSnapshot: opts.onCancellationSnapshot,
-    sem: createSemaphore(opts.concurrency ?? defaultConcurrency()),
-    processSem: createSemaphore(
-      opts.processConcurrency ?? defaultProcessConcurrency(),
-    ),
+    dispatcher,
+    ownsDispatcher: opts.dispatcher === undefined,
     loadWorkflow: opts.loadWorkflow,
     cwd: opts.cwd ?? process.cwd(),
     budgetTotal: opts.budgetTotal ?? null,
@@ -235,6 +236,9 @@ export async function runWorkflow(
     );
   } finally {
     opts.signal?.removeEventListener("abort", forwardAbort);
+    if (engine.ownsDispatcher) {
+      engine.dispatcher.close();
+    }
   }
 }
 
@@ -314,10 +318,8 @@ async function executeScript(
     }
     const isolation = agentOpts.isolation ?? "process";
     const isProcess = isolation !== "in-process";
-    const sem = isProcess ? engine.processSem : engine.sem;
     const resolvedPhase =
       agentOpts.phase != null ? String(agentOpts.phase) : undefined;
-    await sem.acquire();
     let tokensDelta = 0;
     let runnerFailure: { cause: unknown } | undefined;
     try {
@@ -325,25 +327,12 @@ async function executeScript(
       const attempts = hasSchema ? SCHEMA_RETRIES : 1;
       for (let attempt = 0; attempt < attempts; attempt++) {
         if (engine.signal?.aborted) throw new Error("Workflow aborted.");
-        if (engine.counters.agentsSpawned >= MAX_TOTAL_AGENTS) {
-          throw new Error(
-            `Workflow exceeded the ${MAX_TOTAL_AGENTS}-agent lifetime cap.`,
-          );
-        }
-        engine.counters.agentsSpawned++;
-        const agentId = ++engine.nextAgentAttemptId;
-        engine.counters.runningCount++;
+        let agentId: number | undefined;
+        let runnerStarted = false;
         let status: "done" | "error" = "done";
         let agentUsage: WorkflowUsage | undefined;
         let finalModel = agentOpts.model;
         try {
-          emit({
-            kind: "agent_start",
-            label: agentOpts.label,
-            phase: resolvedPhase,
-            model: agentOpts.model,
-            agentId,
-          });
           const finalPrompt = hasSchema
             ? isProcess
               ? buildProcessSchemaPrompt(
@@ -359,8 +348,8 @@ async function executeScript(
             promise: undefined as unknown as Promise<SubagentResult>,
             usageAccounted: false,
           };
-          const agentRun = Promise.resolve().then(() =>
-            engine.runAgent({
+          const agentRun = engine.dispatcher.run(
+            {
               prompt: finalPrompt,
               persona: agentOpts.persona,
               model: agentOpts.model,
@@ -388,7 +377,27 @@ async function executeScript(
                   agentId,
                 });
               },
-            }),
+            },
+            async (request) => {
+              if (engine.signal.aborted) throw new Error("Workflow aborted.");
+              if (engine.counters.agentsSpawned >= MAX_TOTAL_AGENTS) {
+                throw new Error(
+                  `Workflow exceeded the ${MAX_TOTAL_AGENTS}-agent lifetime cap.`,
+                );
+              }
+              engine.counters.agentsSpawned++;
+              agentId = ++engine.nextAgentAttemptId;
+              engine.counters.runningCount++;
+              runnerStarted = true;
+              emit({
+                kind: "agent_start",
+                label: agentOpts.label,
+                phase: resolvedPhase,
+                model: agentOpts.model,
+                agentId,
+              });
+              return engine.runAgent(request);
+            },
           );
           activeRun.promise = agentRun;
           engine.activeAgentRuns.add(activeRun);
@@ -460,16 +469,18 @@ async function executeScript(
             lastErr = "no JSON object/array found in output";
           }
         } finally {
-          engine.counters.runningCount--;
-          emit({
-            kind: "agent_done",
-            label: agentOpts.label,
-            phase: resolvedPhase,
-            model: finalModel,
-            status,
-            agentId,
-            agentUsage,
-          });
+          if (runnerStarted) {
+            engine.counters.runningCount--;
+            emit({
+              kind: "agent_done",
+              label: agentOpts.label,
+              phase: resolvedPhase,
+              model: finalModel,
+              status,
+              agentId,
+              agentUsage,
+            });
+          }
         }
       }
       engine.counters.errorCount++;
@@ -480,8 +491,6 @@ async function executeScript(
       return { value: null, tokensDelta };
     } catch (error) {
       throw new WorkerRpcFailure(error, tokensDelta, runnerFailure);
-    } finally {
-      sem.release();
     }
   };
 

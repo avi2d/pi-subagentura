@@ -132,6 +132,17 @@ export {
   type WorkflowPlanPhaseDefinition,
   type WorkflowPlanTaskDefinition,
 } from "./workflow-plan";
+export {
+  WorkflowAgentDispatcher,
+  type WorkflowAgentDispatcherOptions,
+  type WorkflowAgentDispatchOptions,
+} from "./workflow-dispatcher";
+export {
+  runWorkflowPlan,
+  type RunWorkflowPlanOptions,
+  type WorkflowPlanRunResult,
+  type WorkflowPlanTaskResult,
+} from "./workflow-plan-runner";
 
 /**
  * ── Internal helpers (re-exported for test access) ──

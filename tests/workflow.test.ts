@@ -1731,6 +1731,7 @@ it("throws when all 100 job slots are full and none can be evicted", () => {
       const id = `cap-fill-${i}`;
       workflowJobRegistry.set(id, {
         id,
+        kind: "script",
         name: "filler",
         status: "running",
         startedAt: Date.now(),
@@ -3131,6 +3132,7 @@ describe("registerWorkflowTool", () => {
         const id = `sync-cap-filler-${index}`;
         workflowJobRegistry.set(id, {
           id,
+          kind: "script",
           name: id,
           status: "running",
           startedAt: Date.now(),

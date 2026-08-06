@@ -49,12 +49,34 @@ import type { JobState } from "../src/subagent";
 import type { JobStatus } from "../src/subagent";
 import type { NotifyOnComplete } from "../src/subagent";
 import type { SubagentDetails } from "../src/subagent";
+import type {
+  RunWorkflowPlanOptions,
+  WorkflowAgentDispatcherOptions,
+  WorkflowAgentDispatchOptions,
+  WorkflowPlanAgentDefinition,
+  WorkflowPlanDefinition,
+  WorkflowPlanMode,
+  WorkflowPlanPhaseDefinition,
+  WorkflowPlanRunResult,
+  WorkflowPlanTaskDefinition,
+  WorkflowPlanTaskResult,
+} from "../src/subagent";
 
 function _typeExportGuard(
   _a: JobState,
   _b: JobStatus,
   _c: NotifyOnComplete,
   _d: SubagentDetails,
+  _plan: WorkflowPlanDefinition,
+  _phase: WorkflowPlanPhaseDefinition,
+  _task: WorkflowPlanTaskDefinition,
+  _agent: WorkflowPlanAgentDefinition,
+  _mode: WorkflowPlanMode,
+  _dispatcherOptions: WorkflowAgentDispatcherOptions,
+  _dispatchOptions: WorkflowAgentDispatchOptions,
+  _runOptions: RunWorkflowPlanOptions,
+  _runResult: WorkflowPlanRunResult,
+  _taskResult: WorkflowPlanTaskResult,
 ): void {}
 
 // ── Expected export inventory ──────────────────────────────────────────
@@ -64,6 +86,7 @@ const RUNTIME_EXPORTS = [
   "ACTIVE_TOOL_DEBOUNCE_MS",
   "MAX_INJECT",
   "MAX_REGISTRY_SIZE",
+  "WorkflowAgentDispatcher",
   "SubagentLiveStatus",
   "SubagentResult",
   "findArtifactById",
@@ -76,7 +99,9 @@ const RUNTIME_EXPORTS = [
   "pruneOldestJob",
   "rehydrateInteractiveSubagents",
   "scheduleJobCleanup",
+  "runWorkflowPlan",
   "startSubagentJob",
+  "validateWorkflowPlan",
 ] as const;
 
 // (b) Type-only exports (export type …, erased at runtime)
@@ -85,6 +110,16 @@ const TYPE_ONLY_EXPORTS = [
   "JobStatus",
   "NotifyOnComplete",
   "SubagentDetails",
+  "WorkflowPlanDefinition",
+  "WorkflowPlanPhaseDefinition",
+  "WorkflowPlanTaskDefinition",
+  "WorkflowPlanAgentDefinition",
+  "WorkflowPlanMode",
+  "WorkflowAgentDispatcherOptions",
+  "WorkflowAgentDispatchOptions",
+  "RunWorkflowPlanOptions",
+  "WorkflowPlanRunResult",
+  "WorkflowPlanTaskResult",
 ] as const;
 
 // ── Tests ──────────────────────────────────────────────────────────────
