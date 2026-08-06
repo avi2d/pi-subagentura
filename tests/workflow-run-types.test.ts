@@ -30,6 +30,7 @@ import {
   isLiveWorkflowOwner,
   isWorkflowDefinitionPath,
   isWorkflowEventReceipt,
+  isWorkflowRunEvent,
   isWorkflowIdentifier,
   isWorkflowOperationIdentity,
   liveWorkflowOwnerEquals,
@@ -490,6 +491,37 @@ describe("accounting, receipts, and event contracts", () => {
     expect(event.payload.status).toBe("done");
     expectTypeOf(event.payload.status).toMatchTypeOf<WorkflowTerminalStatus>();
     expect(WORKFLOW_OUTBOX_SCHEMA_VERSION).toBe(1);
+  });
+
+  it("validates exact complete event shapes and rejects nested extras", () => {
+    const event: WorkflowRunTerminalEvent = {
+      schemaVersion: WORKFLOW_RUN_EVENT_SCHEMA_VERSION,
+      eventId: "terminal-exact",
+      runId: createDurableWorkflowRunId("exact-event"),
+      runEpoch: 1,
+      sequence: 1,
+      type: "run_terminal",
+      payload: {
+        status: "done",
+        accounting: {
+          completeness: "exact",
+          usage,
+        },
+      },
+    };
+
+    expect(isWorkflowRunEvent(event)).toBe(true);
+    expect(isWorkflowRunEvent({ ...event, path: "/tmp/not-authority" })).toBe(
+      false,
+    );
+    expect(
+      isWorkflowRunEvent({
+        ...event,
+        payload: { ...event.payload, unexpected: true },
+      }),
+    ).toBe(false);
+    expect(isWorkflowRunEvent({ ...event, sequence: 0 })).toBe(false);
+    expect(isWorkflowRunEvent({ ...event, type: "unknown_event" })).toBe(false);
   });
 });
 
