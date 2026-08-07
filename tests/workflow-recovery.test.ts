@@ -203,20 +203,25 @@ describe("workflow recovery projection", () => {
       owner,
     });
     await store.append("run", "run_created", {});
+    await store.append("run", "task_appended", {
+      taskId: "task",
+      phaseId: "phase",
+      prompt: "work",
+    });
     const controller = new DurableWorkflowController({ store, owner });
     const created = await controller.getStatus("run");
-    expect(created?.revision).toBe(1);
+    expect(created?.revision).toBe(2);
     await expect(
       controller.mutateTask("run", {
         type: "skip",
         taskId: "task",
-        expectedRevision: 0,
+        expectedRevision: 1,
       }),
     ).rejects.toThrow("stale");
     const updated = await controller.mutateTask("run", {
       type: "skip",
       taskId: "task",
-      expectedRevision: 1,
+      expectedRevision: 2,
     });
     expect(updated?.tasks.task.status).toBe("skipped");
 
