@@ -109,7 +109,7 @@ export class WorkflowRunStore {
 
   private async assertRegularFile(path: string): Promise<void> {
     const info = await lstat(path);
-    if (!info.isFile())
+    if (!info.isFile() || info.nlink !== 1)
       throw new Error(`Workflow storage path is not regular: ${path}`);
   }
 
