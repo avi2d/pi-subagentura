@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SubagentResult } from "../src/helpers";
-import { runDurableWorkflowPlan } from "../src/workflow-durable-plan-runner";
+import {
+  DurableWorkflowController,
+  runDurableWorkflowPlan,
+} from "../src/workflow-durable-plan-runner";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
 import type { WorkflowPlan } from "../src/workflow-plan";
@@ -51,6 +54,28 @@ afterEach(async () => {
 });
 
 describe("durable sequential plan runner", () => {
+  it("repairs a terminal run whose delivery intent was not committed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "terminal-without-outbox",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("terminal-without-outbox", "run_created", {});
+    await store.append("terminal-without-outbox", "run_terminal", {
+      result: { status: "done", result: "complete" },
+    });
+
+    const controller = new DurableWorkflowController({ store, owner });
+    const projection = await controller.getStatus("terminal-without-outbox");
+
+    expect(projection?.status).toBe("done");
+    expect(projection?.delivery?.status).toBe("pending");
+  });
+
   it("creates before dispatch and replays committed tasks after interruption", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);

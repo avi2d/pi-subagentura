@@ -41,7 +41,18 @@ export class DurableWorkflowController {
     runId: string,
   ): Promise<WorkflowProjection | undefined> {
     try {
-      return await recoverWorkflowRun(this.options, runId);
+      const projection = await recoverWorkflowRun(this.options, runId);
+      if (isTerminal(projection.status) && !projection.delivery) {
+        // A crash may occur after the terminal event and before the outbox
+        // intent. Repair the limbo window before exposing the projection.
+        await appendDeliveryIntent(
+          this.options.store,
+          this.options.owner,
+          runId,
+        );
+        return recoverWorkflowRun(this.options, runId);
+      }
+      return projection;
     } catch (error) {
       if (isMissingRun(error)) return undefined;
       throw error;
