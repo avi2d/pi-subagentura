@@ -2333,10 +2333,28 @@ export function registerWorkflowTool(
       },
     });
 
-    pi.registerCommand("workflow-resume", {
-      description:
-        "Resume an interrupted durable workflow using its current authority envelope.",
-      handler: resumeDurableWorkflowCommand,
+    pi.registerCommand("workflow-plan", {
+      description: "View a durable workflow projection by run ID.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const runId = args.trim();
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (!controller || !runId) {
+          const text = !runId
+            ? "Usage: /workflow-plan <runId>"
+            : "Durable workflow storage is unavailable.";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const projection = await controller.getStatus(runId);
+        const text = projection
+          ? `Durable workflow ${runId}: ${projection.status} (revision ${projection.revision})`
+          : `Durable workflow ${runId} was not found.`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
     });
 
     pi.registerCommand("workflow-tree", {
