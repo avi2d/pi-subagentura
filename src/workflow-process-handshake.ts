@@ -33,6 +33,24 @@ export interface WorkflowProcessChildStartedEvidence {
   readonly epoch: number;
 }
 
+export interface WorkflowProcessPaneCandidate {
+  readonly paneId: string;
+  readonly launchMarker: string;
+  readonly attemptId: string;
+}
+
+export interface WorkflowProcessAdoptionInspector {
+  findByMarker(
+    marker: string,
+  ): Promise<readonly WorkflowProcessPaneCandidate[]>;
+  fence(candidate: WorkflowProcessPaneCandidate): Promise<void>;
+}
+
+export type WorkflowProcessAdoptionResult =
+  | { kind: "adopted"; candidate: WorkflowProcessPaneCandidate }
+  | { kind: "retry" }
+  | { kind: "fenced"; candidates: readonly WorkflowProcessPaneCandidate[] };
+
 export interface WorkflowProcessLaunchIntentInput {
   runId: string;
   operationId: string;
@@ -154,4 +172,22 @@ export async function persistWorkflowProcessLaunchDispatch(
     await handle.close();
   }
   return path;
+}
+
+export async function adoptWorkflowProcessPane(
+  intent: WorkflowProcessLaunchIntent,
+  inspector: WorkflowProcessAdoptionInspector,
+): Promise<WorkflowProcessAdoptionResult> {
+  const candidates = await inspector.findByMarker(intent.launchMarker);
+  const intended = candidates.filter(
+    (candidate) =>
+      candidate.launchMarker === intent.launchMarker &&
+      candidate.attemptId === intent.attemptId,
+  );
+  if (intended.length === 1) {
+    return { kind: "adopted", candidate: intended[0] };
+  }
+  if (candidates.length === 0) return { kind: "retry" };
+  for (const candidate of candidates) await inspector.fence(candidate);
+  return { kind: "fenced", candidates };
 }
