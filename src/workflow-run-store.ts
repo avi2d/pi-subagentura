@@ -98,6 +98,7 @@ export class WorkflowRunStore {
         ownerId: this.options.owner.ownerId,
         leaseToken: this.options.owner.leaseToken,
         processId: process.pid,
+        processStartTime: Math.floor(Date.now() - process.uptime() * 1000),
       });
       WorkflowRunStore.leases.set(this.leaseKey, lease);
     }
