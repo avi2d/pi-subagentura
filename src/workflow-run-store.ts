@@ -132,6 +132,7 @@ export class WorkflowRunStore {
     const dir = this.runDir(launch.runId);
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
+      await this.assertRegularDirectory(dir);
       const path = join(dir, "launch.json");
       try {
         await stat(path);
