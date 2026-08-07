@@ -61,10 +61,10 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 40. Keep running and terminal task definitions/history immutable.
 - [x] 41. Preserve skip as an audited append-only event.
 - [x] 42. Add monotonic mutation content hashes and a verified hash chain.
-- [ ] 43. Wake the single executor without starting model work in the mutation path.
-- [ ] 44. Preserve plan, phase modes, stable IDs, and read-only history in export/view.
-- [ ] 45. Return stale-editor refresh/diff data without changing authority.
-- [ ] 46. Enforce owner-only, contained, interactive edit/export paths.
+- [x] 43. Wake the single executor without starting model work in the mutation path.
+- [x] 44. Preserve plan, phase modes, stable IDs, and read-only history in export/view.
+- [x] 45. Return stale-editor refresh/diff data without changing authority.
+- [x] 46. Enforce owner-only, contained, interactive edit/export paths.
 
 ## Context, reminders, and approvals
 
@@ -72,10 +72,10 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [ ] 48. Include required run/revision/status/phase/task/count fields without outputs.
 - [ ] 49. Suppress reminders for active wakeups, all-blocked runs, and pending input.
 - [ ] 50. Cap reminders per turn/generation and reset on progress.
-- [ ] 51. Bind and single-consume approvals to all authority fields.
+- [x] 51. Bind and single-consume approvals to all authority fields.
 - [x] 52. Keep approval grants on trusted host paths, not model-callable tools.
-- [ ] 53. Make stale, wrong-owner, duplicate, and post-reload decisions no-ops.
-- [ ] 54. Wake the correct continuation once and implement denial policy.
+- [x] 53. Make stale, wrong-owner, duplicate, and post-reload decisions no-ops.
+- [x] 54. Wake the correct continuation once and implement denial policy.
 
 ## Release and compatibility gates
 
