@@ -96,6 +96,12 @@ export class DurableWorkflowController {
     if (mutation.type === "append") {
       if (!mutation.phaseId || !mutation.prompt?.trim())
         throw new Error("Appending workflow work requires phaseId and prompt");
+      if (projection.tasks[mutation.taskId]) {
+        throw new Error(`Duplicate workflow task: ${mutation.taskId}`);
+      }
+      if (isTerminal(projection.status)) {
+        throw new Error("Cannot append work to a terminal workflow");
+      }
       await this.options.store.append(runId, "task_appended", {
         taskId: mutation.taskId,
         phaseId: mutation.phaseId,
