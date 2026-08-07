@@ -177,7 +177,7 @@ function applyEvent(
         id,
         status: "running",
         attempt,
-        ...(previous?.result === undefined ? {} : { result: previous.result }),
+        ...definitionFields(previous),
       };
       projection.status = "running";
       projection.currentPhase = payload.phaseId ?? projection.currentPhase;
@@ -194,6 +194,7 @@ function applyEvent(
         id,
         status: "succeeded",
         attempt,
+        ...definitionFields(previous),
         ...(payload.result === undefined ? {} : { result: payload.result }),
       };
       break;
@@ -208,6 +209,7 @@ function applyEvent(
         id,
         status: "failed",
         attempt,
+        ...definitionFields(previous),
         error: String(payload.error ?? payload.message ?? "Task failed"),
       };
       projection.status = "error";
@@ -229,6 +231,7 @@ function applyEvent(
         id,
         status,
         attempt: previous?.attempt ?? 0,
+        ...definitionFields(previous),
       };
       projection.status =
         event.type === "task_blocked"
@@ -312,6 +315,16 @@ function finite(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
     : 0;
+}
+
+function definitionFields(
+  previous: WorkflowProjectionTask | undefined,
+): Pick<WorkflowProjectionTask, "phaseId" | "prompt" | "label"> {
+  return {
+    ...(previous?.phaseId === undefined ? {} : { phaseId: previous.phaseId }),
+    ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
+    ...(previous?.label === undefined ? {} : { label: previous.label }),
+  };
 }
 
 function isTerminal(status: WorkflowRunStatus): boolean {
