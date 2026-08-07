@@ -115,6 +115,10 @@ export async function runDurableWorkflowPlan(
           result: result.output,
         });
       } catch (error) {
+        if (options.signal?.aborted) {
+          await store.append(runId, "run_cancelled", {});
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
+        }
         await store.append(runId, "run_interrupted", {});
         throw error;
       }

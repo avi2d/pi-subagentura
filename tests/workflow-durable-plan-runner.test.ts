@@ -174,4 +174,37 @@ describe("durable sequential plan runner", () => {
     expect(result.status).toBe("cancelled");
     expect(result.terminal).toMatchObject({ status: "cancelled" });
   });
+
+  it("commits cancellation when an active task observes an aborted signal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const controller = new AbortController();
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "cancelled-during-task",
+      plan,
+      signal: controller.signal,
+      runAgent: async ({ signal }) => {
+        controller.abort();
+        await new Promise<void>((_, reject) => {
+          if (signal?.aborted) {
+            reject(new Error("agent aborted"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(new Error("agent aborted")),
+            { once: true },
+          );
+        });
+        throw new Error("must not complete");
+      },
+    });
+
+    expect(result.status).toBe("cancelled");
+    expect(result.terminal).toMatchObject({ status: "cancelled" });
+  });
 });
