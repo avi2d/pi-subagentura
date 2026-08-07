@@ -84,6 +84,15 @@ describe("WorkflowRunStore", () => {
       resumePolicy: "manual",
       owner,
     });
+    await store.createRun({
+      runId: "undelivered-terminal",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("undelivered-terminal", "run_terminal", {
+      result: { status: "done" },
+    });
 
     await expect(
       store.pruneTerminalRuns({ olderThanMs: 0, maxRuns: 1 }),
@@ -92,6 +101,7 @@ describe("WorkflowRunStore", () => {
       code: "ENOENT",
     });
     await expect(store.readRun("active")).resolves.toBeDefined();
+    await expect(store.readRun("undelivered-terminal")).resolves.toBeDefined();
   });
 
   it("uses byte offsets and complete-line ordinals for unicode events", async () => {
