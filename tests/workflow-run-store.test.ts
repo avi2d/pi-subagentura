@@ -157,4 +157,18 @@ describe("WorkflowRunStore", () => {
     );
     expect((await store.readRun("run")).events).toHaveLength(0);
   });
+
+  it("rejects invalid durable run IDs before creating storage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await expect(
+      store.createRun({
+        runId: "1-invalid",
+        planRevision: 1,
+        resumePolicy: "manual",
+        owner,
+      }),
+    ).rejects.toThrow("Invalid durable workflow run ID");
+  });
 });

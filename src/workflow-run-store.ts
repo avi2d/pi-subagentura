@@ -14,6 +14,7 @@ import type {
   WorkflowOwnerIdentity,
   WorkflowRunLaunch,
 } from "./workflow-run-types";
+import { validateWorkflowRunId } from "./workflow-run-types";
 
 export interface WorkflowRunStoreOptions {
   rootDir: string;
@@ -60,6 +61,7 @@ export class WorkflowRunStore {
   async createRun(
     input: Omit<WorkflowRunLaunch, "schemaVersion" | "createdAt">,
   ): Promise<WorkflowRunLaunch> {
+    validateWorkflowRunId(input.runId);
     const launch: WorkflowRunLaunch = {
       ...input,
       schemaVersion: 1,
