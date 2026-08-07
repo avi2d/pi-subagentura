@@ -181,6 +181,21 @@ export class DurableWorkflowController {
     return this.getStatus(runId);
   }
 
+  public async dispatchDelivery(
+    runId: string,
+    deliveryId: string,
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection || projection.delivery?.deliveryId !== deliveryId)
+      return projection;
+    if (projection.delivery.status === "pending") {
+      await this.options.store.append(runId, "delivery_dispatched", {
+        deliveryId,
+      });
+    }
+    return this.getStatus(runId);
+  }
+
   public async requestApproval(
     runId: string,
     request: WorkflowApprovalRequest,

@@ -8,7 +8,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 2. Make `get_workflow_result` recover terminal results from durable projections after registry loss.
 - [ ] 3. Repair result, terminal, delivery-intent, dispatch, and receipt crash gaps independently.
 - [x] 4. Fence stale and duplicate evidence from reopening terminal work.
-- [ ] 5. Dispatch deterministic terminal delivery intents and persist dispatch before receipt.
+- [x] 5. Dispatch deterministic terminal delivery intents and persist dispatch before receipt.
 - [ ] 6. Make cancellation idempotent across reload and reconstructed owners.
 - [ ] 7. Restore interrupted, blocked, and budget-paused runs as actionable after restart.
 

@@ -76,6 +76,10 @@ import {
   durableWorkflowStoreForSession,
   runDurableWorkflowForSession,
 } from "./workflow-owner";
+import {
+  workflowDeliveryId,
+  workflowDeliveryMessage,
+} from "./workflow-durable-plan-runner";
 import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import {
   decideWorkflowRouting,
@@ -651,6 +655,35 @@ export function registerWorkflowTool(
           runAgent: makeRunAgent(ctx, params.runId, owner()),
         },
       );
+      if (result.terminal && result.delivery && pi.sendMessage) {
+        const deliveryId = workflowDeliveryId(result.runId);
+        try {
+          pi.sendMessage(
+            {
+              customType: "workflow-notify",
+              content: workflowDeliveryMessage(result),
+              display: true,
+              details: {
+                workflowId: result.runId,
+                status: result.status,
+                durable: true,
+                deliveryId,
+              },
+            },
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+          const controller = durableWorkflowControllerForSession(
+            process.cwd(),
+            sessionScope,
+          );
+          await controller?.dispatchDelivery(result.runId, deliveryId);
+        } catch (error) {
+          debugLog("warn", "durable_workflow_delivery_failed", {
+            workflowId: result.runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       return {
         content: [
           {
