@@ -71,8 +71,11 @@ import {
   type SessionScope,
 } from "./session-scope";
 import { attachAsyncJobSettlement } from "./tools/in-process";
-import { durableWorkflowControllerForSession } from "./workflow-owner";
-import { runDurableWorkflowForSession } from "./workflow-owner";
+import {
+  durableWorkflowControllerForSession,
+  durableWorkflowStoreForSession,
+  runDurableWorkflowForSession,
+} from "./workflow-owner";
 import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import {
   decideWorkflowRouting,
@@ -2638,6 +2641,38 @@ export function registerWorkflowTool(
               )
             : await controller.resumeFromBudget(runId);
         const text = `Durable workflow ${runId} budget ${operation}d (status ${updated?.status ?? "unknown"}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
+    });
+
+    pi.registerCommand("workflow-retention", {
+      description: "Prune old terminal durable workflow runs.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const [olderThanText, maxRunsText] = args.trim().split(/\s+/);
+        const olderThanMs = Number(olderThanText);
+        const maxRuns =
+          maxRunsText === undefined ? undefined : Number(maxRunsText);
+        const store = sessionScope
+          ? durableWorkflowStoreForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (
+          !store ||
+          !Number.isSafeInteger(olderThanMs) ||
+          olderThanMs < 0 ||
+          (maxRuns !== undefined &&
+            (!Number.isSafeInteger(maxRuns) || maxRuns < 0))
+        ) {
+          const text = "Usage: /workflow-retention <olderThanMs> [maxRuns]";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const result = await store.pruneTerminalRuns({
+          olderThanMs,
+          maxRuns,
+        });
+        const text = `Pruned ${result.length} terminal durable workflow run(s).`;
         ctx.ui.notify(text);
         sendCommandMessage(text);
       },
