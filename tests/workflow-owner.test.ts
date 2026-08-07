@@ -3,6 +3,7 @@ import {
   createDurableWorkflowController,
   createWorkflowOwnerIdentity,
   createWorkflowRunStore,
+  durableWorkflowControllerForSession,
   workflowOwnerFromSessionContext,
 } from "../src/workflow-owner";
 
@@ -79,5 +80,13 @@ describe("workflow owner identity", () => {
         leaseToken: "lease",
       }),
     ).toBeDefined();
+  });
+
+  it("does not create a controller before a session has an owner", () => {
+    expect(
+      durableWorkflowControllerForSession("/tmp/workflows", {
+        durableWorkflowOwner: undefined,
+      } as any),
+    ).toBeUndefined();
   });
 });
