@@ -761,6 +761,12 @@ export function registerWorkflowTool(
             "Run in the background and return a workflowId immediately.",
         }),
       ),
+      durable: Type.Optional(
+        Type.Boolean({
+          description:
+            "Durable JavaScript replay is not supported by the legacy workflow tool.",
+        }),
+      ),
     }),
 
     async execute(
@@ -770,87 +776,17 @@ export function registerWorkflowTool(
       onUpdate: any,
       ctx: any,
     ): Promise<any> {
-      const selectedInputs = ["script", "name", "plan"].filter(
-        (key) => params[key] !== undefined,
-      );
-      if (selectedInputs.length !== 1) {
-        const error =
-          "exactly one of `script`, `name`, or `plan` must be provided";
+      if (params.durable === true) {
         return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
+          content: [
+            {
+              type: "text",
+              text: "Durable JavaScript workflows are not supported; use start_durable_workflow with a declarative plan.",
+            },
+          ],
+          details: { status: "unsupported_durable" },
           isError: true,
         };
-      }
-      const durable = params.durable === true;
-      if (durable && params.plan === undefined) {
-        const error =
-          "durable script/name workflows are unavailable; durable execution requires `plan`";
-        return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
-          isError: true,
-        };
-      }
-      if (params.resumePolicy !== undefined && !durable) {
-        const error =
-          "`resumePolicy` is supported only with `plan + durable:true`";
-        return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
-          isError: true,
-        };
-      }
-      if (
-        durable &&
-        params.resumePolicy !== undefined &&
-        params.resumePolicy !== "manual"
-      ) {
-        const error = 'durable workflow `resumePolicy` must be "manual"';
-        return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
-          isError: true,
-        };
-      }
-      if (durable && params.async === false) {
-        const error =
-          "durable plans are asynchronous only; `async:false` is unsupported";
-        return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
-          isError: true,
-        };
-      }
-      if (
-        durable &&
-        (params.args !== undefined || params.budget !== undefined)
-      ) {
-        const error =
-          "durable plans do not support workflow `args` or `budget` in this milestone";
-        return {
-          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
-          details: { status: "error", error },
-          isError: true,
-        };
-      }
-      const plan = params.plan as WorkflowPlan | undefined;
-      if (plan !== undefined) {
-        try {
-          validateWorkflowPlan(plan);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow plan not started: ${msg}`,
-              },
-            ],
-            details: { status: "error", error: msg },
-            isError: true,
-          };
-        }
       }
       const orchestrationContext = getOrchestrationContext();
       if (orchestrationContext) {

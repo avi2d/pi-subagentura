@@ -5,10 +5,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createHash, randomBytes } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 import {
   deleteInteractiveStatesFile,
   removeInteractiveState,
@@ -40,19 +38,12 @@ import {
   removeSessionScope,
   sessionOwner,
   setDurableWorkflowOwner,
-  setDurableWorkflowRootDir,
   setLegacyActiveSessionRefs,
   type SessionOwnerToken,
   type SessionScope,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
-import {
-  createWorkflowOwnerIdentity,
-  durableWorkflowControllerForSession,
-  durableWorkflowStoreForSession,
-} from "./workflow-owner";
-import type { WorkflowOwnerIdentity } from "./workflow-run-types";
-import { DurableWorkflowProjectionRepository } from "./workflow-projection-repository";
+import { workflowOwnerFromSessionContext } from "./workflow-owner";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -333,6 +324,23 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
     scope.lifecycle = "started";
     scope.ui = ctx.ui;
     scope.sessionManager = ctx.sessionManager;
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    if (sessionId) {
+      const ownerId = `${process.pid}-${randomUUID()}`;
+      setDurableWorkflowOwner(
+        scope,
+        workflowOwnerFromSessionContext({
+          projectKey: basename(ctx.cwd) || "project",
+          cwd: ctx.cwd,
+          sessionId,
+          ownerId,
+          generation: scope.generation,
+          leaseToken: randomUUID(),
+        }),
+      );
+    } else {
+      setDurableWorkflowOwner(scope, undefined);
+    }
     scope.parentStreaming = false;
     if (durableContext) {
       setDurableWorkflowRootDir(scope, durableContext.rootDir);
