@@ -81,6 +81,29 @@ export class DurableWorkflowController {
     return recoverWorkflowRun(this.options, runId);
   }
 
+  public async pauseForBudget(
+    runId: string,
+    reason?: string,
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection || isTerminal(projection.status)) return projection;
+    if (projection.status === "awaiting_budget") return projection;
+    await this.options.store.append(runId, "run_awaiting_budget", {
+      ...(reason ? { reason } : {}),
+    });
+    return this.getStatus(runId);
+  }
+
+  public async resumeFromBudget(
+    runId: string,
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection || projection.status !== "awaiting_budget")
+      return projection;
+    await this.options.store.append(runId, "run_budget_resumed", {});
+    return this.getStatus(runId);
+  }
+
   public async mutateTask(
     runId: string,
     mutation: {

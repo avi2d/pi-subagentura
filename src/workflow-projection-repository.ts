@@ -95,6 +95,12 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
     case "run_started":
       projection.status = "running";
       break;
+    case "run_awaiting_budget":
+      projection.status = "awaiting_budget";
+      break;
+    case "run_budget_resumed":
+      projection.status = "running";
+      break;
     case "approval_requested":
       projection.approval = {
         request: payload.request as WorkflowApprovalRequest,

@@ -54,6 +54,34 @@ afterEach(async () => {
 });
 
 describe("durable sequential plan runner", () => {
+  it("persists an idempotent budget pause and continuation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "budget-run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("budget-run", "run_created", {});
+    await store.append("budget-run", "run_started", {});
+    const controller = new DurableWorkflowController({ store, owner });
+
+    expect(
+      (await controller.pauseForBudget("budget-run", "limit"))?.status,
+    ).toBe("awaiting_budget");
+    expect((await controller.pauseForBudget("budget-run"))?.status).toBe(
+      "awaiting_budget",
+    );
+    expect((await controller.resumeFromBudget("budget-run"))?.status).toBe(
+      "running",
+    );
+    expect((await controller.resumeFromBudget("budget-run"))?.status).toBe(
+      "running",
+    );
+  });
+
   it("persists a pending approval and an idempotent host decision", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);
