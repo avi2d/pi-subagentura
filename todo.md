@@ -52,7 +52,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [ ] 34. Fail boundedly on missing response ordinals.
 - [ ] 35. Detect prompt/options/schema/model/isolation/definition divergence.
 - [x] 36. Preserve legacy non-durable script/name behavior.
-- [ ] 37. Reject unsupported durable concurrency before `run_created`.
+- [x] 37. Reject unsupported durable concurrency before `run_created`.
 
 ## Plan mutations and human editing
 
