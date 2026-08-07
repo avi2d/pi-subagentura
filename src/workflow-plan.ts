@@ -1,7 +1,7 @@
 import type { DurableValue } from "./workflow-durable-value";
 
 export const WORKFLOW_PLAN_VERSION = 1 as const;
-export type WorkflowPhaseMode = "sequential";
+export type WorkflowPhaseMode = "sequential" | "parallel";
 export type WorkflowTaskStatus =
   "pending" | "running" | "succeeded" | "failed" | "skipped";
 
@@ -45,7 +45,7 @@ export function validateWorkflowPlan(plan: WorkflowPlan): void {
   for (const phase of plan.phases) {
     if (
       !ID.test(phase.id) ||
-      phase.mode !== "sequential" ||
+      !["sequential", "parallel"].includes(phase.mode) ||
       ids.has(phase.id)
     ) {
       throw new Error(`Invalid or duplicate phase id: ${phase.id}`);
