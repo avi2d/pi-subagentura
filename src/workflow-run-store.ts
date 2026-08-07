@@ -104,15 +104,19 @@ export class WorkflowRunStore {
     return this.withLock(runId, async () => {
       const path = join(dir, "events.ndjson");
       const before = await readFile(path);
+      const completeBytes = lastCompleteLineBytes(before);
       const currentEpoch = lastCompleteRunEpoch(before);
       if (runEpoch < currentEpoch) {
         throw new Error(
           `Cannot append stale run epoch ${runEpoch}; current epoch is ${currentEpoch}`,
         );
       }
-      const file = await open(path, "a", 0o600);
+      const file = await open(path, "r+", 0o600);
       try {
-        await file.write(line, undefined, "utf8");
+        // A crashed writer may leave a partial final line. Remove it before
+        // publishing the next event so the authoritative log stays valid.
+        await file.truncate(completeBytes);
+        await file.write(line, completeBytes, "utf8");
         await file.sync();
       } finally {
         await file.close();
@@ -120,9 +124,9 @@ export class WorkflowRunStore {
       return {
         eventId: event.eventId,
         runId,
-        startByte: before.byteLength,
-        endByte: before.byteLength + Buffer.byteLength(line),
-        eventOrdinal: countCompleteLines(before),
+        startByte: completeBytes,
+        endByte: completeBytes + Buffer.byteLength(line),
+        eventOrdinal: countCompleteLines(before.subarray(0, completeBytes)),
       };
     });
   }
@@ -207,6 +211,10 @@ function countCompleteLines(bytes: Buffer): number {
   let count = 0;
   for (const byte of bytes) if (byte === 0x0a) count++;
   return count;
+}
+
+function lastCompleteLineBytes(bytes: Buffer): number {
+  return bytes.lastIndexOf(0x0a) + 1;
 }
 
 function lastCompleteRunEpoch(bytes: Buffer): number {

@@ -92,6 +92,29 @@ describe("WorkflowRunStore", () => {
     expect(log.completeBytes + log.tornTailBytes).toBeGreaterThan(0);
   });
 
+  it("truncates a torn tail before appending the next event", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    const first = await store.append("run", "task_done", { ok: true });
+    await appendFile(
+      join(root, "project", "session", "runs", "run", "events.ndjson"),
+      '{"torn":',
+    );
+
+    const second = await store.append("run", "run_done", { ok: true });
+    expect(second.startByte).toBe(first.endByte);
+    expect(second.eventOrdinal).toBe(1);
+    expect((await store.readRun("run")).events).toHaveLength(2);
+    expect((await store.readEventLog("run")).tornTailBytes).toBe(0);
+  });
+
   it("rejects stale epochs while allowing repeated events in the current epoch", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
     dirs.push(root);
