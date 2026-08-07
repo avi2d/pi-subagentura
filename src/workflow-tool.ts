@@ -2398,6 +2398,38 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-plan-mutate", {
+      description: "Block, unblock, or skip future durable workflow work.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const [runId, revisionText, type, taskId] = args.trim().split(/\s+/);
+        const expectedRevision = Number(revisionText);
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (
+          !controller ||
+          !runId ||
+          !Number.isSafeInteger(expectedRevision) ||
+          !["block", "unblock", "skip"].includes(type) ||
+          !taskId
+        ) {
+          const text =
+            "Usage: /workflow-plan-mutate <runId> <revision> <block|unblock|skip> <taskId>";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const updated = await controller.mutateTask(runId, {
+          type: type as "block" | "unblock" | "skip",
+          taskId,
+          expectedRevision,
+        });
+        const text = `${type}d ${taskId} in durable workflow ${runId} (revision ${updated?.revision ?? expectedRevision}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
+    });
+
     pi.registerCommand("workflow-tree", {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
