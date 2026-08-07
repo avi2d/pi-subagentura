@@ -57,7 +57,6 @@ export function shouldRemindWorkflow(input: {
   if (input.activeWakeup || input.allBlocked || input.awaitingUserInput)
     return false;
   if (input.generation !== input.state.generation) return true;
-  if (input.revision > input.state.lastProgressRevision) return true;
   return input.state.emitted < MAX_REMINDERS_PER_GENERATION;
 }
 
