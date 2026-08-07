@@ -171,4 +171,23 @@ describe("WorkflowRunStore", () => {
       }),
     ).rejects.toThrow("Invalid durable workflow run ID");
   });
+
+  it("rejects appends that exceed the configured event quota", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({
+      rootDir: root,
+      owner,
+      maxEventBytes: 10,
+    });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await expect(store.append("run", "event", {})).rejects.toThrow(
+      "event quota",
+    );
+  });
 });

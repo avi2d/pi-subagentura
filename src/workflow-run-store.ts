@@ -19,6 +19,7 @@ import { validateWorkflowRunId } from "./workflow-run-types";
 export interface WorkflowRunStoreOptions {
   rootDir: string;
   owner: WorkflowOwnerIdentity;
+  maxEventBytes?: number;
 }
 
 export interface WorkflowRunRecord {
@@ -111,6 +112,15 @@ export class WorkflowRunStore {
       const path = join(dir, "events.ndjson");
       const before = await readFile(path);
       const completeBytes = lastCompleteLineBytes(before);
+      const maxEventBytes = this.options.maxEventBytes;
+      if (
+        maxEventBytes !== undefined &&
+        (!Number.isSafeInteger(maxEventBytes) ||
+          maxEventBytes <= 0 ||
+          completeBytes + Buffer.byteLength(line) > maxEventBytes)
+      ) {
+        throw new Error("Workflow event quota exceeded");
+      }
       const currentEpoch = lastCompleteRunEpoch(before);
       if (runEpoch < currentEpoch) {
         throw new Error(
