@@ -104,11 +104,6 @@ export async function runDurableWorkflowPlan(
   // Validate before recovery so malformed resume input cannot touch an
   // authoritative run or dispatch work.
   validateWorkflowPlan({ ...plan, schemaVersion: 1 });
-  if (plan.phases.some((phase) => phase.mode === "parallel")) {
-    throw new Error(
-      "Durable parallel workflow phases are not supported by this preview",
-    );
-  }
   try {
     projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
@@ -146,7 +141,15 @@ export async function runDurableWorkflowPlan(
   }
 
   for (const phase of plan.phases) {
-    for (const task of phase.tasks) {
+    const tasks = phase.tasks.filter((task) => {
+      const current = projection.tasks[task.id];
+      return current?.status !== "succeeded" && current?.status !== "skipped";
+    });
+    if (phase.mode === "parallel") {
+      await runDurableParallelPhase(options, phase.id, tasks);
+      continue;
+    }
+    for (const task of tasks) {
       projection = await recoverWorkflowRun({ store, owner }, runId);
       const existing = projection.tasks[task.id];
       if (existing?.status === "succeeded" || existing?.status === "skipped")
@@ -215,6 +218,81 @@ export async function runDurableWorkflowPlan(
   await appendDeliveryIntent(store, owner, runId);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
+}
+
+async function runDurableParallelPhase(
+  options: DurableWorkflowPlanOptions,
+  phaseId: string,
+  tasks: WorkflowPlan["phases"][number]["tasks"],
+): Promise<void> {
+  const limit = Math.max(1, Math.min(4, tasks.length));
+  let nextIndex = 0;
+  let firstError: unknown;
+  const worker = async (): Promise<void> => {
+    while (firstError === undefined) {
+      const task = tasks[nextIndex++];
+      if (!task) return;
+      const projection = await recoverWorkflowRun(
+        { store: options.store, owner: options.owner },
+        options.runId,
+      );
+      const attempt = (projection.tasks[task.id]?.attempt ?? 0) + 1;
+      if (options.signal?.aborted) {
+        firstError = options.signal.reason ?? new Error("Workflow cancelled");
+        return;
+      }
+      await options.store.append(options.runId, "task_started", {
+        taskId: task.id,
+        attempt,
+        phaseId,
+      });
+      try {
+        const result = await options.runAgent({
+          prompt: task.prompt,
+          isolation: "in-process",
+          label: task.label ?? task.id,
+          signal: options.signal,
+        });
+        await options.store.append(options.runId, "usage_observed", {
+          input: result.usage.input,
+          output: result.usage.output,
+          taskId: task.id,
+          attempt,
+        });
+        if (result.isError)
+          throw new Error(result.errorMessage ?? "Task failed");
+        await options.store.append(options.runId, "task_succeeded", {
+          taskId: task.id,
+          attempt,
+          result: result.output,
+        });
+      } catch (error) {
+        await options.store.append(options.runId, "task_failed", {
+          taskId: task.id,
+          attempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        firstError ??= error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  if (firstError !== undefined) {
+    await options.store.append(options.runId, "run_terminal", {
+      result: {
+        status: "error",
+        error: {
+          code: "task_failed",
+          message:
+            firstError instanceof Error
+              ? firstError.message
+              : String(firstError),
+        },
+      },
+    });
+    await appendDeliveryIntent(options.store, options.owner, options.runId);
+    throw firstError;
+  }
 }
 
 async function appendDeliveryIntent(
