@@ -1,11 +1,4 @@
 export const WORKFLOW_RUN_TYPES_VERSION = 1 as const;
-export const WORKFLOW_RUN_ID_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
-
-export function validateWorkflowRunId(runId: string): void {
-  if (!WORKFLOW_RUN_ID_PATTERN.test(runId)) {
-    throw new Error("Invalid durable workflow run ID");
-  }
-}
 
 export type WorkflowEagerMode = "off" | "preferred" | "always";
 export type WorkflowResumePolicy = "manual" | "on-session-start";
@@ -46,7 +39,6 @@ export interface WorkflowRunLaunch {
   resumePolicy: WorkflowResumePolicy;
   owner: WorkflowOwnerIdentity;
   createdAt: number;
-  planDigest?: string;
 }
 
 export interface WorkflowAppendReceipt {
@@ -55,20 +47,12 @@ export interface WorkflowAppendReceipt {
   startByte: number;
   endByte: number;
   eventOrdinal: number;
-  runEpoch: number;
-}
-
-export interface WorkflowOutcomeBlobRef {
-  schemaVersion: typeof WORKFLOW_RUN_TYPES_VERSION;
-  digest: string;
-  bytes: number;
 }
 
 export interface WorkflowEventEnvelope<T extends string = string, P = unknown> {
   schemaVersion: typeof WORKFLOW_RUN_TYPES_VERSION;
   eventId: string;
   runId: string;
-  eventOrdinal: number;
   runEpoch: number;
   type: T;
   payload: P;
