@@ -89,6 +89,7 @@
     "src/workflow-plan-runner.ts",
     "src/workflow-run-types.ts",
     "src/workflow-run-store.ts",
+    "src/workflow-lease.ts",
     "src/workflow-recovery.ts",
     "src/workflow-routing.ts",
     "src/workflow-projection-repository.ts",
