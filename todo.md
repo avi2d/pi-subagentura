@@ -5,7 +5,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 ## Durable authority and outbox
 
 - [x] 1. Wire durable run creation before dispatch through the production extension path.
-- [ ] 2. Make `get_workflow_result` recover terminal results from durable projections after registry loss.
+- [x] 2. Make `get_workflow_result` recover terminal results from durable projections after registry loss.
 - [ ] 3. Repair result, terminal, delivery-intent, dispatch, and receipt crash gaps independently.
 - [x] 4. Fence stale and duplicate evidence from reopening terminal work.
 - [ ] 5. Dispatch deterministic terminal delivery intents and persist dispatch before receipt.

@@ -1376,115 +1376,47 @@ export function registerWorkflowTool(
     ): Promise<any> {
       const st = getWorkflowJobForOwner(params.workflowId, owner());
       if (!st) {
-        if (signal?.aborted) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Wait for workflow ${params.workflowId} cancelled.`,
-              },
-            ],
-            details: {
-              status: "wait_cancelled",
-              workflowId: params.workflowId,
-            },
-            isError: true,
-          };
-        }
-        try {
-          let projection = await getDurableWorkflowProjection(
-            params.workflowId,
-          );
-          const live = getDurableWorkflowLiveJobForOwner(
-            params.workflowId,
-            owner(),
-          );
-          if (projection && !projection.terminal && live) {
-            try {
-              const waitResult = await abortableWait(live.promise, signal);
-              if (waitResult.aborted) {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `Wait for workflow ${params.workflowId} cancelled.`,
-                    },
-                  ],
-                  details: {
-                    status: "wait_cancelled",
-                    workflowId: params.workflowId,
-                  },
-                  isError: true,
-                };
-              }
-            } catch {
-              /* The committed projection below remains authoritative. */
-            }
-            projection = await getDurableWorkflowProjection(params.workflowId);
-          }
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (controller) {
+          const projection = await controller.getStatus(params.workflowId);
           if (projection) {
-            const details = await durableProjectionDetails(projection);
             const terminal = projection.terminal;
-            if (!terminal) {
-              const resume =
-                projection.status === "interrupted" &&
-                details.leaseEpoch !== undefined &&
-                details.ownerGeneration !== undefined
-                  ? ` Resume with /workflow-resume ${projection.runId} ${projection.revision} ${details.ownerGeneration} ${details.leaseEpoch}.`
-                  : "";
+            if (terminal) {
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Durable workflow ${projection.runId} is ${projection.status}.${resume}`,
+                    text: `Durable workflow ${projection.runId} ${projection.status}.`,
                   },
                 ],
-                details,
-                isError: projection.status !== "running",
+                details: {
+                  status: projection.status,
+                  workflowId: projection.runId,
+                  result: terminal.result,
+                  error: terminal.error,
+                  usage: projection.usage,
+                  durable: true,
+                },
+                isError: terminal.status === "error",
               };
             }
-            const terminalError = terminal.error?.message;
-            const resultText =
-              terminal.result === undefined
-                ? ""
-                : typeof terminal.result === "string"
-                  ? terminal.result
-                  : stringify(terminal.result);
             return {
               content: [
                 {
                   type: "text",
-                  text:
-                    terminal.status === "done"
-                      ? `Durable workflow ${projection.runId} complete.${resultText ? `\n\n${resultText}` : ""}`
-                      : `Durable workflow ${projection.runId} ${terminal.status}${terminalError ? `: ${terminalError}` : "."}`,
+                  text: `Durable workflow ${projection.runId} is still ${projection.status}.`,
                 },
               ],
               details: {
-                ...details,
-                result: terminal.result,
-                error: terminal.error,
+                status: projection.status,
+                workflowId: projection.runId,
+                durable: true,
               },
-              isError: terminal.status !== "done",
+              isError: true,
             };
           }
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workflow result unavailable: ${message}`,
-              },
-            ],
-            details: {
-              status: "error",
-              workflowId: params.workflowId,
-              error: message,
-            },
-            isError: true,
-          };
         }
         return {
           content: [
