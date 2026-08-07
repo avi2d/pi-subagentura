@@ -80,7 +80,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 ## Release and compatibility gates
 
 - [ ] 55. Expand minimum/latest SDK compatibility coverage to durable and routing behavior.
-- [ ] 56. Assert packed runtime/public types and exclude stores, fixtures, temporary plans, and secrets.
+- [x] 56. Assert packed runtime/public types and exclude stores, fixtures, temporary plans, and secrets.
 - [ ] 57. Add measured routing rollout gates and policy lanes.
 - [ ] 58. Test preferred routing suppression for all listed contexts.
 - [ ] 59. Track observed routing compliance and report `routing_unconfirmed` honestly.
