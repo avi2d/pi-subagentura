@@ -133,6 +133,19 @@ function applyEvent(
   switch (event.type) {
     case "run_created":
       projection.status = "created";
+      for (const task of payload.tasks ?? []) {
+        const id = String(task.id);
+        if (!projection.tasks[id]) {
+          projection.tasks[id] = {
+            id,
+            status: "pending",
+            attempt: 0,
+            phaseId: String(task.phaseId),
+            prompt: String(task.prompt),
+            ...(task.label === undefined ? {} : { label: String(task.label) }),
+          };
+        }
+      }
       break;
     case "run_started":
       projection.status = "running";

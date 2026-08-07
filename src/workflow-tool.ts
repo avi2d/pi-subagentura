@@ -1496,7 +1496,7 @@ export function registerWorkflowTool(
             const terminal = projection.terminal;
             if (terminal) {
               const deliveryId = workflowDeliveryId(projection.runId);
-              if (projection.delivery && pi.sendMessage) {
+              if (projection.delivery?.status === "pending" && pi.sendMessage) {
                 try {
                   pi.sendMessage(
                     {
