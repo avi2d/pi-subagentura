@@ -49,6 +49,8 @@ import {
 } from "./workflow-continuity";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
+export * from "./workflow-process-handshake";
+export * from "./workflow-replay";
 /**
  * Discriminated union describing the live status of a sub-agent job.
  * Used by `renderSubagentResult` and surfaced via `AgentToolResult.details`.
