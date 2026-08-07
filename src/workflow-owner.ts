@@ -41,3 +41,21 @@ export function createWorkflowRunStore(
     owner: createWorkflowOwnerIdentity(input),
   });
 }
+
+export function workflowOwnerFromSessionContext(input: {
+  projectKey: string;
+  cwd: string;
+  sessionId: string;
+  ownerId: string;
+  generation: number;
+  leaseToken: string;
+}): WorkflowOwnerIdentity {
+  return createWorkflowOwnerIdentity({
+    projectKey: input.projectKey,
+    cwd: input.cwd,
+    piSessionId: input.sessionId,
+    ownerId: input.ownerId,
+    ownerGeneration: input.generation,
+    leaseToken: input.leaseToken,
+  });
+}
