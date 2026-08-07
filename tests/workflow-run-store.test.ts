@@ -91,4 +91,26 @@ describe("WorkflowRunStore", () => {
     expect(log.tornTailBytes).toBe(4);
     expect(log.completeBytes + log.tornTailBytes).toBeGreaterThan(0);
   });
+
+  it("rejects stale epochs while allowing repeated events in the current epoch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+
+    await store.append("run", "run_started", {}, 2);
+    await store.append("run", "task_started", {}, 2);
+    await expect(store.append("run", "stale", {}, 1)).rejects.toThrow(
+      "stale run epoch",
+    );
+    await store.append("run", "run_resumed", {}, 3);
+    await expect(store.append("run", "stale", {}, 2)).rejects.toThrow(
+      "stale run epoch",
+    );
+  });
 });
