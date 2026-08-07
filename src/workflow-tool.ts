@@ -72,6 +72,8 @@ import {
 } from "./session-scope";
 import { attachAsyncJobSettlement } from "./tools/in-process";
 import { durableWorkflowControllerForSession } from "./workflow-owner";
+import { runDurableWorkflowForSession } from "./workflow-owner";
+import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -603,6 +605,56 @@ export function registerWorkflowTool(
       terminal: projection.terminal,
     };
   }
+
+  pi.registerTool({
+    name: "start_durable_workflow",
+    label: "Start Durable Workflow",
+    description:
+      "Create and execute a validated sequential or parallel durable plan.",
+    parameters: Type.Object({
+      runId: Type.String(),
+      plan: Type.Any(),
+      resume: Type.Optional(Type.Boolean()),
+    }),
+    async execute(
+      _id: string,
+      params: any,
+      signal?: AbortSignal,
+      _onUpdate?: unknown,
+      ctx?: any,
+    ): Promise<any> {
+      if (!sessionScope) {
+        return {
+          content: [
+            { type: "text", text: "Durable workflow storage is unavailable." },
+          ],
+          isError: true,
+        };
+      }
+      const plan = params.plan as WorkflowPlan;
+      validateWorkflowPlan(plan);
+      const result = await runDurableWorkflowForSession(
+        process.cwd(),
+        sessionScope,
+        {
+          runId: params.runId,
+          plan,
+          resume: params.resume,
+          signal,
+          runAgent: makeRunAgent(ctx, params.runId, owner()),
+        },
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Durable workflow ${result.runId}: ${result.status}`,
+          },
+        ],
+        details: result,
+      };
+    },
+  });
 
   pi.registerTool({
     name: "workflow",
