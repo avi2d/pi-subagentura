@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, open } from "node:fs/promises";
 import { join } from "node:path";
 
 export type WorkflowReplayResponseKind =
@@ -73,11 +74,27 @@ export async function readWorkflowDefinitionBlob(
   path: string,
   expectedDigest: string,
 ): Promise<unknown> {
-  const value = JSON.parse(await readFile(path, "utf8"));
-  if (durableWorkflowDigest(value) !== expectedDigest) {
-    throw new WorkflowReplayDivergedError("Workflow definition blob diverged");
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) {
+      throw new WorkflowReplayDivergedError(
+        "Workflow definition blob is not a file",
+      );
+    }
+    const value = JSON.parse(await handle.readFile("utf8"));
+    if (durableWorkflowDigest(value) !== expectedDigest) {
+      throw new WorkflowReplayDivergedError(
+        "Workflow definition blob diverged",
+      );
+    }
+    return value;
+  } finally {
+    await handle.close();
   }
-  return value;
 }
 
 export function createWorkflowReplayRequest(input: {

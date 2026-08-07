@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -107,5 +107,17 @@ describe("workflow durable replay", () => {
     await expect(
       readWorkflowDefinitionBlob(first.path, "0".repeat(64)),
     ).rejects.toThrow("definition blob diverged");
+  });
+
+  it("rejects symlinked definition blobs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-replay-"));
+    const definition = await persistWorkflowDefinitionBlob(root, {
+      safe: true,
+    });
+    const link = join(root, "link.json");
+    await symlink(definition.path, link);
+    await expect(
+      readWorkflowDefinitionBlob(link, definition.digest),
+    ).rejects.toThrow();
   });
 });
