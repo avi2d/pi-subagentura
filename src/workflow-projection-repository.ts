@@ -39,6 +39,7 @@ export interface WorkflowProjection {
     status: "pending" | "approved" | "rejected";
     decision?: WorkflowApprovalDecision;
   };
+  runBlock?: { reason: string; source: "approval" | "runtime" };
   mutationHash?: string;
 }
 
@@ -172,6 +173,7 @@ function applyEvent(
       const previous = projection.tasks[id];
       const attempt = Number(payload.attempt ?? (previous?.attempt ?? 0) + 1);
       if (previous && isTerminalTask(previous.status)) return;
+      if (previous?.status === "blocked") return;
       if (previous && attempt < previous.attempt) return;
       projection.tasks[id] = {
         id,
@@ -236,7 +238,11 @@ function applyEvent(
       projection.status =
         event.type === "task_blocked"
           ? "blocked"
-          : projection.status === "blocked"
+          : projection.status === "blocked" &&
+              !projection.runBlock &&
+              !Object.values(projection.tasks).some(
+                (task) => task.status === "blocked",
+              )
             ? "running"
             : projection.status;
       break;
@@ -275,6 +281,10 @@ function applyEvent(
       break;
     case "run_blocked":
       projection.status = "blocked";
+      projection.runBlock = {
+        reason: String(payload.reason ?? "Workflow blocked"),
+        source: payload.source === "approval" ? "approval" : "runtime",
+      };
       break;
     case "run_cancelled":
       projection.status = "cancelled";
@@ -301,7 +311,10 @@ function applyEvent(
       }
       break;
     case "delivery_dispatched":
-      if (projection.delivery?.deliveryId === String(payload.deliveryId))
+      if (
+        projection.delivery?.deliveryId === String(payload.deliveryId) &&
+        projection.delivery.status !== "delivered"
+      )
         projection.delivery.status = "dispatched";
       break;
     case "delivery_receipt":
