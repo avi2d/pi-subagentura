@@ -1,4 +1,5 @@
 export type WorkflowEagerMode = "off" | "preferred" | "always";
+export const WORKFLOW_EAGER_DEFAULT: WorkflowEagerMode = "off";
 export type WorkflowRoutingDecision =
   | { kind: "direct"; reason: string }
   | { kind: "durable_plan"; reason: string; mode: WorkflowEagerMode };
@@ -17,6 +18,16 @@ const SIMPLE_REQUEST =
   /^(?:what|why|how|when|where|who|can you|could you|please explain)\b/i;
 const COMPLEX_MARKER =
   /\b(?:investigate|migrate|refactor|implement|audit|compare|review|debug|build|release|coordinate|analyze)\b/i;
+
+export function parseWorkflowEagerMode(value: unknown): WorkflowEagerMode {
+  if (value === undefined || value === null || value === "") {
+    return WORKFLOW_EAGER_DEFAULT;
+  }
+  if (value === "off" || value === "preferred" || value === "always") {
+    return value;
+  }
+  throw new Error("workflow-eager must be off, preferred, or always");
+}
 
 export function decideWorkflowRouting(
   input: WorkflowRoutingInput,

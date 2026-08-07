@@ -1,7 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { decideWorkflowRouting } from "../src/workflow-routing";
+import {
+  decideWorkflowRouting,
+  parseWorkflowEagerMode,
+  WORKFLOW_EAGER_DEFAULT,
+} from "../src/workflow-routing";
 
 describe("workflow eager routing", () => {
+  it("parses the opt-in configuration with an off default", () => {
+    expect(WORKFLOW_EAGER_DEFAULT).toBe("off");
+    expect(parseWorkflowEagerMode(undefined)).toBe("off");
+    expect(parseWorkflowEagerMode("preferred")).toBe("preferred");
+    expect(() => parseWorkflowEagerMode("invalid")).toThrow("workflow-eager");
+  });
+
   it("defaults off to direct execution", () => {
     expect(
       decideWorkflowRouting({ mode: "off", text: "refactor the service" }),
