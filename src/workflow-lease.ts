@@ -77,6 +77,9 @@ export class WorkflowNamespaceLease {
       ) {
         throw new Error("Workflow namespace lease is held by a live process");
       }
+      if (current.processId === undefined) {
+        throw new Error("Workflow namespace lease identity is ambiguous");
+      }
       const replacement = this.record(current.epoch + 1);
       await rm(this.path, { force: true });
       try {
@@ -156,7 +159,9 @@ export class WorkflowNamespaceLease {
         typeof parsed.ownerId !== "string" ||
         typeof parsed.leaseToken !== "string" ||
         !Number.isSafeInteger(parsed.epoch) ||
-        !Number.isSafeInteger(parsed.acquiredAt)
+        !Number.isSafeInteger(parsed.acquiredAt) ||
+        (parsed.processId !== undefined &&
+          (!Number.isSafeInteger(parsed.processId) || parsed.processId <= 0))
       ) {
         return undefined;
       }

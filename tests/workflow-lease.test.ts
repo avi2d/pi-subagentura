@@ -41,6 +41,7 @@ describe("WorkflowNamespaceLease", () => {
       leaseToken: "token-one",
       staleAfterMs: 10,
       now: () => now,
+      processId: 2_000_000_000,
     });
     const second = new WorkflowNamespaceLease({
       rootDir,
