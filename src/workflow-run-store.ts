@@ -102,6 +102,10 @@ export class WorkflowRunStore {
     };
     const line = `${JSON.stringify(event)}\n`;
     return this.withLock(runId, async () => {
+      const launch = JSON.parse(
+        await readFile(join(dir, "launch.json"), "utf8"),
+      ) as WorkflowRunLaunch;
+      assertSameOwner(launch.owner, this.options.owner);
       const path = join(dir, "events.ndjson");
       const before = await readFile(path);
       const completeBytes = lastCompleteLineBytes(before);
@@ -204,6 +208,22 @@ export class WorkflowRunStore {
       release();
       if (this.locks.get(runId) === current) this.locks.delete(runId);
     }
+  }
+}
+
+function assertSameOwner(
+  left: WorkflowOwnerIdentity,
+  right: WorkflowOwnerIdentity,
+): void {
+  if (
+    left.projectKey !== right.projectKey ||
+    left.cwd !== right.cwd ||
+    left.piSessionId !== right.piSessionId ||
+    left.ownerId !== right.ownerId ||
+    left.ownerGeneration !== right.ownerGeneration ||
+    left.leaseToken !== right.leaseToken
+  ) {
+    throw new Error("Workflow run belongs to a different owner or session.");
   }
 }
 

@@ -136,4 +136,25 @@ describe("WorkflowRunStore", () => {
       "stale run epoch",
     );
   });
+
+  it("rejects appends from a different live owner", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    const staleStore = new WorkflowRunStore({
+      rootDir: root,
+      owner: { ...owner, leaseToken: "stale-lease" },
+    });
+
+    await expect(staleStore.append("run", "run_started", {})).rejects.toThrow(
+      "different owner",
+    );
+    expect((await store.readRun("run")).events).toHaveLength(0);
+  });
 });
