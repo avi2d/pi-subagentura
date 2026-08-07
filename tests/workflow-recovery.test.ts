@@ -219,6 +219,19 @@ describe("workflow recovery projection", () => {
       expectedRevision: 1,
     });
     expect(updated?.tasks.task.status).toBe("skipped");
+
+    const appended = await controller.mutateTask("run", {
+      type: "append",
+      taskId: "later",
+      phaseId: "phase-2",
+      prompt: "do later work",
+      expectedRevision: updated?.revision ?? 0,
+    });
+    expect(appended?.tasks.later).toMatchObject({
+      status: "pending",
+      phaseId: "phase-2",
+      prompt: "do later work",
+    });
   });
 
   it("reads projections through the owner-scoped repository", async () => {
