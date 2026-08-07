@@ -20,7 +20,12 @@ const COMPLEX_MARKER =
   /\b(?:investigate|migrate|refactor|implement|audit|compare|review|debug|build|release|coordinate|analyze)\b/i;
 
 export function parseWorkflowEagerMode(value: unknown): WorkflowEagerMode {
-  if (value === undefined || value === null || value === "") {
+  if (
+    value === undefined ||
+    value === null ||
+    value === false ||
+    value === ""
+  ) {
     return WORKFLOW_EAGER_DEFAULT;
   }
   if (value === "off" || value === "preferred" || value === "always") {

@@ -108,6 +108,18 @@ describe("extension registration", () => {
     });
   });
 
+  it("registers the --workflow-eager routing flag", () => {
+    const api = mockApi();
+
+    registerExtension(api as any);
+
+    expect(api.registerFlag).toHaveBeenCalledWith("workflow-eager", {
+      description: "Route eligible complex requests to durable workflows",
+      type: "string",
+      default: "off",
+    });
+  });
+
   it("appends the bundled prompt when --orchestrator is enabled", async () => {
     const api = mockApi({
       getFlag: vi.fn((name: string) => name === "orchestrator"),
@@ -122,6 +134,26 @@ describe("extension registration", () => {
 
     expect(result.systemPrompt).toContain("# Orchestrator System Prompt");
     expect(result.systemPrompt.startsWith("base prompt\n\n")).toBe(true);
+  });
+
+  it("injects the durable routing policy when eager mode is enabled", async () => {
+    const api = mockApi({
+      getFlag: vi.fn((name: string) =>
+        name === "workflow-eager" ? "preferred" : false,
+      ),
+    });
+
+    registerExtension(api as any);
+
+    const beforeAgentStart = api.on.mock.calls.find(
+      ([event]: any[]) => event === "before_agent_start",
+    )?.[1];
+    const result = await beforeAgentStart({ systemPrompt: "base prompt" }, {});
+
+    expect(result.systemPrompt).toContain(
+      "Automatic durable workflow routing is enabled in preferred mode",
+    );
+    expect(result.systemPrompt).toContain("routing is unconfirmed");
   });
 
   it("registers a minimal interactive runtime in child mode", () => {
