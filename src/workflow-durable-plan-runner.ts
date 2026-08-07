@@ -76,6 +76,9 @@ export class DurableWorkflowController {
   public async cancel(runId: string): Promise<WorkflowProjection | undefined> {
     const projection = await this.getStatus(runId);
     if (!projection || isTerminal(projection.status)) return projection;
+    await this.options.store.append(runId, "run_result", {
+      result: { status: "cancelled" },
+    });
     await this.options.store.append(runId, "run_cancelled", {});
     await appendDeliveryIntent(this.options.store, this.options.owner, runId);
     return recoverWorkflowRun(this.options, runId);
@@ -307,6 +310,9 @@ export async function runDurableWorkflowPlan(
       if (existing?.status === "succeeded" || existing?.status === "skipped")
         continue;
       if (options.signal?.aborted) {
+        await store.append(runId, "run_result", {
+          result: { status: "cancelled" },
+        });
         await store.append(runId, "run_cancelled", {});
         return publish(await recoverWorkflowRun({ store, owner }, runId));
       }
@@ -355,6 +361,9 @@ export async function runDurableWorkflowPlan(
         });
       } catch (error) {
         if (options.signal?.aborted) {
+          await store.append(runId, "run_result", {
+            result: { status: "cancelled" },
+          });
           await store.append(runId, "run_cancelled", {});
           await appendDeliveryIntent(store, owner, runId);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
@@ -452,6 +461,9 @@ async function runDurableParallelPhase(
   if (firstError !== undefined) {
     if (interrupted) throw firstError;
     if (options.signal?.aborted) {
+      await options.store.append(options.runId, "run_result", {
+        result: { status: "cancelled" },
+      });
       await options.store.append(options.runId, "run_cancelled", {});
       return false;
     }
