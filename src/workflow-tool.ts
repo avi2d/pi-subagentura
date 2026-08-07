@@ -1417,6 +1417,40 @@ export function registerWorkflowTool(
           if (projection) {
             const terminal = projection.terminal;
             if (terminal) {
+              const deliveryId = workflowDeliveryId(projection.runId);
+              if (projection.delivery && pi.sendMessage) {
+                try {
+                  pi.sendMessage(
+                    {
+                      customType: "workflow-notify",
+                      content: workflowDeliveryMessage(projection),
+                      display: true,
+                      details: {
+                        workflowId: projection.runId,
+                        status: projection.status,
+                        durable: true,
+                        deliveryId,
+                        recovered: true,
+                      },
+                    },
+                    { deliverAs: "followUp", triggerTurn: true },
+                  );
+                  await controller.dispatchDelivery(
+                    projection.runId,
+                    deliveryId,
+                  );
+                } catch (error) {
+                  debugLog(
+                    "warn",
+                    "durable_workflow_recovery_delivery_failed",
+                    {
+                      workflowId: projection.runId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    },
+                  );
+                }
+              }
               return {
                 content: [
                   {
