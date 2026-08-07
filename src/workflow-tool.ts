@@ -74,6 +74,10 @@ import { attachAsyncJobSettlement } from "./tools/in-process";
 import { durableWorkflowControllerForSession } from "./workflow-owner";
 import { runDurableWorkflowForSession } from "./workflow-owner";
 import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
+import {
+  decideWorkflowRouting,
+  parseWorkflowEagerMode,
+} from "./workflow-routing";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -2577,6 +2581,25 @@ export function registerWorkflowTool(
         const text = `Durable workflow ${runId} budget ${operation}d (status ${updated?.status ?? "unknown"}).`;
         ctx.ui.notify(text);
         sendCommandMessage(text);
+      },
+    });
+
+    pi.registerCommand("workflow-route", {
+      description: "Evaluate opt-in complex-task workflow routing.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const [modeText, ...taskParts] = args.trim().split(/\s+/);
+        try {
+          const mode = parseWorkflowEagerMode(modeText);
+          const task = taskParts.join(" ");
+          const decision = decideWorkflowRouting({ mode, text: task });
+          const text = `Routing decision: ${decision.kind} (${decision.reason}).`;
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+        }
       },
     });
 
