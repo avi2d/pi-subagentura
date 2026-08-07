@@ -66,6 +66,33 @@ describe("workflow recovery projection", () => {
     expect(projection.lastEventOrdinal).toBe(3);
   });
 
+  it("counts each committed attempt usage record once during replay", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "usage",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("usage", "usage_observed", {
+      taskId: "a",
+      attempt: 1,
+      input: 10,
+      output: 4,
+    });
+    await store.append("usage", "usage_observed", {
+      taskId: "a",
+      attempt: 1,
+      input: 10,
+      output: 4,
+    });
+
+    const projection = await recoverWorkflowRun({ store, owner }, "usage");
+    expect(projection.usage).toEqual({ input: 10, output: 4 });
+  });
+
   it("rejects another owner and enumerates only matching runs", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);
