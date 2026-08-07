@@ -93,6 +93,19 @@ describe("WorkflowRunStore", () => {
     await store.append("undelivered-terminal", "run_terminal", {
       result: { status: "done" },
     });
+    for (const [runId, event] of [
+      ["blocked", "run_blocked"],
+      ["approval-pending", "approval_requested"],
+      ["interrupted", "run_interrupted"],
+    ] as const) {
+      await store.createRun({
+        runId,
+        planRevision: 1,
+        resumePolicy: "manual",
+        owner,
+      });
+      await store.append(runId, event, {});
+    }
 
     await expect(
       store.pruneTerminalRuns({ olderThanMs: 0, maxRuns: 1 }),
@@ -102,6 +115,9 @@ describe("WorkflowRunStore", () => {
     });
     await expect(store.readRun("active")).resolves.toBeDefined();
     await expect(store.readRun("undelivered-terminal")).resolves.toBeDefined();
+    await expect(store.readRun("blocked")).resolves.toBeDefined();
+    await expect(store.readRun("approval-pending")).resolves.toBeDefined();
+    await expect(store.readRun("interrupted")).resolves.toBeDefined();
   });
 
   it("uses byte offsets and complete-line ordinals for unicode events", async () => {
