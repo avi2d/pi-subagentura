@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export type WorkflowReplayResponseKind =
   "success" | "null" | "error" | "cancelled" | "schema_retry";
@@ -41,6 +43,41 @@ export function durableWorkflowDigest(value: unknown): string {
       ),
     )
     .digest("hex");
+}
+
+export async function persistWorkflowDefinitionBlob(
+  root: string,
+  definition: unknown,
+): Promise<{ digest: string; path: string }> {
+  const encoded = JSON.stringify(definition);
+  const digest = durableWorkflowDigest(definition);
+  const dir = join(root, "workflow-blobs");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${digest}.json`);
+  const handle = await open(path, "wx", 0o600).catch(async (error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    throw error;
+  });
+  if (handle) {
+    try {
+      await handle.writeFile(`${encoded}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+  return { digest, path };
+}
+
+export async function readWorkflowDefinitionBlob(
+  path: string,
+  expectedDigest: string,
+): Promise<unknown> {
+  const value = JSON.parse(await readFile(path, "utf8"));
+  if (durableWorkflowDigest(value) !== expectedDigest) {
+    throw new WorkflowReplayDivergedError("Workflow definition blob diverged");
+  }
+  return value;
 }
 
 export function createWorkflowReplayRequest(input: {

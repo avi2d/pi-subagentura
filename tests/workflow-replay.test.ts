@@ -1,7 +1,12 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createWorkflowReplayRequest,
   durableWorkflowDigest,
+  persistWorkflowDefinitionBlob,
+  readWorkflowDefinitionBlob,
   replayWorkflowResponses,
   WorkflowReplayDivergedError,
 } from "../src/workflow-replay";
@@ -85,5 +90,22 @@ describe("workflow durable replay", () => {
         ],
       ),
     ).toThrow("Unknown workflow replay operation");
+  });
+
+  it("stores immutable content-addressed definition blobs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-replay-"));
+    const definition = { name: "demo", steps: ["a", "b"] };
+    const first = await persistWorkflowDefinitionBlob(root, definition);
+    const second = await persistWorkflowDefinitionBlob(root, {
+      steps: ["a", "b"],
+      name: "demo",
+    });
+    expect(second.digest).toBe(first.digest);
+    await expect(
+      readWorkflowDefinitionBlob(first.path, first.digest),
+    ).resolves.toEqual(definition);
+    await expect(
+      readWorkflowDefinitionBlob(first.path, "0".repeat(64)),
+    ).rejects.toThrow("definition blob diverged");
   });
 });
