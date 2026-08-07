@@ -16,7 +16,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 - [x] 8. Integrate one namespace lease so concurrent Pi processes cannot write together.
 - [x] 9. Add process identity/liveness checks and fail-closed stale takeover.
-- [ ] 10. Apply owner, token, and epoch fencing to every durable mutation.
+- [x] 10. Apply owner, token, and epoch fencing to every durable mutation.
 - [x] 11. Harden filesystem storage against symlinks, hardlinks, races, traversal, and non-regular files.
 - [x] 12. Stop recovery on malformed complete event lines.
 - [x] 13. Recover torn tails only at complete-line byte boundaries.
