@@ -68,10 +68,10 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 ## Context, reminders, and approvals
 
-- [ ] 47. Inject bounded factual continuity context after reload/compaction.
-- [ ] 48. Include required run/revision/status/phase/task/count fields without outputs.
-- [ ] 49. Suppress reminders for active wakeups, all-blocked runs, and pending input.
-- [ ] 50. Cap reminders per turn/generation and reset on progress.
+- [x] 47. Inject bounded factual continuity context after reload/compaction.
+- [x] 48. Include required run/revision/status/phase/task/count fields without outputs.
+- [x] 49. Suppress reminders for active wakeups, all-blocked runs, and pending input.
+- [x] 50. Cap reminders per turn/generation and reset on progress.
 - [x] 51. Bind and single-consume approvals to all authority fields.
 - [x] 52. Keep approval grants on trusted host paths, not model-callable tools.
 - [x] 53. Make stale, wrong-owner, duplicate, and post-reload decisions no-ops.
@@ -81,7 +81,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 - [x] 55. Expand minimum/latest SDK compatibility coverage to durable and routing behavior.
 - [x] 56. Assert packed runtime/public types and exclude stores, fixtures, temporary plans, and secrets.
-- [ ] 57. Add measured routing rollout gates and policy lanes.
+- [x] 57. Add measured routing rollout gates and policy lanes.
 - [x] 58. Test preferred routing suppression for all listed contexts.
 - [x] 59. Track observed routing compliance and report `routing_unconfirmed` honestly.
 - [x] 60. Reject unsupported durable legacy requests instead of silently downgrading.
