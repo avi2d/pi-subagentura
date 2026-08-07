@@ -3,13 +3,17 @@ import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import type { WorkflowProjection } from "./workflow-projection-repository";
 import { recoverWorkflowRun } from "./workflow-recovery";
 import { WorkflowRunStore } from "./workflow-run-store";
-import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import type {
+  WorkflowOwnerIdentity,
+  WorkflowResumePolicy,
+} from "./workflow-run-types";
 
 export interface DurableWorkflowPlanOptions {
   store: WorkflowRunStore;
   owner: WorkflowOwnerIdentity;
   runId: string;
   plan: WorkflowPlan;
+  resumePolicy?: WorkflowResumePolicy;
   runAgent: (input: {
     prompt: string;
     isolation: "in-process";
@@ -30,6 +34,11 @@ export async function runDurableWorkflowPlan(
     return next;
   };
   let projection: WorkflowProjection;
+  // Validation must happen before touching the store. In particular, a bad
+  // resume payload must not parse or project an existing authoritative run.
+  // The stored revision check below owns version-mismatch reporting. Validate
+  // the rest of the candidate before recovery without masking that error.
+  validateWorkflowPlan({ ...plan, schemaVersion: 1 });
   try {
     projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
@@ -40,7 +49,7 @@ export async function runDurableWorkflowPlan(
     await store.createRun({
       runId,
       planRevision: plan.schemaVersion,
-      resumePolicy: "manual",
+      resumePolicy: options.resumePolicy ?? "manual",
       owner,
     });
     await store.append(runId, "run_created", {});
@@ -58,7 +67,6 @@ export async function runDurableWorkflowPlan(
   }
   // Validate a resume after checking the persisted revision so callers get a
   // stable revision-mismatch error for a different plan version.
-  validateWorkflowPlan(plan);
   if (isTerminal(projection.status)) return publish(projection);
   if (options.signal?.aborted) {
     await store.append(runId, "run_cancelled", {});
