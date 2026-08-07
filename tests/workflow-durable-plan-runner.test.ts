@@ -153,6 +153,31 @@ describe("durable sequential plan runner", () => {
     expect(statuses.length).toBeGreaterThan(0);
   });
 
+  it("retains the terminal error envelope after task failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "failed-run",
+      plan,
+      runAgent: async () => ({
+        isError: true as const,
+        output: "",
+        usage: success("ignored").usage,
+        errorMessage: "provider failed",
+      }),
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.terminal).toEqual({
+      status: "error",
+      error: { code: "task_failed", message: "provider failed" },
+    });
+  });
+
   it("commits cancellation as a terminal result before returning", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);

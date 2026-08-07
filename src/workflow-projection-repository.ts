@@ -57,7 +57,15 @@ export function projectWorkflowRun(
 
 function applyEvent(projection: WorkflowProjection, event: Event): void {
   const payload = event.payload ?? {};
-  if (isTerminal(projection.status) && event.type !== "run_result") return;
+  // A task failure moves the projection to `error` before the coordinator
+  // appends the richer terminal result. Keep that follow-up event applicable,
+  // otherwise failed runs lose their durable error envelope during recovery.
+  if (
+    isTerminal(projection.status) &&
+    event.type !== "run_result" &&
+    event.type !== "run_terminal"
+  )
+    return;
   switch (event.type) {
     case "run_created":
       projection.status = "created";
