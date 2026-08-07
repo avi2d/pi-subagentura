@@ -2502,7 +2502,7 @@ describe("renderProgress", () => {
 });
 
 describe("registerWorkflowTool", () => {
-  it("registers 6 tools with the Pi SDK", () => {
+  it("registers workflow tools with the Pi SDK", () => {
     const tools: Array<{ name: string }> = [];
     const pi = {
       registerTool: vi.fn((def: any) => tools.push(def)),
@@ -2511,7 +2511,7 @@ describe("registerWorkflowTool", () => {
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(9);
     expect(tools.map((t) => t.name)).toEqual([
       "workflow",
       "get_workflow_status",
@@ -2520,6 +2520,8 @@ describe("registerWorkflowTool", () => {
       "save_workflow",
       "list_workflows",
       "delete_workflow",
+      "get_durable_workflow_status",
+      "start_durable_workflow",
     ]);
   });
 
@@ -2541,7 +2543,11 @@ describe("registerWorkflowTool", () => {
       "workflows",
       "list-workflows",
       "workflow-status",
-      "workflow-resume",
+      "workflow-plan",
+      "workflow-plan-append",
+      "workflow-plan-mutate",
+      "workflow-plan-edit",
+      "workflow-plan-export",
       "workflow-tree",
       "delete-workflow",
     ]);
