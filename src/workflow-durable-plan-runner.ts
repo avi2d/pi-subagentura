@@ -25,6 +25,44 @@ export interface DurableWorkflowPlanOptions {
   onProjection?: (projection: WorkflowProjection) => void;
 }
 
+export interface DurableWorkflowControllerOptions {
+  store: WorkflowRunStore;
+  owner: WorkflowOwnerIdentity;
+}
+
+/** Owner-scoped controller for durable status, result, and cancellation. */
+export class DurableWorkflowController {
+  public constructor(
+    private readonly options: DurableWorkflowControllerOptions,
+  ) {}
+
+  public async getStatus(
+    runId: string,
+  ): Promise<WorkflowProjection | undefined> {
+    try {
+      return await recoverWorkflowRun(this.options, runId);
+    } catch (error) {
+      if (isMissingRun(error)) return undefined;
+      throw error;
+    }
+  }
+
+  public async getResult(
+    runId: string,
+  ): Promise<WorkflowProjection["terminal"]> {
+    const projection = await this.getStatus(runId);
+    if (!projection) return undefined;
+    return projection.terminal;
+  }
+
+  public async cancel(runId: string): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection || isTerminal(projection.status)) return projection;
+    await this.options.store.append(runId, "run_cancelled", {});
+    return recoverWorkflowRun(this.options, runId);
+  }
+}
+
 export async function runDurableWorkflowPlan(
   options: DurableWorkflowPlanOptions,
 ): Promise<WorkflowProjection> {
@@ -34,17 +72,14 @@ export async function runDurableWorkflowPlan(
     return next;
   };
   let projection: WorkflowProjection;
-  // Validation must happen before touching the store. In particular, a bad
-  // resume payload must not parse or project an existing authoritative run.
-  // The stored revision check below owns version-mismatch reporting. Validate
-  // the rest of the candidate before recovery without masking that error.
+  // Validate before recovery so malformed resume input cannot touch an
+  // authoritative run or dispatch work.
   validateWorkflowPlan({ ...plan, schemaVersion: 1 });
   try {
     projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
     if (!isMissingRun(error)) throw error;
-    // Reject malformed plans before creating the durable run or dispatching
-    // work. This keeps invalid input from leaving an orphaned run directory.
+    // Do not leave an orphaned run directory for an invalid new plan.
     validateWorkflowPlan(plan);
     await store.createRun({
       runId,
@@ -65,8 +100,7 @@ export async function runDurableWorkflowPlan(
         `requested ${plan.schemaVersion}`,
     );
   }
-  // Validate a resume after checking the persisted revision so callers get a
-  // stable revision-mismatch error for a different plan version.
+  // The stored revision owns mismatch reporting before resume validation.
   if (isTerminal(projection.status)) return publish(projection);
   if (options.signal?.aborted) {
     await store.append(runId, "run_cancelled", {});
@@ -80,9 +114,8 @@ export async function runDurableWorkflowPlan(
     for (const task of phase.tasks) {
       projection = await recoverWorkflowRun({ store, owner }, runId);
       const existing = projection.tasks[task.id];
-      if (existing?.status === "succeeded" || existing?.status === "skipped") {
+      if (existing?.status === "succeeded" || existing?.status === "skipped")
         continue;
-      }
       if (options.signal?.aborted) {
         await store.append(runId, "run_cancelled", {});
         return publish(await recoverWorkflowRun({ store, owner }, runId));
