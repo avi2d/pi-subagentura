@@ -14,6 +14,7 @@ export type WorkflowRunStatus =
   | "running"
   | "interrupted"
   | "blocked"
+  | "awaiting_budget"
   | "done"
   | "error"
   | "cancelled";
