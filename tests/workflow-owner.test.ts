@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createWorkflowOwnerIdentity,
   createWorkflowRunStore,
+  workflowOwnerFromSessionContext,
 } from "../src/workflow-owner";
 
 describe("workflow owner identity", () => {
@@ -51,5 +52,18 @@ describe("workflow owner identity", () => {
       leaseToken: "lease",
     });
     expect(store).toBeDefined();
+  });
+
+  it("maps lifecycle naming to the durable owner contract", () => {
+    expect(
+      workflowOwnerFromSessionContext({
+        projectKey: "project",
+        cwd: "/repo",
+        sessionId: "session",
+        ownerId: "owner",
+        generation: 3,
+        leaseToken: "lease",
+      }),
+    ).toMatchObject({ piSessionId: "session", ownerGeneration: 3 });
   });
 });
