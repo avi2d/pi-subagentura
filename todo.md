@@ -83,7 +83,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 56. Assert packed runtime/public types and exclude stores, fixtures, temporary plans, and secrets.
 - [ ] 57. Add measured routing rollout gates and policy lanes.
 - [x] 58. Test preferred routing suppression for all listed contexts.
-- [ ] 59. Track observed routing compliance and report `routing_unconfirmed` honestly.
+- [x] 59. Track observed routing compliance and report `routing_unconfirmed` honestly.
 - [x] 60. Reject unsupported durable legacy requests instead of silently downgrading.
 
 ## Verification
