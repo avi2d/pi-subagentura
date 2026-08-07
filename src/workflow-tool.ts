@@ -71,14 +71,7 @@ import {
   type SessionScope,
 } from "./session-scope";
 import { attachAsyncJobSettlement } from "./tools/in-process";
-import {
-  durableWorkflowControllerForSession,
-  durableWorkflowStoreForSession,
-} from "./workflow-owner";
-import {
-  DurableWorkflowProjectionRepository,
-  type WorkflowProjection,
-} from "./workflow-projection-repository";
+import { durableWorkflowControllerForSession } from "./workflow-owner";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -240,68 +233,48 @@ export function registerWorkflowTool(
       ? { id: sessionScope.id, generation: sessionScope.generation }
       : getActiveSessionOwner();
 
-  function captureWorkflowCancellationInvocation(
-    ctx: WorkflowCancellationContext | undefined,
-  ): WorkflowCancellationInvocation {
-    let canonicalCwd: string | undefined;
-    try {
-      canonicalCwd =
-        typeof ctx?.cwd === "string" ? realpathSync.native(ctx.cwd) : undefined;
-    } catch {
-      canonicalCwd = undefined;
-    }
-    const sessionOwner = owner();
-    const liveScope = resolveLiveSessionScope(sessionOwner);
-    return {
-      sessionOwner,
-      durableOwner:
-        liveScope === sessionScope
-          ? sessionScope?.durableWorkflowOwner
-          : undefined,
-      controller:
-        liveScope === sessionScope && sessionScope
-          ? durableWorkflowControllerForSession(sessionScope)
-          : undefined,
-      canonicalCwd,
-    };
-  }
-
-  function assertWorkflowCancellationAuthority(
-    invocation: WorkflowCancellationInvocation,
-    ctx: WorkflowCancellationContext | undefined,
-  ): void {
-    if (!sessionScope) return;
-    if (
-      !invocation.sessionOwner ||
-      resolveLiveSessionScope(invocation.sessionOwner) !== sessionScope
-    ) {
-      throw new Error("Workflow cancellation session generation is stale");
-    }
-    let canonicalCwd: string | undefined;
-    try {
-      canonicalCwd =
-        typeof ctx?.cwd === "string" ? realpathSync.native(ctx.cwd) : undefined;
-    } catch {
-      canonicalCwd = undefined;
-    }
-    if (
-      !canonicalCwd ||
-      canonicalCwd !== invocation.canonicalCwd ||
-      (invocation.durableOwner && canonicalCwd !== invocation.durableOwner.cwd)
-    ) {
-      throw new Error(
-        "Workflow cancellation cwd does not match the invocation-captured live session",
-      );
-    }
-    if (
-      sessionScope.durableWorkflowOwner !== invocation.durableOwner ||
-      (invocation.controller &&
-        sessionScope.durableWorkflowController !== invocation.controller)
-    ) {
-      throw new Error("Workflow cancellation durable generation is stale");
-    }
-  }
-  const workflowDispatcher = createWorkflowDispatcher();
+  pi.registerTool({
+    name: "get_durable_workflow_status",
+    label: "Durable Workflow Status",
+    description: "Read the owner-scoped durable workflow projection.",
+    parameters: Type.Object({ workflowId: Type.String() }),
+    async execute(_id: string, params: { workflowId: string }): Promise<any> {
+      const controller = sessionScope
+        ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+        : undefined;
+      if (!controller) {
+        return {
+          content: [
+            { type: "text", text: "Durable workflow storage is unavailable." },
+          ],
+          details: { status: "unavailable" },
+          isError: true,
+        };
+      }
+      const projection = await controller.getStatus(params.workflowId);
+      if (!projection) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Durable workflow ${params.workflowId} was not found.`,
+            },
+          ],
+          details: { status: "not_found", workflowId: params.workflowId },
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Durable workflow ${projection.runId}: ${projection.status}`,
+          },
+        ],
+        details: projection,
+      };
+    },
+  });
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(
     ctx: any,
