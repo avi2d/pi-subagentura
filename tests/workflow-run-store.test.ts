@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   WorkflowRunCorruptionError,
+  WorkflowRunStorageError,
   WorkflowRunStore,
 } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
@@ -25,6 +26,15 @@ afterEach(async () => {
 });
 
 describe("WorkflowRunStore", () => {
+  it("exposes a stable storage-exhaustion error envelope", () => {
+    const error = new WorkflowRunStorageError("run", {
+      code: "ENOSPC",
+    });
+    expect(error.code).toBe("ENOSPC");
+    expect(error.runId).toBe("run");
+    expect(error.message).toContain("could not be persisted");
+  });
+
   it("surfaces malformed committed event data as corruption", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
     dirs.push(root);
