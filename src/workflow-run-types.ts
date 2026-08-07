@@ -95,6 +95,11 @@ export interface WorkflowApprovalDecision {
   status: Exclude<WorkflowApprovalStatus, "pending">;
   decidedBy: string;
   reason?: string;
+  policyHash?: string;
+  planRevision?: number;
+  ownerGeneration?: number;
+  leaseEpoch?: number;
+  version?: number;
 }
 
 export function validateWorkflowApprovalRequest(
@@ -126,5 +131,14 @@ export function validateWorkflowApprovalDecision(
   }
   if (decision.reason !== undefined && !decision.reason.trim()) {
     throw new Error("Invalid workflow approval decision reason");
+  }
+  for (const value of [
+    decision.planRevision,
+    decision.ownerGeneration,
+    decision.leaseEpoch,
+    decision.version,
+  ]) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0))
+      throw new Error("Invalid workflow approval decision binding");
   }
 }

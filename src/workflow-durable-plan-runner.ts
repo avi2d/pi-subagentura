@@ -234,6 +234,20 @@ export class DurableWorkflowController {
       projection.approval.request.requestId !== requestId
     )
       throw new Error("Workflow approval request was not found");
+    const request = projection.approval.request;
+    if (
+      (decision.policyHash !== undefined &&
+        decision.policyHash !== request.policyHash) ||
+      (decision.planRevision !== undefined &&
+        decision.planRevision !== request.planRevision) ||
+      (decision.ownerGeneration !== undefined &&
+        decision.ownerGeneration !== request.ownerGeneration) ||
+      (decision.leaseEpoch !== undefined &&
+        decision.leaseEpoch !== request.leaseEpoch) ||
+      (decision.version !== undefined && decision.version !== request.version)
+    ) {
+      return projection;
+    }
     if (projection.approval.status !== "pending") return projection;
     await this.options.store.append(runId, "approval_decided", decision);
     return this.getStatus(runId);
