@@ -26,6 +26,7 @@ export interface WorkflowRunStoreOptions {
   maxEventBytes?: number;
   maxRunBytes?: number;
   maxRuns?: number;
+  maxOwnerBytes?: number;
 }
 
 export interface WorkflowRunRecord {
@@ -200,6 +201,7 @@ export class WorkflowRunStore {
       const completeBytes = lastCompleteLineBytes(before);
       const maxEventBytes = this.options.maxEventBytes;
       const maxRunBytes = this.options.maxRunBytes;
+      const maxOwnerBytes = this.options.maxOwnerBytes;
       if (
         maxRunBytes !== undefined &&
         (!Number.isSafeInteger(maxRunBytes) || maxRunBytes <= 0)
@@ -219,6 +221,23 @@ export class WorkflowRunStore {
         completeBytes + Buffer.byteLength(line) > maxRunBytes
       ) {
         throw new Error("Workflow run byte quota exceeded");
+      }
+      if (
+        maxOwnerBytes !== undefined &&
+        (!Number.isSafeInteger(maxOwnerBytes) || maxOwnerBytes <= 0)
+      ) {
+        throw new Error("Invalid workflow owner byte quota");
+      }
+      if (maxOwnerBytes !== undefined) {
+        let ownerBytes = 0;
+        for (const existingRunId of await this.listRunIds()) {
+          ownerBytes += (
+            await readFile(join(this.runDir(existingRunId), "events.ndjson"))
+          ).length;
+        }
+        if (ownerBytes + Buffer.byteLength(line) > maxOwnerBytes) {
+          throw new Error("Workflow owner byte quota exceeded");
+        }
       }
       const currentEpoch = lastCompleteRunEpoch(before);
       if (runEpoch < currentEpoch) {
