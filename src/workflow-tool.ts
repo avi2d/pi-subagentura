@@ -2686,7 +2686,11 @@ export function registerWorkflowTool(
           const mode = parseWorkflowEagerMode(modeText);
           const task = taskParts.join(" ");
           const decision = decideWorkflowRouting({ mode, text: task });
-          const text = `Routing decision: ${decision.kind} (${decision.reason}).`;
+          const observation =
+            decision.kind === "durable_plan"
+              ? " routing_unconfirmed: inspection does not start a run."
+              : "";
+          const text = `Routing decision: ${decision.kind} (${decision.reason}).${observation}`;
           ctx.ui.notify(text);
           sendCommandMessage(text);
         } catch (error) {
