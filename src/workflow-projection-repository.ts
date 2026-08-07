@@ -63,18 +63,23 @@ export function projectWorkflowRun(
   };
 
   const appliedEventIds = new Set<string>();
+  const usageKeys = new Set<string>();
 
   for (const [ordinal, event] of events.entries()) {
     if (appliedEventIds.has(event.eventId)) continue;
     appliedEventIds.add(event.eventId);
     projection.lastEventOrdinal = ordinal;
     projection.revision++;
-    applyEvent(projection, event);
+    applyEvent(projection, event, usageKeys);
   }
   return projection;
 }
 
-function applyEvent(projection: WorkflowProjection, event: Event): void {
+function applyEvent(
+  projection: WorkflowProjection,
+  event: Event,
+  usageKeys: Set<string>,
+): void {
   const payload = event.payload ?? {};
   // A task failure moves the projection to `error` before the coordinator
   // appends the richer terminal result. Keep that follow-up event applicable,
@@ -198,10 +203,19 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
       };
       break;
     }
-    case "usage_observed":
+    case "usage_observed": {
+      const taskId = payload.taskId;
+      const attempt = payload.attempt;
+      const key =
+        taskId === undefined || attempt === undefined
+          ? event.eventId
+          : `${String(taskId)}:${String(attempt)}`;
+      if (usageKeys.has(key)) return;
+      usageKeys.add(key);
       projection.usage.input += finite(payload.input);
       projection.usage.output += finite(payload.output);
       break;
+    }
     case "run_interrupted":
       projection.status = "interrupted";
       break;
