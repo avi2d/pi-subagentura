@@ -349,4 +349,49 @@ describe("durable sequential plan runner", () => {
     expect(result.tasks.c.status).toBe("succeeded");
     expect(result.usage).toEqual({ input: 3, output: 6 });
   });
+
+  it("commits cancellation when a parallel task observes an aborted signal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const controller = new AbortController();
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "parallel-cancelled-run",
+      plan: {
+        ...plan,
+        phases: [
+          {
+            id: "parallel",
+            mode: "parallel",
+            tasks: [
+              { id: "a", prompt: "A" },
+              { id: "b", prompt: "B" },
+            ],
+          },
+        ],
+      },
+      signal: controller.signal,
+      runAgent: async ({ signal }) => {
+        controller.abort();
+        await new Promise<void>((_, reject) => {
+          if (signal?.aborted) {
+            reject(new Error("agent aborted"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(new Error("agent aborted")),
+            { once: true },
+          );
+        });
+        throw new Error("must not complete");
+      },
+    });
+
+    expect(result.status).toBe("cancelled");
+    expect(result.terminal).toMatchObject({ status: "cancelled" });
+  });
 });

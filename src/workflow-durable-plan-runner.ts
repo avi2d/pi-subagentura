@@ -146,7 +146,11 @@ export async function runDurableWorkflowPlan(
       return current?.status !== "succeeded" && current?.status !== "skipped";
     });
     if (phase.mode === "parallel") {
-      await runDurableParallelPhase(options, phase.id, tasks);
+      const completed = await runDurableParallelPhase(options, phase.id, tasks);
+      if (!completed) {
+        await appendDeliveryIntent(store, owner, runId);
+        return publish(await recoverWorkflowRun({ store, owner }, runId));
+      }
       continue;
     }
     for (const task of tasks) {
@@ -224,7 +228,7 @@ async function runDurableParallelPhase(
   options: DurableWorkflowPlanOptions,
   phaseId: string,
   tasks: WorkflowPlan["phases"][number]["tasks"],
-): Promise<void> {
+): Promise<boolean> {
   const limit = Math.max(1, Math.min(4, tasks.length));
   let nextIndex = 0;
   let firstError: unknown;
@@ -267,6 +271,10 @@ async function runDurableParallelPhase(
           result: result.output,
         });
       } catch (error) {
+        if (options.signal?.aborted) {
+          firstError ??= error;
+          return;
+        }
         await options.store.append(options.runId, "task_failed", {
           taskId: task.id,
           attempt,
@@ -278,6 +286,10 @@ async function runDurableParallelPhase(
   };
   await Promise.all(Array.from({ length: limit }, () => worker()));
   if (firstError !== undefined) {
+    if (options.signal?.aborted) {
+      await options.store.append(options.runId, "run_cancelled", {});
+      return false;
+    }
     await options.store.append(options.runId, "run_terminal", {
       result: {
         status: "error",
@@ -293,6 +305,7 @@ async function runDurableParallelPhase(
     await appendDeliveryIntent(options.store, options.owner, options.runId);
     throw firstError;
   }
+  return true;
 }
 
 async function appendDeliveryIntent(
