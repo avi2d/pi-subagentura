@@ -165,6 +165,33 @@ describe("workflow recovery projection", () => {
     });
   });
 
+  it("projects future-task mutations without reopening terminal tasks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "task_blocked", { taskId: "blocked" });
+    await store.append("run", "task_unblocked", { taskId: "blocked" });
+    await store.append("run", "task_skipped", { taskId: "blocked" });
+    await store.append("run", "task_succeeded", {
+      taskId: "done",
+      attempt: 1,
+    });
+    await store.append("run", "task_blocked", { taskId: "done" });
+
+    const projection = await recoverWorkflowRun({ store, owner }, "run");
+    expect(projection.tasks.blocked).toMatchObject({
+      status: "skipped",
+      attempt: 0,
+    });
+    expect(projection.tasks.done.status).toBe("succeeded");
+  });
+
   it("reads projections through the owner-scoped repository", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);
