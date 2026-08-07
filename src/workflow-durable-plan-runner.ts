@@ -56,6 +56,9 @@ export async function runDurableWorkflowPlan(
         `requested ${plan.schemaVersion}`,
     );
   }
+  // Validate a resume after checking the persisted revision so callers get a
+  // stable revision-mismatch error for a different plan version.
+  validateWorkflowPlan(plan);
   if (isTerminal(projection.status)) return publish(projection);
   if (options.signal?.aborted) {
     await store.append(runId, "run_cancelled", {});

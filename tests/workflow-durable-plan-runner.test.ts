@@ -230,4 +230,39 @@ describe("durable sequential plan runner", () => {
     ).rejects.toThrow("Invalid or duplicate task id");
     await expect(store.listRunIds()).resolves.toEqual([]);
   });
+
+  it("rejects an invalid plan before recovering an existing run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+
+    await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "existing-run",
+      plan,
+      runAgent: async () => success("done"),
+    });
+
+    const invalidPlan = {
+      ...plan,
+      phases: [{ ...plan.phases[0], tasks: [{ id: "bad/id", prompt: "bad" }] }],
+    } as WorkflowPlan;
+    const calls: string[] = [];
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "existing-run",
+        plan: invalidPlan,
+        resume: true,
+        runAgent: async ({ prompt }) => {
+          calls.push(prompt);
+          return success("must not run");
+        },
+      }),
+    ).rejects.toThrow("Invalid or duplicate task id");
+    expect(calls).toEqual([]);
+  });
 });
