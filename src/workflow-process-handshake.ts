@@ -51,6 +51,13 @@ export type WorkflowProcessAdoptionResult =
   | { kind: "retry" }
   | { kind: "fenced"; candidates: readonly WorkflowProcessPaneCandidate[] };
 
+export interface WorkflowProcessUsageProjection {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly completeness: "exact" | "lower_bound";
+  readonly provenance: "child_report" | "child_dead";
+}
+
 export interface WorkflowProcessLaunchIntentInput {
   runId: string;
   operationId: string;
@@ -190,4 +197,26 @@ export async function adoptWorkflowProcessPane(
   if (candidates.length === 0) return { kind: "retry" };
   for (const candidate of candidates) await inspector.fence(candidate);
   return { kind: "fenced", candidates };
+}
+
+export function projectWorkflowProcessUsage(
+  usage: { inputTokens?: number; outputTokens?: number } | undefined,
+  childAlive: boolean,
+): WorkflowProcessUsageProjection {
+  const inputTokens = usage?.inputTokens ?? 0;
+  const outputTokens = usage?.outputTokens ?? 0;
+  if (
+    !Number.isSafeInteger(inputTokens) ||
+    inputTokens < 0 ||
+    !Number.isSafeInteger(outputTokens) ||
+    outputTokens < 0
+  ) {
+    throw new Error("Invalid workflow process usage");
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    completeness: childAlive ? "exact" : "lower_bound",
+    provenance: childAlive ? "child_report" : "child_dead",
+  };
 }
