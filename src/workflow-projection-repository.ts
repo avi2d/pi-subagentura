@@ -74,7 +74,6 @@ export function projectWorkflowRun(
     appliedEventIds.add(event.eventId);
     projection.lastEventOrdinal = ordinal;
     projection.revision++;
-    applyEvent(projection, event, usageKeys);
     if (isMutationEvent(event.type)) {
       const payload = event.payload ?? {};
       const {
@@ -85,11 +84,16 @@ export function projectWorkflowRun(
       const expected = createHash("sha256")
         .update(JSON.stringify({ previousMutationHash, payload: data }))
         .digest("hex");
-      if (previousMutationHash === mutationHash && candidate === expected) {
+      const hasHashEvidence =
+        previousMutationHash !== undefined || candidate !== undefined;
+      if (hasHashEvidence) {
+        if (previousMutationHash !== mutationHash || candidate !== expected)
+          continue;
         mutationHash = candidate;
         projection.mutationHash = candidate;
       }
     }
+    applyEvent(projection, event, usageKeys);
   }
   projection.tasks = Object.fromEntries(
     Object.entries(projection.tasks).sort(([left], [right]) =>
