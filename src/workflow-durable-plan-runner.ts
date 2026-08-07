@@ -134,12 +134,19 @@ export class DurableWorkflowController {
       if (isTerminal(projection.status)) {
         throw new Error("Cannot append work to a terminal workflow");
       }
-      await this.options.store.append(runId, "task_appended", {
-        taskId: mutation.taskId,
-        phaseId: mutation.phaseId,
-        prompt: mutation.prompt,
-        ...(mutation.label ? { label: mutation.label } : {}),
-      });
+      await this.options.store.append(
+        runId,
+        "task_appended",
+        withMutationHash(
+          {
+            taskId: mutation.taskId,
+            phaseId: mutation.phaseId,
+            prompt: mutation.prompt,
+            ...(mutation.label ? { label: mutation.label } : {}),
+          },
+          projection.mutationHash,
+        ),
+      );
       return this.getStatus(runId);
     }
     const currentTask = projection.tasks[mutation.taskId];
@@ -163,9 +170,11 @@ export class DurableWorkflowController {
         : mutation.type === "unblock"
           ? "task_unblocked"
           : "task_skipped";
-    await this.options.store.append(runId, eventType, {
-      taskId: mutation.taskId,
-    });
+    await this.options.store.append(
+      runId,
+      eventType,
+      withMutationHash({ taskId: mutation.taskId }, projection.mutationHash),
+    );
     return this.getStatus(runId);
   }
 
@@ -229,6 +238,17 @@ export class DurableWorkflowController {
     await this.options.store.append(runId, "approval_decided", decision);
     return this.getStatus(runId);
   }
+}
+
+function withMutationHash(
+  payload: Record<string, unknown>,
+  previousMutationHash: string | undefined,
+): Record<string, unknown> {
+  const previous = previousMutationHash ?? "";
+  const mutationHash = createHash("sha256")
+    .update(JSON.stringify({ previousMutationHash: previous, payload }))
+    .digest("hex");
+  return { ...payload, previousMutationHash: previous, mutationHash };
 }
 
 export function workflowDeliveryId(runId: string): string {

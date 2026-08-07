@@ -7,6 +7,7 @@ import type {
   WorkflowApprovalRequest,
   WorkflowApprovalDecision,
 } from "./workflow-run-types";
+import { createHash } from "node:crypto";
 
 export interface WorkflowProjectionTask {
   id: string;
@@ -38,6 +39,7 @@ export interface WorkflowProjection {
     status: "pending" | "approved" | "rejected";
     decision?: WorkflowApprovalDecision;
   };
+  mutationHash?: string;
 }
 
 /** Read-only authority used by status, result, and tree projections. */
@@ -65,6 +67,7 @@ export function projectWorkflowRun(
 
   const appliedEventIds = new Set<string>();
   const usageKeys = new Set<string>();
+  let mutationHash = "";
 
   for (const [ordinal, event] of events.entries()) {
     if (appliedEventIds.has(event.eventId)) continue;
@@ -72,6 +75,21 @@ export function projectWorkflowRun(
     projection.lastEventOrdinal = ordinal;
     projection.revision++;
     applyEvent(projection, event, usageKeys);
+    if (isMutationEvent(event.type)) {
+      const payload = event.payload ?? {};
+      const {
+        previousMutationHash,
+        mutationHash: candidate,
+        ...data
+      } = payload;
+      const expected = createHash("sha256")
+        .update(JSON.stringify({ previousMutationHash, payload: data }))
+        .digest("hex");
+      if (previousMutationHash === mutationHash && candidate === expected) {
+        mutationHash = candidate;
+        projection.mutationHash = candidate;
+      }
+    }
   }
   projection.tasks = Object.fromEntries(
     Object.entries(projection.tasks).sort(([left], [right]) =>
@@ -79,6 +97,15 @@ export function projectWorkflowRun(
     ),
   );
   return projection;
+}
+
+function isMutationEvent(type: string): boolean {
+  return [
+    "task_blocked",
+    "task_unblocked",
+    "task_skipped",
+    "task_appended",
+  ].includes(type);
 }
 
 function applyEvent(
