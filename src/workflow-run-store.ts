@@ -295,6 +295,10 @@ export class WorkflowRunStore {
           ["run_terminal", "run_cancelled"].includes(event.type),
         );
       if (!terminal || record.launch.createdAt > cutoff) continue;
+      const delivered = record.events.some(
+        (event) => event.type === "delivery_receipt",
+      );
+      if (!delivered) continue;
       candidates.push({ runId, createdAt: record.launch.createdAt });
     }
     candidates.sort((left, right) => left.createdAt - right.createdAt);
