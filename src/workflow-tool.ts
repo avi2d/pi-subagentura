@@ -85,6 +85,25 @@ import {
   decideWorkflowRouting,
   parseWorkflowEagerMode,
 } from "./workflow-routing";
+import type { WorkflowProjection } from "./workflow-projection-repository";
+
+function publishWorkflowContinuity(projection: WorkflowProjection): void {
+  const tasks = Object.values(projection.tasks);
+  const globalState = globalThis as typeof globalThis & {
+    __piSubagenturaWorkflowContinuity?: unknown;
+  };
+  globalState.__piSubagenturaWorkflowContinuity = {
+    runId: projection.runId,
+    revision: projection.revision,
+    status: projection.status,
+    phase: projection.currentPhase,
+    tasks: tasks.map((task) => ({ id: task.id, status: task.status })),
+    pendingCount: tasks.filter((task) => task.status === "pending").length,
+    blockedCount: tasks.filter((task) => task.status === "blocked").length,
+    approvalPendingCount: projection.approval?.status === "pending" ? 1 : 0,
+    awaitingBudget: projection.status === "awaiting_budget",
+  };
+}
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -277,6 +296,7 @@ export function registerWorkflowTool(
           isError: true,
         };
       }
+      publishWorkflowContinuity(projection);
       return {
         content: [
           {

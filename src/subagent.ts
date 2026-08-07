@@ -43,6 +43,10 @@ import { registerCancelAllFlows } from "./cancel-all-flows-registration";
 import { renderSubagentNotify } from "./rendering";
 import { registerInteractiveSupervisor } from "./interactive-supervisor-registration";
 import { parseWorkflowEagerMode } from "./workflow-routing";
+import {
+  formatWorkflowContinuity,
+  type WorkflowContinuitySnapshot,
+} from "./workflow-continuity";
 /** @internal Session-rehydration helper used by session-handlers.ts */
 export { rehydrateInteractiveSubagents } from "./rehydrate";
 /**
@@ -128,6 +132,12 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("before_agent_start", (event) => {
     const additions: string[] = [];
+    const continuity = (
+      globalThis as typeof globalThis & {
+        __piSubagenturaWorkflowContinuity?: WorkflowContinuitySnapshot;
+      }
+    ).__piSubagenturaWorkflowContinuity;
+    if (continuity) additions.push(formatWorkflowContinuity(continuity));
     if (pi.getFlag("orchestrator") === true) {
       additions.push(ORCHESTRATOR_SYSTEM_PROMPT);
     }
