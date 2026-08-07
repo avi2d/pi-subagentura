@@ -135,6 +135,9 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
       break;
     case "run_result":
     case "run_terminal": {
+      // Terminal state is append-only. A late or stale terminal event must not
+      // replace the result already committed by the coordinator.
+      if (projection.terminal) return;
       const terminal = (payload.result ?? payload) as WorkflowTerminalResult;
       projection.terminal = terminal;
       projection.status = terminal.status;

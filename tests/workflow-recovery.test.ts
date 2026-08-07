@@ -134,4 +134,29 @@ describe("workflow recovery projection", () => {
       result: "ok",
     });
   });
+
+  it("preserves the first committed terminal result", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "run_terminal", {
+      result: { status: "done", result: "authoritative" },
+    });
+    await store.append("run", "run_terminal", {
+      result: { status: "error", error: { code: "late", message: "stale" } },
+    });
+
+    const projection = await recoverWorkflowRun({ store, owner }, "run");
+    expect(projection.status).toBe("done");
+    expect(projection.terminal).toEqual({
+      status: "done",
+      result: "authoritative",
+    });
+  });
 });
