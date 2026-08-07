@@ -30,7 +30,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [ ] 18. Make stop-on-failure draining and dispatch order deterministic.
 - [x] 19. Deduplicate attempt accounting across replay and crash boundaries.
 - [x] 20. Mark interrupted usage as an explicit lower bound with provenance.
-- [ ] 21. Make terminal task and result ordering stable across reloads.
+- [x] 21. Make terminal task and result ordering stable across reloads.
 
 ## Process-child handshake and adoption
 
