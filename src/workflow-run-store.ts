@@ -33,6 +33,18 @@ export interface WorkflowRunEventLog {
   readonly tornTailBytes: number;
 }
 
+export class WorkflowRunCorruptionError extends Error {
+  public readonly code = "WORKFLOW_RUN_CORRUPT";
+
+  public constructor(
+    public readonly runId: string,
+    cause: unknown,
+  ) {
+    super(`Durable workflow run ${runId} is corrupt`, { cause });
+    this.name = "WorkflowRunCorruptionError";
+  }
+}
+
 function safePart(value: string, label: string): string {
   if (
     !value ||
@@ -148,20 +160,25 @@ export class WorkflowRunStore {
   }
 
   async readRun(runId: string): Promise<WorkflowRunRecord> {
-    const launch = JSON.parse(
-      await readFile(join(this.runDir(runId), "launch.json"), "utf8"),
-    ) as WorkflowRunLaunch;
-    const bytes = await readFile(join(this.runDir(runId), "events.ndjson"));
-    const events: WorkflowEventEnvelope[] = [];
-    let offset = 0;
-    while (offset < bytes.length) {
-      const newline = bytes.indexOf(0x0a, offset);
-      if (newline < 0) break;
-      const line = bytes.subarray(offset, newline).toString("utf8");
-      if (line) events.push(JSON.parse(line) as WorkflowEventEnvelope);
-      offset = newline + 1;
+    try {
+      const launch = JSON.parse(
+        await readFile(join(this.runDir(runId), "launch.json"), "utf8"),
+      ) as WorkflowRunLaunch;
+      const bytes = await readFile(join(this.runDir(runId), "events.ndjson"));
+      const events: WorkflowEventEnvelope[] = [];
+      let offset = 0;
+      while (offset < bytes.length) {
+        const newline = bytes.indexOf(0x0a, offset);
+        if (newline < 0) break;
+        const line = bytes.subarray(offset, newline).toString("utf8");
+        if (line) events.push(JSON.parse(line) as WorkflowEventEnvelope);
+        offset = newline + 1;
+      }
+      return { launch, events };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+      throw new WorkflowRunCorruptionError(runId, error);
     }
-    return { launch, events };
   }
 
   async listRunIds(): Promise<readonly string[]> {
