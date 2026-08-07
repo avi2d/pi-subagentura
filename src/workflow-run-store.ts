@@ -327,6 +327,7 @@ export class WorkflowRunStore {
     olderThanMs: number;
     maxRuns?: number;
   }): Promise<readonly string[]> {
+    await this.assertNamespaceLease();
     if (!Number.isSafeInteger(options.olderThanMs) || options.olderThanMs < 0) {
       throw new Error("Invalid workflow retention age");
     }
