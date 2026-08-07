@@ -153,8 +153,9 @@ export class DurableWorkflowController {
       if (isTerminal(projection.status)) {
         throw new Error("Cannot append work to a terminal workflow");
       }
-      await this.options.store.append(
+      const appendResult = await this.options.store.appendIfCurrent(
         runId,
+        projection.lastEventOrdinal,
         "task_appended",
         withMutationHash(
           {
@@ -166,6 +167,11 @@ export class DurableWorkflowController {
           projection.mutationHash,
         ),
       );
+      if (appendResult.status === "conflict")
+        throw staleWorkflowRevision(
+          mutation.expectedRevision,
+          appendResult.actualLastEventOrdinal + 1,
+        );
       return this.getStatus(runId);
     }
     const currentTask = projection.tasks[mutation.taskId];
@@ -189,11 +195,17 @@ export class DurableWorkflowController {
         : mutation.type === "unblock"
           ? "task_unblocked"
           : "task_skipped";
-    await this.options.store.append(
+    const appendResult = await this.options.store.appendIfCurrent(
       runId,
+      projection.lastEventOrdinal,
       eventType,
       withMutationHash({ taskId: mutation.taskId }, projection.mutationHash),
     );
+    if (appendResult.status === "conflict")
+      throw staleWorkflowRevision(
+        mutation.expectedRevision,
+        appendResult.actualLastEventOrdinal + 1,
+      );
     return this.getStatus(runId);
   }
 
@@ -288,6 +300,12 @@ function withMutationHash(
     .update(JSON.stringify({ previousMutationHash: previous, payload }))
     .digest("hex");
   return { ...payload, previousMutationHash: previous, mutationHash };
+}
+
+function staleWorkflowRevision(expected: number, current: number): Error {
+  return new Error(
+    `Workflow plan revision is stale: expected ${expected}, current ${current}`,
+  );
 }
 
 export function workflowDeliveryId(runId: string): string {
@@ -684,8 +702,10 @@ async function commitCancelledRun(
       result: { status: "cancelled" },
     });
   const afterResult = await recoverWorkflowRun({ store, owner }, runId);
-  if (afterResult.status !== "cancelled")
-    await store.append(runId, "run_cancelled", {});
+  const hasCancellationMarker = (await store.readRun(runId)).events.some(
+    (event) => event.type === "run_cancelled",
+  );
+  if (!hasCancellationMarker) await store.append(runId, "run_cancelled", {});
   await appendDeliveryIntent(store, owner, runId);
   return recoverWorkflowRun({ store, owner }, runId);
 }

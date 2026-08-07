@@ -20,6 +20,10 @@ import type {
 import { validateWorkflowRunId } from "./workflow-run-types";
 import { WorkflowNamespaceLease } from "./workflow-lease";
 
+export type WorkflowConditionalAppendResult =
+  | { status: "appended"; receipt: WorkflowAppendReceipt }
+  | { status: "conflict"; actualLastEventOrdinal: number };
+
 export interface WorkflowRunStoreOptions {
   rootDir: string;
   owner: WorkflowOwnerIdentity;
@@ -223,6 +227,7 @@ export class WorkflowRunStore {
     type: T,
     payload: P,
     runEpoch = 0,
+    expectedLastEventOrdinal?: number,
   ): Promise<WorkflowAppendReceipt> {
     await this.assertNamespaceLease();
     const dir = this.runDir(runId);
@@ -244,6 +249,14 @@ export class WorkflowRunStore {
       await this.assertRegularFile(path);
       const before = await readFile(path);
       const completeBytes = lastCompleteLineBytes(before);
+      const actualLastEventOrdinal =
+        countCompleteLines(before.subarray(0, completeBytes)) - 1;
+      if (
+        expectedLastEventOrdinal !== undefined &&
+        expectedLastEventOrdinal !== actualLastEventOrdinal
+      ) {
+        throw new WorkflowConditionalAppendConflict(actualLastEventOrdinal);
+      }
       const maxEventBytes = this.options.maxEventBytes;
       const maxRunBytes = this.options.maxRunBytes;
       const maxOwnerBytes = this.options.maxOwnerBytes;
@@ -319,6 +332,32 @@ export class WorkflowRunStore {
     });
   }
 
+  async appendIfCurrent<T extends string, P>(
+    runId: string,
+    expectedLastEventOrdinal: number,
+    type: T,
+    payload: P,
+    runEpoch = 0,
+  ): Promise<WorkflowConditionalAppendResult> {
+    try {
+      const receipt = await this.append(
+        runId,
+        type,
+        payload,
+        runEpoch,
+        expectedLastEventOrdinal,
+      );
+      return { status: "appended", receipt };
+    } catch (error) {
+      if (error instanceof WorkflowConditionalAppendConflict)
+        return {
+          status: "conflict",
+          actualLastEventOrdinal: error.actualLastEventOrdinal,
+        };
+      throw error;
+    }
+  }
+
   async readRun(runId: string): Promise<WorkflowRunRecord> {
     try {
       await this.assertRegularDirectory(this.runDir(runId));
@@ -389,7 +428,7 @@ export class WorkflowRunStore {
       const terminal = [...record.events]
         .reverse()
         .find((event) =>
-          ["run_terminal", "run_cancelled"].includes(event.type),
+          ["run_terminal", "run_cancelled", "run_result"].includes(event.type),
         );
       if (!terminal || record.launch.createdAt > cutoff) continue;
       const delivered = record.events.some(
@@ -441,6 +480,12 @@ export class WorkflowRunStore {
       release();
       if (this.locks.get(runId) === current) this.locks.delete(runId);
     }
+  }
+}
+
+class WorkflowConditionalAppendConflict extends Error {
+  public constructor(public readonly actualLastEventOrdinal: number) {
+    super("Workflow journal revision conflict");
   }
 }
 
