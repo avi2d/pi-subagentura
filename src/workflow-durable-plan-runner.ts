@@ -314,11 +314,18 @@ export async function runDurableWorkflowPlan(
     return next;
   };
   let projection: WorkflowProjection;
+  const controller = new DurableWorkflowController({ store, owner });
   // Validate before recovery so malformed resume input cannot touch an
   // authoritative run or dispatch work.
   validateWorkflowPlan({ ...plan, schemaVersion: 1 });
   try {
-    projection = await recoverWorkflowRun({ store, owner }, runId);
+    const recovered = await controller.getStatus(runId);
+    if (!recovered) {
+      const missing = new Error("Workflow run not found");
+      Object.assign(missing, { code: "ENOENT" });
+      throw missing;
+    }
+    projection = recovered;
   } catch (error) {
     if (!isMissingRun(error)) throw error;
     // Do not leave an orphaned run directory for an invalid new plan.
@@ -330,8 +337,17 @@ export async function runDurableWorkflowPlan(
       resumePolicy: options.resumePolicy ?? "manual",
       owner,
     });
-    await store.append(runId, "run_created", {});
-    projection = await recoverWorkflowRun({ store, owner }, runId);
+    await store.append(runId, "run_created", {
+      tasks: plan.phases.flatMap((phase) =>
+        phase.tasks.map((task) => ({
+          id: task.id,
+          phaseId: phase.id,
+          prompt: task.prompt,
+          ...(task.label ? { label: task.label } : {}),
+        })),
+      ),
+    });
+    projection = (await controller.getStatus(runId)) as WorkflowProjection;
   }
 
   if (projection.status === "interrupted" && !options.resume) {
@@ -372,7 +388,7 @@ export async function runDurableWorkflowPlan(
       continue;
     }
     for (const task of tasks) {
-      projection = await recoverWorkflowRun({ store, owner }, runId);
+      projection = (await controller.getStatus(runId)) as WorkflowProjection;
       const existing = projection.tasks[task.id];
       if (existing?.status === "succeeded" || existing?.status === "skipped")
         continue;
@@ -447,52 +463,82 @@ export async function runDurableWorkflowPlan(
   const declaredTaskIds = new Set(
     plan.phases.flatMap((phase) => phase.tasks.map((task) => task.id)),
   );
-  for (const task of Object.values(projection.tasks)) {
-    if (
-      declaredTaskIds.has(task.id) ||
-      !task.prompt ||
-      task.status === "succeeded" ||
-      task.status === "skipped" ||
-      task.status === "blocked"
-    )
-      continue;
-    const attempt = task.attempt + 1;
-    await store.append(runId, "task_started", {
-      taskId: task.id,
-      attempt,
-      phaseId: task.phaseId ?? "appended",
+  const executedAppended = new Set<string>();
+  while (true) {
+    projection = (await controller.getStatus(runId)) as WorkflowProjection;
+    const appended = Object.values(projection.tasks).filter((task) => {
+      return (
+        !declaredTaskIds.has(task.id) &&
+        !executedAppended.has(task.id) &&
+        task.prompt &&
+        task.status !== "succeeded" &&
+        task.status !== "skipped" &&
+        task.status !== "blocked"
+      );
     });
-    const result = await options.runAgent({
-      prompt: task.prompt,
-      isolation: "in-process",
-      label: task.label ?? task.id,
-      signal: options.signal,
-    });
-    await store.append(runId, "usage_observed", {
-      input: result.usage.input,
-      output: result.usage.output,
-      taskId: task.id,
-      attempt,
-    });
-    if (result.isError) {
-      const message = result.errorMessage ?? "Task failed";
-      await store.append(runId, "task_failed", {
+    if (appended.length === 0) break;
+    for (const task of appended) {
+      executedAppended.add(task.id);
+      if (
+        declaredTaskIds.has(task.id) ||
+        !task.prompt ||
+        task.status === "succeeded" ||
+        task.status === "skipped" ||
+        task.status === "blocked"
+      )
+        continue;
+      const attempt = task.attempt + 1;
+      await store.append(runId, "task_started", {
         taskId: task.id,
         attempt,
-        error: message,
+        phaseId: task.phaseId ?? "appended",
       });
-      await store.append(runId, "run_result", {
-        result: { status: "error", error: { code: "task_failed", message } },
+      let result: SubagentResult;
+      try {
+        result = await options.runAgent({
+          prompt: task.prompt,
+          isolation: "in-process",
+          label: task.label ?? task.id,
+          signal: options.signal,
+        });
+      } catch (error) {
+        if (options.signal?.aborted) {
+          await store.append(runId, "run_result", {
+            result: { status: "cancelled" },
+          });
+          await store.append(runId, "run_cancelled", {});
+          await appendDeliveryIntent(store, owner, runId);
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
+        }
+        await store.append(runId, "run_interrupted", {});
+        throw error;
+      }
+      await store.append(runId, "usage_observed", {
+        input: result.usage.input,
+        output: result.usage.output,
+        taskId: task.id,
+        attempt,
       });
-      await store.append(runId, "run_terminal", {});
-      await appendDeliveryIntent(store, owner, runId);
-      return publish(await recoverWorkflowRun({ store, owner }, runId));
+      if (result.isError) {
+        const message = result.errorMessage ?? "Task failed";
+        await store.append(runId, "task_failed", {
+          taskId: task.id,
+          attempt,
+          error: message,
+        });
+        await store.append(runId, "run_result", {
+          result: { status: "error", error: { code: "task_failed", message } },
+        });
+        await store.append(runId, "run_terminal", {});
+        await appendDeliveryIntent(store, owner, runId);
+        return publish(await recoverWorkflowRun({ store, owner }, runId));
+      }
+      await store.append(runId, "task_succeeded", {
+        taskId: task.id,
+        attempt,
+        result: result.output,
+      });
     }
-    await store.append(runId, "task_succeeded", {
-      taskId: task.id,
-      attempt,
-      result: result.output,
-    });
   }
 
   await store.append(runId, "run_result", {

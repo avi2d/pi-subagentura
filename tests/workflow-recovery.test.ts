@@ -134,15 +134,7 @@ describe("workflow recovery projection", () => {
       resumePolicy: "manual",
       owner,
     });
-    const other = { ...owner, leaseToken: "other" };
-    const otherStore = new WorkflowRunStore({ rootDir: root, owner: other });
-    await otherStore.createRun({
-      runId: "other",
-      planRevision: 1,
-      resumePolicy: "manual",
-      owner: other,
-    });
-
+    const other = { ...owner, ownerId: "other-owner", leaseToken: "other" };
     expect(
       (await enumerateRecoverableWorkflowRuns({ store, owner })).map(
         (run) => run.runId,
