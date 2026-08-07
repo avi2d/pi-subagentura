@@ -7,6 +7,7 @@ import {
   enumerateRecoverableWorkflowRuns,
   recoverWorkflowRun,
 } from "../src/workflow-recovery";
+import { DurableWorkflowController } from "../src/workflow-durable-plan-runner";
 import { projectWorkflowRun } from "../src/workflow-projection-repository";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
@@ -182,5 +183,33 @@ describe("workflow recovery projection", () => {
       status: "done",
     });
     await expect(repository.list()).resolves.toHaveLength(1);
+  });
+
+  it("returns durable results and makes cancellation idempotent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "run_started", {});
+    const controller = new DurableWorkflowController({ store, owner });
+
+    await expect(controller.getResult("run")).resolves.toBeUndefined();
+    await expect(controller.cancel("run")).resolves.toMatchObject({
+      status: "cancelled",
+      terminal: { status: "cancelled" },
+    });
+    const eventsAfterCancel = (await store.readRun("run")).events.length;
+    await expect(controller.cancel("run")).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    expect((await store.readRun("run")).events.length).toBe(eventsAfterCancel);
+    await expect(controller.getResult("run")).resolves.toEqual({
+      status: "cancelled",
+    });
   });
 });
