@@ -52,6 +52,35 @@ describe("WorkflowRunStore", () => {
     );
   });
 
+  it("prunes only bounded terminal runs and retains active runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "old-terminal",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("old-terminal", "run_terminal", {
+      result: { status: "done" },
+    });
+    await store.createRun({
+      runId: "active",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+
+    await expect(
+      store.pruneTerminalRuns({ olderThanMs: 0, maxRuns: 1 }),
+    ).resolves.toEqual(["old-terminal"]);
+    await expect(store.readRun("old-terminal")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(store.readRun("active")).resolves.toBeDefined();
+  });
+
   it("uses byte offsets and complete-line ordinals for unicode events", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
     dirs.push(root);

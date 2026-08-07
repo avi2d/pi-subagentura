@@ -3,6 +3,7 @@ import {
   open,
   readFile,
   readdir,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -203,6 +204,42 @@ export class WorkflowRunStore {
         }
       })
       .sort();
+  }
+
+  async pruneTerminalRuns(options: {
+    olderThanMs: number;
+    maxRuns?: number;
+  }): Promise<readonly string[]> {
+    if (!Number.isSafeInteger(options.olderThanMs) || options.olderThanMs < 0) {
+      throw new Error("Invalid workflow retention age");
+    }
+    if (
+      options.maxRuns !== undefined &&
+      (!Number.isSafeInteger(options.maxRuns) || options.maxRuns < 0)
+    ) {
+      throw new Error("Invalid workflow retention limit");
+    }
+    const cutoff = Date.now() - options.olderThanMs;
+    const candidates: Array<{ runId: string; createdAt: number }> = [];
+    for (const runId of await this.listRunIds()) {
+      const record = await this.readRun(runId);
+      const terminal = [...record.events]
+        .reverse()
+        .find((event) =>
+          ["run_terminal", "run_cancelled"].includes(event.type),
+        );
+      if (!terminal || record.launch.createdAt > cutoff) continue;
+      candidates.push({ runId, createdAt: record.launch.createdAt });
+    }
+    candidates.sort((left, right) => left.createdAt - right.createdAt);
+    const selected =
+      options.maxRuns === undefined
+        ? candidates
+        : candidates.slice(0, options.maxRuns);
+    for (const candidate of selected) {
+      await rm(this.runDir(candidate.runId), { recursive: true, force: true });
+    }
+    return selected.map((candidate) => candidate.runId);
   }
 
   async readEventLog(runId: string): Promise<WorkflowRunEventLog> {
