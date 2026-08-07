@@ -28,7 +28,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [ ] 16. Cover committed/running/undispatched sibling crash recovery.
 - [ ] 17. Add a namespace-shared dispatcher with process and in-process caps.
 - [ ] 18. Make stop-on-failure draining and dispatch order deterministic.
-- [ ] 19. Deduplicate attempt accounting across replay and crash boundaries.
+- [x] 19. Deduplicate attempt accounting across replay and crash boundaries.
 - [ ] 20. Mark interrupted usage as an explicit lower bound with provenance.
 - [ ] 21. Make terminal task and result ordering stable across reloads.
 
