@@ -1,5 +1,6 @@
 import {
   mkdir,
+  lstat,
   open,
   readFile,
   readdir,
@@ -106,6 +107,12 @@ export class WorkflowRunStore {
     await lease.assertHeld();
   }
 
+  private async assertRegularFile(path: string): Promise<void> {
+    const info = await lstat(path);
+    if (!info.isFile())
+      throw new Error(`Workflow storage path is not regular: ${path}`);
+  }
+
   async createRun(
     input: Omit<WorkflowRunLaunch, "schemaVersion" | "createdAt">,
   ): Promise<WorkflowRunLaunch> {
@@ -166,6 +173,7 @@ export class WorkflowRunStore {
       ) as WorkflowRunLaunch;
       assertSameOwner(launch.owner, this.options.owner);
       const path = join(dir, "events.ndjson");
+      await this.assertRegularFile(path);
       const before = await readFile(path);
       const completeBytes = lastCompleteLineBytes(before);
       const maxEventBytes = this.options.maxEventBytes;
@@ -210,6 +218,8 @@ export class WorkflowRunStore {
 
   async readRun(runId: string): Promise<WorkflowRunRecord> {
     try {
+      await this.assertRegularFile(join(this.runDir(runId), "launch.json"));
+      await this.assertRegularFile(join(this.runDir(runId), "events.ndjson"));
       const launch = JSON.parse(
         await readFile(join(this.runDir(runId), "launch.json"), "utf8"),
       ) as WorkflowRunLaunch;
