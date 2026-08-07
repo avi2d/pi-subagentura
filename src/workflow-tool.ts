@@ -2430,6 +2430,34 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-plan-edit", {
+      description: "Edit future durable workflow work using a revision fence.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const text = args.trim();
+        if (!text) {
+          const usage =
+            "Usage: /workflow-plan-edit <runId> <revision> <block|unblock|skip> <taskId>";
+          ctx.ui.notify(usage);
+          sendCommandMessage(usage);
+          return;
+        }
+        const parts = text.split(/\s+/);
+        const [runId, revision, operation, taskId] = parts;
+        if (operation === "append") {
+          const appendArgs = parts.slice(1).join(" ");
+          ctx.ui.notify("Use /workflow-plan-append for append edits.");
+          sendCommandMessage(
+            `Use /workflow-plan-append ${runId} ${appendArgs}`,
+          );
+          return;
+        }
+        ctx.ui.notify("Use /workflow-plan-mutate for this edit.");
+        sendCommandMessage(
+          `/workflow-plan-mutate ${runId} ${revision} ${operation} ${taskId}`,
+        );
+      },
+    });
+
     pi.registerCommand("workflow-plan-export", {
       description: "Export a durable workflow projection as JSON.",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
