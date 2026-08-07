@@ -26,6 +26,12 @@ export interface WorkflowProjection {
   lastEventOrdinal: number;
 }
 
+/** Read-only authority used by status, result, and tree projections. */
+export interface WorkflowProjectionRepository {
+  get(runId: string): Promise<WorkflowProjection | undefined>;
+  list(): Promise<readonly WorkflowProjection[]>;
+}
+
 type Event = WorkflowEventEnvelope<string, any>;
 
 export function projectWorkflowRun(

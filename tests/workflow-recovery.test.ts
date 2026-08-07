@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  DurableWorkflowProjectionRepository,
   enumerateRecoverableWorkflowRuns,
   recoverWorkflowRun,
 } from "../src/workflow-recovery";
@@ -158,5 +159,28 @@ describe("workflow recovery projection", () => {
       status: "done",
       result: "authoritative",
     });
+  });
+
+  it("reads projections through the owner-scoped repository", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "run_terminal", {
+      result: { status: "done", result: "complete" },
+    });
+
+    const repository = new DurableWorkflowProjectionRepository(store, owner);
+    await expect(repository.get("missing")).resolves.toBeUndefined();
+    await expect(repository.get("run")).resolves.toMatchObject({
+      runId: "run",
+      status: "done",
+    });
+    await expect(repository.list()).resolves.toHaveLength(1);
   });
 });
