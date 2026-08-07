@@ -6,6 +6,7 @@ import {
   createWorkflowReplayRequest,
   durableWorkflowDigest,
   assertWorkflowReplayRequestMatches,
+  assertWorkflowReplayResponseDigest,
   persistWorkflowDefinitionBlob,
   readWorkflowDefinitionBlob,
   replayWorkflowResponses,
@@ -61,6 +62,12 @@ describe("workflow durable replay", () => {
       },
     ];
     expect(replayWorkflowResponses([request], responses)).toEqual(responses);
+    expect(() =>
+      assertWorkflowReplayResponseDigest({
+        ...responses[0],
+        payload: { changed: true },
+      }),
+    ).toThrow("response diverged");
   });
 
   it("fails boundedly on missing or unknown responses", () => {

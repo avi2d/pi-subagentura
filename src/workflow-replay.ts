@@ -160,3 +160,22 @@ export function assertWorkflowReplayRequestMatches(
     throw new WorkflowReplayDivergedError("Workflow replay request diverged");
   }
 }
+
+export function assertWorkflowReplayResponseDigest(
+  response: WorkflowReplayResponse,
+): void {
+  if (response.kind === "null") {
+    if (response.valueDigest !== durableWorkflowDigest(null)) {
+      throw new WorkflowReplayDivergedError(
+        "Workflow replay response diverged",
+      );
+    }
+    return;
+  }
+  if (
+    response.payload !== undefined &&
+    durableWorkflowDigest(response.payload) !== response.valueDigest
+  ) {
+    throw new WorkflowReplayDivergedError("Workflow replay response diverged");
+  }
+}
