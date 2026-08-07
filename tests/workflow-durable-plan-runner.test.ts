@@ -152,4 +152,26 @@ describe("durable sequential plan runner", () => {
     expect(statuses.at(-1)).toBe("done");
     expect(statuses.length).toBeGreaterThan(0);
   });
+
+  it("commits cancellation as a terminal result before returning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const signal = new AbortController();
+    signal.abort();
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "cancelled-run",
+      plan,
+      signal: signal.signal,
+      runAgent: async () => {
+        throw new Error("must not dispatch");
+      },
+    });
+
+    expect(result.status).toBe("cancelled");
+    expect(result.terminal).toMatchObject({ status: "cancelled" });
+  });
 });
