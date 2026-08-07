@@ -16,6 +16,23 @@ export interface WorkflowProcessLaunchIntent {
   readonly fallbackMode: "none" | "process_unavailable";
 }
 
+export interface WorkflowProcessLaunchDispatch {
+  readonly schemaVersion: 1;
+  readonly launchMarker: string;
+  readonly nonce: string;
+  readonly attemptId: string;
+  readonly epoch: number;
+  readonly dispatchedAt: number;
+}
+
+export interface WorkflowProcessChildStartedEvidence {
+  readonly schemaVersion: 1;
+  readonly launchMarker: string;
+  readonly nonce: string;
+  readonly attemptId: string;
+  readonly epoch: number;
+}
+
 export interface WorkflowProcessLaunchIntentInput {
   runId: string;
   operationId: string;
@@ -97,4 +114,44 @@ export async function readWorkflowProcessLaunchIntent(
     throw new Error("Invalid workflow process launch intent");
   }
   return intent as WorkflowProcessLaunchIntent;
+}
+
+export function validateWorkflowProcessChildStarted(
+  intent: WorkflowProcessLaunchIntent,
+  evidence: WorkflowProcessChildStartedEvidence,
+): void {
+  if (
+    evidence.schemaVersion !== 1 ||
+    evidence.launchMarker !== intent.launchMarker ||
+    evidence.nonce !== intent.nonce ||
+    evidence.attemptId !== intent.attemptId ||
+    evidence.epoch !== intent.epoch
+  ) {
+    throw new Error("Stale workflow process child evidence");
+  }
+}
+
+export async function persistWorkflowProcessLaunchDispatch(
+  root: string,
+  intent: WorkflowProcessLaunchIntent,
+): Promise<string> {
+  const dir = join(root, "process-attempts", intent.runId);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${intent.attemptId}.dispatched.json`);
+  const dispatch: WorkflowProcessLaunchDispatch = {
+    schemaVersion: 1,
+    launchMarker: intent.launchMarker,
+    nonce: intent.nonce,
+    attemptId: intent.attemptId,
+    epoch: intent.epoch,
+    dispatchedAt: Date.now(),
+  };
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(dispatch)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return path;
 }
