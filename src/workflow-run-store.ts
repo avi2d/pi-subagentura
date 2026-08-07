@@ -25,6 +25,7 @@ export interface WorkflowRunStoreOptions {
   owner: WorkflowOwnerIdentity;
   maxEventBytes?: number;
   maxRunBytes?: number;
+  maxRuns?: number;
 }
 
 export interface WorkflowRunRecord {
@@ -126,6 +127,18 @@ export class WorkflowRunStore {
   ): Promise<WorkflowRunLaunch> {
     await this.assertNamespaceLease();
     validateWorkflowRunId(input.runId);
+    if (
+      this.options.maxRuns !== undefined &&
+      (!Number.isSafeInteger(this.options.maxRuns) || this.options.maxRuns <= 0)
+    ) {
+      throw new Error("Invalid workflow run count quota");
+    }
+    if (
+      this.options.maxRuns !== undefined &&
+      (await this.listRunIds()).length >= this.options.maxRuns
+    ) {
+      throw new Error("Workflow run count quota exceeded");
+    }
     const launch: WorkflowRunLaunch = {
       ...input,
       schemaVersion: 1,
