@@ -55,5 +55,26 @@ describe("workflow eager routing", () => {
         childContext: true,
       }),
     ).toEqual({ kind: "direct", reason: "child_context" });
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "refactor it",
+        hasActiveWorkflow: true,
+      }),
+    ).toEqual({ kind: "direct", reason: "active_workflow" });
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "refactor it",
+        awaitingUserInput: true,
+      }),
+    ).toEqual({ kind: "direct", reason: "awaiting_user_input" });
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "refactor it",
+        planOnly: true,
+      }),
+    ).toEqual({ kind: "direct", reason: "plan_only" });
   });
 });
