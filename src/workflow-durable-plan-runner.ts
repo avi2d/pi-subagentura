@@ -1,5 +1,5 @@
 import type { SubagentResult } from "./helpers";
-import type { WorkflowPlan } from "./workflow-plan";
+import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import type { WorkflowProjection } from "./workflow-projection-repository";
 import { recoverWorkflowRun } from "./workflow-recovery";
 import { WorkflowRunStore } from "./workflow-run-store";
@@ -34,6 +34,9 @@ export async function runDurableWorkflowPlan(
     projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
     if (!isMissingRun(error)) throw error;
+    // Reject malformed plans before creating the durable run or dispatching
+    // work. This keeps invalid input from leaving an orphaned run directory.
+    validateWorkflowPlan(plan);
     await store.createRun({
       runId,
       planRevision: plan.schemaVersion,

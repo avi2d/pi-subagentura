@@ -207,4 +207,27 @@ describe("durable sequential plan runner", () => {
     expect(result.status).toBe("cancelled");
     expect(result.terminal).toMatchObject({ status: "cancelled" });
   });
+
+  it("rejects an invalid plan before creating a durable run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const invalidPlan = {
+      ...plan,
+      phases: [{ ...plan.phases[0], tasks: [{ id: "bad/id", prompt: "bad" }] }],
+    } as WorkflowPlan;
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "invalid-run",
+        plan: invalidPlan,
+        runAgent: async () => {
+          throw new Error("must not dispatch");
+        },
+      }),
+    ).rejects.toThrow("Invalid or duplicate task id");
+    await expect(store.listRunIds()).resolves.toEqual([]);
+  });
 });
