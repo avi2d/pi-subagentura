@@ -71,6 +71,12 @@ export class WorkflowNamespaceLease {
       if (!current || this.now() - current.acquiredAt < this.staleAfterMs) {
         throw new Error("Workflow namespace lease is held");
       }
+      if (
+        current.processId !== undefined &&
+        isProcessAlive(current.processId)
+      ) {
+        throw new Error("Workflow namespace lease is held by a live process");
+      }
       const replacement = this.record(current.epoch + 1);
       await rm(this.path, { force: true });
       try {
@@ -159,5 +165,18 @@ export class WorkflowNamespaceLease {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw new Error("Workflow namespace lease is corrupt", { cause: error });
     }
+  }
+}
+
+function isProcessAlive(processId: number): boolean {
+  if (!Number.isSafeInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    throw error;
   }
 }
