@@ -320,7 +320,7 @@ export async function runDurableWorkflowPlan(
             attempt,
             error: result.errorMessage ?? "Task failed",
           });
-          await store.append(runId, "run_terminal", {
+          await store.append(runId, "run_result", {
             result: {
               status: "error",
               error: {
@@ -329,6 +329,7 @@ export async function runDurableWorkflowPlan(
               },
             },
           });
+          await store.append(runId, "run_terminal", {});
           await appendDeliveryIntent(store, owner, runId);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
@@ -349,9 +350,10 @@ export async function runDurableWorkflowPlan(
     }
   }
 
-  await store.append(runId, "run_terminal", {
+  await store.append(runId, "run_result", {
     result: { status: "done", result: "Workflow completed" },
   });
+  await store.append(runId, "run_terminal", {});
   await appendDeliveryIntent(store, owner, runId);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
@@ -438,7 +440,7 @@ async function runDurableParallelPhase(
       await options.store.append(options.runId, "run_cancelled", {});
       return false;
     }
-    await options.store.append(options.runId, "run_terminal", {
+    await options.store.append(options.runId, "run_result", {
       result: {
         status: "error",
         error: {
@@ -450,6 +452,7 @@ async function runDurableParallelPhase(
         },
       },
     });
+    await options.store.append(options.runId, "run_terminal", {});
     await appendDeliveryIntent(options.store, options.owner, options.runId);
     // The coordinator has already committed the terminal result. Returning
     // the projection keeps the public result aligned with durable state.
