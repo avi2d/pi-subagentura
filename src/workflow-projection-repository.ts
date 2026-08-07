@@ -3,6 +3,7 @@ import type {
   WorkflowRunLaunch,
   WorkflowRunStatus,
   WorkflowTerminalResult,
+  WorkflowDeliveryIntent,
 } from "./workflow-run-types";
 
 export interface WorkflowProjectionTask {
@@ -24,6 +25,7 @@ export interface WorkflowProjection {
   terminal?: WorkflowTerminalResult;
   usage: { input: number; output: number };
   lastEventOrdinal: number;
+  delivery?: WorkflowDeliveryIntent;
 }
 
 /** Read-only authority used by status, result, and tree projections. */
@@ -69,7 +71,10 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
   if (
     isTerminal(projection.status) &&
     event.type !== "run_result" &&
-    event.type !== "run_terminal"
+    event.type !== "run_terminal" &&
+    event.type !== "delivery_intent" &&
+    event.type !== "delivery_dispatched" &&
+    event.type !== "delivery_receipt"
   )
     return;
   switch (event.type) {
@@ -149,6 +154,24 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
       projection.status = terminal.status;
       break;
     }
+    case "delivery_intent":
+      if (!projection.delivery) {
+        projection.delivery = {
+          deliveryId: String(payload.deliveryId),
+          kind: "terminal",
+          status: "pending",
+          message: String(payload.message ?? ""),
+        };
+      }
+      break;
+    case "delivery_dispatched":
+      if (projection.delivery?.deliveryId === String(payload.deliveryId))
+        projection.delivery.status = "dispatched";
+      break;
+    case "delivery_receipt":
+      if (projection.delivery?.deliveryId === String(payload.deliveryId))
+        projection.delivery.status = "delivered";
+      break;
   }
 }
 

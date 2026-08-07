@@ -7,7 +7,10 @@ import {
   enumerateRecoverableWorkflowRuns,
   recoverWorkflowRun,
 } from "../src/workflow-recovery";
-import { DurableWorkflowController } from "../src/workflow-durable-plan-runner";
+import {
+  DurableWorkflowController,
+  workflowDeliveryId,
+} from "../src/workflow-durable-plan-runner";
 import { projectWorkflowRun } from "../src/workflow-projection-repository";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
@@ -211,5 +214,41 @@ describe("workflow recovery projection", () => {
     await expect(controller.getResult("run")).resolves.toEqual({
       status: "cancelled",
     });
+  });
+
+  it("persists one deterministic terminal delivery intent and receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const controller = new DurableWorkflowController({ store, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "run_terminal", {
+      result: { status: "done", result: "complete" },
+    });
+    await store.append("run", "delivery_intent", {
+      deliveryId: workflowDeliveryId("run"),
+      message: "Workflow run done",
+    });
+
+    const pending = await controller.getStatus("run");
+    expect(pending?.delivery).toMatchObject({
+      deliveryId: workflowDeliveryId("run"),
+      status: "pending",
+    });
+    await controller.acknowledgeDelivery("run", workflowDeliveryId("run"));
+    await controller.acknowledgeDelivery("run", workflowDeliveryId("run"));
+    expect((await controller.getStatus("run"))?.delivery?.status).toBe(
+      "delivered",
+    );
+    expect(
+      (await store.readRun("run")).events.filter(
+        (event) => event.type === "delivery_receipt",
+      ),
+    ).toHaveLength(1);
   });
 });

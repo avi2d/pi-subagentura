@@ -63,3 +63,10 @@ export interface WorkflowTerminalResult {
   result?: unknown;
   error?: { code: string; message: string };
 }
+
+export interface WorkflowDeliveryIntent {
+  deliveryId: string;
+  kind: "terminal";
+  status: "pending" | "dispatched" | "delivered";
+  message: string;
+}
