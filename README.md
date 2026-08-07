@@ -113,24 +113,24 @@ See the [workflow guide](./docs/workflows.md) and
 
 These commands are intended for people at the Pi prompt.
 
-| Command                 | Purpose                                                           |
-| ----------------------- | ----------------------------------------------------------------- |
-| `/workflow`             | Create, save, and run a reusable workflow from a task             |
-| `/workflows`            | Select and run a saved workflow                                   |
-| `/list-workflows`       | Alias for `/workflows`                                            |
-| `/workflow-status`      | List workflow jobs and their live or terminal status              |
-| `/workflow-plan`        | View a durable workflow projection and revision                   |
-| `/workflow-plan-append` | Append a future task with an explicit revision fence              |
-| `/workflow-plan-mutate` | Block, unblock, or skip future work with a revision fence         |
-| `/workflow-plan-edit`   | Apply a fenced durable plan edit                                  |
-| `/workflow-plan-export` | Export a durable workflow projection as JSON                      |
-| `/workflow-approval`    | Approve or reject a pending durable workflow request              |
-| `/workflow-budget`      | Pause or resume a durable workflow budget gate                    |
-| `/workflow-route`       | Evaluate opt-in complex-task workflow routing                     |
-| `/workflow-tree`        | Open the specialized workflow progress tree                       |
-| `/subagents`            | Supervise all async work (`Ctrl+Alt+A`)                           |
-| `/delete-workflow`      | Delete a saved workflow by name or picker                         |
-| `/cancel-all-flows`     | Cancel active jobs, workflows, and running interactive sub-agents |
+| Command                 | Purpose                                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| `/workflow`             | Create, save, and run a reusable workflow from a task                                                  |
+| `/workflows`            | Select and run a saved workflow                                                                        |
+| `/list-workflows`       | Alias for `/workflows`                                                                                 |
+| `/workflow-status`      | List workflow jobs and their live or terminal status                                                   |
+| `/workflow-plan`        | Create or view a durable workflow projection and revision; use `create <task>` for host-owned creation |
+| `/workflow-plan-append` | Append a future task with an explicit revision fence                                                   |
+| `/workflow-plan-mutate` | Block, unblock, or skip future work with a revision fence                                              |
+| `/workflow-plan-edit`   | Apply a fenced durable plan edit                                                                       |
+| `/workflow-plan-export` | Export a durable workflow projection as JSON                                                           |
+| `/workflow-approval`    | Approve or reject a pending durable workflow request                                                   |
+| `/workflow-budget`      | Pause or resume a durable workflow budget gate                                                         |
+| `/workflow-route`       | Evaluate opt-in complex-task workflow routing                                                          |
+| `/workflow-tree`        | Open the specialized workflow progress tree                                                            |
+| `/subagents`            | Supervise all async work (`Ctrl+Alt+A`)                                                                |
+| `/delete-workflow`      | Delete a saved workflow by name or picker                                                              |
+| `/cancel-all-flows`     | Cancel active jobs, workflows, and running interactive sub-agents                                      |
 
 ## Agent-facing tools
 
