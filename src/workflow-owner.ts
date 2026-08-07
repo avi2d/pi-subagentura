@@ -1,6 +1,7 @@
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
 import { WorkflowRunStore } from "./workflow-run-store";
 import { DurableWorkflowController } from "./workflow-durable-plan-runner";
+import type { SessionScope } from "./session-scope";
 
 export interface WorkflowOwnerIdentityInput {
   projectKey: string;
@@ -48,6 +49,18 @@ export function createDurableWorkflowController(
   input: WorkflowOwnerIdentityInput,
 ): DurableWorkflowController {
   const owner = createWorkflowOwnerIdentity(input);
+  return new DurableWorkflowController({
+    store: new WorkflowRunStore({ rootDir, owner }),
+    owner,
+  });
+}
+
+export function durableWorkflowControllerForSession(
+  rootDir: string,
+  scope: SessionScope,
+): DurableWorkflowController | undefined {
+  const owner = scope.durableWorkflowOwner;
+  if (!owner) return undefined;
   return new DurableWorkflowController({
     store: new WorkflowRunStore({ rootDir, owner }),
     owner,
