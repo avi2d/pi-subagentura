@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import { realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { abortableWait } from "./abortable-wait";
 import {
   debugLog,
@@ -2338,9 +2338,59 @@ export function registerWorkflowTool(
     });
 
     pi.registerCommand("workflow-plan", {
-      description: "View a durable workflow projection by run ID.",
+      description: "Create or view a durable workflow projection.",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
-        const runId = args.trim();
+        const input = args.trim();
+        if (input.startsWith("create ")) {
+          const task = input.slice("create ".length).trim();
+          const runId = `durable-${randomUUID()}`;
+          if (!task) {
+            ctx.ui.notify("Usage: /workflow-plan create <task>");
+            return;
+          }
+          if (!sessionScope) {
+            ctx.ui.notify("Durable workflow storage is unavailable.");
+            return;
+          }
+          try {
+            const result = await runDurableWorkflowForSession(
+              process.cwd(),
+              sessionScope,
+              {
+                runId,
+                plan: {
+                  schemaVersion: 1,
+                  name: "host-plan",
+                  phases: [
+                    {
+                      id: "phase-1",
+                      mode: "sequential",
+                      tasks: [
+                        {
+                          id: "task-1",
+                          prompt: task,
+                          isolation: "in-process",
+                        },
+                      ],
+                    },
+                  ],
+                },
+                runAgent: makeRunAgent(ctx, runId, owner()),
+              },
+            );
+            const text = `Created durable workflow ${result.runId}: ${result.status}`;
+            ctx.ui.notify(text);
+            sendCommandMessage(text);
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            const text = `Durable workflow not started: ${message}`;
+            ctx.ui.notify(text);
+            sendCommandMessage(text);
+          }
+          return;
+        }
+        const runId = input;
         const controller = sessionScope
           ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
           : undefined;
