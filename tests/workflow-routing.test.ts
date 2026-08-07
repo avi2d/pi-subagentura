@@ -9,6 +9,7 @@ describe("workflow eager routing", () => {
   it("parses the opt-in configuration with an off default", () => {
     expect(WORKFLOW_EAGER_DEFAULT).toBe("off");
     expect(parseWorkflowEagerMode(undefined)).toBe("off");
+    expect(parseWorkflowEagerMode(false)).toBe("off");
     expect(parseWorkflowEagerMode("preferred")).toBe("preferred");
     expect(() => parseWorkflowEagerMode("invalid")).toThrow("workflow-eager");
   });
