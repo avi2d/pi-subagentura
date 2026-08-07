@@ -12,6 +12,9 @@ export interface WorkflowReplayRequest {
   readonly promptDigest: string;
   readonly optionsDigest: string;
   readonly definitionDigest: string;
+  readonly schemaDigest?: string;
+  readonly modelDigest?: string;
+  readonly isolationDigest?: string;
 }
 
 export interface WorkflowReplayResponse {
@@ -44,6 +47,10 @@ export function durableWorkflowDigest(value: unknown): string {
       ),
     )
     .digest("hex");
+}
+
+function digestOptional(value: unknown): string | undefined {
+  return value === undefined ? undefined : durableWorkflowDigest(value);
 }
 
 export async function persistWorkflowDefinitionBlob(
@@ -103,6 +110,9 @@ export function createWorkflowReplayRequest(input: {
   prompt: unknown;
   options: unknown;
   definition: unknown;
+  schema?: unknown;
+  model?: unknown;
+  isolation?: unknown;
 }): WorkflowReplayRequest {
   if (
     !Number.isSafeInteger(input.dispatchOrdinal) ||
@@ -116,6 +126,15 @@ export function createWorkflowReplayRequest(input: {
     promptDigest: durableWorkflowDigest(input.prompt),
     optionsDigest: durableWorkflowDigest(input.options),
     definitionDigest: durableWorkflowDigest(input.definition),
+    ...(digestOptional(input.schema)
+      ? { schemaDigest: digestOptional(input.schema) }
+      : {}),
+    ...(digestOptional(input.model)
+      ? { modelDigest: digestOptional(input.model) }
+      : {}),
+    ...(digestOptional(input.isolation)
+      ? { isolationDigest: digestOptional(input.isolation) }
+      : {}),
   };
 }
 
@@ -123,6 +142,14 @@ export function replayWorkflowResponses(
   expected: readonly WorkflowReplayRequest[],
   actual: readonly WorkflowReplayResponse[],
 ): readonly WorkflowReplayResponse[] {
+  const requestByOperation = new Map(
+    expected.map((request) => [request.operationId, request]),
+  );
+  if (requestByOperation.size !== expected.length) {
+    throw new WorkflowReplayDivergedError(
+      "Duplicate workflow replay operation",
+    );
+  }
   let nextOrdinal = 1;
   for (const response of actual) {
     if (response.responseOrdinal !== nextOrdinal) {
@@ -130,9 +157,7 @@ export function replayWorkflowResponses(
         "Missing workflow replay response ordinal",
       );
     }
-    const request = expected.find(
-      (item) => item.operationId === response.operationId,
-    );
+    const request = requestByOperation.get(response.operationId);
     if (!request) {
       throw new WorkflowReplayDivergedError(
         "Unknown workflow replay operation",
@@ -140,6 +165,9 @@ export function replayWorkflowResponses(
     }
     if (!response.valueDigest) {
       throw new WorkflowReplayDivergedError("Invalid workflow replay response");
+    }
+    if (response.payload !== undefined) {
+      assertWorkflowReplayResponseDigest(response);
     }
     nextOrdinal++;
   }
