@@ -2513,6 +2513,8 @@ describe("registerWorkflowTool", () => {
     registerWorkflowTool(pi as any);
     expect(tools).toHaveLength(9);
     expect(tools.map((t) => t.name)).toEqual([
+      "get_durable_workflow_status",
+      "start_durable_workflow",
       "workflow",
       "get_workflow_status",
       "get_workflow_result",
@@ -2520,8 +2522,6 @@ describe("registerWorkflowTool", () => {
       "save_workflow",
       "list_workflows",
       "delete_workflow",
-      "get_durable_workflow_status",
-      "start_durable_workflow",
     ]);
   });
 
