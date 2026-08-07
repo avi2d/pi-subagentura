@@ -24,6 +24,7 @@ export interface WorkflowRunStoreOptions {
   rootDir: string;
   owner: WorkflowOwnerIdentity;
   maxEventBytes?: number;
+  maxRunBytes?: number;
 }
 
 export interface WorkflowRunRecord {
@@ -185,6 +186,13 @@ export class WorkflowRunStore {
       const before = await readFile(path);
       const completeBytes = lastCompleteLineBytes(before);
       const maxEventBytes = this.options.maxEventBytes;
+      const maxRunBytes = this.options.maxRunBytes;
+      if (
+        maxRunBytes !== undefined &&
+        (!Number.isSafeInteger(maxRunBytes) || maxRunBytes <= 0)
+      ) {
+        throw new Error("Invalid workflow run byte quota");
+      }
       if (
         maxEventBytes !== undefined &&
         (!Number.isSafeInteger(maxEventBytes) ||
@@ -192,6 +200,12 @@ export class WorkflowRunStore {
           completeBytes + Buffer.byteLength(line) > maxEventBytes)
       ) {
         throw new Error("Workflow event quota exceeded");
+      }
+      if (
+        maxRunBytes !== undefined &&
+        completeBytes + Buffer.byteLength(line) > maxRunBytes
+      ) {
+        throw new Error("Workflow run byte quota exceeded");
       }
       const currentEpoch = lastCompleteRunEpoch(before);
       if (runEpoch < currentEpoch) {

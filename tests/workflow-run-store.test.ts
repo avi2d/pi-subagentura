@@ -288,4 +288,23 @@ describe("WorkflowRunStore", () => {
       "event quota",
     );
   });
+
+  it("rejects appends that exceed the configured run byte quota", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({
+      rootDir: root,
+      owner,
+      maxRunBytes: 10,
+    });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await expect(store.append("run", "event", {})).rejects.toThrow(
+      "run byte quota",
+    );
+  });
 });
