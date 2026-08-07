@@ -30,6 +30,7 @@ export interface WorkflowProjection {
   tasks: Record<string, WorkflowProjectionTask>;
   terminal?: WorkflowTerminalResult;
   usage: { input: number; output: number };
+  usageLowerBound?: boolean;
   lastEventOrdinal: number;
   delivery?: WorkflowDeliveryIntent;
   approval?: {
@@ -218,6 +219,7 @@ function applyEvent(
     }
     case "run_interrupted":
       projection.status = "interrupted";
+      projection.usageLowerBound = true;
       break;
     case "run_blocked":
       projection.status = "blocked";

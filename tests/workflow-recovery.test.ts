@@ -57,6 +57,7 @@ describe("workflow recovery projection", () => {
 
     const projection = await recoverWorkflowRun({ store, owner }, "run");
     expect(projection.status).toBe("interrupted");
+    expect(projection.usageLowerBound).toBe(true);
     expect(projection.tasks.a).toEqual({
       id: "a",
       status: "succeeded",
