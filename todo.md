@@ -21,7 +21,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 12. Stop recovery on malformed complete event lines.
 - [x] 13. Recover torn tails only at complete-line byte boundaries.
 - [ ] 14. Complete ENOSPC, event, run, owner-byte, blob, and output quota behavior.
-- [ ] 15. Retain active, blocked, approval-pending, interrupted, and undelivered terminal runs.
+- [x] 15. Retain active, blocked, approval-pending, interrupted, and undelivered terminal runs.
 
 ## Parallel execution and accounting
 
