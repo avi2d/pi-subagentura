@@ -2544,7 +2544,7 @@ export function registerWorkflowTool(
         const updated = await controller.decideApproval(runId, requestId, {
           requestId,
           status: operation === "approve" ? "approved" : "rejected",
-          decidedBy: owner()?.id ?? "host",
+          decidedBy: String(owner()?.id ?? "host"),
           ...(reasonParts.length > 0 ? { reason: reasonParts.join(" ") } : {}),
         });
         const text = `${operation === "approve" ? "Approved" : "Rejected"} durable workflow approval ${requestId} for ${runId} (status ${updated?.approval?.status ?? "unknown"}).`;
