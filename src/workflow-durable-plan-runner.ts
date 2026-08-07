@@ -43,6 +43,12 @@ export async function runDurableWorkflowPlan(
   if (projection.status === "interrupted" && !options.resume) {
     return projection;
   }
+  if (projection.planRevision !== plan.schemaVersion) {
+    throw new Error(
+      `Workflow plan revision mismatch: stored ${projection.planRevision}, ` +
+        `requested ${plan.schemaVersion}`,
+    );
+  }
   if (isTerminal(projection.status)) return projection;
   if (projection.status === "created" || projection.status === "interrupted") {
     await store.append(runId, "run_started", {});
