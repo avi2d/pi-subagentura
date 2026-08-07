@@ -59,4 +59,40 @@ describe("workflow plan runner", () => {
     ).rejects.toThrow("failed");
     expect(calls).toEqual(["A"]);
   });
+
+  it("runs parallel phases with the configured concurrency cap", async () => {
+    const running: string[] = [];
+    let peak = 0;
+    const parallelPlan: WorkflowPlan = {
+      ...plan,
+      phases: [
+        {
+          id: "parallel",
+          mode: "parallel",
+          tasks: [
+            { id: "a", prompt: "A" },
+            { id: "b", prompt: "B" },
+            { id: "c", prompt: "C" },
+          ],
+        },
+      ],
+    };
+    const result = await runWorkflowPlan(parallelPlan, {
+      concurrency: 2,
+      runAgent: async ({ prompt }) => {
+        running.push(prompt);
+        peak = Math.max(peak, running.length);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        running.splice(running.indexOf(prompt), 1);
+        return success(`done:${prompt}`);
+      },
+    });
+
+    expect(peak).toBe(2);
+    expect(result.taskResults.map((task) => task.taskId).sort()).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+  });
 });

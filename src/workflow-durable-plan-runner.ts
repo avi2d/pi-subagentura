@@ -104,6 +104,11 @@ export async function runDurableWorkflowPlan(
   // Validate before recovery so malformed resume input cannot touch an
   // authoritative run or dispatch work.
   validateWorkflowPlan({ ...plan, schemaVersion: 1 });
+  if (plan.phases.some((phase) => phase.mode === "parallel")) {
+    throw new Error(
+      "Durable parallel workflow phases are not supported by this preview",
+    );
+  }
   try {
     projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
