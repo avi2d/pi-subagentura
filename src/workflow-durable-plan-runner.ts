@@ -250,6 +250,11 @@ export class DurableWorkflowController {
     }
     if (projection.approval.status !== "pending") return projection;
     await this.options.store.append(runId, "approval_decided", decision);
+    if (decision.status === "rejected") {
+      await this.options.store.append(runId, "run_blocked", {
+        reason: decision.reason ?? "Workflow approval rejected",
+      });
+    }
     return this.getStatus(runId);
   }
 }
