@@ -2542,10 +2542,22 @@ export function registerWorkflowTool(
           sendCommandMessage(usage);
           return;
         }
+        const current = await controller.getStatus(runId);
+        const binding = current?.approval?.request;
+        if (!binding || binding.requestId !== requestId) {
+          ctx.ui.notify("Workflow approval request was not found");
+          sendCommandMessage("Workflow approval request was not found");
+          return;
+        }
         const updated = await controller.decideApproval(runId, requestId, {
           requestId,
           status: operation === "approve" ? "approved" : "rejected",
           decidedBy: String(owner()?.id ?? "host"),
+          policyHash: binding.policyHash,
+          planRevision: binding.planRevision,
+          ownerGeneration: binding.ownerGeneration,
+          leaseEpoch: binding.leaseEpoch,
+          version: binding.version,
           ...(reasonParts.length > 0 ? { reason: reasonParts.join(" ") } : {}),
         });
         const text = `${operation === "approve" ? "Approved" : "Rejected"} durable workflow approval ${requestId} for ${runId} (status ${updated?.approval?.status ?? "unknown"}).`;
