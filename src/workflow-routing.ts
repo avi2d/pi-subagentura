@@ -14,6 +14,23 @@ export interface WorkflowRoutingInput {
   planOnly?: boolean;
 }
 
+export interface WorkflowRoutingRolloutGate {
+  enabled: boolean;
+  minimumSdkSatisfied: boolean;
+  observedRuns: number;
+  compliantRuns: number;
+  maxUnconfirmedRate: number;
+}
+
+export function passesWorkflowRoutingRolloutGate(
+  gate: WorkflowRoutingRolloutGate,
+): boolean {
+  if (!gate.enabled || !gate.minimumSdkSatisfied || gate.observedRuns <= 0)
+    return false;
+  const unconfirmed = gate.observedRuns - gate.compliantRuns;
+  return unconfirmed / gate.observedRuns <= gate.maxUnconfirmedRate;
+}
+
 const SIMPLE_REQUEST =
   /^(?:what|why|how|when|where|who|can you|could you|please explain)\b/i;
 const COMPLEX_MARKER =
