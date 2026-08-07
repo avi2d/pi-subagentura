@@ -6,8 +6,6 @@ import type { JobState } from "./helpers";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import type { PendingJobDelivery } from "./notifications";
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
-import type { WorkflowRunStore } from "./workflow-run-store";
-import type { DurableWorkflowController } from "./workflow-durable-plan-runner";
 
 const SESSION_SCOPE_REGISTRY_KEY = "__piSubagenturaSessionScopes";
 const SESSION_SCOPE_ID_COUNTER_KEY = "__piSubagenturaSessionScopeIdCounter";
@@ -35,10 +33,7 @@ export interface SessionScope {
   inProcessJobs: Map<string, JobState>;
   pendingInProcessDeliveries: PendingJobDelivery[];
   interactiveStates: Map<string, InteractiveSubagentState>;
-  durableWorkflowRootDir?: string;
   durableWorkflowOwner?: WorkflowOwnerIdentity;
-  durableWorkflowStore?: WorkflowRunStore;
-  durableWorkflowController?: DurableWorkflowController;
 }
 
 /** External registrations may omit runtime-owned collections and streaming state. */
@@ -53,10 +48,7 @@ export interface SessionScopeRegistration {
   inProcessJobs?: Map<string, JobState>;
   pendingInProcessDeliveries?: PendingJobDelivery[];
   interactiveStates?: Map<string, InteractiveSubagentState>;
-  durableWorkflowRootDir?: string;
   durableWorkflowOwner?: WorkflowOwnerIdentity;
-  durableWorkflowStore?: WorkflowRunStore;
-  durableWorkflowController?: DurableWorkflowController;
 }
 
 export interface SessionOwnerToken {
@@ -165,18 +157,8 @@ export function registerSessionScope(
     if (registration.interactiveStates !== undefined) {
       existing.interactiveStates = registration.interactiveStates;
     }
-    if (registration.durableWorkflowRootDir !== undefined) {
-      existing.durableWorkflowRootDir = registration.durableWorkflowRootDir;
-    }
     if (registration.durableWorkflowOwner !== undefined) {
       existing.durableWorkflowOwner = registration.durableWorkflowOwner;
-    }
-    if (registration.durableWorkflowStore !== undefined) {
-      existing.durableWorkflowStore = registration.durableWorkflowStore;
-    }
-    if (registration.durableWorkflowController !== undefined) {
-      existing.durableWorkflowController =
-        registration.durableWorkflowController;
     }
     return existing;
   }
@@ -195,10 +177,7 @@ export function registerSessionScope(
         pendingInProcessDeliveries:
           registration.pendingInProcessDeliveries ?? [],
         interactiveStates: registration.interactiveStates ?? new Map(),
-        durableWorkflowRootDir: registration.durableWorkflowRootDir,
         durableWorkflowOwner: registration.durableWorkflowOwner,
-        durableWorkflowStore: registration.durableWorkflowStore,
-        durableWorkflowController: registration.durableWorkflowController,
       };
   registry.set(scope.id, scope);
   return scope;
