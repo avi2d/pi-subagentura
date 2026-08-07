@@ -311,4 +311,42 @@ describe("durable sequential plan runner", () => {
     const record = await store.readRun("auto-resume-run");
     expect(record.launch.resumePolicy).toBe("on-session-start");
   });
+
+  it("executes parallel siblings once and folds their usage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const calls: string[] = [];
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "parallel-run",
+      plan: {
+        ...plan,
+        phases: [
+          {
+            id: "parallel",
+            mode: "parallel",
+            tasks: [
+              { id: "a", prompt: "A" },
+              { id: "b", prompt: "B" },
+              { id: "c", prompt: "C" },
+            ],
+          },
+        ],
+      },
+      runAgent: async ({ prompt }) => {
+        calls.push(prompt);
+        return success(`done:${prompt}`);
+      },
+    });
+
+    expect(result.status).toBe("done");
+    expect(calls.sort()).toEqual(["A", "B", "C"]);
+    expect(result.tasks.a.status).toBe("succeeded");
+    expect(result.tasks.b.status).toBe("succeeded");
+    expect(result.tasks.c.status).toBe("succeeded");
+    expect(result.usage).toEqual({ input: 3, output: 6 });
+  });
 });
