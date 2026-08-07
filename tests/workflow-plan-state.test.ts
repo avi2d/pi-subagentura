@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   createWorkflowPlanState,
+  mutateWorkflowPlanState,
   reduceWorkflowPlanState,
 } from "../src/workflow-plan-state";
 import type { WorkflowPlan } from "../src/workflow-plan";
@@ -68,5 +69,36 @@ describe("workflow plan state transitions", () => {
         phaseId: "phase",
       }),
     ).toThrow("cannot start");
+  });
+
+  it("fences mutations by revision and only edits future work", () => {
+    const created = createWorkflowPlanState(plan);
+    const appended = mutateWorkflowPlanState(
+      created,
+      {
+        type: "append",
+        phaseId: "phase",
+        task: { id: "later", prompt: "later" },
+      },
+      0,
+    );
+    expect(appended).toMatchObject({
+      revision: 1,
+      tasks: { task: "pending", later: "pending" },
+    });
+
+    expect(() =>
+      mutateWorkflowPlanState(appended, { type: "skip", taskId: "later" }, 0),
+    ).toThrow("stale");
+
+    const skipped = mutateWorkflowPlanState(
+      appended,
+      { type: "skip", taskId: "later" },
+      1,
+    );
+    expect(skipped.tasks.later).toBe("skipped");
+    expect(() =>
+      mutateWorkflowPlanState(skipped, { type: "block", taskId: "later" }, 2),
+    ).toThrow("no longer mutable");
   });
 });
