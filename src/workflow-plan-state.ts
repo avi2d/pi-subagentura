@@ -14,6 +14,9 @@ export type WorkflowPlanAction =
   | { type: "start"; taskId: string; phaseId: string }
   | { type: "succeed"; taskId: string }
   | { type: "fail"; taskId: string }
+  | { type: "block"; taskId: string }
+  | { type: "unblock"; taskId: string }
+  | { type: "skip"; taskId: string }
   | { type: "cancel" };
 
 export function createWorkflowPlanState(plan: WorkflowPlan): WorkflowPlanState {
@@ -34,7 +37,12 @@ export function reduceWorkflowPlanState(
     revision: state.revision + 1,
   };
   if (action.type === "cancel") {
-    if (state.status === "done" || state.status === "error") return state;
+    if (
+      state.status === "done" ||
+      state.status === "error" ||
+      state.status === "cancelled"
+    )
+      return state;
     next.status = "cancelled";
     return next;
   }
@@ -44,6 +52,7 @@ export function reduceWorkflowPlanState(
     if (
       current !== "pending" ||
       state.status === "done" ||
+      state.status === "error" ||
       state.status === "cancelled"
     ) {
       throw new Error(`Task ${action.taskId} cannot start from ${current}`);
@@ -51,6 +60,21 @@ export function reduceWorkflowPlanState(
     next.tasks[action.taskId] = "running";
     next.status = "running";
     next.currentPhase = action.phaseId;
+  } else if (action.type === "block") {
+    if (current !== "pending")
+      throw new Error(`Task ${action.taskId} cannot block from ${current}`);
+    next.tasks[action.taskId] = "blocked";
+    next.status = "blocked";
+  } else if (action.type === "unblock") {
+    if (current !== "blocked")
+      throw new Error(`Task ${action.taskId} cannot unblock from ${current}`);
+    next.tasks[action.taskId] = "pending";
+    next.status = "running";
+  } else if (action.type === "skip") {
+    if (current !== "pending" && current !== "blocked")
+      throw new Error(`Task ${action.taskId} cannot skip from ${current}`);
+    next.tasks[action.taskId] = "skipped";
+    next.status = allTasksTerminal(next) ? "done" : "running";
   } else if (action.type === "succeed" || action.type === "fail") {
     if (current !== "running")
       throw new Error(`Task ${action.taskId} is not running`);

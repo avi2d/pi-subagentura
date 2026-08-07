@@ -3,7 +3,7 @@ import type { DurableValue } from "./workflow-durable-value";
 export const WORKFLOW_PLAN_VERSION = 1 as const;
 export type WorkflowPhaseMode = "sequential" | "parallel";
 export type WorkflowTaskStatus =
-  "pending" | "running" | "succeeded" | "failed" | "skipped";
+  "pending" | "blocked" | "running" | "succeeded" | "failed" | "skipped";
 
 export interface WorkflowPlanTask {
   id: string;
