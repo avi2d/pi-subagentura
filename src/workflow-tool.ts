@@ -2404,7 +2404,16 @@ export function registerWorkflowTool(
         }
         const projection = await controller.getStatus(runId);
         const text = projection
-          ? `Durable workflow ${runId}: ${projection.status} (revision ${projection.revision})`
+          ? [
+              `Durable workflow ${runId}: ${projection.status} (revision ${projection.revision})`,
+              `Phase: ${projection.currentPhase ?? "none"}`,
+              `Tasks: ${Object.values(projection.tasks)
+                .map((task) => `${task.id}=${task.status}`)
+                .join(", ")}`,
+              projection.terminal
+                ? `Terminal: ${JSON.stringify(projection.terminal)}`
+                : "Terminal: none",
+            ].join("\n")
           : `Durable workflow ${runId} was not found.`;
         ctx.ui.notify(text);
         sendCommandMessage(text);
