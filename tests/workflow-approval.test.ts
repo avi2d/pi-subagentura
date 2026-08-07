@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { validateWorkflowApprovalRequest } from "../src/workflow-run-types";
+import {
+  validateWorkflowApprovalDecision,
+  validateWorkflowApprovalRequest,
+} from "../src/workflow-run-types";
 
 describe("workflow approval request", () => {
   it("accepts a fully bound trusted request", () => {
@@ -36,5 +39,22 @@ describe("workflow approval request", () => {
         version: 1,
       }),
     ).toThrow("version");
+  });
+
+  it("validates a host decision envelope", () => {
+    expect(() =>
+      validateWorkflowApprovalDecision({
+        requestId: "request",
+        status: "approved",
+        decidedBy: "operator",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkflowApprovalDecision({
+        requestId: "request",
+        status: "pending" as never,
+        decidedBy: "operator",
+      }),
+    ).toThrow("status");
   });
 });

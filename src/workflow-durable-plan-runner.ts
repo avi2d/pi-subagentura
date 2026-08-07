@@ -4,8 +4,14 @@ import type { WorkflowProjection } from "./workflow-projection-repository";
 import { recoverWorkflowRun } from "./workflow-recovery";
 import { WorkflowRunStore } from "./workflow-run-store";
 import type {
+  WorkflowApprovalDecision,
+  WorkflowApprovalRequest,
   WorkflowOwnerIdentity,
   WorkflowResumePolicy,
+} from "./workflow-run-types";
+import {
+  validateWorkflowApprovalDecision,
+  validateWorkflowApprovalRequest,
 } from "./workflow-run-types";
 import { createHash } from "node:crypto";
 
@@ -149,6 +155,37 @@ export class DurableWorkflowController {
         deliveryId,
       });
     }
+    return this.getStatus(runId);
+  }
+
+  public async requestApproval(
+    runId: string,
+    request: WorkflowApprovalRequest,
+  ): Promise<WorkflowProjection | undefined> {
+    validateWorkflowApprovalRequest(request);
+    const projection = await this.getStatus(runId);
+    if (!projection) return undefined;
+    if (projection.approval?.status === "pending") return projection;
+    await this.options.store.append(runId, "approval_requested", { request });
+    return this.getStatus(runId);
+  }
+
+  public async decideApproval(
+    runId: string,
+    requestId: string,
+    decision: WorkflowApprovalDecision,
+  ): Promise<WorkflowProjection | undefined> {
+    validateWorkflowApprovalDecision(decision);
+    if (decision.requestId !== requestId)
+      throw new Error("Workflow approval request mismatch");
+    const projection = await this.getStatus(runId);
+    if (
+      !projection?.approval ||
+      projection.approval.request.requestId !== requestId
+    )
+      throw new Error("Workflow approval request was not found");
+    if (projection.approval.status !== "pending") return projection;
+    await this.options.store.append(runId, "approval_decided", decision);
     return this.getStatus(runId);
   }
 }
