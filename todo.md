@@ -20,14 +20,14 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 11. Harden filesystem storage against symlinks, hardlinks, races, traversal, and non-regular files.
 - [x] 12. Stop recovery on malformed complete event lines.
 - [x] 13. Recover torn tails only at complete-line byte boundaries.
-- [ ] 14. Complete ENOSPC, event, run, owner-byte, blob, and output quota behavior.
+- [x] 14. Complete ENOSPC, event, run, owner-byte, blob, and output quota behavior.
 - [x] 15. Retain active, blocked, approval-pending, interrupted, and undelivered terminal runs.
 
 ## Parallel execution and accounting
 
-- [ ] 16. Cover committed/running/undispatched sibling crash recovery.
-- [ ] 17. Add a namespace-shared dispatcher with process and in-process caps.
-- [ ] 18. Make stop-on-failure draining and dispatch order deterministic.
+- [x] 16. Cover committed/running/undispatched sibling crash recovery.
+- [x] 17. Add a namespace-shared dispatcher with process and in-process caps.
+- [x] 18. Make stop-on-failure draining and dispatch order deterministic.
 - [x] 19. Deduplicate attempt accounting across replay and crash boundaries.
 - [x] 20. Mark interrupted usage as an explicit lower bound with provenance.
 - [x] 21. Make terminal task and result ordering stable across reloads.
@@ -56,7 +56,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 ## Plan mutations and human editing
 
-- [ ] 38. Require exact owner, lease epoch, and base revision for mutations.
+- [x] 38. Require exact owner, lease epoch, and base revision for mutations.
 - [x] 39. Restrict mutations to pending or blocked future tasks.
 - [x] 40. Keep running and terminal task definitions/history immutable.
 - [x] 41. Preserve skip as an audited append-only event.
