@@ -232,6 +232,15 @@ describe("workflow recovery projection", () => {
       phaseId: "phase-2",
       prompt: "do later work",
     });
+    await expect(
+      controller.mutateTask("run", {
+        type: "append",
+        taskId: "later",
+        phaseId: "phase-2",
+        prompt: "duplicate",
+        expectedRevision: appended?.revision ?? 0,
+      }),
+    ).rejects.toThrow("Duplicate");
   });
 
   it("reads projections through the owner-scoped repository", async () => {
