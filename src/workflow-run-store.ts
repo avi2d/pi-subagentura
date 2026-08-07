@@ -1,6 +1,6 @@
 import {
-  appendFile,
   mkdir,
+  open,
   readFile,
   readdir,
   stat,
@@ -110,7 +110,13 @@ export class WorkflowRunStore {
           `Cannot append stale run epoch ${runEpoch}; current epoch is ${currentEpoch}`,
         );
       }
-      await appendFile(path, line, { mode: 0o600 });
+      const file = await open(path, "a", 0o600);
+      try {
+        await file.write(line, undefined, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
       return {
         eventId: event.eventId,
         runId,
