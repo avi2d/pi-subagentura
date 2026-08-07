@@ -263,6 +263,19 @@ export async function releaseDurableWorkflowAuthority(
   }
 }
 
+export function setDurableWorkflowOwner(
+  scope: SessionScope,
+  owner: WorkflowOwnerIdentity | undefined,
+): void {
+  scope.durableWorkflowOwner = owner;
+}
+
+export function durableWorkflowOwner(
+  scope: SessionScope,
+): WorkflowOwnerIdentity | undefined {
+  return scope.durableWorkflowOwner;
+}
+
 /** Resolve an exact owner only while that lifecycle generation remains live. */
 export function resolveLiveSessionScope(
   owner: SessionOwnerToken | undefined,
