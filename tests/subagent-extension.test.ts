@@ -28,6 +28,7 @@ const IN_PROCESS_TOOL_NAMES = [
 const WORKFLOW_TOOL_NAMES = [
   "cancel_workflow",
   "delete_workflow",
+  "get_durable_workflow_result",
   "get_durable_workflow_status",
   "get_workflow_result",
   "get_workflow_status",

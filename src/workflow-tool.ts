@@ -308,6 +308,59 @@ export function registerWorkflowTool(
       };
     },
   });
+  pi.registerTool({
+    name: "get_durable_workflow_result",
+    label: "Durable Workflow Result",
+    description: "Read a persisted terminal durable workflow result.",
+    parameters: Type.Object({ workflowId: Type.String() }),
+    async execute(_id: string, params: { workflowId: string }): Promise<any> {
+      const controller = sessionScope
+        ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+        : undefined;
+      if (!controller) {
+        return {
+          content: [
+            { type: "text", text: "Durable workflow storage is unavailable." },
+          ],
+          details: { status: "unavailable" },
+          isError: true,
+        };
+      }
+      const projection = await controller.getStatus(params.workflowId);
+      if (!projection) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Durable workflow ${params.workflowId} was not found.`,
+            },
+          ],
+          details: { status: "not_found", workflowId: params.workflowId },
+          isError: true,
+        };
+      }
+      if (!projection.terminal) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Durable workflow ${projection.runId} is not terminal.`,
+            },
+          ],
+          details: { status: projection.status, workflowId: projection.runId },
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify(projection.terminal) }],
+        details: {
+          status: "terminal",
+          workflowId: projection.runId,
+          result: projection.terminal,
+        },
+      };
+    },
+  });
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(
     ctx: any,
