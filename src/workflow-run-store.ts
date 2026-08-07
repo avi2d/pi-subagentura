@@ -46,6 +46,19 @@ export class WorkflowRunCorruptionError extends Error {
   }
 }
 
+export class WorkflowRunStorageError extends Error {
+  public readonly code: "ENOSPC";
+
+  public constructor(
+    public readonly runId: string,
+    cause: unknown,
+  ) {
+    super(`Durable workflow run ${runId} could not be persisted`, { cause });
+    this.name = "WorkflowRunStorageError";
+    this.code = "ENOSPC";
+  }
+}
+
 function safePart(value: string, label: string): string {
   if (
     !value ||
@@ -82,22 +95,29 @@ export class WorkflowRunStore {
       createdAt: Date.now(),
     };
     const dir = this.runDir(launch.runId);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    const path = join(dir, "launch.json");
     try {
-      await stat(path);
-      throw new Error(`Workflow run already exists: ${launch.runId}`);
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const path = join(dir, "launch.json");
+      try {
+        await stat(path);
+        throw new Error(`Workflow run already exists: ${launch.runId}`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await writeFile(path, `${JSON.stringify(launch)}\n`, {
+        mode: 0o600,
+        flag: "wx",
+      });
+      await writeFile(join(dir, "events.ndjson"), "", {
+        mode: 0o600,
+        flag: "wx",
+      });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
+        throw new WorkflowRunStorageError(launch.runId, error);
+      }
+      throw error;
     }
-    await writeFile(path, `${JSON.stringify(launch)}\n`, {
-      mode: 0o600,
-      flag: "wx",
-    });
-    await writeFile(join(dir, "events.ndjson"), "", {
-      mode: 0o600,
-      flag: "wx",
-    });
     return launch;
   }
 
@@ -157,6 +177,11 @@ export class WorkflowRunStore {
         endByte: completeBytes + Buffer.byteLength(line),
         eventOrdinal: countCompleteLines(before.subarray(0, completeBytes)),
       };
+    }).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOSPC") {
+        throw new WorkflowRunStorageError(runId, error);
+      }
+      throw error;
     });
   }
 
