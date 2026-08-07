@@ -1,6 +1,10 @@
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
 import { WorkflowRunStore } from "./workflow-run-store";
-import { DurableWorkflowController } from "./workflow-durable-plan-runner";
+import {
+  DurableWorkflowController,
+  runDurableWorkflowPlan,
+  type DurableWorkflowPlanOptions,
+} from "./workflow-durable-plan-runner";
 import type { SessionScope } from "./session-scope";
 
 export interface WorkflowOwnerIdentityInput {
@@ -74,6 +78,20 @@ export function durableWorkflowStoreForSession(
   const owner = scope.durableWorkflowOwner;
   if (!owner) return undefined;
   return new WorkflowRunStore({ rootDir, owner });
+}
+
+export function runDurableWorkflowForSession(
+  rootDir: string,
+  scope: SessionScope,
+  options: Omit<DurableWorkflowPlanOptions, "store" | "owner">,
+): Promise<Awaited<ReturnType<typeof runDurableWorkflowPlan>>> {
+  const owner = scope.durableWorkflowOwner;
+  if (!owner) throw new Error("Durable workflow storage is unavailable.");
+  return runDurableWorkflowPlan({
+    ...options,
+    store: new WorkflowRunStore({ rootDir, owner }),
+    owner,
+  });
 }
 
 export function workflowOwnerFromSessionContext(input: {

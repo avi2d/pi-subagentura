@@ -5,6 +5,7 @@ import {
   createWorkflowRunStore,
   durableWorkflowControllerForSession,
   durableWorkflowStoreForSession,
+  runDurableWorkflowForSession,
   workflowOwnerFromSessionContext,
 } from "../src/workflow-owner";
 
@@ -97,5 +98,17 @@ describe("workflow owner identity", () => {
         durableWorkflowOwner: undefined,
       } as any),
     ).toBeUndefined();
+  });
+
+  it("rejects execution before a session has an owner", () => {
+    expect(() =>
+      runDurableWorkflowForSession(
+        "/tmp/workflows",
+        {
+          durableWorkflowOwner: undefined,
+        } as any,
+        {} as any,
+      ),
+    ).toThrow("unavailable");
   });
 });
