@@ -104,6 +104,12 @@ export class WorkflowRunStore {
     return this.withLock(runId, async () => {
       const path = join(dir, "events.ndjson");
       const before = await readFile(path);
+      const currentEpoch = lastCompleteRunEpoch(before);
+      if (runEpoch < currentEpoch) {
+        throw new Error(
+          `Cannot append stale run epoch ${runEpoch}; current epoch is ${currentEpoch}`,
+        );
+      }
       await appendFile(path, line, { mode: 0o600 });
       return {
         eventId: event.eventId,
@@ -195,6 +201,27 @@ function countCompleteLines(bytes: Buffer): number {
   let count = 0;
   for (const byte of bytes) if (byte === 0x0a) count++;
   return count;
+}
+
+function lastCompleteRunEpoch(bytes: Buffer): number {
+  let offset = 0;
+  let epoch = 0;
+  while (offset < bytes.length) {
+    const newline = bytes.indexOf(0x0a, offset);
+    if (newline < 0) break;
+    const line = bytes.subarray(offset, newline).toString("utf8");
+    if (line) {
+      const event = JSON.parse(line) as Partial<WorkflowEventEnvelope>;
+      if (
+        typeof event.runEpoch === "number" &&
+        Number.isFinite(event.runEpoch)
+      ) {
+        epoch = Math.max(epoch, event.runEpoch);
+      }
+    }
+    offset = newline + 1;
+  }
+  return epoch;
 }
 
 export function workflowRunStoreRoot(
