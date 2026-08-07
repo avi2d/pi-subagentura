@@ -77,3 +77,30 @@ export interface WorkflowDeliveryIntent {
   status: "pending" | "dispatched" | "delivered";
   message: string;
 }
+
+export interface WorkflowApprovalRequest {
+  requestId: string;
+  policyHash: string;
+  planRevision: number;
+  ownerGeneration: number;
+  leaseEpoch: number;
+  version: number;
+}
+
+export function validateWorkflowApprovalRequest(
+  request: WorkflowApprovalRequest,
+): void {
+  if (!request.requestId || !request.policyHash) {
+    throw new Error("Invalid workflow approval request");
+  }
+  for (const value of [
+    request.planRevision,
+    request.ownerGeneration,
+    request.leaseEpoch,
+    request.version,
+  ]) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Invalid workflow approval request version");
+    }
+  }
+}
