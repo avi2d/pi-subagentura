@@ -2430,6 +2430,32 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-plan-export", {
+      description: "Export a durable workflow projection as JSON.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const runId = args.trim();
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (!controller || !runId) {
+          const text = !runId
+            ? "Usage: /workflow-plan-export <runId>"
+            : "Durable workflow storage is unavailable.";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const projection = await controller.getStatus(runId);
+        const text = projection
+          ? JSON.stringify(projection, null, 2)
+          : `Durable workflow ${runId} was not found.`;
+        ctx.ui.notify(
+          projection ? `Exported durable workflow ${runId}.` : text,
+        );
+        sendCommandMessage(text);
+      },
+    });
+
     pi.registerCommand("workflow-tree", {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
