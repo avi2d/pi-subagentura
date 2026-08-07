@@ -307,4 +307,24 @@ describe("WorkflowRunStore", () => {
       "run byte quota",
     );
   });
+
+  it("rejects creating runs beyond the configured count quota", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner, maxRuns: 1 });
+    await store.createRun({
+      runId: "first",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await expect(
+      store.createRun({
+        runId: "second",
+        planRevision: 1,
+        resumePolicy: "manual",
+        owner,
+      }),
+    ).rejects.toThrow("run count quota");
+  });
 });
