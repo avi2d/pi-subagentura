@@ -290,4 +290,25 @@ describe("durable sequential plan runner", () => {
     ).rejects.toThrow("Invalid or duplicate task id");
     expect(calls).toEqual([]);
   });
+
+  it("persists the requested resume policy in the launch snapshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+
+    await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "auto-resume-run",
+      plan: {
+        ...plan,
+        phases: [{ ...plan.phases[0], tasks: [plan.phases[0].tasks[0]] }],
+      },
+      resumePolicy: "on-session-start",
+      runAgent: async () => success("done"),
+    });
+
+    const record = await store.readRun("auto-resume-run");
+    expect(record.launch.resumePolicy).toBe("on-session-start");
+  });
 });
