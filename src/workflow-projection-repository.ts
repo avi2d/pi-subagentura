@@ -15,6 +15,7 @@ export interface WorkflowProjectionTask {
 
 export interface WorkflowProjection {
   runId: string;
+  planRevision: number;
   owner: WorkflowRunLaunch["owner"];
   status: WorkflowRunStatus;
   revision: number;
@@ -33,6 +34,7 @@ export function projectWorkflowRun(
 ): WorkflowProjection {
   const projection: WorkflowProjection = {
     runId: launch.runId,
+    planRevision: launch.planRevision,
     owner: launch.owner,
     status: "created",
     revision: 0,

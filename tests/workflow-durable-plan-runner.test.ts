@@ -105,4 +105,29 @@ describe("durable sequential plan runner", () => {
     expect(done.tasks.b).toMatchObject({ status: "succeeded", attempt: 2 });
     expect(calls).toEqual(["A", "B", "B"]);
   });
+
+  it("rejects resuming an existing run with a different plan revision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+
+    await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "run",
+      plan,
+      runAgent: async () => success("done"),
+    });
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "run",
+        plan: { ...plan, schemaVersion: 2 } as unknown as WorkflowPlan,
+        resume: true,
+        runAgent: async () => success("must not run"),
+      }),
+    ).rejects.toThrow("Workflow plan revision mismatch");
+  });
 });
