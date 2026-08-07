@@ -67,6 +67,15 @@ export function durableWorkflowControllerForSession(
   });
 }
 
+export function durableWorkflowStoreForSession(
+  rootDir: string,
+  scope: SessionScope,
+): WorkflowRunStore | undefined {
+  const owner = scope.durableWorkflowOwner;
+  if (!owner) return undefined;
+  return new WorkflowRunStore({ rootDir, owner });
+}
+
 export function workflowOwnerFromSessionContext(input: {
   projectKey: string;
   cwd: string;
