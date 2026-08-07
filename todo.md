@@ -60,7 +60,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 39. Restrict mutations to pending or blocked future tasks.
 - [x] 40. Keep running and terminal task definitions/history immutable.
 - [x] 41. Preserve skip as an audited append-only event.
-- [ ] 42. Add monotonic mutation content hashes and a verified hash chain.
+- [x] 42. Add monotonic mutation content hashes and a verified hash chain.
 - [ ] 43. Wake the single executor without starting model work in the mutation path.
 - [ ] 44. Preserve plan, phase modes, stable IDs, and read-only history in export/view.
 - [ ] 45. Return stale-editor refresh/diff data without changing authority.
