@@ -113,6 +113,12 @@ export class WorkflowRunStore {
       throw new Error(`Workflow storage path is not regular: ${path}`);
   }
 
+  private async assertRegularDirectory(path: string): Promise<void> {
+    const info = await lstat(path);
+    if (!info.isDirectory() || info.nlink < 1)
+      throw new Error(`Workflow storage path is not a directory: ${path}`);
+  }
+
   async createRun(
     input: Omit<WorkflowRunLaunch, "schemaVersion" | "createdAt">,
   ): Promise<WorkflowRunLaunch> {
@@ -218,6 +224,7 @@ export class WorkflowRunStore {
 
   async readRun(runId: string): Promise<WorkflowRunRecord> {
     try {
+      await this.assertRegularDirectory(this.runDir(runId));
       await this.assertRegularFile(join(this.runDir(runId), "launch.json"));
       await this.assertRegularFile(join(this.runDir(runId), "events.ndjson"));
       const launch = JSON.parse(
