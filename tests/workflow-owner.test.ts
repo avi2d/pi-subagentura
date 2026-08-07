@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createDurableWorkflowController,
   createWorkflowOwnerIdentity,
   createWorkflowRunStore,
   workflowOwnerFromSessionContext,
@@ -65,5 +66,18 @@ describe("workflow owner identity", () => {
         leaseToken: "lease",
       }),
     ).toMatchObject({ piSessionId: "session", ownerGeneration: 3 });
+  });
+
+  it("constructs an owner-scoped durable controller", () => {
+    expect(
+      createDurableWorkflowController("/tmp/workflows", {
+        projectKey: "project",
+        cwd: "/repo",
+        piSessionId: "session",
+        ownerId: "owner",
+        ownerGeneration: 0,
+        leaseToken: "lease",
+      }),
+    ).toBeDefined();
   });
 });

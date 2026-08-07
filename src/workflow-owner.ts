@@ -1,5 +1,6 @@
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
 import { WorkflowRunStore } from "./workflow-run-store";
+import { DurableWorkflowController } from "./workflow-durable-plan-runner";
 
 export interface WorkflowOwnerIdentityInput {
   projectKey: string;
@@ -39,6 +40,17 @@ export function createWorkflowRunStore(
   return new WorkflowRunStore({
     rootDir,
     owner: createWorkflowOwnerIdentity(input),
+  });
+}
+
+export function createDurableWorkflowController(
+  rootDir: string,
+  input: WorkflowOwnerIdentityInput,
+): DurableWorkflowController {
+  const owner = createWorkflowOwnerIdentity(input);
+  return new DurableWorkflowController({
+    store: new WorkflowRunStore({ rootDir, owner }),
+    owner,
   });
 }
 
