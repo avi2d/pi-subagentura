@@ -8,7 +8,8 @@ import type {
 
 export interface WorkflowProjectionTask {
   id: string;
-  status: "pending" | "running" | "succeeded" | "failed" | "skipped";
+  status:
+    "pending" | "blocked" | "running" | "succeeded" | "failed" | "skipped";
   attempt: number;
   result?: unknown;
   error?: string;
@@ -128,6 +129,31 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
         error: String(payload.error ?? payload.message ?? "Task failed"),
       };
       projection.status = "error";
+      break;
+    }
+    case "task_blocked":
+    case "task_unblocked":
+    case "task_skipped": {
+      const id = String(payload.taskId);
+      const previous = projection.tasks[id];
+      if (previous && isTerminalTask(previous.status)) return;
+      const status =
+        event.type === "task_blocked"
+          ? "blocked"
+          : event.type === "task_skipped"
+            ? "skipped"
+            : "pending";
+      projection.tasks[id] = {
+        id,
+        status,
+        attempt: previous?.attempt ?? 0,
+      };
+      projection.status =
+        event.type === "task_blocked"
+          ? "blocked"
+          : projection.status === "blocked"
+            ? "running"
+            : projection.status;
       break;
     }
     case "usage_observed":
