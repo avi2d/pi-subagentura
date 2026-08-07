@@ -54,6 +54,10 @@ export async function runDurableWorkflowPlan(
     );
   }
   if (isTerminal(projection.status)) return publish(projection);
+  if (options.signal?.aborted) {
+    await store.append(runId, "run_cancelled", {});
+    return publish(await recoverWorkflowRun({ store, owner }, runId));
+  }
   if (projection.status === "created" || projection.status === "interrupted") {
     await store.append(runId, "run_started", {});
   }
@@ -66,7 +70,7 @@ export async function runDurableWorkflowPlan(
         continue;
       }
       if (options.signal?.aborted) {
-        await store.append(runId, "run_interrupted", {});
+        await store.append(runId, "run_cancelled", {});
         return publish(await recoverWorkflowRun({ store, owner }, runId));
       }
       const attempt = (existing?.attempt ?? 0) + 1;
