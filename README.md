@@ -124,6 +124,7 @@ These commands are intended for people at the Pi prompt.
 | `/workflow-plan-mutate` | Block, unblock, or skip future work with a revision fence         |
 | `/workflow-plan-edit`   | Apply a fenced durable plan edit                                  |
 | `/workflow-plan-export` | Export a durable workflow projection as JSON                      |
+| `/workflow-approval`    | Approve or reject a pending durable workflow request              |
 | `/workflow-tree`        | Open the specialized workflow progress tree                       |
 | `/subagents`            | Supervise all async work (`Ctrl+Alt+A`)                           |
 | `/delete-workflow`      | Delete a saved workflow by name or picker                         |

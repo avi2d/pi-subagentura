@@ -2520,6 +2520,39 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-approval", {
+      description: "Approve or reject a pending durable workflow request.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const [runId, requestId, operation, ...reasonParts] = args
+          .trim()
+          .split(/\s+/);
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (
+          !controller ||
+          !runId ||
+          !requestId ||
+          !["approve", "reject"].includes(operation)
+        ) {
+          const usage =
+            "Usage: /workflow-approval <runId> <requestId> <approve|reject> [reason]";
+          ctx.ui.notify(usage);
+          sendCommandMessage(usage);
+          return;
+        }
+        const updated = await controller.decideApproval(runId, requestId, {
+          requestId,
+          status: operation === "approve" ? "approved" : "rejected",
+          decidedBy: owner().ownerId,
+          ...(reasonParts.length > 0 ? { reason: reasonParts.join(" ") } : {}),
+        });
+        const text = `${operation === "approve" ? "Approved" : "Rejected"} durable workflow approval ${requestId} for ${runId} (status ${updated?.approval?.status ?? "unknown"}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
+    });
+
     pi.registerCommand("workflow-tree", {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",

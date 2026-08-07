@@ -2548,6 +2548,7 @@ describe("registerWorkflowTool", () => {
       "workflow-plan-mutate",
       "workflow-plan-edit",
       "workflow-plan-export",
+      "workflow-approval",
       "workflow-tree",
       "delete-workflow",
     ]);
