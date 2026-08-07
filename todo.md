@@ -10,7 +10,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 4. Fence stale and duplicate evidence from reopening terminal work.
 - [x] 5. Dispatch deterministic terminal delivery intents and persist dispatch before receipt.
 - [x] 6. Make cancellation idempotent across reload and reconstructed owners.
-- [ ] 7. Restore interrupted, blocked, and budget-paused runs as actionable after restart.
+- [x] 7. Restore interrupted, blocked, and budget-paused runs as actionable after restart.
 
 ## Ownership, leases, and storage safety
 
