@@ -62,4 +62,33 @@ describe("WorkflowRunStore", () => {
     const record = await store.readRun("run");
     expect(record.events).toHaveLength(1);
   });
+
+  it("enumerates runs safely and reports a torn tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "z-run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.createRun({
+      runId: "a-run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("a-run", "task_done", { ok: true });
+    await appendFile(
+      join(root, "project", "session", "runs", "a-run", "events.ndjson"),
+      "torn",
+    );
+
+    expect(await store.listRunIds()).toEqual(["a-run", "z-run"]);
+    const log = await store.readEventLog("a-run");
+    expect(log.events).toHaveLength(1);
+    expect(log.tornTailBytes).toBe(4);
+    expect(log.completeBytes + log.tornTailBytes).toBeGreaterThan(0);
+  });
 });

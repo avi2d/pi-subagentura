@@ -1,4 +1,11 @@
-import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
@@ -16,6 +23,12 @@ export interface WorkflowRunStoreOptions {
 export interface WorkflowRunRecord {
   launch: WorkflowRunLaunch;
   events: WorkflowEventEnvelope[];
+}
+
+export interface WorkflowRunEventLog {
+  readonly events: readonly WorkflowEventEnvelope[];
+  readonly completeBytes: number;
+  readonly tornTailBytes: number;
 }
 
 function safePart(value: string, label: string): string {
@@ -117,6 +130,41 @@ export class WorkflowRunStore {
       offset = newline + 1;
     }
     return { launch, events };
+  }
+
+  async listRunIds(): Promise<readonly string[]> {
+    const runsDir = join(this.root, "runs");
+    let entries;
+    try {
+      entries = await readdir(runsDir, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((runId) => {
+        try {
+          safePart(runId, "run id");
+          return true;
+        } catch {
+          /* Ignore malformed paths rather than exposing traversal candidates. */
+          return false;
+        }
+      })
+      .sort();
+  }
+
+  async readEventLog(runId: string): Promise<WorkflowRunEventLog> {
+    const path = join(this.runDir(runId), "events.ndjson");
+    const bytes = await readFile(path);
+    const completeBytes = bytes.lastIndexOf(0x0a) + 1;
+    return {
+      events: (await this.readRun(runId)).events,
+      completeBytes,
+      tornTailBytes: bytes.length - completeBytes,
+    };
   }
 
   private runDir(runId: string): string {
