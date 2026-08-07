@@ -8,6 +8,7 @@ export interface WorkflowNamespaceLeaseRecord {
   epoch: number;
   acquiredAt: number;
   processId?: number;
+  processStartTime?: number;
 }
 
 export interface WorkflowNamespaceLeaseOptions {
@@ -18,6 +19,7 @@ export interface WorkflowNamespaceLeaseOptions {
   staleAfterMs?: number;
   now?: () => number;
   processId?: number;
+  processStartTime?: number;
 }
 
 /**
@@ -75,6 +77,14 @@ export class WorkflowNamespaceLease {
         current.processId !== undefined &&
         isProcessAlive(current.processId)
       ) {
+        if (
+          current.processId === process.pid &&
+          current.processStartTime !== undefined &&
+          current.processStartTime !==
+            Math.floor(Date.now() - process.uptime() * 1000)
+        ) {
+          throw new Error("Workflow namespace lease process identity changed");
+        }
         throw new Error("Workflow namespace lease is held by a live process");
       }
       if (current.processId === undefined) {
@@ -133,7 +143,12 @@ export class WorkflowNamespaceLease {
       acquiredAt: this.now(),
       ...(this.options.processId === undefined
         ? {}
-        : { processId: this.options.processId }),
+        : {
+            processId: this.options.processId,
+            ...(this.options.processStartTime === undefined
+              ? {}
+              : { processStartTime: this.options.processStartTime }),
+          }),
     };
   }
 
