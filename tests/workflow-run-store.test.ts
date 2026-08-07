@@ -2,7 +2,10 @@ import { mkdtemp, appendFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { WorkflowRunStore } from "../src/workflow-run-store";
+import {
+  WorkflowRunCorruptionError,
+  WorkflowRunStore,
+} from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
 
 const dirs: string[] = [];
@@ -22,6 +25,33 @@ afterEach(async () => {
 });
 
 describe("WorkflowRunStore", () => {
+  it("surfaces malformed committed event data as corruption", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "corrupt",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await appendFile(
+      join(
+        root,
+        owner.projectKey,
+        owner.piSessionId,
+        "runs",
+        "corrupt",
+        "events.ndjson",
+      ),
+      "{not-json}\n",
+    );
+
+    await expect(store.readRun("corrupt")).rejects.toBeInstanceOf(
+      WorkflowRunCorruptionError,
+    );
+  });
+
   it("uses byte offsets and complete-line ordinals for unicode events", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
     dirs.push(root);
