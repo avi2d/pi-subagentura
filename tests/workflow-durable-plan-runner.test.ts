@@ -394,4 +394,46 @@ describe("durable sequential plan runner", () => {
     expect(result.status).toBe("cancelled");
     expect(result.terminal).toMatchObject({ status: "cancelled" });
   });
+
+  it("returns the committed terminal projection for parallel task failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "parallel-failed-run",
+      plan: {
+        ...plan,
+        phases: [
+          {
+            id: "parallel",
+            mode: "parallel",
+            tasks: [
+              { id: "a", prompt: "A" },
+              { id: "b", prompt: "B" },
+            ],
+          },
+        ],
+      },
+      runAgent: async ({ prompt }) => {
+        if (prompt === "A") {
+          return {
+            isError: true as const,
+            output: "failed",
+            usage: success("ignored").usage,
+            errorMessage: "provider failed",
+          };
+        }
+        return success("done:B");
+      },
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.terminal).toEqual({
+      status: "error",
+      error: { code: "task_failed", message: "provider failed" },
+    });
+  });
 });

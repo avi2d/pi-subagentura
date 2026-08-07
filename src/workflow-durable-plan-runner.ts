@@ -303,7 +303,9 @@ async function runDurableParallelPhase(
       },
     });
     await appendDeliveryIntent(options.store, options.owner, options.runId);
-    throw firstError;
+    // The coordinator has already committed the terminal result. Returning
+    // the projection keeps the public result aligned with durable state.
+    return false;
   }
   return true;
 }
