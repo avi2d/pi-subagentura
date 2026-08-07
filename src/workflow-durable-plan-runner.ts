@@ -366,10 +366,9 @@ export async function runDurableWorkflowPlan(
   // The stored revision owns mismatch reporting before resume validation.
   if (isTerminal(projection.status)) return publish(projection);
   if (options.signal?.aborted) {
-    await store.append(runId, "run_cancelled", {});
-    await appendDeliveryIntent(store, owner, runId);
-    return publish(await recoverWorkflowRun({ store, owner }, runId));
+    return publish(await commitCancelledRun(store, owner, runId));
   }
+  if (isRunDispatchSuspended(projection)) return publish(projection);
   if (projection.status === "created" || projection.status === "interrupted") {
     await store.append(runId, "run_started", {});
   }
@@ -392,12 +391,14 @@ export async function runDurableWorkflowPlan(
       const existing = projection.tasks[task.id];
       if (existing?.status === "succeeded" || existing?.status === "skipped")
         continue;
+      if (isRunDispatchSuspended(projection) || !isTaskDispatchable(existing))
+        return publish(projection);
       if (options.signal?.aborted) {
         await store.append(runId, "run_result", {
           result: { status: "cancelled" },
         });
         await store.append(runId, "run_cancelled", {});
-        return publish(await recoverWorkflowRun({ store, owner }, runId));
+        return publish(await commitCancelledRun(store, owner, runId));
       }
       const attempt = (existing?.attempt ?? 0) + 1;
       await store.append(runId, "task_started", {
@@ -448,8 +449,7 @@ export async function runDurableWorkflowPlan(
             result: { status: "cancelled" },
           });
           await store.append(runId, "run_cancelled", {});
-          await appendDeliveryIntent(store, owner, runId);
-          return publish(await recoverWorkflowRun({ store, owner }, runId));
+          return publish(await commitCancelledRun(store, owner, runId));
         }
         await store.append(runId, "run_interrupted", {});
         throw error;
@@ -460,6 +460,7 @@ export async function runDurableWorkflowPlan(
   // Mutations are authoritative. Re-read after the declared plan so work
   // appended while the coordinator was running cannot be silently ignored.
   projection = await recoverWorkflowRun({ store, owner }, runId);
+  if (isRunDispatchSuspended(projection)) return publish(projection);
   const declaredTaskIds = new Set(
     plan.phases.flatMap((phase) => phase.tasks.map((task) => task.id)),
   );
@@ -541,6 +542,8 @@ export async function runDurableWorkflowPlan(
     }
   }
 
+  projection = await recoverWorkflowRun({ store, owner }, runId);
+  if (isRunDispatchSuspended(projection)) return publish(projection);
   await store.append(runId, "run_result", {
     result: { status: "done", result: "Workflow completed" },
   });
@@ -568,6 +571,11 @@ async function runDurableParallelPhase(
         options.runId,
       );
       const attempt = (projection.tasks[task.id]?.attempt ?? 0) + 1;
+      if (
+        isRunDispatchSuspended(projection) ||
+        !isTaskDispatchable(projection.tasks[task.id])
+      )
+        return;
       if (options.signal?.aborted) {
         firstError = options.signal.reason ?? new Error("Workflow cancelled");
         return;
@@ -628,10 +636,7 @@ async function runDurableParallelPhase(
   if (firstError !== undefined) {
     if (interrupted) throw firstError;
     if (options.signal?.aborted) {
-      await options.store.append(options.runId, "run_result", {
-        result: { status: "cancelled" },
-      });
-      await options.store.append(options.runId, "run_cancelled", {});
+      await commitCancelledRun(options.store, options.owner, options.runId);
       return false;
     }
     await options.store.append(options.runId, "run_result", {
@@ -666,6 +671,39 @@ async function appendDeliveryIntent(
     deliveryId: workflowDeliveryId(runId),
     message: workflowDeliveryMessage(projection),
   });
+}
+
+async function commitCancelledRun(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+): Promise<WorkflowProjection> {
+  const current = await recoverWorkflowRun({ store, owner }, runId);
+  if (!current.terminal)
+    await store.append(runId, "run_result", {
+      result: { status: "cancelled" },
+    });
+  const afterResult = await recoverWorkflowRun({ store, owner }, runId);
+  if (afterResult.status !== "cancelled")
+    await store.append(runId, "run_cancelled", {});
+  await appendDeliveryIntent(store, owner, runId);
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+function isRunDispatchSuspended(projection: WorkflowProjection): boolean {
+  return (
+    projection.status === "blocked" ||
+    projection.status === "awaiting_budget" ||
+    projection.approval?.status === "pending"
+  );
+}
+
+function isTaskDispatchable(
+  task: WorkflowProjection["tasks"][string] | undefined,
+): boolean {
+  return (
+    task === undefined || task.status === "pending" || task.status === "running"
+  );
 }
 
 function isTerminal(status: WorkflowProjection["status"]): boolean {
