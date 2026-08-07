@@ -78,9 +78,12 @@ export class DurableWorkflowController {
   public async mutateTask(
     runId: string,
     mutation: {
-      type: "block" | "unblock" | "skip";
+      type: "block" | "unblock" | "skip" | "append";
       taskId: string;
       expectedRevision: number;
+      phaseId?: string;
+      prompt?: string;
+      label?: string;
     },
   ): Promise<WorkflowProjection | undefined> {
     const projection = await this.getStatus(runId);
@@ -89,6 +92,17 @@ export class DurableWorkflowController {
       throw new Error(
         `Workflow plan revision is stale: expected ${mutation.expectedRevision}, current ${projection.revision}`,
       );
+    }
+    if (mutation.type === "append") {
+      if (!mutation.phaseId || !mutation.prompt?.trim())
+        throw new Error("Appending workflow work requires phaseId and prompt");
+      await this.options.store.append(runId, "task_appended", {
+        taskId: mutation.taskId,
+        phaseId: mutation.phaseId,
+        prompt: mutation.prompt,
+        ...(mutation.label ? { label: mutation.label } : {}),
+      });
+      return this.getStatus(runId);
     }
     const eventType =
       mutation.type === "block"

@@ -11,6 +11,9 @@ export interface WorkflowProjectionTask {
   status:
     "pending" | "blocked" | "running" | "succeeded" | "failed" | "skipped";
   attempt: number;
+  phaseId?: string;
+  prompt?: string;
+  label?: string;
   result?: unknown;
   error?: string;
 }
@@ -154,6 +157,21 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
           : projection.status === "blocked"
             ? "running"
             : projection.status;
+      break;
+    }
+    case "task_appended": {
+      const id = String(payload.taskId);
+      if (projection.tasks[id]) return;
+      projection.tasks[id] = {
+        id,
+        status: "pending",
+        attempt: 0,
+        phaseId: String(payload.phaseId),
+        prompt: String(payload.prompt),
+        ...(payload.label === undefined
+          ? {}
+          : { label: String(payload.label) }),
+      };
       break;
     }
     case "usage_observed":
