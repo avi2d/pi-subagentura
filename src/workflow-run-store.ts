@@ -16,6 +16,7 @@ import type {
   WorkflowRunLaunch,
 } from "./workflow-run-types";
 import { validateWorkflowRunId } from "./workflow-run-types";
+import { WorkflowNamespaceLease } from "./workflow-lease";
 
 export interface WorkflowRunStoreOptions {
   rootDir: string;
@@ -74,8 +75,10 @@ function safePart(value: string, label: string): string {
 }
 
 export class WorkflowRunStore {
+  private static readonly leases = new Map<string, WorkflowNamespaceLease>();
   private readonly root: string;
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly leaseKey: string;
 
   constructor(private readonly options: WorkflowRunStoreOptions) {
     this.root = join(
@@ -83,11 +86,29 @@ export class WorkflowRunStore {
       safePart(options.owner.projectKey, "project key"),
       safePart(options.owner.piSessionId, "session id"),
     );
+    this.leaseKey = this.root;
+  }
+
+  private async assertNamespaceLease(): Promise<void> {
+    let lease = WorkflowRunStore.leases.get(this.leaseKey);
+    if (!lease) {
+      lease = new WorkflowNamespaceLease({
+        rootDir: this.root,
+        namespace: "namespace",
+        ownerId: this.options.owner.ownerId,
+        leaseToken: this.options.owner.leaseToken,
+        processId: process.pid,
+      });
+      WorkflowRunStore.leases.set(this.leaseKey, lease);
+    }
+    if (!lease.isHeld) await lease.acquire();
+    await lease.assertHeld();
   }
 
   async createRun(
     input: Omit<WorkflowRunLaunch, "schemaVersion" | "createdAt">,
   ): Promise<WorkflowRunLaunch> {
+    await this.assertNamespaceLease();
     validateWorkflowRunId(input.runId);
     const launch: WorkflowRunLaunch = {
       ...input,
@@ -127,6 +148,7 @@ export class WorkflowRunStore {
     payload: P,
     runEpoch = 0,
   ): Promise<WorkflowAppendReceipt> {
+    await this.assertNamespaceLease();
     const dir = this.runDir(runId);
     const event: WorkflowEventEnvelope<T, P> = {
       schemaVersion: 1,
