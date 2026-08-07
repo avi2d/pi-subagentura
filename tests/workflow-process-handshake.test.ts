@@ -7,6 +7,7 @@ import {
   adoptWorkflowProcessPane,
   persistWorkflowProcessLaunchIntent,
   persistWorkflowProcessLaunchDispatch,
+  projectWorkflowProcessUsage,
   readWorkflowProcessLaunchIntent,
   validateWorkflowProcessChildStarted,
 } from "../src/workflow-process-handshake";
@@ -129,5 +130,18 @@ describe("workflow process launch intents", () => {
       kind: "fenced",
     });
     expect(fenced).toEqual(["pane-1", "pane-2"]);
+  });
+
+  it("marks dead-child usage as a lower bound", () => {
+    expect(projectWorkflowProcessUsage({ inputTokens: 4 }, false)).toEqual({
+      inputTokens: 4,
+      outputTokens: 0,
+      completeness: "lower_bound",
+      provenance: "child_dead",
+    });
+    expect(
+      projectWorkflowProcessUsage({ inputTokens: 4, outputTokens: 2 }, true)
+        .completeness,
+    ).toBe("exact");
   });
 });
