@@ -441,6 +441,60 @@ export async function runDurableWorkflowPlan(
     }
   }
 
+  // Mutations are authoritative. Re-read after the declared plan so work
+  // appended while the coordinator was running cannot be silently ignored.
+  projection = await recoverWorkflowRun({ store, owner }, runId);
+  const declaredTaskIds = new Set(
+    plan.phases.flatMap((phase) => phase.tasks.map((task) => task.id)),
+  );
+  for (const task of Object.values(projection.tasks)) {
+    if (
+      declaredTaskIds.has(task.id) ||
+      !task.prompt ||
+      task.status === "succeeded" ||
+      task.status === "skipped" ||
+      task.status === "blocked"
+    )
+      continue;
+    const attempt = task.attempt + 1;
+    await store.append(runId, "task_started", {
+      taskId: task.id,
+      attempt,
+      phaseId: task.phaseId ?? "appended",
+    });
+    const result = await options.runAgent({
+      prompt: task.prompt,
+      isolation: "in-process",
+      label: task.label ?? task.id,
+      signal: options.signal,
+    });
+    await store.append(runId, "usage_observed", {
+      input: result.usage.input,
+      output: result.usage.output,
+      taskId: task.id,
+      attempt,
+    });
+    if (result.isError) {
+      const message = result.errorMessage ?? "Task failed";
+      await store.append(runId, "task_failed", {
+        taskId: task.id,
+        attempt,
+        error: message,
+      });
+      await store.append(runId, "run_result", {
+        result: { status: "error", error: { code: "task_failed", message } },
+      });
+      await store.append(runId, "run_terminal", {});
+      await appendDeliveryIntent(store, owner, runId);
+      return publish(await recoverWorkflowRun({ store, owner }, runId));
+    }
+    await store.append(runId, "task_succeeded", {
+      taskId: task.id,
+      attempt,
+      result: result.output,
+    });
+  }
+
   await store.append(runId, "run_result", {
     result: { status: "done", result: "Workflow completed" },
   });
