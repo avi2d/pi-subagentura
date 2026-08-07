@@ -6,6 +6,7 @@ import {
   enumerateRecoverableWorkflowRuns,
   recoverWorkflowRun,
 } from "../src/workflow-recovery";
+import { projectWorkflowRun } from "../src/workflow-projection-repository";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
 
@@ -87,5 +88,50 @@ describe("workflow recovery projection", () => {
     await expect(
       recoverWorkflowRun({ store, owner: other }, "run"),
     ).rejects.toThrow("different owner");
+  });
+
+  it("does not let stale or duplicate evidence reopen terminal work", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "task_started", {
+      taskId: "a",
+      attempt: 2,
+    });
+    await store.append("run", "task_succeeded", {
+      taskId: "a",
+      attempt: 2,
+      result: "ok",
+    });
+    await store.append("run", "task_started", { taskId: "a", attempt: 1 });
+    await store.append("run", "run_terminal", {
+      result: { status: "done", result: "complete" },
+    });
+    await store.append("run", "task_failed", {
+      taskId: "a",
+      attempt: 3,
+      error: "late",
+    });
+
+    const record = await store.readRun("run");
+    const duplicateProjection = projectWorkflowRun(record.launch, [
+      ...record.events,
+      record.events[1],
+    ]);
+    const projection = await recoverWorkflowRun({ store, owner }, "run");
+
+    expect(projection.status).toBe("done");
+    expect(duplicateProjection.revision).toBe(projection.revision);
+    expect(projection.tasks.a).toMatchObject({
+      status: "succeeded",
+      attempt: 2,
+      result: "ok",
+    });
   });
 });
