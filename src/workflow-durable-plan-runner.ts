@@ -25,6 +25,10 @@ export async function runDurableWorkflowPlan(
   options: DurableWorkflowPlanOptions,
 ): Promise<WorkflowProjection> {
   const { store, owner, runId, plan } = options;
+  const publish = (next: WorkflowProjection): WorkflowProjection => {
+    options.onProjection?.(next);
+    return next;
+  };
   let projection: WorkflowProjection;
   try {
     projection = await recoverWorkflowRun({ store, owner }, runId);
@@ -41,7 +45,7 @@ export async function runDurableWorkflowPlan(
   }
 
   if (projection.status === "interrupted" && !options.resume) {
-    return projection;
+    return publish(projection);
   }
   if (projection.planRevision !== plan.schemaVersion) {
     throw new Error(
@@ -49,7 +53,7 @@ export async function runDurableWorkflowPlan(
         `requested ${plan.schemaVersion}`,
     );
   }
-  if (isTerminal(projection.status)) return projection;
+  if (isTerminal(projection.status)) return publish(projection);
   if (projection.status === "created" || projection.status === "interrupted") {
     await store.append(runId, "run_started", {});
   }
@@ -63,7 +67,7 @@ export async function runDurableWorkflowPlan(
       }
       if (options.signal?.aborted) {
         await store.append(runId, "run_interrupted", {});
-        return recoverWorkflowRun({ store, owner }, runId);
+        return publish(await recoverWorkflowRun({ store, owner }, runId));
       }
       const attempt = (existing?.attempt ?? 0) + 1;
       await store.append(runId, "task_started", {
@@ -99,7 +103,7 @@ export async function runDurableWorkflowPlan(
               },
             },
           });
-          return recoverWorkflowRun({ store, owner }, runId);
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
         await store.append(runId, "task_succeeded", {
           taskId: task.id,
@@ -117,8 +121,7 @@ export async function runDurableWorkflowPlan(
     result: { status: "done", result: "Workflow completed" },
   });
   projection = await recoverWorkflowRun({ store, owner }, runId);
-  options.onProjection?.(projection);
-  return projection;
+  return publish(projection);
 }
 
 function isTerminal(status: WorkflowProjection["status"]): boolean {

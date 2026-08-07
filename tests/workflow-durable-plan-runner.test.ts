@@ -130,4 +130,26 @@ describe("durable sequential plan runner", () => {
       }),
     ).rejects.toThrow("Workflow plan revision mismatch");
   });
+
+  it("publishes terminal projections for recovered and failed runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const statuses: string[] = [];
+
+    await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "run",
+      plan: {
+        ...plan,
+        phases: [{ ...plan.phases[0], tasks: [plan.phases[0].tasks[0]] }],
+      },
+      runAgent: async () => success("done"),
+      onProjection: (projection) => statuses.push(projection.status),
+    });
+
+    expect(statuses.at(-1)).toBe("done");
+    expect(statuses.length).toBeGreaterThan(0);
+  });
 });
