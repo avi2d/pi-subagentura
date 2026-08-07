@@ -2553,6 +2553,33 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-budget", {
+      description: "Pause or resume a durable workflow budget gate.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const [runId, operation, ...reasonParts] = args.trim().split(/\s+/);
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        if (!controller || !runId || !["pause", "resume"].includes(operation)) {
+          const usage =
+            "Usage: /workflow-budget <runId> <pause|resume> [reason]";
+          ctx.ui.notify(usage);
+          sendCommandMessage(usage);
+          return;
+        }
+        const updated =
+          operation === "pause"
+            ? await controller.pauseForBudget(
+                runId,
+                reasonParts.length > 0 ? reasonParts.join(" ") : undefined,
+              )
+            : await controller.resumeFromBudget(runId);
+        const text = `Durable workflow ${runId} budget ${operation}d (status ${updated?.status ?? "unknown"}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
+    });
+
     pi.registerCommand("workflow-tree", {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
