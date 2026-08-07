@@ -29,7 +29,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [ ] 17. Add a namespace-shared dispatcher with process and in-process caps.
 - [ ] 18. Make stop-on-failure draining and dispatch order deterministic.
 - [x] 19. Deduplicate attempt accounting across replay and crash boundaries.
-- [ ] 20. Mark interrupted usage as an explicit lower bound with provenance.
+- [x] 20. Mark interrupted usage as an explicit lower bound with provenance.
 - [ ] 21. Make terminal task and result ordering stable across reloads.
 
 ## Process-child handshake and adoption
