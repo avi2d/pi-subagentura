@@ -1,4 +1,5 @@
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import { WorkflowRunStore } from "./workflow-run-store";
 
 export interface WorkflowOwnerIdentityInput {
   projectKey: string;
@@ -26,4 +27,17 @@ export function createWorkflowOwnerIdentity(
     throw new Error("Invalid workflow owner generation");
   }
   return { ...input };
+}
+
+export function createWorkflowRunStore(
+  rootDir: string,
+  input: WorkflowOwnerIdentityInput,
+): WorkflowRunStore {
+  if (!rootDir || rootDir.length > 500) {
+    throw new Error("Invalid workflow store root directory");
+  }
+  return new WorkflowRunStore({
+    rootDir,
+    owner: createWorkflowOwnerIdentity(input),
+  });
 }
