@@ -97,8 +97,7 @@ export class WorkflowRunStore {
         runId,
         startByte: before.byteLength,
         endByte: before.byteLength + Buffer.byteLength(line),
-        eventOrdinal:
-          before.length === 0 ? 0 : before.toString().split("\n").length - 1,
+        eventOrdinal: countCompleteLines(before),
       };
     });
   }
@@ -107,14 +106,15 @@ export class WorkflowRunStore {
     const launch = JSON.parse(
       await readFile(join(this.runDir(runId), "launch.json"), "utf8"),
     ) as WorkflowRunLaunch;
-    const text = await readFile(
-      join(this.runDir(runId), "events.ndjson"),
-      "utf8",
-    );
+    const bytes = await readFile(join(this.runDir(runId), "events.ndjson"));
     const events: WorkflowEventEnvelope[] = [];
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      events.push(JSON.parse(line) as WorkflowEventEnvelope);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const newline = bytes.indexOf(0x0a, offset);
+      if (newline < 0) break;
+      const line = bytes.subarray(offset, newline).toString("utf8");
+      if (line) events.push(JSON.parse(line) as WorkflowEventEnvelope);
+      offset = newline + 1;
     }
     return { launch, events };
   }
@@ -141,6 +141,12 @@ export class WorkflowRunStore {
       if (this.locks.get(runId) === current) this.locks.delete(runId);
     }
   }
+}
+
+function countCompleteLines(bytes: Buffer): number {
+  let count = 0;
+  for (const byte of bytes) if (byte === 0x0a) count++;
+  return count;
 }
 
 export function workflowRunStoreRoot(
