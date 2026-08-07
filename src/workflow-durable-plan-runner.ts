@@ -35,6 +35,7 @@ export interface DurableWorkflowPlanOptions {
 export interface DurableWorkflowControllerOptions {
   store: WorkflowRunStore;
   owner: WorkflowOwnerIdentity;
+  onApprovalDecision?: (runId: string, status: "approved" | "rejected") => void;
 }
 
 /** Owner-scoped controller for durable status, result, and cancellation. */
@@ -255,6 +256,7 @@ export class DurableWorkflowController {
         reason: decision.reason ?? "Workflow approval rejected",
       });
     }
+    this.options.onApprovalDecision?.(runId, decision.status);
     return this.getStatus(runId);
   }
 }
