@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createWorkflowOwnerIdentity } from "../src/workflow-owner";
+import {
+  createWorkflowOwnerIdentity,
+  createWorkflowRunStore,
+} from "../src/workflow-owner";
 
 describe("workflow owner identity", () => {
   it("constructs the complete durable fence", () => {
@@ -36,5 +39,17 @@ describe("workflow owner identity", () => {
         leaseToken: "lease",
       }),
     ).toThrow("generation");
+  });
+
+  it("binds a run store to the validated owner", () => {
+    const store = createWorkflowRunStore("/tmp/workflows", {
+      projectKey: "project",
+      cwd: "/repo",
+      piSessionId: "session",
+      ownerId: "owner",
+      ownerGeneration: 0,
+      leaseToken: "lease",
+    });
+    expect(store).toBeDefined();
   });
 });
