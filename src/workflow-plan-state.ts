@@ -19,6 +19,16 @@ export type WorkflowPlanAction =
   | { type: "skip"; taskId: string }
   | { type: "cancel" };
 
+export type WorkflowPlanMutation =
+  | { type: "block"; taskId: string }
+  | { type: "unblock"; taskId: string }
+  | { type: "skip"; taskId: string }
+  | {
+      type: "append";
+      phaseId: string;
+      task: WorkflowPlan["phases"][number]["tasks"][number];
+    };
+
 export function createWorkflowPlanState(plan: WorkflowPlan): WorkflowPlanState {
   validateWorkflowPlan(plan);
   const tasks: Record<string, WorkflowTaskStatus> = {};
@@ -88,6 +98,83 @@ export function reduceWorkflowPlanState(
           : "running";
   }
   return next;
+}
+
+/**
+ * Apply one human/model plan edit without changing execution history.
+ * Future-only edits are deliberately separate from execution transitions so a
+ * caller cannot manufacture task outcomes through the mutation surface.
+ */
+export function mutateWorkflowPlanState(
+  state: WorkflowPlanState,
+  mutation: WorkflowPlanMutation,
+  expectedRevision: number,
+): WorkflowPlanState {
+  if (expectedRevision !== state.revision) {
+    throw new Error(
+      `Workflow plan revision is stale: expected ${expectedRevision}, current ${state.revision}`,
+    );
+  }
+  const current =
+    mutation.type === "append" ? undefined : state.tasks[mutation.taskId];
+  if (mutation.type !== "append" && !current) {
+    throw new Error(`Unknown workflow task: ${mutation.taskId}`);
+  }
+  if (
+    mutation.type !== "append" &&
+    current !== "pending" &&
+    current !== "blocked"
+  ) {
+    throw new Error(`Task ${mutation.taskId} is no longer mutable`);
+  }
+  if (mutation.type === "append") {
+    if (
+      state.status === "done" ||
+      state.status === "error" ||
+      state.status === "cancelled"
+    ) {
+      throw new Error("Cannot append work to a terminal workflow");
+    }
+    const phase = state.plan.phases.find(
+      (candidate) => candidate.id === mutation.phaseId,
+    );
+    if (!phase) throw new Error(`Unknown workflow phase: ${mutation.phaseId}`);
+    if (state.tasks[mutation.task.id]) {
+      throw new Error(`Duplicate workflow task: ${mutation.task.id}`);
+    }
+    const plan = {
+      ...state.plan,
+      phases: state.plan.phases.map((candidate) =>
+        candidate.id === mutation.phaseId
+          ? { ...candidate, tasks: [...candidate.tasks, mutation.task] }
+          : candidate,
+      ),
+    };
+    validateWorkflowPlan(plan);
+    return {
+      ...state,
+      plan,
+      tasks: { ...state.tasks, [mutation.task.id]: "pending" },
+      revision: state.revision + 1,
+    };
+  }
+  const nextStatus =
+    mutation.type === "skip"
+      ? "skipped"
+      : mutation.type === "block"
+        ? "blocked"
+        : "pending";
+  return {
+    ...state,
+    tasks: { ...state.tasks, [mutation.taskId]: nextStatus },
+    status:
+      mutation.type === "block"
+        ? "blocked"
+        : state.status === "blocked"
+          ? "running"
+          : state.status,
+    revision: state.revision + 1,
+  };
 }
 
 function allTasksTerminal(state: WorkflowPlanState): boolean {
