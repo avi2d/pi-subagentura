@@ -204,6 +204,42 @@ describe("durable sequential plan runner", () => {
     expect(calls).toEqual(["A", "B", "B"]);
   });
 
+  it("executes a task appended while the declared plan is running", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const calls: string[] = [];
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "appended-run",
+      plan: {
+        ...plan,
+        phases: [{ ...plan.phases[0], tasks: [plan.phases[0].tasks[0]] }],
+      },
+      runAgent: async ({ prompt }) => {
+        calls.push(prompt);
+        if (prompt === "A") {
+          const controller = new DurableWorkflowController({ store, owner });
+          const current = await controller.getStatus("appended-run");
+          await controller.mutateTask("appended-run", {
+            type: "append",
+            taskId: "C",
+            phaseId: "phase",
+            prompt: "C",
+            expectedRevision: current?.revision ?? 0,
+          });
+        }
+        return success(`done:${prompt}`);
+      },
+    });
+
+    expect(result.status).toBe("done");
+    expect(result.tasks.C).toMatchObject({ status: "succeeded" });
+    expect(calls).toEqual(["A", "C"]);
+  });
+
   it("rejects resuming an existing run with a different plan revision", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);
