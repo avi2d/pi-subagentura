@@ -65,6 +65,18 @@ export class WorkflowRunStorageError extends Error {
   }
 }
 
+export class WorkflowRunQuotaError extends Error {
+  public readonly code = "QUOTA" as const;
+
+  public constructor(
+    public readonly runId: string,
+    public readonly quota: "event" | "run byte" | "owner byte" | "run count",
+  ) {
+    super(`Durable workflow ${quota} quota exceeded for ${runId}`);
+    this.name = "WorkflowRunQuotaError";
+  }
+}
+
 function safePart(value: string, label: string): string {
   if (
     !value ||
@@ -138,7 +150,7 @@ export class WorkflowRunStore {
       this.options.maxRuns !== undefined &&
       (await this.listRunIds()).length >= this.options.maxRuns
     ) {
-      throw new Error("Workflow run count quota exceeded");
+      throw new WorkflowRunQuotaError(input.runId, "run count");
     }
     const launch: WorkflowRunLaunch = {
       ...input,
@@ -214,13 +226,13 @@ export class WorkflowRunStore {
           maxEventBytes <= 0 ||
           completeBytes + Buffer.byteLength(line) > maxEventBytes)
       ) {
-        throw new Error("Workflow event quota exceeded");
+        throw new WorkflowRunQuotaError(runId, "event");
       }
       if (
         maxRunBytes !== undefined &&
         completeBytes + Buffer.byteLength(line) > maxRunBytes
       ) {
-        throw new Error("Workflow run byte quota exceeded");
+        throw new WorkflowRunQuotaError(runId, "run byte");
       }
       if (
         maxOwnerBytes !== undefined &&
@@ -236,7 +248,7 @@ export class WorkflowRunStore {
           ).length;
         }
         if (ownerBytes + Buffer.byteLength(line) > maxOwnerBytes) {
-          throw new Error("Workflow owner byte quota exceeded");
+          throw new WorkflowRunQuotaError(runId, "owner byte");
         }
       }
       const currentEpoch = lastCompleteRunEpoch(before);
