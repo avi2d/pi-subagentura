@@ -7,6 +7,7 @@ import type {
   WorkflowOwnerIdentity,
   WorkflowResumePolicy,
 } from "./workflow-run-types";
+import { createHash } from "node:crypto";
 
 export interface DurableWorkflowPlanOptions {
   store: WorkflowRunStore;
@@ -59,8 +60,36 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection || isTerminal(projection.status)) return projection;
     await this.options.store.append(runId, "run_cancelled", {});
+    await appendDeliveryIntent(this.options.store, this.options.owner, runId);
     return recoverWorkflowRun(this.options, runId);
   }
+
+  public async acknowledgeDelivery(
+    runId: string,
+    deliveryId: string,
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection || projection.delivery?.deliveryId !== deliveryId)
+      return projection;
+    if (projection.delivery.status !== "delivered") {
+      await this.options.store.append(runId, "delivery_receipt", {
+        deliveryId,
+      });
+    }
+    return this.getStatus(runId);
+  }
+}
+
+export function workflowDeliveryId(runId: string): string {
+  return createHash("sha256")
+    .update(`workflow:${runId}:terminal`)
+    .digest("hex");
+}
+
+export function workflowDeliveryMessage(
+  projection: WorkflowProjection,
+): string {
+  return `Workflow ${projection.runId} ${projection.status}`;
 }
 
 export async function runDurableWorkflowPlan(
@@ -104,6 +133,7 @@ export async function runDurableWorkflowPlan(
   if (isTerminal(projection.status)) return publish(projection);
   if (options.signal?.aborted) {
     await store.append(runId, "run_cancelled", {});
+    await appendDeliveryIntent(store, owner, runId);
     return publish(await recoverWorkflowRun({ store, owner }, runId));
   }
   if (projection.status === "created" || projection.status === "interrupted") {
@@ -154,6 +184,7 @@ export async function runDurableWorkflowPlan(
               },
             },
           });
+          await appendDeliveryIntent(store, owner, runId);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
         await store.append(runId, "task_succeeded", {
@@ -164,6 +195,7 @@ export async function runDurableWorkflowPlan(
       } catch (error) {
         if (options.signal?.aborted) {
           await store.append(runId, "run_cancelled", {});
+          await appendDeliveryIntent(store, owner, runId);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
         await store.append(runId, "run_interrupted", {});
@@ -175,8 +207,22 @@ export async function runDurableWorkflowPlan(
   await store.append(runId, "run_terminal", {
     result: { status: "done", result: "Workflow completed" },
   });
+  await appendDeliveryIntent(store, owner, runId);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
+}
+
+async function appendDeliveryIntent(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+): Promise<void> {
+  const projection = await recoverWorkflowRun({ store, owner }, runId);
+  if (projection.delivery) return;
+  await store.append(runId, "delivery_intent", {
+    deliveryId: workflowDeliveryId(runId),
+    message: workflowDeliveryMessage(projection),
+  });
 }
 
 function isTerminal(status: WorkflowProjection["status"]): boolean {
