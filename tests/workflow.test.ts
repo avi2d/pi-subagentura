@@ -2511,9 +2511,10 @@ describe("registerWorkflowTool", () => {
       on: vi.fn(),
     };
     registerWorkflowTool(pi as any);
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
     expect(tools.map((t) => t.name)).toEqual([
       "get_durable_workflow_status",
+      "get_durable_workflow_result",
       "start_durable_workflow",
       "workflow",
       "get_workflow_status",

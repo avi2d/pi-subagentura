@@ -46,7 +46,7 @@ describe("README public surface", () => {
       "## Agent-facing tools",
     );
 
-    expect(tools).toHaveLength(23);
+    expect(tools).toHaveLength(24);
     expect(commands).toHaveLength(17);
     for (const name of tools) {
       expect(toolInventory, `Missing tool inventory row for ${name}`).toContain(

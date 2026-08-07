@@ -135,7 +135,7 @@ These commands are intended for people at the Pi prompt.
 
 ## Agent-facing tools
 
-The extension registers 23 public tools for parent agents.
+The extension registers 24 public tools for parent agents.
 
 | Tool                                | Purpose                                                        |
 | ----------------------------------- | -------------------------------------------------------------- |
@@ -147,6 +147,7 @@ The extension registers 23 public tools for parent agents.
 | `get_workflow_result`               | Wait for and return a workflow result                          |
 | `cancel_workflow`                   | Cancel a background workflow                                   |
 | `get_durable_workflow_status`       | Inspect a durable workflow projection                          |
+| `get_durable_workflow_result`       | Retrieve a persisted terminal durable workflow result          |
 | `start_durable_workflow`            | Validate and start an owner-bound durable plan                 |
 | `subagent_with_context`             | Delegate with the parent conversation                          |
 | `subagent_isolated`                 | Delegate with a fresh context                                  |
