@@ -192,6 +192,35 @@ describe("workflow recovery projection", () => {
     expect(projection.tasks.done.status).toBe("succeeded");
   });
 
+  it("fences controller mutations by the projected revision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "run_created", {});
+    const controller = new DurableWorkflowController({ store, owner });
+    const created = await controller.getStatus("run");
+    expect(created?.revision).toBe(1);
+    await expect(
+      controller.mutateTask("run", {
+        type: "skip",
+        taskId: "task",
+        expectedRevision: 0,
+      }),
+    ).rejects.toThrow("stale");
+    const updated = await controller.mutateTask("run", {
+      type: "skip",
+      taskId: "task",
+      expectedRevision: 1,
+    });
+    expect(updated?.tasks.task.status).toBe("skipped");
+  });
+
   it("reads projections through the owner-scoped repository", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);

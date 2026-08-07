@@ -75,6 +75,33 @@ export class DurableWorkflowController {
     return recoverWorkflowRun(this.options, runId);
   }
 
+  public async mutateTask(
+    runId: string,
+    mutation: {
+      type: "block" | "unblock" | "skip";
+      taskId: string;
+      expectedRevision: number;
+    },
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.getStatus(runId);
+    if (!projection) return undefined;
+    if (projection.revision !== mutation.expectedRevision) {
+      throw new Error(
+        `Workflow plan revision is stale: expected ${mutation.expectedRevision}, current ${projection.revision}`,
+      );
+    }
+    const eventType =
+      mutation.type === "block"
+        ? "task_blocked"
+        : mutation.type === "unblock"
+          ? "task_unblocked"
+          : "task_skipped";
+    await this.options.store.append(runId, eventType, {
+      taskId: mutation.taskId,
+    });
+    return this.getStatus(runId);
+  }
+
   public async acknowledgeDelivery(
     runId: string,
     deliveryId: string,
