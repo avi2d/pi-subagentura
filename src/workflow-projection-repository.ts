@@ -41,7 +41,11 @@ export function projectWorkflowRun(
     lastEventOrdinal: -1,
   };
 
+  const appliedEventIds = new Set<string>();
+
   for (const [ordinal, event] of events.entries()) {
+    if (appliedEventIds.has(event.eventId)) continue;
+    appliedEventIds.add(event.eventId);
     projection.lastEventOrdinal = ordinal;
     projection.revision++;
     applyEvent(projection, event);
@@ -51,6 +55,7 @@ export function projectWorkflowRun(
 
 function applyEvent(projection: WorkflowProjection, event: Event): void {
   const payload = event.payload ?? {};
+  if (isTerminal(projection.status) && event.type !== "run_result") return;
   switch (event.type) {
     case "run_created":
       projection.status = "created";
@@ -61,10 +66,13 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
     case "task_started": {
       const id = String(payload.taskId);
       const previous = projection.tasks[id];
+      const attempt = Number(payload.attempt ?? (previous?.attempt ?? 0) + 1);
+      if (previous && isTerminalTask(previous.status)) return;
+      if (previous && attempt < previous.attempt) return;
       projection.tasks[id] = {
         id,
         status: "running",
-        attempt: Number(payload.attempt ?? (previous?.attempt ?? 0) + 1),
+        attempt,
         ...(previous?.result === undefined ? {} : { result: previous.result }),
       };
       projection.status = "running";
@@ -75,10 +83,13 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
     case "task_done": {
       const id = String(payload.taskId);
       const previous = projection.tasks[id];
+      const attempt = Number(payload.attempt ?? previous?.attempt ?? 1);
+      if (previous && attempt < previous.attempt) return;
+      if (previous?.status === "succeeded") return;
       projection.tasks[id] = {
         id,
         status: "succeeded",
-        attempt: Number(payload.attempt ?? previous?.attempt ?? 1),
+        attempt,
         ...(payload.result === undefined ? {} : { result: payload.result }),
       };
       break;
@@ -86,10 +97,13 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
     case "task_failed": {
       const id = String(payload.taskId);
       const previous = projection.tasks[id];
+      const attempt = Number(payload.attempt ?? previous?.attempt ?? 1);
+      if (previous && attempt < previous.attempt) return;
+      if (previous && isTerminalTask(previous.status)) return;
       projection.tasks[id] = {
         id,
         status: "failed",
-        attempt: Number(payload.attempt ?? previous?.attempt ?? 1),
+        attempt,
         error: String(payload.error ?? payload.message ?? "Task failed"),
       };
       projection.status = "error";
@@ -123,4 +137,12 @@ function finite(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
     : 0;
+}
+
+function isTerminal(status: WorkflowRunStatus): boolean {
+  return status === "done" || status === "error" || status === "cancelled";
+}
+
+function isTerminalTask(status: WorkflowProjectionTask["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "skipped";
 }
