@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createWorkflowProcessLaunchIntent,
+  adoptWorkflowProcessPane,
   persistWorkflowProcessLaunchIntent,
   persistWorkflowProcessLaunchDispatch,
   readWorkflowProcessLaunchIntent,
@@ -93,5 +94,40 @@ describe("workflow process launch intents", () => {
         epoch: intent.epoch,
       }),
     ).toThrow("Stale workflow process child evidence");
+  });
+
+  it("adopts one intended pane and fences ambiguity", async () => {
+    const intent = createWorkflowProcessLaunchIntent({
+      runId: "run-1",
+      operationId: "op-1",
+      attemptId: "attempt-1",
+      attemptNumber: 1,
+      epoch: 1,
+    });
+    const intended = {
+      paneId: "pane-1",
+      launchMarker: intent.launchMarker,
+      attemptId: intent.attemptId,
+    };
+    const inspector = {
+      findByMarker: async () => [intended],
+      fence: async () => undefined,
+    };
+    await expect(adoptWorkflowProcessPane(intent, inspector)).resolves.toEqual({
+      kind: "adopted",
+      candidate: intended,
+    });
+    const fenced: string[] = [];
+    const ambiguous = {
+      findByMarker: async () => [intended, { ...intended, paneId: "pane-2" }],
+      fence: async (candidate: { paneId: string }) =>
+        void fenced.push(candidate.paneId),
+    };
+    await expect(
+      adoptWorkflowProcessPane(intent, ambiguous),
+    ).resolves.toMatchObject({
+      kind: "fenced",
+    });
+    expect(fenced).toEqual(["pane-1", "pane-2"]);
   });
 });
