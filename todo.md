@@ -15,9 +15,9 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 ## Ownership, leases, and storage safety
 
 - [x] 8. Integrate one namespace lease so concurrent Pi processes cannot write together.
-- [ ] 9. Add process identity/liveness checks and fail-closed stale takeover.
+- [x] 9. Add process identity/liveness checks and fail-closed stale takeover.
 - [ ] 10. Apply owner, token, and epoch fencing to every durable mutation.
-- [ ] 11. Harden filesystem storage against symlinks, hardlinks, races, traversal, and non-regular files.
+- [x] 11. Harden filesystem storage against symlinks, hardlinks, races, traversal, and non-regular files.
 - [x] 12. Stop recovery on malformed complete event lines.
 - [x] 13. Recover torn tails only at complete-line byte boundaries.
 - [ ] 14. Complete ENOSPC, event, run, owner-byte, blob, and output quota behavior.
