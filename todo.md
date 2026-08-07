@@ -88,7 +88,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 ## Verification
 
-- [ ] Run `npm run typecheck`.
-- [ ] Run `npm test`.
-- [ ] Run `npm run format:check`.
-- [ ] Run `npm run pack:check`.
+- [x] Run `npm run typecheck`.
+- [x] Run `npm test`.
+- [x] Run `npm run format:check`.
+- [x] Run `npm run pack:check`.
