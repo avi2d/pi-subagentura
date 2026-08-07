@@ -2357,6 +2357,47 @@ export function registerWorkflowTool(
       },
     });
 
+    pi.registerCommand("workflow-plan-append", {
+      description: "Append one future task to a durable workflow.",
+      handler: async (args: string, ctx: ExtensionCommandContext) => {
+        const parts = args.trim().split(/\s+/);
+        const [runId, revisionText, taskId, phaseId, ...promptParts] = parts;
+        const controller = sessionScope
+          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
+          : undefined;
+        const expectedRevision = Number(revisionText);
+        if (
+          !controller ||
+          !runId ||
+          !Number.isSafeInteger(expectedRevision) ||
+          !taskId ||
+          !phaseId ||
+          promptParts.length === 0
+        ) {
+          const text =
+            "Usage: /workflow-plan-append <runId> <revision> <taskId> <phaseId> <prompt>";
+          ctx.ui.notify(text);
+          sendCommandMessage(text);
+          return;
+        }
+        const projection = await controller.getStatus(runId);
+        if (!projection) {
+          ctx.ui.notify(`Durable workflow ${runId} was not found.`);
+          return;
+        }
+        const updated = await controller.mutateTask(runId, {
+          type: "append",
+          taskId,
+          phaseId,
+          prompt: promptParts.join(" "),
+          expectedRevision,
+        });
+        const text = `Appended ${taskId} to durable workflow ${runId} (revision ${updated?.revision ?? projection.revision}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      },
+    });
+
     pi.registerCommand("workflow-tree", {
       description:
         "Open an interactive workflow tree with expand/collapse and cancel controls.",
