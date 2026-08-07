@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   createWorkflowReplayRequest,
   durableWorkflowDigest,
+  assertWorkflowReplayRequestMatches,
   persistWorkflowDefinitionBlob,
   readWorkflowDefinitionBlob,
   replayWorkflowResponses,
@@ -29,6 +30,12 @@ describe("workflow durable replay", () => {
     });
     expect(first).toEqual(second);
     expect(durableWorkflowDigest(null)).toHaveLength(64);
+    expect(() =>
+      assertWorkflowReplayRequestMatches(first, {
+        ...second,
+        promptDigest: "0".repeat(64),
+      }),
+    ).toThrow("request diverged");
   });
 
   it("replays all response kinds in ordinal order", () => {

@@ -145,3 +145,18 @@ export function replayWorkflowResponses(
   }
   return actual;
 }
+
+export function assertWorkflowReplayRequestMatches(
+  expected: WorkflowReplayRequest,
+  actual: WorkflowReplayRequest,
+): void {
+  if (
+    expected.operationId !== actual.operationId ||
+    expected.dispatchOrdinal !== actual.dispatchOrdinal ||
+    expected.promptDigest !== actual.promptDigest ||
+    expected.optionsDigest !== actual.optionsDigest ||
+    expected.definitionDigest !== actual.definitionDigest
+  ) {
+    throw new WorkflowReplayDivergedError("Workflow replay request diverged");
+  }
+}
