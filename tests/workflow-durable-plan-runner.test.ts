@@ -436,4 +436,69 @@ describe("durable sequential plan runner", () => {
       error: { code: "task_failed", message: "provider failed" },
     });
   });
+
+  it("retries an interrupted parallel attempt without rerunning committed siblings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const calls: string[] = [];
+    let interrupted = true;
+    const parallelPlan: WorkflowPlan = {
+      ...plan,
+      phases: [
+        {
+          id: "parallel",
+          mode: "parallel",
+          tasks: [
+            { id: "a", prompt: "A" },
+            { id: "b", prompt: "B" },
+          ],
+        },
+      ],
+    };
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "parallel-interrupted-run",
+        plan: parallelPlan,
+        runAgent: async ({ prompt }) => {
+          calls.push(prompt);
+          if (prompt === "B" && interrupted) {
+            interrupted = false;
+            throw new Error("parent died");
+          }
+          return success(`done:${prompt}`);
+        },
+      }),
+    ).rejects.toThrow("parent died");
+
+    const interruptedProjection = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "parallel-interrupted-run",
+      plan: parallelPlan,
+      resume: false,
+      runAgent: async ({ prompt }) => success(`done:${prompt}`),
+    });
+    expect(interruptedProjection.status).toBe("interrupted");
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "parallel-interrupted-run",
+      plan: parallelPlan,
+      resume: true,
+      runAgent: async ({ prompt }) => {
+        calls.push(prompt);
+        return success(`done:${prompt}`);
+      },
+    });
+
+    expect(result.status).toBe("done");
+    expect(calls.sort()).toEqual(["A", "B", "B"]);
+    expect(result.tasks.a).toMatchObject({ status: "succeeded", attempt: 1 });
+    expect(result.tasks.b).toMatchObject({ status: "succeeded", attempt: 2 });
+  });
 });

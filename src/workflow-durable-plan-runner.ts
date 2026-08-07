@@ -232,6 +232,7 @@ async function runDurableParallelPhase(
   const limit = Math.max(1, Math.min(4, tasks.length));
   let nextIndex = 0;
   let firstError: unknown;
+  let interrupted = false;
   const worker = async (): Promise<void> => {
     while (firstError === undefined) {
       const task = tasks[nextIndex++];
@@ -263,8 +264,18 @@ async function runDurableParallelPhase(
           taskId: task.id,
           attempt,
         });
-        if (result.isError)
-          throw new Error(result.errorMessage ?? "Task failed");
+        if (result.isError) {
+          const message = result.errorMessage ?? "Task failed";
+          await options.store.append(options.runId, "task_failed", {
+            taskId: task.id,
+            attempt,
+            error: message,
+          });
+          if (firstError === undefined) {
+            firstError = new Error(message);
+          }
+          return;
+        }
         await options.store.append(options.runId, "task_succeeded", {
           taskId: task.id,
           attempt,
@@ -275,17 +286,21 @@ async function runDurableParallelPhase(
           firstError ??= error;
           return;
         }
-        await options.store.append(options.runId, "task_failed", {
-          taskId: task.id,
-          attempt,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        firstError ??= error;
+        // A thrown runner error means the coordinator/attempt was interrupted.
+        // Logical task failures are represented by result.isError and are the
+        // only failures that should close the run as terminal.
+        if (firstError === undefined) {
+          interrupted = true;
+          firstError = error;
+          await options.store.append(options.runId, "run_interrupted", {});
+        }
+        return;
       }
     }
   };
   await Promise.all(Array.from({ length: limit }, () => worker()));
   if (firstError !== undefined) {
+    if (interrupted) throw firstError;
     if (options.signal?.aborted) {
       await options.store.append(options.runId, "run_cancelled", {});
       return false;
