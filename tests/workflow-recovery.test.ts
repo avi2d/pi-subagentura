@@ -248,6 +248,43 @@ describe("workflow recovery projection", () => {
     ).rejects.toThrow("Duplicate");
   });
 
+  it("enforces the legal block and unblock transition sequence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("run", "task_appended", {
+      taskId: "task",
+      phaseId: "phase",
+      prompt: "work",
+    });
+    const controller = new DurableWorkflowController({ store, owner });
+    const initial = await controller.getStatus("run");
+    const blocked = await controller.mutateTask("run", {
+      type: "block",
+      taskId: "task",
+      expectedRevision: initial?.revision ?? 0,
+    });
+    await expect(
+      controller.mutateTask("run", {
+        type: "block",
+        taskId: "task",
+        expectedRevision: blocked?.revision ?? 0,
+      }),
+    ).rejects.toThrow("cannot be block");
+    const unblocked = await controller.mutateTask("run", {
+      type: "unblock",
+      taskId: "task",
+      expectedRevision: blocked?.revision ?? 0,
+    });
+    expect(unblocked?.tasks.task.status).toBe("pending");
+  });
+
   it("reads projections through the owner-scoped repository", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);
