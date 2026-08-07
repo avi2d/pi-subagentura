@@ -110,6 +110,21 @@ export class DurableWorkflowController {
       });
       return this.getStatus(runId);
     }
+    const currentTask = projection.tasks[mutation.taskId];
+    if (!currentTask)
+      throw new Error(`Unknown workflow task: ${mutation.taskId}`);
+    if (
+      (mutation.type === "block" || mutation.type === "unblock") &&
+      currentTask.status !== (mutation.type === "block" ? "pending" : "blocked")
+    ) {
+      throw new Error(`Task ${mutation.taskId} cannot be ${mutation.type}d`);
+    }
+    if (
+      mutation.type === "skip" &&
+      !["pending", "blocked"].includes(currentTask.status)
+    ) {
+      throw new Error(`Task ${mutation.taskId} is no longer mutable`);
+    }
     const eventType =
       mutation.type === "block"
         ? "task_blocked"
