@@ -87,6 +87,15 @@ export interface WorkflowApprovalRequest {
   version: number;
 }
 
+export type WorkflowApprovalStatus = "pending" | "approved" | "rejected";
+
+export interface WorkflowApprovalDecision {
+  requestId: string;
+  status: Exclude<WorkflowApprovalStatus, "pending">;
+  decidedBy: string;
+  reason?: string;
+}
+
 export function validateWorkflowApprovalRequest(
   request: WorkflowApprovalRequest,
 ): void {
@@ -102,5 +111,19 @@ export function validateWorkflowApprovalRequest(
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new Error("Invalid workflow approval request version");
     }
+  }
+}
+
+export function validateWorkflowApprovalDecision(
+  decision: WorkflowApprovalDecision,
+): void {
+  if (!decision.requestId || !decision.decidedBy) {
+    throw new Error("Invalid workflow approval decision");
+  }
+  if (decision.status !== "approved" && decision.status !== "rejected") {
+    throw new Error("Invalid workflow approval decision status");
+  }
+  if (decision.reason !== undefined && !decision.reason.trim()) {
+    throw new Error("Invalid workflow approval decision reason");
   }
 }

@@ -4,6 +4,8 @@ import type {
   WorkflowRunStatus,
   WorkflowTerminalResult,
   WorkflowDeliveryIntent,
+  WorkflowApprovalRequest,
+  WorkflowApprovalDecision,
 } from "./workflow-run-types";
 
 export interface WorkflowProjectionTask {
@@ -30,6 +32,11 @@ export interface WorkflowProjection {
   usage: { input: number; output: number };
   lastEventOrdinal: number;
   delivery?: WorkflowDeliveryIntent;
+  approval?: {
+    request: WorkflowApprovalRequest;
+    status: "pending" | "approved" | "rejected";
+    decision?: WorkflowApprovalDecision;
+  };
 }
 
 /** Read-only authority used by status, result, and tree projections. */
@@ -87,6 +94,17 @@ function applyEvent(projection: WorkflowProjection, event: Event): void {
       break;
     case "run_started":
       projection.status = "running";
+      break;
+    case "approval_requested":
+      projection.approval = {
+        request: payload.request as WorkflowApprovalRequest,
+        status: "pending",
+      };
+      break;
+    case "approval_decided":
+      if (!projection.approval) return;
+      projection.approval.status = payload.status;
+      projection.approval.decision = payload as WorkflowApprovalDecision;
       break;
     case "task_started": {
       const id = String(payload.taskId);

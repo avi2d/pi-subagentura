@@ -54,6 +54,51 @@ afterEach(async () => {
 });
 
 describe("durable sequential plan runner", () => {
+  it("persists a pending approval and an idempotent host decision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "approval-run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("approval-run", "run_created", {});
+    const controller = new DurableWorkflowController({ store, owner });
+    const request = {
+      requestId: "approval-1",
+      policyHash: "policy",
+      planRevision: 1,
+      ownerGeneration: 1,
+      leaseEpoch: 0,
+      version: 1,
+    };
+
+    const pending = await controller.requestApproval("approval-run", request);
+    expect(pending?.approval?.status).toBe("pending");
+    const decided = await controller.decideApproval(
+      "approval-run",
+      "approval-1",
+      {
+        requestId: "approval-1",
+        status: "approved",
+        decidedBy: "operator",
+      },
+    );
+    expect(decided?.approval?.status).toBe("approved");
+    const replayed = await controller.decideApproval(
+      "approval-run",
+      "approval-1",
+      {
+        requestId: "approval-1",
+        status: "rejected",
+        decidedBy: "late-operator",
+      },
+    );
+    expect(replayed?.approval?.status).toBe("approved");
+  });
+
   it("repairs a terminal run whose delivery intent was not committed", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);
