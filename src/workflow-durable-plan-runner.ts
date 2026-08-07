@@ -49,7 +49,25 @@ export class DurableWorkflowController {
   ): Promise<WorkflowProjection | undefined> {
     try {
       const projection = await recoverWorkflowRun(this.options, runId);
-      if (isTerminal(projection.status) && !projection.delivery) {
+      if (projection.status === "error" && !projection.terminal) {
+        const failed = Object.values(projection.tasks).find(
+          (task) => task.status === "failed",
+        );
+        if (failed) {
+          await this.options.store.append(runId, "run_result", {
+            result: {
+              status: "error",
+              error: {
+                code: "task_failed",
+                message: failed.error ?? "Task failed",
+              },
+            },
+          });
+          await this.options.store.append(runId, "run_terminal", {});
+        }
+      }
+      const repaired = await recoverWorkflowRun(this.options, runId);
+      if (isTerminal(repaired.status) && !repaired.delivery) {
         // A crash may occur after the terminal event and before the outbox
         // intent. Repair the limbo window before exposing the projection.
         await appendDeliveryIntent(
@@ -59,7 +77,7 @@ export class DurableWorkflowController {
         );
         return recoverWorkflowRun(this.options, runId);
       }
-      return projection;
+      return repaired;
     } catch (error) {
       if (isMissingRun(error)) return undefined;
       throw error;
@@ -288,6 +306,9 @@ export async function runDurableWorkflowPlan(
   options: DurableWorkflowPlanOptions,
 ): Promise<WorkflowProjection> {
   const { store, owner, runId, plan } = options;
+  const planDigest = createHash("sha256")
+    .update(JSON.stringify(plan))
+    .digest("hex");
   const publish = (next: WorkflowProjection): WorkflowProjection => {
     options.onProjection?.(next);
     return next;
@@ -305,6 +326,7 @@ export async function runDurableWorkflowPlan(
     await store.createRun({
       runId,
       planRevision: plan.schemaVersion,
+      planDigest,
       resumePolicy: options.resumePolicy ?? "manual",
       owner,
     });
@@ -320,6 +342,10 @@ export async function runDurableWorkflowPlan(
       `Workflow plan revision mismatch: stored ${projection.planRevision}, ` +
         `requested ${plan.schemaVersion}`,
     );
+  }
+  const launch = await store.readRun(runId);
+  if (launch.launch.planDigest && launch.launch.planDigest !== planDigest) {
+    throw new Error("Workflow plan definition mismatch");
   }
   // The stored revision owns mismatch reporting before resume validation.
   if (isTerminal(projection.status)) return publish(projection);

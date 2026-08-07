@@ -59,6 +59,12 @@ export class WorkflowNamespaceLease {
     return this.held;
   }
 
+  public belongsTo(ownerId: string, leaseToken: string): boolean {
+    return (
+      this.options.ownerId === ownerId && this.options.leaseToken === leaseToken
+    );
+  }
+
   public async acquire(): Promise<WorkflowNamespaceLeaseRecord> {
     await mkdir(join(this.options.rootDir, this.options.namespace), {
       recursive: true,

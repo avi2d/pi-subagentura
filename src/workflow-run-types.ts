@@ -47,6 +47,7 @@ export interface WorkflowRunLaunch {
   resumePolicy: WorkflowResumePolicy;
   owner: WorkflowOwnerIdentity;
   createdAt: number;
+  planDigest?: string;
 }
 
 export interface WorkflowAppendReceipt {

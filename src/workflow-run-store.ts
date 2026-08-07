@@ -97,6 +97,12 @@ export class WorkflowRunStore {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly leaseKey: string;
 
+  public static async releaseAllLeases(): Promise<void> {
+    const leases = [...WorkflowRunStore.leases.entries()];
+    WorkflowRunStore.leases.clear();
+    for (const [, lease] of leases) await lease.release();
+  }
+
   constructor(private readonly options: WorkflowRunStoreOptions) {
     this.root = join(
       options.rootDir,
@@ -108,6 +114,19 @@ export class WorkflowRunStore {
 
   private async assertNamespaceLease(): Promise<void> {
     let lease = WorkflowRunStore.leases.get(this.leaseKey);
+    if (lease && !lease.isHeld) {
+      WorkflowRunStore.leases.delete(this.leaseKey);
+      lease = undefined;
+    }
+    if (
+      lease &&
+      !lease.belongsTo(
+        this.options.owner.ownerId,
+        this.options.owner.leaseToken,
+      )
+    ) {
+      throw new Error("Workflow namespace lease is held by a different owner");
+    }
     if (!lease) {
       lease = new WorkflowNamespaceLease({
         rootDir: this.root,
@@ -121,6 +140,20 @@ export class WorkflowRunStore {
     }
     if (!lease.isHeld) await lease.acquire();
     await lease.assertHeld();
+  }
+
+  async release(): Promise<void> {
+    const lease = WorkflowRunStore.leases.get(this.leaseKey);
+    if (
+      !lease ||
+      !lease.belongsTo(
+        this.options.owner.ownerId,
+        this.options.owner.leaseToken,
+      )
+    )
+      return;
+    await lease.release();
+    WorkflowRunStore.leases.delete(this.leaseKey);
   }
 
   private async assertRegularFile(path: string): Promise<void> {

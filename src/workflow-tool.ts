@@ -728,7 +728,11 @@ export function registerWorkflowTool(
           runAgent: makeRunAgent(ctx, params.runId, owner()),
         },
       );
-      if (result.terminal && result.delivery && pi.sendMessage) {
+      if (
+        result.terminal &&
+        result.delivery?.status === "pending" &&
+        pi.sendMessage
+      ) {
         const deliveryId = workflowDeliveryId(result.runId);
         try {
           pi.sendMessage(
@@ -750,6 +754,7 @@ export function registerWorkflowTool(
             sessionScope,
           );
           await controller?.dispatchDelivery(result.runId, deliveryId);
+          await controller?.acknowledgeDelivery(result.runId, deliveryId);
         } catch (error) {
           debugLog("warn", "durable_workflow_delivery_failed", {
             workflowId: result.runId,

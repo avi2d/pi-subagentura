@@ -5,7 +5,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { WorkflowRunStore } from "./workflow-run-store";
 import { basename } from "node:path";
 import {
   deleteInteractiveStatesFile,
@@ -326,7 +327,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
     scope.sessionManager = ctx.sessionManager;
     const sessionId = ctx.sessionManager?.getSessionId?.();
     if (sessionId) {
-      const ownerId = `${process.pid}-${randomUUID()}`;
+      const ownerId = `session-${createHash("sha256").update(sessionId).digest("hex")}`;
+      const leaseToken = createHash("sha256")
+        .update(`${ctx.cwd}\0${sessionId}`)
+        .digest("hex");
       setDurableWorkflowOwner(
         scope,
         workflowOwnerFromSessionContext({
@@ -334,8 +338,8 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
           cwd: ctx.cwd,
           sessionId,
           ownerId,
-          generation: scope.generation,
-          leaseToken: randomUUID(),
+          generation: 0,
+          leaseToken,
         }),
       );
     } else {
@@ -394,12 +398,10 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
       const durableStore = scope.durableWorkflowStore;
       closeActiveInteractiveSupervisor(owner);
       clearSessionParsers(owner);
-      const durableJobsDrained = cleanupScopeGeneration(
-        scope,
-        owner,
-        event,
-        ctx,
-      );
+      cleanupScopeGeneration(scope, owner, event, ctx);
+      void WorkflowRunStore.releaseAllLeases().catch(() => {
+        /* shutdown must not block session teardown */
+      });
       scope.parentStreaming = false;
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
