@@ -73,6 +73,11 @@ export function projectWorkflowRun(
     projection.revision++;
     applyEvent(projection, event, usageKeys);
   }
+  projection.tasks = Object.fromEntries(
+    Object.entries(projection.tasks).sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  );
   return projection;
 }
 

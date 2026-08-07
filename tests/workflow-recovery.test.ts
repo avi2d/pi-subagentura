@@ -94,6 +94,36 @@ describe("workflow recovery projection", () => {
     expect(projection.usage).toEqual({ input: 10, output: 4 });
   });
 
+  it("orders recovered tasks deterministically rather than by completion order", () => {
+    const launch = {
+      schemaVersion: 1 as const,
+      runId: "ordered",
+      planRevision: 1,
+      resumePolicy: "manual" as const,
+      owner,
+      createdAt: 1,
+    };
+    const projection = projectWorkflowRun(launch, [
+      {
+        schemaVersion: 1,
+        eventId: "b",
+        runId: "ordered",
+        runEpoch: 0,
+        type: "task_started",
+        payload: { taskId: "b", attempt: 1 },
+      },
+      {
+        schemaVersion: 1,
+        eventId: "a",
+        runId: "ordered",
+        runEpoch: 0,
+        type: "task_started",
+        payload: { taskId: "a", attempt: 1 },
+      },
+    ]);
+    expect(Object.keys(projection.tasks)).toEqual(["a", "b"]);
+  });
+
   it("rejects another owner and enumerates only matching runs", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);
