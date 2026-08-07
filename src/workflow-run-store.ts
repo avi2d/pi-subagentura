@@ -8,6 +8,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
@@ -198,7 +199,11 @@ export class WorkflowRunStore {
           `Cannot append stale run epoch ${runEpoch}; current epoch is ${currentEpoch}`,
         );
       }
-      const file = await open(path, "r+", 0o600);
+      const file = await open(
+        path,
+        fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
       try {
         // A crashed writer may leave a partial final line. Remove it before
         // publishing the next event so the authoritative log stays valid.
