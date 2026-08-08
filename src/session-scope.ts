@@ -6,6 +6,8 @@ import type { JobState } from "./helpers";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import type { PendingJobDelivery } from "./notifications";
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import type { WorkflowRunStore } from "./workflow-run-store";
+import type { DurableWorkflowController } from "./workflow-durable-plan-runner";
 
 const SESSION_SCOPE_REGISTRY_KEY = "__piSubagenturaSessionScopes";
 const SESSION_SCOPE_ID_COUNTER_KEY = "__piSubagenturaSessionScopeIdCounter";
@@ -34,6 +36,8 @@ export interface SessionScope {
   pendingInProcessDeliveries: PendingJobDelivery[];
   interactiveStates: Map<string, InteractiveSubagentState>;
   durableWorkflowOwner?: WorkflowOwnerIdentity;
+  durableWorkflowStore?: WorkflowRunStore;
+  durableWorkflowController?: DurableWorkflowController;
 }
 
 /** External registrations may omit runtime-owned collections and streaming state. */
@@ -49,6 +53,8 @@ export interface SessionScopeRegistration {
   pendingInProcessDeliveries?: PendingJobDelivery[];
   interactiveStates?: Map<string, InteractiveSubagentState>;
   durableWorkflowOwner?: WorkflowOwnerIdentity;
+  durableWorkflowStore?: WorkflowRunStore;
+  durableWorkflowController?: DurableWorkflowController;
 }
 
 export interface SessionOwnerToken {
@@ -207,6 +213,21 @@ export function advanceSessionScopeGeneration(id: number): number {
   return scope.generation;
 }
 
+function sameWorkflowOwner(
+  left: WorkflowOwnerIdentity | undefined,
+  right: WorkflowOwnerIdentity | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.projectKey === right.projectKey &&
+    left.cwd === right.cwd &&
+    left.piSessionId === right.piSessionId &&
+    left.ownerId === right.ownerId &&
+    left.ownerGeneration === right.ownerGeneration &&
+    left.leaseToken === right.leaseToken
+  );
+}
+
 export function sessionOwner(scope: SessionScope): SessionOwnerToken {
   return { id: scope.id, generation: scope.generation };
 }
@@ -267,6 +288,10 @@ export function setDurableWorkflowOwner(
   scope: SessionScope,
   owner: WorkflowOwnerIdentity | undefined,
 ): void {
+  if (!sameWorkflowOwner(scope.durableWorkflowOwner, owner)) {
+    scope.durableWorkflowStore = undefined;
+    scope.durableWorkflowController = undefined;
+  }
   scope.durableWorkflowOwner = owner;
 }
 
@@ -274,6 +299,16 @@ export function durableWorkflowOwner(
   scope: SessionScope,
 ): WorkflowOwnerIdentity | undefined {
   return scope.durableWorkflowOwner;
+}
+
+export function releaseDurableWorkflowAuthority(
+  scope: SessionScope,
+): Promise<void> {
+  const store = scope.durableWorkflowStore;
+  scope.durableWorkflowStore = undefined;
+  scope.durableWorkflowController = undefined;
+  if (!store) return Promise.resolve();
+  return store.release();
 }
 
 /** Resolve an exact owner only while that lifecycle generation remains live. */

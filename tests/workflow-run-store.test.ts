@@ -378,4 +378,41 @@ describe("WorkflowRunStore", () => {
       "owner byte quota",
     );
   });
+
+  it("serializes appendIfCurrent across multiple store instances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+
+    const first = new WorkflowRunStore({ rootDir: root, owner });
+    const second = new WorkflowRunStore({ rootDir: root, owner });
+
+    await first.createRun({
+      runId: "shared-run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+
+    const results = await Promise.all([
+      first.appendIfCurrent("shared-run", -1, "task_started", {
+        phase: "first",
+      }),
+      second.appendIfCurrent("shared-run", -1, "task_started", {
+        phase: "second",
+      }),
+    ]);
+
+    const appended = results.filter(
+      (result) => result.status === "appended",
+    ).length;
+    const conflicted = results.filter(
+      (result) => result.status === "conflict",
+    ).length;
+
+    expect(appended).toBe(1);
+    expect(conflicted).toBe(1);
+
+    const runRecord = await first.readRun("shared-run");
+    expect(runRecord.events).toHaveLength(1);
+  });
 });

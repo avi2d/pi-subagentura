@@ -4,14 +4,9 @@
  * on registration and public exports.
  */
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
-import type { WorkflowOwnerIdentity } from "./workflow-run-types";
-import { randomUUID } from "node:crypto";
-import { WorkflowRunStore } from "./workflow-run-store";
-import { realpathSync } from "node:fs";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import {
   deleteInteractiveStatesFile,
   removeInteractiveState,
@@ -54,6 +49,7 @@ import {
   setLegacyActiveSessionRefs,
   type SessionOwnerToken,
   type SessionScope,
+  releaseDurableWorkflowAuthority,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
 import {
@@ -447,27 +443,26 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
     const sessionId = ctx.sessionManager?.getSessionId?.();
     let durableOwner: WorkflowOwnerIdentity | undefined;
     if (sessionId) {
-      const startsNewNamespace =
-        event.reason === "new" || event.reason === "fork";
-      const ownerId =
-        !startsNewNamespace &&
-        previousDurableOwner !== undefined &&
-        previousDurableOwner.piSessionId === sessionId
-          ? previousDurableOwner.ownerId
-          : workflowSessionOwnerId(
-              sessionId,
-              startsNewNamespace ? randomUUID() : "",
-            );
-      const projectKey = canonicalWorkflowProjectKey(ctx.cwd);
-      durableOwner = workflowOwnerFromSessionContext({
-        projectKey,
-        cwd: realpathSync.native(ctx.cwd),
-        sessionId,
-        ownerId,
-        generation: scope.generation,
-        leaseToken: workflowLeaseToken(ctx.cwd, sessionId, scope.generation),
-      });
-      setDurableWorkflowOwner(scope, durableOwner);
+      const ownerId = `session-${createHash("sha256").update(sessionId).digest("hex")}`;
+      const preservedOwnerGeneration =
+        scope.durableWorkflowOwner?.piSessionId === sessionId &&
+        scope.durableWorkflowOwner.cwd === ctx.cwd
+          ? scope.durableWorkflowOwner.ownerGeneration
+          : 0;
+      const leaseToken = createHash("sha256")
+        .update(`${ctx.cwd}\0${sessionId}`)
+        .digest("hex");
+      setDurableWorkflowOwner(
+        scope,
+        workflowOwnerFromSessionContext({
+          projectKey: basename(ctx.cwd) || "project",
+          cwd: ctx.cwd,
+          sessionId,
+          ownerId,
+          generation: preservedOwnerGeneration,
+          leaseToken,
+        }),
+      );
     } else {
       setDurableWorkflowOwner(scope, undefined);
     }
@@ -569,6 +564,9 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
         await drainActiveDurableExecutions(durableOwner, "session_shutdown");
       }
       cleanupScopeGeneration(scope, owner, event, ctx);
+      void releaseDurableWorkflowAuthority(scope).catch(() => {
+        /* shutdown must not block session teardown */
+      });
       scope.parentStreaming = false;
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
