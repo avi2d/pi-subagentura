@@ -59,25 +59,40 @@ export function createDurableWorkflowController(
   });
 }
 
+function sessionScopeDurableStore(
+  rootDir: string,
+  scope: SessionScope,
+): WorkflowRunStore | undefined {
+  const owner = scope.durableWorkflowOwner;
+  if (!owner) return undefined;
+  if (!scope.durableWorkflowStore) {
+    scope.durableWorkflowStore = new WorkflowRunStore({ rootDir, owner });
+  }
+  return scope.durableWorkflowStore;
+}
+
 export function durableWorkflowControllerForSession(
   rootDir: string,
   scope: SessionScope,
 ): DurableWorkflowController | undefined {
   const owner = scope.durableWorkflowOwner;
   if (!owner) return undefined;
-  return new DurableWorkflowController({
-    store: new WorkflowRunStore({ rootDir, owner }),
-    owner,
-  });
+  if (!scope.durableWorkflowController) {
+    const store = sessionScopeDurableStore(rootDir, scope);
+    if (!store) return undefined;
+    scope.durableWorkflowController = new DurableWorkflowController({
+      store,
+      owner,
+    });
+  }
+  return scope.durableWorkflowController;
 }
 
 export function durableWorkflowStoreForSession(
   rootDir: string,
   scope: SessionScope,
 ): WorkflowRunStore | undefined {
-  const owner = scope.durableWorkflowOwner;
-  if (!owner) return undefined;
-  return new WorkflowRunStore({ rootDir, owner });
+  return sessionScopeDurableStore(rootDir, scope);
 }
 
 export function runDurableWorkflowForSession(
@@ -87,9 +102,11 @@ export function runDurableWorkflowForSession(
 ): Promise<Awaited<ReturnType<typeof runDurableWorkflowPlan>>> {
   const owner = scope.durableWorkflowOwner;
   if (!owner) throw new Error("Durable workflow storage is unavailable.");
+  const store = sessionScopeDurableStore(rootDir, scope);
+  if (!store) throw new Error("Durable workflow storage is unavailable.");
   return runDurableWorkflowPlan({
     ...options,
-    store: new WorkflowRunStore({ rootDir, owner }),
+    store,
     owner,
   });
 }

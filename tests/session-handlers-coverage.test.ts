@@ -64,6 +64,21 @@ function startSession(
   return ctx;
 }
 
+function restartSession(
+  registration: HandlerRegistration,
+  root: string,
+  sessionId: string,
+) {
+  const sessionManager = {
+    getSessionId: () => sessionId,
+    getEntries: () => [],
+  };
+  const ui = { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() };
+  const ctx = { cwd: root, ui, sessionManager };
+  registration.handlers.get("session_start")![0]({ reason: "new" }, ctx);
+  return ctx;
+}
+
 function ownedJob(scope: SessionScope, id: string) {
   const abort = vi.fn().mockResolvedValue(undefined);
   // The lifecycle path only calls abort; constructing a real AgentSession would
@@ -368,6 +383,31 @@ describe("session handler lifecycle callbacks", () => {
     expect(jobRegistry.has(bJob.job.id)).toBe(false);
     expect(interactiveSubagentRegistry.has("state-b-old")).toBe(false);
     expect(getSessionScopes()).toEqual([a.sessionScope, b.sessionScope]);
+  });
+
+  it("keeps durable ownerGeneration stable across session reload", () => {
+    const registration = registerHandlers();
+    const initial = startSession(registration, root, "session-a");
+    const initialOwnerGeneration =
+      registration.sessionScope.durableWorkflowOwner?.ownerGeneration;
+    const initialScopeGeneration = registration.sessionScope.generation;
+
+    restartSession(registration, root, "session-a");
+
+    expect(registration.sessionScope.generation).toBe(
+      initialScopeGeneration + 1,
+    );
+    expect(
+      registration.sessionScope.durableWorkflowOwner?.ownerGeneration,
+    ).toBe(initialOwnerGeneration);
+
+    const stillStarted = registration.sessionScope.lifecycle;
+    expect(stillStarted).toBe("started");
+    registration.handlers.get("session_shutdown")![0](
+      { reason: "quit" },
+      initial,
+    );
+    expect(registration.sessionScope.lifecycle).toBe("shutdown");
   });
 
   it("clears a stopped scope's contribution from a shared UI", () => {

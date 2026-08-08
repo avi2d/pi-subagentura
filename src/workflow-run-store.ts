@@ -97,14 +97,25 @@ function safePart(value: string, label: string): string {
 
 export class WorkflowRunStore {
   private static readonly leases = new Map<string, WorkflowNamespaceLease>();
+  private static readonly locks = new Map<string, Promise<void>>();
   private readonly root: string;
-  private readonly locks = new Map<string, Promise<void>>();
   private readonly leaseKey: string;
 
-  public static async releaseAllLeases(): Promise<void> {
-    const leases = [...WorkflowRunStore.leases.entries()];
-    WorkflowRunStore.leases.clear();
-    for (const [, lease] of leases) await lease.release();
+  public static async releaseAllLeases(owner?: {
+    ownerId: string;
+    leaseToken: string;
+  }): Promise<void> {
+    const leaseEntries = [...WorkflowRunStore.leases.entries()];
+    const entries =
+      owner === undefined
+        ? leaseEntries
+        : leaseEntries.filter(([, lease]) =>
+            lease.belongsTo(owner.ownerId, owner.leaseToken),
+          );
+    for (const [key, lease] of entries) {
+      await lease.release();
+      WorkflowRunStore.leases.delete(key);
+    }
   }
 
   constructor(private readonly options: WorkflowRunStoreOptions) {
@@ -463,22 +474,28 @@ export class WorkflowRunStore {
     return join(this.root, "runs", safePart(runId, "run id"));
   }
 
+  private static runLockKey(root: string, runId: string): string {
+    return `${root}:${runId}`;
+  }
+
   private async withLock<T>(
     runId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
-    const prior = this.locks.get(runId) ?? Promise.resolve();
+    const lockKey = WorkflowRunStore.runLockKey(this.root, runId);
+    const prior = WorkflowRunStore.locks.get(lockKey) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.locks.set(runId, current);
+    WorkflowRunStore.locks.set(lockKey, current);
     await prior;
     try {
       return await operation();
     } finally {
       release();
-      if (this.locks.get(runId) === current) this.locks.delete(runId);
+      if (WorkflowRunStore.locks.get(lockKey) === current)
+        WorkflowRunStore.locks.delete(lockKey);
     }
   }
 }
