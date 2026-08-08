@@ -2,6 +2,31 @@
 
 This document is the question set for validating the Milestones 3–8 workflow slice. Every answer should include the test, fixture, or persisted evidence that supports it.
 
+## 1. Frozen plan scope in practice
+
+| Item                           | Scope status                  |
+| ------------------------------ | ----------------------------- |
+| X01–X05 (out-of-scope this PR) | Deferred                      |
+| X06 (security boundary)        | Deferred / helper-only checks |
+| 1–21, 22*, 39–47, 54+, 55+     | In-scope for PR-84            |
+
+The PR-84 foundation is **declarative in-process** durability only. Supported production behavior:
+
+- durable run creation + restart recovery;
+- trusted-command resume and explicit trust boundaries;
+- at-least-once terminal delivery with receipts;
+- manual resume and explicit trust boundaries;
+- helper-only support for process-isolated launch, durable JS replay, and notification semantics.
+
+Out of scope in this frozen scope:
+
+- **X01:** process-isolated durable task launch + handshake/adoption/dead-child accounting;
+- **X02:** durable arbitrary JS replay / process-replay stability guarantees;
+- **X03:** host-forced routing enforcement; routing remains opt-in.
+- **X04:** autonomous wake after mutation/approval/budget change (explicit resume action remains required);
+- **X05:** exactly-once execution/notification claims.
+- **X06:** defense against same-user same-directory rename/substitution races; no native `openat2`-class containment claim.
+
 ## Durable authority and outbox
 
 1. Does a newly created run persist `run_created` before any agent or process dispatch?
@@ -32,7 +57,7 @@ This document is the question set for validating the Milestones 3–8 workflow s
 20. Is interrupted provider usage marked as an explicit lower bound rather than presented as exact?
 21. Is terminal task and result ordering stable across runs and reloads?
 
-## Process-child handshake and adoption
+## Process-child handshake and adoption (DEFERRED — PR #84 foundation scope)
 
 22. Is the launch intent persisted before pane creation?
 23. Are attempt, nonce, epoch, launch marker, and effective fallback mode persisted before use?
@@ -42,7 +67,7 @@ This document is the question set for validating the Milestones 3–8 workflow s
 27. Can stale nonce, attempt, or epoch artifacts settle a replacement attempt?
 28. Is a dead child’s partial usage surfaced as lower-bound evidence when billing cannot be observed exactly?
 
-## Durable JavaScript replay
+## Durable JavaScript replay (DEFERRED — PR #84 foundation scope)
 
 29. Does `durable: true` require explicit stable IDs for `agent()` and nested `workflow()` boundaries?
 30. Are root and nested saved definitions snapshotted immutably before the first durable acknowledgement?
@@ -54,7 +79,7 @@ This document is the question set for validating the Milestones 3–8 workflow s
 36. Do non-durable scripts without IDs retain their existing behavior and result shape?
 37. Are unsupported durable concurrency shapes rejected before `run_created`?
 
-## Plan mutations and human editing
+## Plan mutations and human editing (X04 deferred: explicit resume action)
 
 38. Does every mutation require the exact owner, lease epoch, and base revision?
 39. Can only pending or blocked future tasks be block, unblock, skip, or append targets?
