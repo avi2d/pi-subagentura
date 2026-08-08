@@ -77,16 +77,16 @@ available, the runtime falls back to in-process execution. Intermediate agent
 results stay in workflow variables outside the parent model context, and only
 the workflow's final result returns to the parent.
 
-Durable declarative plans currently support the in-process execution path.
-Requesting process isolation for a durable plan is rejected before persistence;
-it never silently changes isolation modes. Interactive sub-agents remain a
-separate, artifact-backed process feature.
+Workflow scripts are trusted agent-authored JavaScript. The VM improves determinism but is not a security boundary, so never run untrusted JavaScript.
 
-Workflow scripts are trusted agent-authored JavaScript. The VM improves
-determinism but is not a security boundary, so never run untrusted JavaScript.
-Non-durable background workflow jobs are scoped to the current parent session
-and are cancelled by reload, resume, quit, or a new session. Attachable
-interactive sub-agents use durable artifacts and can survive those boundaries.
+For this PR, the foundation contract is declarative **in-process** durability with
+trusted-command resume and explicit authority. Process-isolated durable launch,
+durable JavaScript replay, and exactly-once notification claims remain
+out-of-scope and may appear as helper modules only.
+
+Background workflow jobs are scoped to the current parent session and are
+cancelled by reload, resume, quit, or a new session. Attachable interactive
+sub-agents use durable artifacts and can survive those boundaries.
 
 See the [workflow guide](./docs/workflows.md) and
 [bundled examples](./examples/workflows/README.md).

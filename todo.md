@@ -34,25 +34,25 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 ## Process-child handshake and adoption
 
-- [x] 22. Persist process launch intent before pane creation.
-- [x] 23. Persist attempt nonce, epoch, launch marker, and effective fallback mode.
-- [x] 24. Persist launch dispatch and validate child start before model work.
-- [x] 25. Discover, fence, and adopt intended panes after startup crashes.
-- [x] 26. Probe and fence ambiguous command dispatch before retry.
-- [x] 27. Reject stale child nonce, attempt, and epoch evidence.
-- [x] 28. Project dead-child usage as a lower bound.
+- [DEFERRED — PR #84 foundation scope] 22. Persist process launch intent before pane creation.
+- [DEFERRED — PR #84 foundation scope] 23. Persist attempt nonce, epoch, launch marker, and effective fallback mode.
+- [DEFERRED — PR #84 foundation scope] 24. Persist launch dispatch and validate child start before model work.
+- [DEFERRED — PR #84 foundation scope] 25. Discover, fence, and adopt intended panes after startup crashes.
+- [DEFERRED — PR #84 foundation scope] 26. Probe and fence ambiguous command dispatch before retry.
+- [DEFERRED — PR #84 foundation scope] 27. Reject stale child nonce, attempt, and epoch evidence.
+- [DEFERRED — PR #84 foundation scope] 28. Project dead-child usage as a lower bound.
 
 ## Durable JavaScript replay
 
-- [x] 29. Add explicit stable IDs for durable `agent()` and nested `workflow()` calls.
-- [x] 30. Snapshot root and nested definitions into immutable durable blobs.
-- [x] 31. Persist dispatch and response ordinals independently.
-- [x] 32. Replay all worker-visible response kinds in original order.
-- [x] 33. Bound nondeterministic Promise and nested replay as `replay_diverged`.
-- [x] 34. Fail boundedly on missing response ordinals.
-- [x] 35. Detect prompt/options/schema/model/isolation/definition divergence.
-- [x] 36. Preserve legacy non-durable script/name behavior.
-- [x] 37. Reject unsupported durable concurrency before `run_created`.
+- [DEFERRED — PR #84 foundation scope] 29. Add explicit stable IDs for durable `agent()` and nested `workflow()` calls.
+- [DEFERRED — PR #84 foundation scope] 30. Snapshot root and nested definitions into immutable durable blobs.
+- [DEFERRED — PR #84 foundation scope] 31. Persist dispatch and response ordinals independently.
+- [DEFERRED — PR #84 foundation scope] 32. Replay all worker-visible response kinds in original order.
+- [DEFERRED — PR #84 foundation scope] 33. Bound nondeterministic Promise and nested replay as `replay_diverged`.
+- [DEFERRED — PR #84 foundation scope] 34. Fail boundedly on missing response ordinals.
+- [DEFERRED — PR #84 foundation scope] 35. Detect prompt/options/schema/model/isolation/definition divergence.
+- [DEFERRED — PR #84 foundation scope] 36. Preserve legacy non-durable script/name behavior.
+- [DEFERRED — PR #84 foundation scope] 37. Reject unsupported durable concurrency before `run_created`.
 
 ## Plan mutations and human editing
 
@@ -61,7 +61,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 - [x] 40. Keep running and terminal task definitions/history immutable.
 - [x] 41. Preserve skip as an audited append-only event.
 - [x] 42. Add monotonic mutation content hashes and a verified hash chain.
-- [x] 43. Wake the single executor without starting model work in the mutation path.
+- [DEFERRED — PR #84 foundation scope] 43. Wake the single executor without starting model work in the mutation path.
 - [x] 44. Preserve plan, phase modes, stable IDs, and read-only history in export/view.
 - [x] 45. Return stale-editor refresh/diff data without changing authority.
 - [x] 46. Enforce owner-only, contained, interactive edit/export paths.
