@@ -183,6 +183,33 @@ describe("WorkflowNamespaceLease", () => {
     });
     await expect(blocked.acquire()).rejects.toThrow("interlock is held");
   });
+  it("fails closed when a stale lease reuses the current PID with a different start identity", async () => {
+    const rootDir = await root();
+    const dir = join(rootDir, "project");
+    await (await import("node:fs/promises")).mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "namespace.lease"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        ownerId: "old-owner",
+        leaseToken: "old-token",
+        epoch: 4,
+        acquiredAt: 100,
+        processId: process.pid,
+        processStartTime: 0,
+      })}\n`,
+    );
+    const lease = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "replacement",
+      leaseToken: "replacement-token",
+      staleAfterMs: 10,
+      now: () => 111,
+    });
+    await expect(lease.acquire()).rejects.toThrow("process identity changed");
+  });
+
   it("fails closed on malformed lease evidence", async () => {
     const rootDir = await root();
     const dir = join(rootDir, "project");
