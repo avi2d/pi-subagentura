@@ -105,6 +105,55 @@ describe("WorkflowNamespaceLease", () => {
     await expect(second.acquire()).rejects.toThrow("held by a live process");
   });
 
+  it("recovers an abandoned interlock only when its process is dead", async () => {
+    const rootDir = await root();
+    const dir = join(rootDir, "project");
+    await (await import("node:fs/promises")).mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "namespace.interlock"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        ownerId: "dead",
+        leaseToken: "dead-token",
+        lockToken: "lock",
+        acquiredAt: 100,
+        processId: 2_000_000_000,
+      })}\n`,
+    );
+    let now = 111;
+    const lease = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "one",
+      leaseToken: "token-one",
+      staleAfterMs: 10,
+      now: () => now,
+    });
+    await expect(lease.acquire()).resolves.toMatchObject({ epoch: 1 });
+    await lease.release();
+
+    await writeFile(
+      join(dir, "namespace.interlock"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        ownerId: "live",
+        leaseToken: "live-token",
+        lockToken: "lock-live",
+        acquiredAt: 100,
+        processId: process.pid,
+      })}\n`,
+    );
+    now = 200;
+    const blocked = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "two",
+      leaseToken: "token-two",
+      staleAfterMs: 10,
+      now: () => now,
+    });
+    await expect(blocked.acquire()).rejects.toThrow("interlock is held");
+  });
   it("fails closed on malformed lease evidence", async () => {
     const rootDir = await root();
     const dir = join(rootDir, "project");
