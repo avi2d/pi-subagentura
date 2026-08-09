@@ -388,9 +388,18 @@ export class TmuxMultiplexer implements Multiplexer {
       "send-keys",
       "tmux",
       // `-l` sends the agent/user text literally. Do not add a GNU-style `--`
-      // terminator here: tmux send-keys treats it as a literal key, so the
-      // launch command would become `--exec ...` and never run on tmux 3.5a.
-      withTmuxSocket(["send-keys", "-t", paneId, "-l", text]),
+      // terminator here: tmux send-keys treats it as a literal key. When text
+      // starts with `-`, send that first key separately; the lone `-` ends
+      // tmux's option scan and the remainder is then safe as a key argument.
+      withTmuxSocket([
+        "send-keys",
+        "-t",
+        paneId,
+        "-l",
+        ...(text.startsWith("-")
+          ? ["-", ...(text.length > 1 ? [text.slice(1)] : [])]
+          : [text]),
+      ]),
       {
         encoding: "utf8",
         timeout: 5000,
