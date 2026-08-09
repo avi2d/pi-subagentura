@@ -387,10 +387,10 @@ export class TmuxMultiplexer implements Multiplexer {
       "tmux",
       "send-keys",
       "tmux",
-      // `--` terminates flag parsing: agent follow-up text is user/model
-      // controlled and text starting with `-` would otherwise be read as a
-      // send-keys flag (`command send-keys: unknown flag -n`, exit 1).
-      withTmuxSocket(["send-keys", "-t", paneId, "-l", "--", text]),
+      // `-l` sends the agent/user text literally. Do not add a GNU-style `--`
+      // terminator here: tmux send-keys treats it as a literal key, so the
+      // launch command would become `--exec ...` and never run on tmux 3.5a.
+      withTmuxSocket(["send-keys", "-t", paneId, "-l", text]),
       {
         encoding: "utf8",
         timeout: 5000,
