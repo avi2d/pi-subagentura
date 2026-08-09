@@ -1432,7 +1432,14 @@ function isRetentionEligible(record: WorkflowRunRecord): boolean {
   const terminal = terminalState(record.events);
   if (!terminal) return false;
   const expectedDeliveryId = terminalDeliveryId(record.launch.runId);
-  const postTerminal = record.events.slice(terminal.ordinal + 1);
+  const terminalMarkerOrdinal = record.events.reduce(
+    (latest, event, ordinal) =>
+      event.type === "run_terminal" || event.type === "run_cancelled"
+        ? ordinal
+        : latest,
+    terminal.ordinal,
+  );
+  const postTerminal = record.events.slice(terminalMarkerOrdinal + 1);
   const receipt = postTerminal.at(-1);
   if (
     !receipt ||
