@@ -1406,13 +1406,17 @@ function isRetentionEligible(record: WorkflowRunRecord): boolean {
     receipt.payload.deliveryId !== expectedDeliveryId
   )
     return false;
-  return postTerminal
-    .slice(0, -1)
-    .every((event) =>
-      ["delivery_intent", "delivery_dispatched", "delivery_receipt"].includes(
-        event.type,
-      ),
-    );
+  const prefix = postTerminal.slice(0, -1);
+  if (
+    !prefix.some((event) => event.type === "delivery_intent") ||
+    !prefix.some((event) => event.type === "delivery_dispatched")
+  )
+    return false;
+  return prefix.every((event) =>
+    ["delivery_intent", "delivery_dispatched", "delivery_receipt"].includes(
+      event.type,
+    ),
+  );
 }
 
 function terminalState(
