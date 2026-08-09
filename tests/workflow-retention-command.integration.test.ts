@@ -114,7 +114,29 @@ describe("production workflow-retention command", () => {
     expect(command).toBeDefined();
     const prune = vi.spyOn(store, "pruneTerminalRuns");
     const uiNotify = vi.fn();
-    await command?.handler("0", { ui: { notify: uiNotify } });
+    let releaseWriter!: () => void;
+    let writerEntered!: () => void;
+    const writerEnteredPromise = new Promise<void>((resolve) => {
+      writerEntered = resolve;
+    });
+    const writerRelease = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    const activeWriter = (store as any).withLock("delivered-run", async () => {
+      writerEntered();
+      await writerRelease;
+    }) as Promise<void>;
+    await writerEnteredPromise;
+    let commandSettled = false;
+    const commandRun = command?.handler("0", { ui: { notify: uiNotify } });
+    void commandRun?.then(() => {
+      commandSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(commandSettled).toBe(false);
+    releaseWriter();
+    await activeWriter;
+    await commandRun;
     expect(uiNotify).toHaveBeenCalledWith(
       "Pruned 1 terminal durable workflow run(s).",
     );
