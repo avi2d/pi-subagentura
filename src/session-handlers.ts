@@ -5,6 +5,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import {
   deleteInteractiveStatesFile,
   removeInteractiveState,
@@ -35,11 +39,20 @@ import {
   registerSessionScope,
   removeSessionScope,
   sessionOwner,
+  setDurableWorkflowOwner,
+  setDurableWorkflowRootDir,
   setLegacyActiveSessionRefs,
   type SessionOwnerToken,
   type SessionScope,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
+import {
+  createWorkflowOwnerIdentity,
+  durableWorkflowControllerForSession,
+  durableWorkflowStoreForSession,
+} from "./workflow-owner";
+import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import { DurableWorkflowProjectionRepository } from "./workflow-projection-repository";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -74,6 +87,94 @@ function sessionIdForScope(
     return (scope.sessionManager ?? fallbackManager)?.getSessionId?.();
   } catch {
     return undefined;
+  }
+}
+const DURABLE_WORKFLOW_ROOT_ENV = "PI_SUBAGENTURA_WORKFLOW_RUNS_DIR";
+const MAX_DURABLE_WORKFLOW_ROOT_LENGTH = 1_024;
+
+function durableWorkflowRootDir(): string {
+  const configured = process.env[DURABLE_WORKFLOW_ROOT_ENV];
+  if (configured !== undefined) {
+    if (
+      configured.length === 0 ||
+      configured.length > MAX_DURABLE_WORKFLOW_ROOT_LENGTH ||
+      configured.includes("\0") ||
+      !isAbsolute(configured)
+    ) {
+      throw new Error(
+        `${DURABLE_WORKFLOW_ROOT_ENV} must be a bounded absolute path`,
+      );
+    }
+    return resolve(configured);
+  }
+  return join(homedir(), ".pi-subagentura", "workflow-runs", "v1");
+}
+
+interface DurableWorkflowSessionContext {
+  rootDir: string;
+  owner?: WorkflowOwnerIdentity;
+}
+
+function durableWorkflowSessionContext(
+  scope: SessionScope,
+  cwd: string,
+  sessionId: string | undefined,
+): DurableWorkflowSessionContext {
+  const rootDir = durableWorkflowRootDir();
+  if (process.env.PI_SUBAGENTURA_CHILD === "1" || !sessionId) {
+    return { rootDir };
+  }
+  if (sessionId.length > 4_096 || sessionId.includes("\0")) {
+    throw new Error(
+      "Pi session ID is too large for durable workflow ownership",
+    );
+  }
+  const canonicalCwd = realpathSync.native(cwd);
+  const projectKey = createHash("sha256").update(canonicalCwd).digest("hex");
+  const piSessionId = createHash("sha256").update(sessionId).digest("hex");
+  const ownerGeneration = randomBytes(6).readUIntBE(0, 6);
+  return {
+    rootDir,
+    owner: createWorkflowOwnerIdentity({
+      projectKey,
+      cwd: canonicalCwd,
+      piSessionId,
+      ownerId: `session-${piSessionId}`,
+      ownerGeneration,
+      leaseToken: randomBytes(32).toString("hex"),
+    }),
+  };
+}
+
+async function recoverDurableWorkflowProjections(
+  scope: SessionScope,
+): Promise<void> {
+  const controller = durableWorkflowControllerForSession(scope);
+  const store = durableWorkflowStoreForSession(scope);
+  const owner = scope.durableWorkflowOwner;
+  if (!controller || !store || !owner) return;
+  await store.getLeaseEpoch();
+  await new DurableWorkflowProjectionRepository(store, owner).list();
+}
+
+async function revokeAndReleaseDurableWorkflowAuthoritySafely(
+  scope: SessionScope,
+  store: NonNullable<SessionScope["durableWorkflowStore"]> | undefined,
+): Promise<void> {
+  if (!store) return;
+  try {
+    await store.revoke();
+  } catch (error) {
+    console.error("[subagentura] durable workflow store revoke failed", error);
+  }
+  try {
+    await store.release();
+  } catch (error) {
+    console.error("[subagentura] durable workflow lease release failed", error);
+  }
+  if (scope.durableWorkflowStore === store) {
+    scope.durableWorkflowStore = undefined;
+    scope.durableWorkflowController = undefined;
   }
 }
 
@@ -116,11 +217,11 @@ function cleanupScopeGeneration(
     cwd?: string;
     sessionManager?: { getSessionId?: () => string };
   },
-): void {
+): Promise<void> {
   const sessionId = sessionIdForScope(scope, ctx?.sessionManager);
   const reason = `session_shutdown (${event?.reason ?? "unknown"})`;
   snapshotOwnedJobs(scope, sessionId, ctx?.cwd, reason);
-  cleanupWorkflowJobsForOwner(owner);
+  const durableJobsDrained = cleanupWorkflowJobsForOwner(owner);
   clearInProcessDeliveries(owner);
 
   const preserveInteractivePanes =
@@ -167,6 +268,7 @@ function cleanupScopeGeneration(
     removeInProcessJob(jobId, owner);
   }
   if (scope.ui) clearSessionScopeUiContributions(scope.ui, owner);
+  return durableJobsDrained;
 }
 
 export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
@@ -189,22 +291,62 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
     flushInProcessDeliveries(owner);
   });
 
-  pi.on("session_start", (event, ctx) => {
-    if (scope.lifecycle === "started") {
-      const previousOwner = sessionOwner(scope);
-      closeActiveInteractiveSupervisor(previousOwner);
-      clearSessionParsers(previousOwner);
-      cleanupScopeGeneration(scope, previousOwner, event, ctx);
-      scope.lifecycle = "shutdown";
+  pi.on("session_start", async (event, ctx) => {
+    let durableContext: DurableWorkflowSessionContext | undefined;
+    let previousDurableStore: SessionScope["durableWorkflowStore"];
+    let previousDurableJobsDrained: Promise<void> | undefined;
+    try {
+      durableContext = durableWorkflowSessionContext(
+        scope,
+        ctx.cwd,
+        ctx.sessionManager?.getSessionId?.(),
+      );
+    } catch (error) {
+      console.error(
+        "[subagentura] durable workflow ownership is unavailable",
+        error,
+      );
     }
 
+    if (scope.lifecycle === "started") {
+      const previousOwner = sessionOwner(scope);
+      previousDurableStore = scope.durableWorkflowStore;
+      closeActiveInteractiveSupervisor(previousOwner);
+      clearSessionParsers(previousOwner);
+      previousDurableJobsDrained = cleanupScopeGeneration(
+        scope,
+        previousOwner,
+        event,
+        ctx,
+      );
+      scope.lifecycle = "shutdown";
+    }
     advanceSessionScopeGeneration(scope.id);
+    if (previousDurableJobsDrained && previousDurableStore) {
+      await previousDurableJobsDrained;
+      await revokeAndReleaseDurableWorkflowAuthoritySafely(
+        scope,
+        previousDurableStore,
+      );
+    }
+
     scope.lifecycle = "started";
     scope.ui = ctx.ui;
     scope.sessionManager = ctx.sessionManager;
     scope.parentStreaming = false;
+    if (durableContext) {
+      setDurableWorkflowRootDir(scope, durableContext.rootDir);
+      setDurableWorkflowOwner(scope, durableContext.owner);
+    } else {
+      setDurableWorkflowOwner(scope, undefined);
+    }
     registerSessionScope(scope);
+    if (scope.durableWorkflowOwner) {
+      durableWorkflowControllerForSession(scope);
+    }
     setLegacyActiveSessionRefs(scope);
+
+    ensureInteractivePoller(globalState);
 
     const shouldRehydrate =
       event.reason === "startup" ||
@@ -221,22 +363,35 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
       } catch {
         /* best effort — rehydrate is a recovery path */
       }
+      try {
+        await recoverDurableWorkflowProjections(scope);
+      } catch (error) {
+        console.error(
+          "[subagentura] durable workflow namespace recovery failed",
+          error,
+        );
+      }
     }
-    ensureInteractivePoller(globalState);
   });
 
   (pi as any).on?.(
     "session_shutdown",
-    (
+    async (
       event?: { reason?: string },
       ctx?: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
     ) => {
       if (scope.lifecycle !== "started") return;
 
       const owner = sessionOwner(scope);
+      const durableStore = scope.durableWorkflowStore;
       closeActiveInteractiveSupervisor(owner);
       clearSessionParsers(owner);
-      cleanupScopeGeneration(scope, owner, event, ctx);
+      const durableJobsDrained = cleanupScopeGeneration(
+        scope,
+        owner,
+        event,
+        ctx,
+      );
       scope.parentStreaming = false;
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
@@ -244,25 +399,28 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
 
       const remainingScopes = getStartedSessionScopes();
       setLegacyActiveSessionRefs(remainingScopes.at(-1));
-      if (remainingScopes.length > 0) return;
-
-      const handle = globalState.__piSubagenturaInteractivePollerHandle;
-      if (handle) {
-        try {
-          clearInterval(handle);
-        } catch {
-          /* defensive */
+      if (remainingScopes.length === 0) {
+        const handle = globalState.__piSubagenturaInteractivePollerHandle;
+        if (handle) {
+          try {
+            clearInterval(handle);
+          } catch {
+            /* defensive */
+          }
+          globalState.__piSubagenturaInteractivePollerHandle = undefined;
         }
-        globalState.__piSubagenturaInteractivePollerHandle = undefined;
+
+        if (event?.reason === "new" && ctx?.cwd) {
+          try {
+            deleteInteractiveStatesFile(ctx.cwd);
+          } catch {
+            /* best effort */
+          }
+        }
       }
 
-      if (event?.reason === "new" && ctx?.cwd) {
-        try {
-          deleteInteractiveStatesFile(ctx.cwd);
-        } catch {
-          /* best effort */
-        }
-      }
+      await durableJobsDrained;
+      await revokeAndReleaseDurableWorkflowAuthoritySafely(scope, durableStore);
     },
   );
 

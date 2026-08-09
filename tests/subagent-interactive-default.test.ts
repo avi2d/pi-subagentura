@@ -118,20 +118,20 @@ describe("subagent_interactive tool lifecycle", () => {
   }
 
   /** Bind ui + sessionManager onto the registered session context. */
-  function startSession(ctx: ReturnType<typeof mockCtx>): void {
+  async function startSession(ctx: ReturnType<typeof mockCtx>): Promise<void> {
     const handler = (api.on as any).mock.calls.find(
       ([event]: [string]) => event === "session_start",
     )?.[1] as Function;
-    handler({ reason: "new" }, ctx);
+    await handler({ reason: "new" }, ctx);
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     clearSessionScopes();
     const g = globalThis as any;
     g.__piSubagenturaInteractivePollerHandle = undefined;
     api = setupExtension() as any;
-    startSession(mockCtx());
+    await startSession(mockCtx());
     mockLaunchInteractiveSubagent.mockReset();
     mockCancelInteractiveSubagent.mockReset();
     mockPruneDeadInteractiveSubagents.mockReset();
@@ -317,7 +317,7 @@ describe("subagent_interactive tool lifecycle", () => {
   it("updates the running footer immediately after launch", async () => {
     const toolDef = getInteractiveToolDef(api);
     const ctx = mockCtx();
-    startSession(ctx);
+    await startSession(ctx);
     const state = {
       ...mockInteractiveState(),
       parentSessionId: "test-session-id",
@@ -350,7 +350,7 @@ describe("subagent_interactive tool lifecycle", () => {
     // updateRunningSubagentFooter owns the scoping decision.
     const toolDef = getInteractiveToolDef(api);
     const ctx = mockCtx();
-    startSession(ctx);
+    await startSession(ctx);
     const mine = {
       ...mockInteractiveState(),
       parentSessionId: "test-session-id",
@@ -386,7 +386,7 @@ describe("subagent_interactive tool lifecycle", () => {
     // a cross-session global count.
     const toolDef = getInteractiveToolDef(api);
     const ctx = mockCtx();
-    startSession(ctx);
+    await startSession(ctx);
     const foreign = {
       ...mockInteractiveState(),
       id: "def67890",

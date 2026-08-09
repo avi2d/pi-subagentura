@@ -5,6 +5,9 @@ import type {
 import type { JobState } from "./helpers";
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import type { PendingJobDelivery } from "./notifications";
+import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import type { WorkflowRunStore } from "./workflow-run-store";
+import type { DurableWorkflowController } from "./workflow-durable-plan-runner";
 
 const SESSION_SCOPE_REGISTRY_KEY = "__piSubagenturaSessionScopes";
 const SESSION_SCOPE_ID_COUNTER_KEY = "__piSubagenturaSessionScopeIdCounter";
@@ -32,6 +35,10 @@ export interface SessionScope {
   inProcessJobs: Map<string, JobState>;
   pendingInProcessDeliveries: PendingJobDelivery[];
   interactiveStates: Map<string, InteractiveSubagentState>;
+  durableWorkflowRootDir?: string;
+  durableWorkflowOwner?: WorkflowOwnerIdentity;
+  durableWorkflowStore?: WorkflowRunStore;
+  durableWorkflowController?: DurableWorkflowController;
 }
 
 /** External registrations may omit runtime-owned collections and streaming state. */
@@ -46,6 +53,10 @@ export interface SessionScopeRegistration {
   inProcessJobs?: Map<string, JobState>;
   pendingInProcessDeliveries?: PendingJobDelivery[];
   interactiveStates?: Map<string, InteractiveSubagentState>;
+  durableWorkflowRootDir?: string;
+  durableWorkflowOwner?: WorkflowOwnerIdentity;
+  durableWorkflowStore?: WorkflowRunStore;
+  durableWorkflowController?: DurableWorkflowController;
 }
 
 export interface SessionOwnerToken {
@@ -154,6 +165,19 @@ export function registerSessionScope(
     if (registration.interactiveStates !== undefined) {
       existing.interactiveStates = registration.interactiveStates;
     }
+    if (registration.durableWorkflowRootDir !== undefined) {
+      existing.durableWorkflowRootDir = registration.durableWorkflowRootDir;
+    }
+    if (registration.durableWorkflowOwner !== undefined) {
+      existing.durableWorkflowOwner = registration.durableWorkflowOwner;
+    }
+    if (registration.durableWorkflowStore !== undefined) {
+      existing.durableWorkflowStore = registration.durableWorkflowStore;
+    }
+    if (registration.durableWorkflowController !== undefined) {
+      existing.durableWorkflowController =
+        registration.durableWorkflowController;
+    }
     return existing;
   }
 
@@ -171,6 +195,10 @@ export function registerSessionScope(
         pendingInProcessDeliveries:
           registration.pendingInProcessDeliveries ?? [],
         interactiveStates: registration.interactiveStates ?? new Map(),
+        durableWorkflowRootDir: registration.durableWorkflowRootDir,
+        durableWorkflowOwner: registration.durableWorkflowOwner,
+        durableWorkflowStore: registration.durableWorkflowStore,
+        durableWorkflowController: registration.durableWorkflowController,
       };
   registry.set(scope.id, scope);
   return scope;
@@ -202,6 +230,58 @@ export function advanceSessionScopeGeneration(id: number): number {
 
 export function sessionOwner(scope: SessionScope): SessionOwnerToken {
   return { id: scope.id, generation: scope.generation };
+}
+function sameDurableWorkflowOwner(
+  left: WorkflowOwnerIdentity | undefined,
+  right: WorkflowOwnerIdentity | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.projectKey === right.projectKey &&
+    left.cwd === right.cwd &&
+    left.piSessionId === right.piSessionId &&
+    left.ownerId === right.ownerId &&
+    left.ownerGeneration === right.ownerGeneration &&
+    left.leaseToken === right.leaseToken
+  );
+}
+
+function clearDurableWorkflowServices(scope: SessionScope): void {
+  scope.durableWorkflowStore = undefined;
+  scope.durableWorkflowController = undefined;
+}
+
+export function setDurableWorkflowRootDir(
+  scope: SessionScope,
+  rootDir: string,
+): void {
+  if (scope.durableWorkflowRootDir === rootDir) return;
+  clearDurableWorkflowServices(scope);
+  scope.durableWorkflowRootDir = rootDir;
+}
+
+export function setDurableWorkflowOwner(
+  scope: SessionScope,
+  owner: WorkflowOwnerIdentity | undefined,
+): void {
+  if (!sameDurableWorkflowOwner(scope.durableWorkflowOwner, owner)) {
+    clearDurableWorkflowServices(scope);
+  }
+  scope.durableWorkflowOwner = owner;
+}
+
+export async function releaseDurableWorkflowAuthority(
+  scope: SessionScope,
+): Promise<void> {
+  const store = scope.durableWorkflowStore;
+  if (!store) {
+    scope.durableWorkflowController = undefined;
+    return;
+  }
+  await store.release();
+  if (scope.durableWorkflowStore === store) {
+    clearDurableWorkflowServices(scope);
+  }
 }
 
 /** Resolve an exact owner only while that lifecycle generation remains live. */
