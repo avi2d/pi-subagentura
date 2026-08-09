@@ -83,6 +83,58 @@ afterEach(async () => {
 });
 
 describe("PR84 durable concurrency", () => {
+  it("F03 lets exactly one of two same-owner stores win a CAS append", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-concurrency-"));
+    roots.push(root);
+    const firstStore = new WorkflowRunStore({ rootDir: root, owner });
+    const secondStore = new WorkflowRunStore({ rootDir: root, owner });
+    await firstStore.createRun({
+      runId: "two-store-cas",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+
+    let readyCount = 0;
+    let releaseBarrier!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      const check = (): void => {
+        readyCount++;
+        if (readyCount === 2) resolve();
+      };
+      releaseBarrier = check;
+    });
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const append = async (
+      store: WorkflowRunStore,
+      type: string,
+    ): Promise<Awaited<ReturnType<WorkflowRunStore["appendIfCurrent"]>>> => {
+      releaseBarrier();
+      await barrier;
+      return store.appendIfCurrent("two-store-cas", -1, type, {});
+    };
+
+    const first = append(firstStore, "first");
+    const second = append(secondStore, "second");
+    await ready;
+    release();
+    const results = await Promise.all([first, second]);
+
+    expect(
+      results.filter((result) => result.status === "appended"),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "conflict"),
+    ).toHaveLength(1);
+    await expect(firstStore.readRun("two-store-cas")).resolves.toMatchObject({
+      events: [{ eventOrdinal: 0 }],
+    });
+    await firstStore.release();
+  });
+
   it("allows only one concurrent coordinator to run a claimed task", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-concurrency-"));
     roots.push(root);
