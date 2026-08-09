@@ -1,4 +1,13 @@
 import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  fsyncSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -153,6 +162,74 @@ export function validateWorkflowProcessChildStarted(
     evidence.epoch !== intent.epoch
   ) {
     throw new Error("Stale workflow process child evidence");
+  }
+}
+
+function childStartedPath(root: string): string {
+  return join(root, "process-child-started.json");
+}
+
+/** Write child-start evidence from the child extension before its first model turn. */
+export function persistWorkflowProcessChildStartedEvidenceSync(
+  root: string,
+  intent: Pick<
+    WorkflowProcessLaunchIntent,
+    "launchMarker" | "nonce" | "attemptId" | "epoch"
+  >,
+): string {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const path = childStartedPath(root);
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const fd = openSync(temporaryPath, "wx", 0o600);
+  try {
+    const evidence: WorkflowProcessChildStartedEvidence = {
+      schemaVersion: 1,
+      launchMarker: intent.launchMarker,
+      nonce: intent.nonce,
+      attemptId: intent.attemptId,
+      epoch: intent.epoch,
+    };
+    writeSync(fd, `${JSON.stringify(evidence)}\n`, undefined, "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    linkSync(temporaryPath, path);
+  } finally {
+    unlinkSync(temporaryPath);
+  }
+  return path;
+}
+
+export async function awaitWorkflowProcessChildStartedEvidence(
+  root: string,
+  intent: WorkflowProcessLaunchIntent,
+  signal: AbortSignal | undefined,
+  timeoutMs = 30_000,
+  pollMs = 50,
+): Promise<WorkflowProcessChildStartedEvidence> {
+  const startedAt = Date.now();
+  for (;;) {
+    if (signal?.aborted)
+      throw new Error("Workflow process child start aborted");
+    try {
+      const value: unknown = JSON.parse(
+        await readFile(childStartedPath(root), "utf8"),
+      );
+      if (!value || typeof value !== "object") {
+        throw new Error("Invalid workflow process child evidence");
+      }
+      const evidence = value as WorkflowProcessChildStartedEvidence;
+      validateWorkflowProcessChildStarted(intent, evidence);
+      return evidence;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Timed out waiting for workflow process child start");
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
   }
 }
 

@@ -11,7 +11,9 @@ import {
 import {
   launchInteractiveSubagent,
   registerInteractiveSubagentState,
+  cancelInteractiveSubagent,
 } from "./interactive-tmux";
+import { awaitWorkflowProcessChildStartedEvidence } from "./workflow-process-handshake";
 import {
   MAX_ITEMS_PER_CALL,
   INTERACTIVE_POLL_MS,
@@ -373,6 +375,8 @@ export function registerWorkflowTool(
       thinkingLevel,
       onProgress,
       onCancellationSnapshot,
+      processLaunchIntent,
+      onProcessLaunchDispatched,
     }) => {
       if (supervisorOwner && !isSessionOwnerLive(supervisorOwner)) {
         throw new Error(
@@ -409,6 +413,9 @@ export function registerWorkflowTool(
             sessionScope: childScope,
             workflowId: ownedWorkflowId,
             completionOwner: "workflow",
+            ...(processLaunchIntent
+              ? { workflowProcessLaunchIntent: processLaunchIntent }
+              : {}),
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -420,6 +427,30 @@ export function registerWorkflowTool(
           });
         }
         if (state) {
+          if (processLaunchIntent && onProcessLaunchDispatched) {
+            try {
+              await awaitWorkflowProcessChildStartedEvidence(
+                state.artifactDir,
+                processLaunchIntent,
+                signal,
+              );
+              await onProcessLaunchDispatched({
+                schemaVersion: 1,
+                launchMarker: processLaunchIntent.launchMarker,
+                nonce: processLaunchIntent.nonce,
+                attemptId: processLaunchIntent.attemptId,
+                epoch: processLaunchIntent.epoch,
+                dispatchedAt: Date.now(),
+              });
+            } catch (error) {
+              try {
+                cancelInteractiveSubagent(state.id, "workflow", state);
+              } catch {
+                /* best effort; preserve the claim error */
+              }
+              throw error;
+            }
+          }
           // launchInteractiveSubagent performs this registration itself. Repeating
           // the idempotent synchronization here keeps alternate launch adapters and
           // test doubles on the same production contract: the owner scope is the

@@ -1207,7 +1207,11 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
             throw new Error(
               "Workflow task label exceeds the durable size limit",
             );
-          if (isolation !== undefined && isolation !== "in-process")
+          if (
+            isolation !== undefined &&
+            isolation !== "in-process" &&
+            isolation !== "process"
+          )
             throw new Error("Invalid workflow task isolation");
           const normalizedInput =
             input === undefined ? undefined : toDurableValue(input);

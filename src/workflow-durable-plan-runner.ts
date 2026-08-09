@@ -28,6 +28,11 @@ import {
   mutationPayload,
   type WorkflowTaskClaim,
 } from "./workflow-mutation";
+import {
+  createWorkflowProcessLaunchIntent,
+  type WorkflowProcessLaunchDispatch,
+  type WorkflowProcessLaunchIntent,
+} from "./workflow-process-handshake";
 
 export type { WorkflowTaskClaim } from "./workflow-mutation";
 
@@ -39,9 +44,13 @@ export interface DurableWorkflowPlanOptions {
   resumePolicy?: WorkflowResumePolicy;
   runAgent: (input: {
     prompt: string;
-    isolation: "in-process";
+    isolation: "in-process" | "process";
     label: string;
     signal?: AbortSignal;
+    processLaunchIntent?: WorkflowProcessLaunchIntent;
+    onProcessLaunchDispatched?: (
+      dispatch: WorkflowProcessLaunchDispatch,
+    ) => Promise<void>;
   }) => Promise<SubagentResult>;
   signal?: AbortSignal;
   resume?: boolean;
@@ -1215,7 +1224,12 @@ export async function claimTask(
 async function appendClaimEvent(
   options: DurableWorkflowPlanOptions,
   taskClaim: WorkflowTaskClaim,
-  type: "task_succeeded" | "task_failed" | "usage_observed",
+  type:
+    | "task_succeeded"
+    | "task_failed"
+    | "usage_observed"
+    | "process_launch_intent"
+    | "process_launch_dispatched",
   payload: Record<string, unknown>,
 ): Promise<boolean> {
   for (let retry = 0; retry < 16; retry++) {
@@ -1242,16 +1256,64 @@ async function runClaimedAgent(
   task:
     | WorkflowPlan["phases"][number]["tasks"][number]
     | WorkflowProjectionTaskLike,
-  _taskClaim: WorkflowTaskClaim,
+  taskClaim: WorkflowTaskClaim,
 ): Promise<SubagentResult> {
   const prompt = task.prompt;
   if (!prompt) throw new Error(`Workflow task ${task.id} has no prompt`);
+  const isolation = task.isolation ?? "in-process";
+  let processLaunchIntent: WorkflowProcessLaunchIntent | undefined;
+  let onProcessLaunchDispatched:
+    ((dispatch: WorkflowProcessLaunchDispatch) => Promise<void>) | undefined;
+  if (isolation === "process") {
+    const intent = createWorkflowProcessLaunchIntent({
+      runId: options.runId,
+      operationId: task.id,
+      attemptId: `${task.id}-${taskClaim.attempt}`,
+      attemptNumber: taskClaim.attempt,
+      epoch: taskClaim.leaseEpoch,
+      effectiveIsolation: "process",
+      fallbackMode: "none",
+    });
+    processLaunchIntent = intent;
+    const intentCommitted = await appendClaimEvent(
+      options,
+      taskClaim,
+      "process_launch_intent",
+      { taskId: task.id, attempt: taskClaim.attempt, intent },
+    );
+    if (!intentCommitted)
+      throw new Error(`Workflow process launch claim lost for ${task.id}`);
+    onProcessLaunchDispatched = async (dispatch) => {
+      if (
+        dispatch.schemaVersion !== 1 ||
+        dispatch.launchMarker !== intent.launchMarker ||
+        dispatch.nonce !== intent.nonce ||
+        dispatch.attemptId !== intent.attemptId ||
+        dispatch.epoch !== intent.epoch ||
+        !Number.isSafeInteger(dispatch.dispatchedAt)
+      ) {
+        throw new Error(
+          `Stale workflow process launch dispatch for ${task.id}`,
+        );
+      }
+      const committed = await appendClaimEvent(
+        options,
+        taskClaim,
+        "process_launch_dispatched",
+        { taskId: task.id, attempt: taskClaim.attempt, dispatch },
+      );
+      if (!committed)
+        throw new Error(`Workflow process dispatch claim lost for ${task.id}`);
+    };
+  }
   const work = (): Promise<SubagentResult> =>
     options.runAgent({
       prompt,
-      isolation: "in-process",
+      isolation,
       label: task.label ?? task.id,
       signal: options.signal,
+      ...(processLaunchIntent ? { processLaunchIntent } : {}),
+      ...(onProcessLaunchDispatched ? { onProcessLaunchDispatched } : {}),
     });
   return options.dispatcher?.run(work, options.signal) ?? work();
 }
@@ -1302,6 +1364,7 @@ interface WorkflowProjectionTaskLike {
   id: string;
   prompt?: string;
   label?: string;
+  isolation?: "in-process" | "process";
   attempt: number;
 }
 

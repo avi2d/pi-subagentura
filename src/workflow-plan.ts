@@ -65,8 +65,6 @@ export function validateWorkflowPlan(plan: WorkflowPlan): void {
       ) {
         throw new Error(`Invalid or duplicate task id: ${task.id}`);
       }
-      if (task.isolation === "process")
-        throw new Error("Process isolation is not supported by the preview");
       if (
         task.approval !== undefined &&
         (!task.approval.policyHash.trim() ||
