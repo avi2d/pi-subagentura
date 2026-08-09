@@ -4,24 +4,26 @@ This document is the question set for validating the Milestones 3–8 workflow s
 
 ## 1. Frozen plan scope in practice
 
-| Item                           | Scope status                  |
-| ------------------------------ | ----------------------------- |
-| X01 (22–23 partial; 24+ deferred) | Partial                    |
-| X02–X05 (out-of-scope this PR) | Deferred                      |
-| X06 (security boundary)        | Deferred / helper-only checks |
-| 1–21, 22*, 39–47, 54+, 55+     | In-scope for PR-84            |
+| Item                              | Scope status                  |
+| --------------------------------- | ----------------------------- |
+| X01 (22–24 partial; 25+ deferred) | Partial                       |
+| X02–X05 (out-of-scope this PR)    | Deferred                      |
+| X06 (security boundary)           | Deferred / helper-only checks |
+| 1–21, 22*, 39–47, 54+, 55+        | In-scope for PR-84            |
 
-The PR-84 foundation is **declarative in-process** durability only. Supported production behavior:
+The PR-84 foundation provides declarative durability with a production-reachable
+process launch slice. Supported production behavior:
 
 - durable run creation + restart recovery;
-- trusted-command resume and explicit trust boundaries;
+- trusted-command resume and explicit authority;
 - at-least-once terminal delivery with receipts;
-- manual resume and explicit trust boundaries;
-- helper-only support for process-isolated launch, durable JS replay, and notification semantics.
+- claim-bound process launch intent and dispatch evidence;
+- exact launch identity propagation and child-start evidence validation.
 
 Out of scope in this frozen scope:
 
-- **X01:** child handshake/adoption/dead-child accounting remains deferred;
+- **X01:** pane adoption after startup crashes, ambiguous command recovery,
+  exactly-one-child enforcement, and dead-child accounting;
 - **X02:** durable arbitrary JS replay / process-replay stability guarantees;
 - **X03:** host-forced routing enforcement; routing remains opt-in.
 - **X04:** autonomous wake after mutation/approval/budget change (explicit resume action remains required);
@@ -62,11 +64,11 @@ Out of scope in this frozen scope:
 
 22. Is the claim-bound launch intent persisted before process dispatch? **PASS for the durable journal slice; pane adoption remains deferred.**
 23. Are attempt, nonce, epoch, launch marker, and effective fallback mode persisted before use? **PASS for the durable journal slice.**
-24. Is `launch_dispatched` durable before command send, and is child `started` validated before model work?
-25. After a crash before pane assignment, can startup find and fence the intended pane without creating a duplicate?
-26. After ambiguous command dispatch, does recovery probe and fence before retrying rather than blindly resending?
-27. Can stale nonce, attempt, or epoch artifacts settle a replacement attempt?
-28. Is a dead child’s partial usage surfaced as lower-bound evidence when billing cannot be observed exactly?
+24. Is `launch_dispatched` published only after the command runner returns and exact child-start evidence is persisted? **PASS for the registered process path; this is not pane adoption or full OS lifecycle proof.**
+25. After a crash before pane assignment, can startup find and fence the intended pane without creating a duplicate? **DEFERRED.**
+26. After ambiguous command dispatch, does recovery probe and fence before retrying rather than blindly resending? **DEFERRED.**
+27. Can stale nonce, attempt, or epoch artifacts settle a replacement attempt? **Exact identity rejection is covered by the child evidence protocol; full replacement-pane fencing is deferred.**
+28. Is a dead child’s partial usage surfaced as lower-bound evidence when billing cannot be observed exactly? **DEFERRED.**
 
 ## Durable JavaScript replay (DEFERRED — PR #84 foundation scope)
 

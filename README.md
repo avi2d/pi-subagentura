@@ -81,9 +81,11 @@ Workflow scripts are trusted agent-authored JavaScript. The VM improves determin
 
 For this PR, the foundation contract is declarative durability with trusted-command
 resume and explicit authority. Durable process tasks now persist a claim-bound
-launch intent before process dispatch, but child handshake/adoption/recovery,
-durable JavaScript replay, and exactly-once notification claims remain deferred;
-see [`docs/pr84-x-boundaries.md`](./docs/pr84-x-boundaries.md).
+launch intent before dispatch, propagate the exact launch identity to the child,
+and publish dispatch evidence only after exact child-start evidence is persisted.
+Pane adoption after coordinator restart, dead-child accounting, durable JavaScript
+replay, and exactly-once notification claims remain deferred; see
+[`docs/pr84-x-boundaries.md`](./docs/pr84-x-boundaries.md).
 
 Background workflow jobs are scoped to the current parent session and are
 cancelled by reload, resume, quit, or a new session. Attachable interactive

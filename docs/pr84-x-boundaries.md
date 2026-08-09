@@ -18,28 +18,38 @@ counted as production closure unless a registered workflow path exercises it.
   attempt number, lease epoch, nonce, launch marker, requested/effective
   isolation, and fallback mode.
 - The registered `start_durable_workflow` path has executed a real process task
-  to terminal success and the persisted journal contains the launch intent
-  after `task_started`.
+  to terminal success and the persisted journal contains the launch intent after
+  `task_started`.
+- The process runner propagates the exact `launchMarker`, `nonce`, `attemptId`,
+  and `epoch` to the child environment.
+- The registered process path persists child-start evidence atomically, rejects
+  incomplete or mismatched identity, and publishes `process_launch_dispatched`
+  only after the runner callback and exact child-start evidence.
 
 Evidence:
 
 - `src/workflow-durable-plan-runner.ts`
 - `src/workflow-plan.ts`
 - `src/workflow-run-store.ts`
+- `src/workflow-process-handshake.ts`
+- `src/child-protocol.ts`
+- `src/interactive-tmux.ts`
+- `src/workflow-tool.ts`
 - `tests/workflow-durable-plan-runner.test.ts` — intent ordering and payload
+- `tests/workflow-process-handshake.test.ts` — exact identity and fencing
+- `tests/child-protocol.test.ts` — child startup persistence and rejection
 - `tests/workflow-contract-foundation.test.ts` — plan admission
 - `tests/workflow-acceptance-lifecycle-compatibility.test.ts` — F18 real
   `start_durable_workflow` process lane
 
 ### Still deferred
 
-The following are not claimed: durable `launch_dispatched` before the actual
-multiplexer command send; child `started` evidence bound to the persisted nonce
-and marker; pane adoption after coordinator restart; stale-candidate fencing;
-exactly-one-child enforcement; dead-child accounting with complete-vs-lower-bound
-usage; and reconciliation across a different host or multiplexer namespace.
-The existing `workflow-process-handshake.ts` helpers remain helper-level until
-those production paths are wired and independently exercised.
+The following are not claimed: pane adoption after coordinator restart;
+ambiguous command dispatch probing and retry fencing; exactly-one-child
+OS-level enforcement; dead-child accounting with complete-vs-lower-bound usage;
+reattachment across coordinator restart; and reconciliation across a different
+host or multiplexer namespace. Exact artifact identity rejection is not a claim
+of full OS process lifecycle or replacement-pane fencing.
 
 ## X02 — durable arbitrary-JavaScript replay
 
