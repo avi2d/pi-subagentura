@@ -976,7 +976,24 @@ export async function cancelDurableWorkflowRun(
       if (isMissingRun(error)) return undefined;
       throw error;
     }
-    if (isTerminal(projection.status)) return projection;
+    if (isTerminal(projection.status)) {
+      const existingCancellationRequestId = projection.cancellation?.requestId;
+      if (
+        projection.status !== "cancelled" ||
+        existingCancellationRequestId === undefined
+      )
+        return projection;
+      const repaired = await terminalizeWorkflowRun(
+        store,
+        owner,
+        runId,
+        { status: "cancelled" },
+        { cancellationRequestId: existingCancellationRequestId },
+      );
+      if (repaired.status === "cancelled")
+        await ensureDeliveryIntent(store, owner, runId);
+      return recoverWorkflowRun({ store, owner }, runId);
+    }
     if (
       projection.cancellation &&
       projection.cancellation.requestId !== requestId
@@ -1026,10 +1043,12 @@ async function runDurableParallelPhase(
   tasks: WorkflowPlan["phases"][number]["tasks"],
 ): Promise<boolean> {
   const limit = options.dispatcher
-    ? Math.max(1, tasks.length)
+    ? Math.max(1, Math.min(options.dispatcher.snapshot().max, tasks.length))
     : Math.max(1, Math.min(4, tasks.length));
   let nextIndex = 0;
   let firstError: unknown;
+  const logicalFailures: Array<{ taskIndex: number; message: string }> = [];
+  const taskOrder = new Map(tasks.map((task, index) => [task.id, index]));
   let interrupted = false;
   let abandoned = false;
   const worker = async (): Promise<void> => {
@@ -1085,8 +1104,13 @@ async function runDurableParallelPhase(
             "task_failed",
             { taskId: task.id, attempt: taskClaim.attempt, error: message },
           );
-          if (failureCommitted && firstError === undefined)
-            firstError = new Error(message);
+          if (failureCommitted) {
+            logicalFailures.push({
+              taskIndex: taskOrder.get(task.id) ?? Number.MAX_SAFE_INTEGER,
+              message,
+            });
+            firstError ??= new Error(message);
+          }
           continue;
         }
         await appendClaimEvent(options, taskClaim, "task_succeeded", {
@@ -1126,12 +1150,18 @@ async function runDurableParallelPhase(
       if (!cancelled) throw new Error("Workflow run not found");
       return false;
     }
+    const selectedFailure = logicalFailures
+      .slice()
+      .sort((left, right) => left.taskIndex - right.taskIndex)[0];
     await terminalizeWorkflowRun(options.store, options.owner, options.runId, {
       status: "error",
       error: {
         code: "task_failed",
         message:
-          firstError instanceof Error ? firstError.message : String(firstError),
+          selectedFailure?.message ??
+          (firstError instanceof Error
+            ? firstError.message
+            : String(firstError)),
       },
     });
     await ensureDeliveryIntent(options.store, options.owner, options.runId);

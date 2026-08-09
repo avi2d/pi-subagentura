@@ -476,8 +476,22 @@ export class WorkflowRunStore {
           await this.assertNamespaceLease();
           await this.assertLaunchUnchanged(runId, dir, launch);
           await this.assertOpenFileTarget(file, path);
-          await writeFully(file, line, parsed.completeBytes);
-          await file.sync();
+          try {
+            await writeFully(file, line, parsed.completeBytes);
+            await file.sync();
+          } catch (error) {
+            try {
+              await this.assertOpenFileTarget(file, path);
+              await file.truncate(parsed.completeBytes);
+              await file.sync();
+              await this.assertOpenFileTarget(file, path);
+            } catch (rollbackError) {
+              throw new Error("Failed to roll back workflow journal suffix", {
+                cause: new AggregateError([error, rollbackError]),
+              });
+            }
+            throw error;
+          }
           await this.assertOpenFileTarget(file, path);
           return {
             eventId: JSON.parse(line.toString("utf8")).eventId as string,
