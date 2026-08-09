@@ -251,55 +251,70 @@ export class WorkflowNamespaceLease {
       return;
     }
     await mkdir(dirname(this.interlockPath), { recursive: true, mode: 0o700 });
-    let file;
-    try {
-      file = await open(
-        this.interlockPath,
-        fsConstants.O_WRONLY |
-          fsConstants.O_CREAT |
-          fsConstants.O_EXCL |
-          fsConstants.O_NOFOLLOW,
-        0o600,
-      );
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new Error("Workflow namespace lease interlock is held", {
-          cause: error,
-        });
-      }
-      throw error;
-    }
-    try {
-      const identity = fileIdentity(await file.stat());
-      await writeFully(
-        file,
-        Buffer.from(`${JSON.stringify(this.interlockRecord())}\n`, "utf8"),
-      );
-      await file.sync();
-      await assertDescriptorAndTarget(file, this.interlockPath, identity);
-      this.interlockFile = file;
-      this.interlockIdentity = identity;
-      this.interlockIdle = new Promise<void>((resolve) => {
-        this.resolveInterlockIdle = resolve;
-      });
-      this.interlockDepth = 1;
-    } catch (error) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let file;
       try {
-        await file.close();
-      } catch (closeError) {
-        throw new Error("Failed to close workflow namespace interlock", {
-          cause: closeError,
-        });
+        file = await open(
+          this.interlockPath,
+          fsConstants.O_WRONLY |
+            fsConstants.O_CREAT |
+            fsConstants.O_EXCL |
+            fsConstants.O_NOFOLLOW,
+          0o600,
+        );
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code === "EEXIST" &&
+          attempt === 0 &&
+          (await recoverStaleInterlock(
+            this.interlockPath,
+            this.now,
+            this.staleAfterMs,
+          ))
+        ) {
+          continue;
+        }
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error("Workflow namespace lease interlock is held", {
+            cause: error,
+          });
+        }
+        throw error;
       }
       try {
-        await rm(this.interlockPath, { force: false });
-      } catch (cleanupError) {
-        throw new Error("Failed to remove workflow namespace interlock", {
-          cause: new AggregateError([error, cleanupError]),
+        const identity = fileIdentity(await file.stat());
+        await writeFully(
+          file,
+          Buffer.from(`${JSON.stringify(this.interlockRecord())}\n`, "utf8"),
+        );
+        await file.sync();
+        await assertDescriptorAndTarget(file, this.interlockPath, identity);
+        this.interlockFile = file;
+        this.interlockIdentity = identity;
+        this.interlockIdle = new Promise<void>((resolve) => {
+          this.resolveInterlockIdle = resolve;
         });
+        this.interlockDepth = 1;
+        return;
+      } catch (error) {
+        try {
+          await file.close();
+        } catch (closeError) {
+          throw new Error("Failed to close workflow namespace interlock", {
+            cause: closeError,
+          });
+        }
+        try {
+          await rm(this.interlockPath, { force: false });
+        } catch (cleanupError) {
+          throw new Error("Failed to remove workflow namespace interlock", {
+            cause: new AggregateError([error, cleanupError]),
+          });
+        }
+        throw error;
       }
-      throw error;
     }
+    throw new Error("Workflow namespace interlock acquisition failed");
   }
 
   private async leaveInterlock(): Promise<void> {
@@ -384,6 +399,68 @@ export class WorkflowNamespaceLease {
     } finally {
       await file?.close();
     }
+  }
+}
+
+async function recoverStaleInterlock(
+  path: string,
+  now: () => number,
+  staleAfterMs: number,
+): Promise<boolean> {
+  let file;
+  try {
+    file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const identity = fileIdentity(await file.stat());
+    const raw = (await file.readFile()).toString("utf8");
+    const parsed = JSON.parse(raw) as Partial<InterlockRecord>;
+    await assertDescriptorAndTarget(file, path, identity);
+    if (
+      parsed.schemaVersion !== 1 ||
+      typeof parsed.ownerId !== "string" ||
+      parsed.ownerId.length === 0 ||
+      typeof parsed.leaseToken !== "string" ||
+      parsed.leaseToken.length === 0 ||
+      typeof parsed.lockToken !== "string" ||
+      parsed.lockToken.length === 0 ||
+      typeof parsed.acquiredAt !== "number" ||
+      !Number.isSafeInteger(parsed.acquiredAt) ||
+      parsed.acquiredAt < 0 ||
+      (parsed.processId !== undefined &&
+        (!Number.isSafeInteger(parsed.processId) || parsed.processId <= 0)) ||
+      (parsed.processStartTime !== undefined &&
+        (!Number.isSafeInteger(parsed.processStartTime) ||
+          parsed.processStartTime < 0))
+    ) {
+      throw new Error("Workflow namespace interlock is corrupt");
+    }
+    const acquiredAt = parsed.acquiredAt as number;
+    if (now() - acquiredAt < staleAfterMs) {
+      return false;
+    }
+    if (parsed.processId === undefined) {
+      throw new Error("Workflow namespace interlock identity is ambiguous");
+    }
+    const samePidWithNewStart =
+      parsed.processId === process.pid &&
+      parsed.processStartTime !== undefined &&
+      parsed.processStartTime !== currentProcessStartTime();
+    if (!samePidWithNewStart && isProcessAlive(parsed.processId)) {
+      return false;
+    }
+    await assertDescriptorAndTarget(file, path, identity);
+    await rm(path, { force: false });
+    await syncDirectory(dirname(path));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    if (
+      error instanceof Error &&
+      error.message === "Workflow namespace interlock is held"
+    )
+      return false;
+    throw error;
+  } finally {
+    await file?.close();
   }
 }
 
