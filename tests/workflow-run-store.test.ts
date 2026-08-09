@@ -76,6 +76,14 @@ describe("WorkflowRunStore", () => {
     await store.append("old-terminal", "run_terminal", {
       result: { status: "done" },
     });
+    await store.append("old-terminal", "delivery_intent", {
+      deliveryId: workflowDeliveryId("old-terminal"),
+      kind: "terminal",
+      message: "Workflow old-terminal done",
+    });
+    await store.append("old-terminal", "delivery_dispatched", {
+      deliveryId: workflowDeliveryId("old-terminal"),
+    });
     await store.append("old-terminal", "delivery_receipt", {
       deliveryId: workflowDeliveryId("old-terminal"),
     });
