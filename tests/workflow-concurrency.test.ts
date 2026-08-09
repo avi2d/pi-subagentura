@@ -370,6 +370,31 @@ describe("PR84 durable concurrency", () => {
     expect(projection.mutationHash).toBeUndefined();
   });
 
+  it("rejects mutation evidence with a missing hash without advancing authority", () => {
+    const projection = projectWorkflowRun(launch, [
+      event("created", "run_created", {
+        tasks: [{ id: "a", phaseId: "p", prompt: "A" }],
+      }),
+      event("missing-hash", "task_blocked", {
+        taskId: "a",
+        mutationProtocolVersion: 1,
+        mutationRunId: launch.runId,
+        mutationType: "task_blocked",
+        mutationOwnerId: owner.ownerId,
+        mutationOwnerGeneration: owner.ownerGeneration,
+        mutationLeaseEpoch: 0,
+        mutationBaseRevision: 1,
+        mutationBaseOrdinal: 0,
+        previousMutationHash: "",
+      }),
+    ]);
+
+    expect(projection.revision).toBe(1);
+    expect(projection.lastEventOrdinal).toBe(1);
+    expect(projection.tasks.a.status).toBe("pending");
+    expect(projection.mutationHash).toBeUndefined();
+  });
+
   it("enforces one dispatcher limit across two durable runs", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-dispatcher-"));
     roots.push(root);
