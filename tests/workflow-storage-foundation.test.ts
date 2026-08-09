@@ -1,4 +1,5 @@
 import {
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -10,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SubagentResult } from "../src/helpers";
 import {
@@ -19,7 +20,10 @@ import {
 } from "../src/workflow-durable-plan-runner";
 import {
   WorkflowRunCorruptionError,
+  WorkflowRunQuotaError,
+  WorkflowRunStorageError,
   WorkflowRunStore,
+  workflowRunPath,
 } from "../src/workflow-run-store";
 import { WorkflowNamespaceLease } from "../src/workflow-lease";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
@@ -91,6 +95,96 @@ afterEach(async () => {
 });
 
 describe("workflow storage foundation", () => {
+  it("F01 leaves no dispatchable run when creation fails before publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const runAgent = vi.fn(async () => success());
+    const originalAssert = (store as any).assertRegularDirectory.bind(store);
+    vi.spyOn(store as any, "assertRegularDirectory").mockImplementation(
+      async (...args: unknown[]) => {
+        const path = String(args[0]);
+        if (path.includes(".creating-"))
+          throw new Error("injected creation failure before publication");
+        return originalAssert(path);
+      },
+    );
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "before-publication",
+        plan: {
+          schemaVersion: 1,
+          name: "before-publication",
+          phases: [
+            {
+              id: "phase",
+              mode: "sequential",
+              tasks: [{ id: "task", prompt: "prompt" }],
+            },
+          ],
+        },
+        runAgent,
+      }),
+    ).rejects.toThrow("before publication");
+
+    expect(runAgent).not.toHaveBeenCalled();
+    await expect(store.listRunIds()).resolves.toEqual([]);
+  });
+
+  it("F01 keeps a complete immutable prefix when publication fails after rename", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const runAgent = vi.fn(async () => success());
+    const originalAssert = (store as any).assertRegularDirectory.bind(store);
+    let injected = false;
+    vi.spyOn(store as any, "assertRegularDirectory").mockImplementation(
+      async (...args: unknown[]) => {
+        const path = String(args[0]);
+        if (!injected && path.endsWith(join("runs", "after-publication"))) {
+          injected = true;
+          throw new Error("injected post-publication failure");
+        }
+        return originalAssert(path);
+      },
+    );
+    const plan = {
+      schemaVersion: 1 as const,
+      name: "after-publication",
+      phases: [
+        {
+          id: "phase",
+          mode: "sequential" as const,
+          tasks: [{ id: "task", prompt: "prompt" }],
+        },
+      ],
+    };
+
+    await expect(
+      store.createRunWithInitialEvent(
+        {
+          runId: "after-publication",
+          planRevision: plan.schemaVersion,
+          resumePolicy: "manual",
+          owner,
+        },
+        { type: "run_created", payload: { plan } },
+      ),
+    ).rejects.toThrow("post-publication");
+
+    vi.restoreAllMocks();
+    const published = await store.readRun("after-publication");
+    expect(published.events).toHaveLength(1);
+    expect(published.events[0]).toMatchObject({
+      type: "run_created",
+      eventOrdinal: 0,
+    });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
   it("publishes launch and run_created as one durable creation prefix", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
     roots.push(root);
@@ -261,6 +355,102 @@ describe("workflow storage foundation", () => {
       "not regular",
     );
     await expect(readFile(outside, "utf8")).resolves.toBe("");
+  });
+
+  it("F05 rejects a symlinked final launch target", async () => {
+    const { store, root } = await makeStore("symlink-launch");
+    const launchPath = join(
+      root,
+      owner.projectKey,
+      owner.piSessionId,
+      "runs",
+      "symlink-launch",
+      "launch.json",
+    );
+    const outside = join(root, "outside-launch.json");
+    const launch = await readFile(launchPath);
+    await writeFile(outside, launch);
+    await rm(launchPath);
+    await symlink(outside, launchPath);
+
+    await expect(store.readRun("symlink-launch")).rejects.toThrow("corrupt");
+    await expect(readFile(outside)).resolves.toEqual(launch);
+  });
+
+  it("F05 rejects lexical run-id escapes before constructing final targets", async () => {
+    for (const runId of ["../escape", "nested/run", "nested\\run"]) {
+      expect(() => workflowRunPath("/tmp/workflows", owner, runId)).toThrow(
+        "Invalid durable workflow run ID",
+      );
+    }
+  });
+
+  it.each(["launch.json", "events.ndjson"])(
+    "F05 rejects hardlinked final target %s without changing its outside inode",
+    async (fileName) => {
+      const runId = `hardlink-${fileName === "launch.json" ? "launch" : "events"}`;
+      const { store, root, eventsPath } = await makeStore(runId);
+      const target = join(dirname(eventsPath), fileName);
+      const outside = join(root, `outside-${fileName}`);
+      const original = await readFile(target);
+      await writeFile(outside, original);
+      await rm(target);
+      await link(outside, target);
+
+      const operation =
+        fileName === "launch.json"
+          ? store.readRun(runId)
+          : store.append(runId, "blocked", {});
+      await expect(operation).rejects.toThrow(
+        fileName === "launch.json" ? "corrupt" : "not regular",
+      );
+      await expect(readFile(outside)).resolves.toEqual(original);
+    },
+  );
+
+  it.each(["launch.json", "events.ndjson"])(
+    "F05 rejects non-regular final target %s",
+    async (fileName) => {
+      const runId = `nonregular-${fileName === "launch.json" ? "launch" : "events"}`;
+      const { store, eventsPath } = await makeStore(runId);
+      const target = join(dirname(eventsPath), fileName);
+      await rm(target);
+      await mkdir(target);
+
+      const operation =
+        fileName === "launch.json"
+          ? store.readRun(runId)
+          : store.append(runId, "blocked", {});
+      await expect(operation).rejects.toThrow(
+        fileName === "launch.json" ? "corrupt" : "not regular",
+      );
+    },
+  );
+
+  it("F05 rejects an inode replacement after opening the final journal", async () => {
+    const { store, root, eventsPath } = await makeStore("inode-replacement");
+    const committed = await readFile(eventsPath);
+    const replacement = join(root, "replacement-events.ndjson");
+    const originalAssert = (store as any).assertOpenFileTarget.bind(store);
+    let checks = 0;
+    vi.spyOn(store as any, "assertOpenFileTarget").mockImplementation(
+      async (...args: unknown[]) => {
+        const file = args[0];
+        const path = String(args[1]);
+        checks++;
+        if (checks === 2) {
+          await rename(eventsPath, replacement);
+          await writeFile(eventsPath, "replacement\n");
+        }
+        return originalAssert(file, path);
+      },
+    );
+
+    await expect(
+      store.append("inode-replacement", "blocked", {}),
+    ).rejects.toThrow("target changed");
+    await expect(readFile(replacement)).resolves.toEqual(committed);
+    await expect(readFile(eventsPath, "utf8")).resolves.toBe("replacement\n");
   });
 
   it("repairs one torn suffix while holding storage authority", async () => {
@@ -627,6 +817,64 @@ describe("workflow storage foundation", () => {
     await expect(store.readRun("run")).resolves.toMatchObject({
       events: [{ type: "short_write", payload: { value: "x" } }],
     });
+  });
+
+  it("F06 preserves the valid prefix across ENOSPC and quota failures", async () => {
+    const { store, eventsPath, root } = await makeStore("storage-faults");
+    const prefix = await readFile(eventsPath);
+    const probe = await (
+      await import("node:fs/promises")
+    ).open(join(root, "enospc-probe"), "w+");
+    const prototype = Object.getPrototypeOf(probe) as {
+      write: (...args: any[]) => Promise<any>;
+    };
+    await probe.close();
+    const originalWrite = prototype.write;
+    let injected = true;
+    vi.spyOn(prototype, "write").mockImplementation(async function (
+      this: unknown,
+      ...args: any[]
+    ) {
+      if (injected && Buffer.isBuffer(args[0]) && typeof args[1] === "number") {
+        injected = false;
+        const error = new Error("simulated ENOSPC") as NodeJS.ErrnoException;
+        error.code = "ENOSPC";
+        throw error;
+      }
+      return originalWrite.apply(this, args);
+    });
+
+    await expect(
+      store.append("storage-faults", "enospc", {}),
+    ).rejects.toBeInstanceOf(WorkflowRunStorageError);
+    await expect(readFile(eventsPath)).resolves.toEqual(prefix);
+
+    vi.restoreAllMocks();
+    for (const quota of ["event", "run byte", "owner byte"] as const) {
+      const quotaRoot = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
+      roots.push(quotaRoot);
+      const quotaStore = new WorkflowRunStore({
+        rootDir: quotaRoot,
+        owner,
+        ...(quota === "event" ? { maxEventBytes: 1 } : {}),
+        ...(quota === "run byte" ? { maxRunBytes: 1 } : {}),
+        ...(quota === "owner byte" ? { maxOwnerBytes: 1 } : {}),
+      });
+      const quotaRunId = `quota-${quota.replace(" ", "-")}`;
+      await quotaStore.createRun({
+        runId: quotaRunId,
+        planRevision: 1,
+        resumePolicy: "manual",
+        owner,
+      });
+      await expect(
+        quotaStore.append(quotaRunId, "quota", {}),
+      ).rejects.toMatchObject({ code: "QUOTA", quota });
+      await expect(quotaStore.readRun(quotaRunId)).resolves.toMatchObject({
+        events: [],
+      });
+      await quotaStore.release();
+    }
   });
 
   it("fails closed when the run directory descriptor is replaced before prune", async () => {
