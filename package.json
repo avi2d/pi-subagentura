@@ -52,6 +52,7 @@
     "src/artifact.ts",
     "src/artifact-poller.ts",
     "src/child-protocol.ts",
+    "src/workflow-process-handshake.ts",
     "src/delivery.ts",
     "src/helpers.ts",
     "src/orchestration-context.ts",
