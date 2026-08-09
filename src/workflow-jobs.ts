@@ -8,6 +8,15 @@ import {
 import type { CancellationSnapshotReceipt } from "./cancellation-snapshots";
 import { runWorkflow } from "./workflow-worker";
 import {
+  runWorkflowPlan,
+  type WorkflowPlanRunOptions,
+} from "./workflow-plan-runner";
+import {
+  createWorkflowPlanState,
+  type WorkflowPlanState,
+} from "./workflow-plan-state";
+import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
+import {
   type RunWorkflowOptions,
   type WorkflowAgentRunner,
   type WorkflowAgentRecord,
@@ -53,6 +62,7 @@ export interface WorkflowJobState {
     agentRecords?: WorkflowAgentRecord[];
     agentRecordsOmitted?: number;
     runningCount?: number;
+    planState?: WorkflowPlanState;
   };
   result?: WorkflowRunResult;
   error?: string;
@@ -177,12 +187,33 @@ export type StartWorkflowJobOptions = Omit<
 > &
   Pick<RunWorkflowOptions, "signal" | "onProgress">;
 
+export type StartWorkflowPlanJobOptions = Pick<
+  WorkflowPlanRunOptions,
+  "runAgent" | "signal" | "onState"
+> & {
+  budgetTotal?: number | null;
+};
+
+type SharedWorkflowJobOptions = {
+  runAgent: WorkflowAgentRunner;
+  signal?: AbortSignal;
+  budgetTotal?: number | null;
+};
+
+type WorkflowJobExecutor<TOptions extends SharedWorkflowJobOptions> = (
+  state: WorkflowJobState,
+  options: TOptions,
+  signal: AbortSignal,
+) => Promise<WorkflowRunResultWithUsage>;
+
 /**
- * Start a workflow running in the background. Returns the job id immediately.
+ * Start a JavaScript workflow. The shared lifecycle keeps script and plan jobs
+ * in the same registry with identical ownership, cancellation, settlement, and
+ * retention behavior.
  *
  * `opts` may be a builder so callers that need the job id while constructing the
  * options (e.g. to tag spawned children with their owning `workflowId`) receive it
- * before `runWorkflow` can invoke `runAgent`.
+ * before either runner can invoke `runAgent`.
  */
 export function startWorkflowJob(
   name: string,
@@ -193,6 +224,139 @@ export function startWorkflowJob(
   onComplete?: (job: WorkflowJobState) => boolean | void,
   owner: SessionOwnerToken | undefined = getActiveSessionOwner(),
   executionMode: "async" | "sync" = "async",
+): WorkflowJobState {
+  return startSharedWorkflowJob(
+    name,
+    optsOrBuilder,
+    startedAt,
+    onComplete,
+    owner,
+    executionMode,
+    (state, opts, signal) => {
+      const liveUsageByAgent = new Map<number, WorkflowUsage>();
+      return runWorkflow(script, {
+        ...opts,
+        runAgent: (request) =>
+          runTrackedWorkflowAgent(state, opts.runAgent, request),
+        signal,
+        onProgress: (p) => {
+          state.snapshot.agentsSpawned = p.agentsSpawned;
+          state.snapshot.errorCount = p.errorCount;
+          state.snapshot.tokensSpent = p.tokensSpent;
+          state.snapshot.budgetTotal =
+            p.budgetTotal ?? state.snapshot.budgetTotal;
+          state.snapshot.usage = p.usage
+            ? { ...p.usage }
+            : state.snapshot.usage;
+          state.snapshot.runningCount = p.runningCount;
+          if (p.kind === "phase" && p.phase) {
+            state.snapshot.currentPhase = p.phase;
+            state.snapshot.phases.push(p.phase);
+            state.snapshot.lastMessage = `◆ phase: ${p.phase}`;
+          } else if (p.kind === "log" && p.message) {
+            state.snapshot.lastMessage = p.message;
+          } else if (p.kind === "agent_start") {
+            state.snapshot.lastMessage = `→ started${formatWorkflowAgentTag(p)}`;
+          } else if (p.kind === "agent_done") {
+            state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
+          }
+          if (p.kind === "agent_start" || p.kind === "agent_done") {
+            recordWorkflowAgentProgress(state.snapshot, p);
+          }
+          if (typeof p.agentId === "number") {
+            if (p.liveUsage) {
+              liveUsageByAgent.set(p.agentId, { ...p.liveUsage });
+              recordWorkflowAgentLiveUsage(
+                state.snapshot,
+                p.agentId,
+                p.liveUsage,
+              );
+            }
+            if (p.kind === "agent_done") liveUsageByAgent.delete(p.agentId);
+          }
+          state.snapshot.liveUsage =
+            aggregateWorkflowLiveUsage(liveUsageByAgent);
+          opts.onProgress?.(p);
+        },
+        onCancellationSnapshot: (receipt) => {
+          (state.cancellationSnapshots ??= []).push(receipt);
+        },
+      }).finally(() => liveUsageByAgent.clear());
+    },
+  );
+}
+
+/**
+ * Start a validated declarative preview through the ordinary workflow-job
+ * lifecycle. Validation and initial-state construction happen before the shared
+ * registry or runner is touched.
+ */
+export function startWorkflowPlanJob(
+  plan: WorkflowPlan,
+  optsOrBuilder:
+    | StartWorkflowPlanJobOptions
+    | ((workflowId: string) => StartWorkflowPlanJobOptions),
+  startedAt?: number,
+  onComplete?: (job: WorkflowJobState) => boolean | void,
+  owner: SessionOwnerToken | undefined = getActiveSessionOwner(),
+  executionMode: "async" | "sync" = "async",
+): WorkflowJobState {
+  validateWorkflowPlan(plan);
+  const initialPlanState = createWorkflowPlanState(plan);
+  return startSharedWorkflowJob(
+    plan.name,
+    optsOrBuilder,
+    startedAt,
+    onComplete,
+    owner,
+    executionMode,
+    (state, opts, signal) => {
+      state.snapshot.planState = initialPlanState;
+      return runWorkflowPlan(plan, {
+        runAgent: (request) =>
+          runTrackedWorkflowAgent(state, opts.runAgent, request),
+        signal,
+        onState: (planState) => {
+          state.snapshot.planState = planState;
+          state.snapshot.currentPhase = planState.currentPhase;
+          if (
+            planState.currentPhase &&
+            state.snapshot.phases.at(-1) !== planState.currentPhase
+          ) {
+            state.snapshot.phases.push(planState.currentPhase);
+          }
+          const taskStates = Object.values(planState.tasks);
+          const startedTaskCount = taskStates.filter(
+            (status) =>
+              status === "running" ||
+              status === "succeeded" ||
+              status === "failed",
+          ).length;
+          state.snapshot.agentsSpawned = Math.max(
+            state.snapshot.agentsSpawned,
+            startedTaskCount,
+          );
+          state.snapshot.errorCount = taskStates.filter(
+            (status) => status === "failed",
+          ).length;
+          state.snapshot.runningCount = taskStates.filter(
+            (status) => status === "running",
+          ).length;
+          opts.onState?.(planState);
+        },
+      });
+    },
+  );
+}
+
+function startSharedWorkflowJob<TOptions extends SharedWorkflowJobOptions>(
+  name: string,
+  optsOrBuilder: TOptions | ((workflowId: string) => TOptions),
+  startedAt: number | undefined,
+  onComplete: ((job: WorkflowJobState) => boolean | void) | undefined,
+  owner: SessionOwnerToken | undefined,
+  executionMode: "async" | "sync",
+  execute: WorkflowJobExecutor<TOptions>,
 ): WorkflowJobState {
   const parentSessionOwner = owner;
   // A blocking sync workflow ran unconditionally before it was tracked here.
@@ -256,55 +420,26 @@ export function startWorkflowJob(
     activeAgentRuns: new Set(),
     parentSessionOwner,
   };
-  const liveUsageByAgent = new Map<number, WorkflowUsage>();
-  state.promise = runWorkflow(script, {
-    ...opts,
-    runAgent: (request) =>
-      runTrackedWorkflowAgent(state, opts.runAgent, request),
-    signal: abort.signal,
-    onProgress: (p) => {
-      state.snapshot.agentsSpawned = p.agentsSpawned;
-      state.snapshot.errorCount = p.errorCount;
-      state.snapshot.tokensSpent = p.tokensSpent;
-      state.snapshot.budgetTotal = p.budgetTotal ?? state.snapshot.budgetTotal;
-      state.snapshot.usage = p.usage ? { ...p.usage } : state.snapshot.usage;
-      state.snapshot.runningCount = p.runningCount;
-      if (p.kind === "phase" && p.phase) {
-        state.snapshot.currentPhase = p.phase;
-        state.snapshot.phases.push(p.phase);
-        state.snapshot.lastMessage = `◆ phase: ${p.phase}`;
-      } else if (p.kind === "log" && p.message) {
-        state.snapshot.lastMessage = p.message;
-      } else if (p.kind === "agent_start") {
-        state.snapshot.lastMessage = `→ started${formatWorkflowAgentTag(p)}`;
-      } else if (p.kind === "agent_done") {
-        state.snapshot.lastMessage = `→ done${formatWorkflowAgentTag(p)}`;
-      }
-      if (p.kind === "agent_start" || p.kind === "agent_done") {
-        recordWorkflowAgentProgress(state.snapshot, p);
-      }
-      if (typeof p.agentId === "number") {
-        if (p.liveUsage) {
-          liveUsageByAgent.set(p.agentId, { ...p.liveUsage });
-          recordWorkflowAgentLiveUsage(state.snapshot, p.agentId, p.liveUsage);
-        }
-        if (p.kind === "agent_done") liveUsageByAgent.delete(p.agentId);
-      }
-      state.snapshot.liveUsage = aggregateWorkflowLiveUsage(liveUsageByAgent);
-      opts.onProgress?.(p);
-    },
-    onCancellationSnapshot: (receipt) => {
-      (state.cancellationSnapshots ??= []).push(receipt);
-    },
-  })
-    .then((r) => {
+  let execution: Promise<WorkflowRunResultWithUsage>;
+  try {
+    execution = execute(state, opts, abort.signal);
+  } catch (error) {
+    execution = Promise.reject(error);
+  }
+  state.promise = execution
+    .then((result) => {
       if (state.status === "running") state.status = "done";
-      state.result = r;
+      state.result = result;
+      state.snapshot.agentsSpawned = result.agentsSpawned;
+      state.snapshot.errorCount = result.errorCount;
+      state.snapshot.tokensSpent = result.tokensSpent;
+      state.snapshot.usage = { ...result.usage };
+      state.snapshot.phases = [...result.phases];
+      state.snapshot.runningCount = 0;
       state.snapshot.liveUsage = undefined;
-      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
-      return r;
+      return result;
     })
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -315,7 +450,6 @@ export function startWorkflowJob(
         state.snapshot.tokensSpent = err.usage.output;
       }
       state.snapshot.liveUsage = undefined;
-      liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
       invokeCompletionHook(state);
       throw err;
