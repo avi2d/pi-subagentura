@@ -240,6 +240,45 @@ describe("durable workflow control plane", () => {
     });
   });
 
+  it("repairs an interrupted cancellation prefix idempotently after recovery", async () => {
+    const runId = "cancel-recovery";
+    const store = await createStoreRun(runId);
+    await store.append(runId, "run_started", {});
+    const leaseEpoch = await store.getLeaseEpoch();
+    await store.append(runId, "run_cancel_requested", {
+      ownerId: owner.ownerId,
+      ownerGeneration: owner.ownerGeneration,
+      leaseEpoch,
+      requestId: "cancel-recovery-request",
+    });
+    const controller = new RunnerController({ store, owner });
+
+    const repaired = await controller.cancel(
+      runId,
+      "cancel-recovery-request",
+    );
+    const replayed = await controller.cancel(
+      runId,
+      "cancel-recovery-request",
+    );
+    const record = await store.readRun(runId);
+
+    expect(repaired?.status).toBe("cancelled");
+    expect(replayed?.status).toBe("cancelled");
+    expect(
+      record.events.filter((event) => event.type === "run_cancel_requested"),
+    ).toHaveLength(1);
+    expect(record.events.filter((event) => event.type === "run_result")).toHaveLength(
+      1,
+    );
+    expect(record.events.filter((event) => event.type === "run_cancelled")).toHaveLength(
+      1,
+    );
+    expect(record.events.filter((event) => event.type === "delivery_intent")).toHaveLength(
+      1,
+    );
+  });
+
   it("binds approvals to the current authority and keeps rejection blocked but non-terminal", async () => {
     const store = await createStoreRun("approval-binding");
     const controller = new RunnerController({ store, owner });
