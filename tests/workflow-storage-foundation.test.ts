@@ -972,6 +972,34 @@ describe("workflow storage foundation", () => {
     await expect(readFile(eventsPath)).resolves.toEqual(prefix);
   });
 
+  it("F06 rejects complete records with schema, unknown-field, and UTF-8 faults", async () => {
+    const { store, eventsPath } = await makeStore("record-faults");
+    const valid = {
+      schemaVersion: 1,
+      eventId: "event-0",
+      eventOrdinal: 0,
+      runId: "record-faults",
+      runEpoch: 0,
+      type: "run_started",
+      payload: {},
+    };
+    const cases = [
+      Buffer.from(`${JSON.stringify({ ...valid, schemaVersion: 2 })}\n`),
+      Buffer.from(`${JSON.stringify({ ...valid, unexpected: true })}\n`),
+      Buffer.concat([
+        Buffer.from('{"schemaVersion":1,"eventId":"event-0","eventOrdinal":0,"runId":"record-faults","runEpoch":0,"type":"run_started","payload":"'),
+        Buffer.from([0xff]),
+        Buffer.from('"}\n'),
+      ]),
+    ];
+    for (const bytes of cases) {
+      await writeFile(eventsPath, bytes);
+      await expect(store.readRun("record-faults")).rejects.toBeInstanceOf(
+        WorkflowRunCorruptionError,
+      );
+    }
+  });
+
   it("fails closed when the run directory descriptor is replaced before prune", async () => {
     const { store, root } = await makeStore("descriptor-run");
     const runsDir = join(root, owner.projectKey, owner.piSessionId, "runs");
