@@ -1,7 +1,6 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
   getWorkflowCompletionPresentation,
-  normalizeCancelledWorkflowState,
   workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
@@ -14,6 +13,7 @@ import {
 import { formatWorkflowPlanRows } from "./workflow-plan-ui";
 import type { WorkflowPlanState } from "./workflow-plan-state";
 import type { SessionOwnerToken } from "./session-scope";
+import type { WorkflowProjection } from "./workflow-projection-repository";
 
 const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
 
@@ -29,16 +29,22 @@ type WorkflowTreeDone = (action: WorkflowTreeAction) => void;
 interface WorkflowTreeOptions {
   done: WorkflowTreeDone;
   owner?: SessionOwnerToken;
+  durableProjections?: readonly WorkflowProjection[];
   requestRender?: () => void;
   notify?: (message: string) => void;
 }
 
 interface WorkflowRow {
-  job: WorkflowJobState;
+  job?: WorkflowJobState;
+  projection?: WorkflowProjection;
   depth: number;
   text: string;
   selectable: boolean;
 }
+
+type WorkflowTreeSelection =
+  | { kind: "live"; id: string; job: WorkflowJobState }
+  | { kind: "durable"; id: string; projection: WorkflowProjection };
 
 export class WorkflowTreeComponent {
   private selectedWorkflowIndex = 0;
@@ -85,7 +91,10 @@ export class WorkflowTreeComponent {
   }
 
   handleInput(data: string): void {
-    const jobs = selectableJobs(this.opts.owner);
+    const jobs = selectableWorkflows(
+      this.opts.owner,
+      this.opts.durableProjections,
+    );
     if (data === "q" || data === "\x1b") {
       this.opts.done({ kind: "close" });
       return;
@@ -130,16 +139,29 @@ export class WorkflowTreeComponent {
 
   private rows(): WorkflowRow[] {
     const rows: WorkflowRow[] = [];
-    for (const job of workflowJobsForOwner(this.opts.owner)) {
-      const isExpanded = this.expanded.has(job.id);
-      rows.push({
-        job,
-        depth: 0,
-        selectable: true,
-        text: `${isExpanded ? "▾" : "▸"} ${formatWorkflowSummary(job)}`,
-      });
-      if (isExpanded) {
-        rows.push(...formatWorkflowDetails(job));
+    for (const item of selectableWorkflows(
+      this.opts.owner,
+      this.opts.durableProjections,
+    )) {
+      const isExpanded = this.expanded.has(item.id);
+      if (item.kind === "live") {
+        rows.push({
+          job: item.job,
+          depth: 0,
+          selectable: true,
+          text: `${isExpanded ? "▾" : "▸"} ${formatWorkflowSummary(item.job)}`,
+        });
+        if (isExpanded) rows.push(...formatWorkflowDetails(item.job));
+      } else {
+        rows.push({
+          projection: item.projection,
+          depth: 0,
+          selectable: true,
+          text: `${isExpanded ? "▾" : "▸"} ${formatDurableWorkflowSummary(item.projection)}`,
+        });
+        if (isExpanded) {
+          rows.push(...formatDurableWorkflowDetails(item.projection));
+        }
       }
     }
     return rows;
@@ -151,18 +173,26 @@ export class WorkflowTreeComponent {
     this.changed();
   }
 
-  private cancel(job: WorkflowJobState): void {
+  private cancel(item: WorkflowTreeSelection): void {
+    if (item.kind === "durable") {
+      if (item.projection.terminal) {
+        this.opts.notify?.(
+          `Workflow ${item.id} is ${item.projection.terminal.status}; nothing to cancel.`,
+        );
+        return;
+      }
+      this.opts.notify?.(`Cancelling durable workflow ${item.id}.`);
+      this.opts.done({ kind: "cancel", workflowId: item.id });
+      return;
+    }
+    const job = item.job;
     if (job.status !== "running") {
       this.opts.notify?.(
         `Workflow ${job.id} is ${job.status}; nothing to cancel.`,
       );
       return;
     }
-    job.abort.abort();
-    job.status = "cancelled";
-    normalizeCancelledWorkflowState(job);
-    this.opts.notify?.(`Cancelled workflow ${job.id}.`);
-    this.changed();
+    this.opts.notify?.(`Cancelling workflow ${job.id}.`);
     this.opts.done({ kind: "cancel", workflowId: job.id });
   }
 
@@ -175,6 +205,7 @@ export class WorkflowTreeComponent {
 export async function showWorkflowTree(
   ui: ExtensionUIContext,
   owner?: SessionOwnerToken,
+  durableProjections: readonly WorkflowProjection[] = [],
 ): Promise<WorkflowTreeAction> {
   const custom = (ui as any).custom;
   if (typeof custom !== "function") {
@@ -192,6 +223,7 @@ export async function showWorkflowTree(
       new WorkflowTreeComponent({
         done,
         owner,
+        durableProjections,
         requestRender: () => tui.requestRender?.(),
         notify: (message) => ui.notify(message),
       }),
@@ -206,8 +238,26 @@ export async function showWorkflowTree(
   );
 }
 
-function selectableJobs(owner?: SessionOwnerToken): WorkflowJobState[] {
-  return workflowJobsForOwner(owner);
+function selectableWorkflows(
+  owner?: SessionOwnerToken,
+  durableProjections: readonly WorkflowProjection[] = [],
+): WorkflowTreeSelection[] {
+  const live = workflowJobsForOwner(owner);
+  const liveIds = new Set(live.map((job) => job.id));
+  return [
+    ...live.map((job): WorkflowTreeSelection => ({
+      kind: "live",
+      id: job.id,
+      job,
+    })),
+    ...durableProjections
+      .filter((projection) => !liveIds.has(projection.runId))
+      .map((projection): WorkflowTreeSelection => ({
+        kind: "durable",
+        id: projection.runId,
+        projection,
+      })),
+  ];
 }
 function formatWorkflowSummary(job: WorkflowJobState): string {
   const s = job.snapshot;
@@ -232,6 +282,106 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
   const currentPhase = planState?.currentPhase ?? s.currentPhase;
   if (currentPhase) parts.push(`phase: ${currentPhase}`);
   return parts.join(" · ");
+}
+
+function formatDurableWorkflowSummary(projection: WorkflowProjection): string {
+  const tasks = Object.values(projection.tasks);
+  const running = tasks.filter((task) => task.status === "running").length;
+  const errors = tasks.filter((task) => task.status === "failed").length;
+  const marker =
+    projection.status === "done"
+      ? "✓ "
+      : projection.status === "error"
+        ? "✗ "
+        : projection.status === "cancelled"
+          ? "⊘ "
+          : projection.status === "interrupted"
+            ? "‼ "
+            : "";
+  const parts = [
+    `${marker}durable (${projection.runId})`,
+    `[${projection.status}]`,
+    `${tasks.length} task${tasks.length === 1 ? "" : "s"}`,
+    `${running} running`,
+  ];
+  if (errors > 0) parts.push(`${errors} errors`);
+  const usage = presentWorkflowUsage(projection.usage);
+  if (usage) parts.push(formatWorkflowUsage(usage));
+  if (projection.currentPhase) {
+    parts.push(`phase: ${projection.currentPhase}`);
+  }
+  return parts.join(" · ");
+}
+
+function formatDurableWorkflowDetails(
+  projection: WorkflowProjection,
+): WorkflowRow[] {
+  const rows: WorkflowRow[] = [];
+  const usage = presentWorkflowUsage(projection.usage);
+  if (usage) {
+    for (const field of formatWorkflowUsageFields(usage)) {
+      rows.push({
+        projection,
+        depth: 1,
+        selectable: false,
+        text: field,
+      });
+    }
+  }
+  let previousPhase: string | undefined;
+  for (const task of Object.values(projection.tasks)) {
+    if (task.phaseId !== previousPhase) {
+      previousPhase = task.phaseId;
+      rows.push({
+        projection,
+        depth: 1,
+        selectable: false,
+        text: `◆ phase: ${task.phaseId}`,
+      });
+    }
+    const marker =
+      task.status === "succeeded"
+        ? "✓"
+        : task.status === "failed"
+          ? "✗"
+          : task.status === "running"
+            ? "→"
+            : task.status === "interrupted"
+              ? "‼"
+              : "○";
+    const error = task.error ? ` — ${task.error}` : "";
+    rows.push({
+      projection,
+      depth: 2,
+      selectable: false,
+      text: `${marker} ${task.status} ${task.label ?? task.id} (attempt ${task.attempt})${error}`,
+    });
+  }
+  if (projection.usageLowerBound) {
+    rows.push({
+      projection,
+      depth: 1,
+      selectable: false,
+      text: "Usage is a committed lower bound after interruption.",
+    });
+  }
+  if (projection.terminal?.error) {
+    rows.push({
+      projection,
+      depth: 1,
+      selectable: false,
+      text: `error: ${projection.terminal.error.message}`,
+    });
+  }
+  if (rows.length === 0) {
+    rows.push({
+      projection,
+      depth: 1,
+      selectable: false,
+      text: "No durable task events yet.",
+    });
+  }
+  return rows;
 }
 
 function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {

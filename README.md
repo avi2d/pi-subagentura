@@ -78,16 +78,19 @@ results stay in workflow variables outside the parent model context, and only
 the workflow's final result returns to the parent.
 
 The `workflow` tool also accepts bounded declarative `plan` objects with
-ordered sequential phases and stable task IDs. Declarative plans run
-in-process and non-durably in this preview, use the same async-by-default
-status, result, cancellation, and tree surfaces as script workflows, and reject
-process isolation or durability before starting work.
+ordered sequential phases and stable task IDs. Plans run in-process and use
+the same async status, result, cancellation, and tree surfaces as script
+workflows. With `durable: true`, the plan and committed task outcomes survive
+same-host, same-real-cwd, same-Pi-session parent replacement. Recovery remains
+manual in this preview: inspect the interrupted run, then use the fenced
+`/workflow-resume` command. Process isolation, parallel phases, automatic
+resume, durable JavaScript, and completion delivery are not supported yet.
 
 Workflow scripts are trusted agent-authored JavaScript. The VM improves
 determinism but is not a security boundary, so never run untrusted JavaScript.
-Background workflow jobs are scoped to the current parent session and are
-cancelled by reload, resume, quit, or a new session. Attachable interactive
-sub-agents use durable artifacts and can survive those boundaries.
+Non-durable background workflow jobs are scoped to the current parent session
+and are cancelled by reload, resume, quit, or a new session. Attachable
+interactive sub-agents use durable artifacts and can survive those boundaries.
 
 See the [workflow guide](./docs/workflows.md) and
 [bundled examples](./examples/workflows/README.md).
@@ -117,6 +120,7 @@ These commands are intended for people at the Pi prompt.
 | `/list-workflows`   | Alias for `/workflows`                                            |
 | `/workflow-status`  | List workflow jobs and their live or terminal status              |
 | `/workflow-tree`    | Open the specialized workflow progress tree                       |
+| `/workflow-resume`  | Resume an interrupted durable plan with current authority fences  |
 | `/subagents`        | Supervise all async work (`Ctrl+Alt+A`)                           |
 | `/delete-workflow`  | Delete a saved workflow by name or picker                         |
 | `/cancel-all-flows` | Cancel active jobs, workflows, and running interactive sub-agents |
