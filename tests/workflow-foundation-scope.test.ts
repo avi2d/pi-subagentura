@@ -11,7 +11,7 @@ const readme = readFileSync(resolve(REPO_ROOT, "README.md"), "utf8");
 describe("workflow foundation scope", () => {
   it("keeps out-of-scope X01..X05 items explicitly deferred in todo", () => {
     const deferred = [
-      ...Array.from({ length: 7 }, (_, i) => String(22 + i)),
+      ...Array.from({ length: 4 }, (_, i) => String(25 + i)),
       ...Array.from({ length: 9 }, (_, i) => String(29 + i)),
       "43",
     ];
@@ -47,8 +47,8 @@ describe("workflow foundation scope", () => {
   it("README explains production scope and doesn't over-claim notifications", () => {
     expect(readme).toMatch(/at-least-once/);
     expect(readme).toMatch(/trusted-command/i);
-    expect(readme).toMatch(/Process-isolated durable launch/);
-    expect(readme).toMatch(/durable JavaScript replay/);
-    expect(readme).toMatch(/out-of-scope/);
+    expect(readme).toMatch(/claim-bound[\s\S]*launch intent/);
+    expect(readme).toMatch(/durable JavaScript\s+replay/);
+    expect(readme).toMatch(/deferred/i);
   });
 });

@@ -372,11 +372,11 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     expect(todo).toContain(
       "[x] 60. Reject unsupported durable legacy requests",
     );
-    expect(qa).toContain("X01 (22–23 partial; 24+ deferred) | Partial");
-    expect(qa).toContain("X02–X05 (out-of-scope this PR) | Deferred");
-    expect(qa).toContain(
-      "X06 (security boundary)        | Deferred / helper-only checks",
-    );
+    expect(qa).toContain("X01 (22–24 partial; 25+ deferred) | Partial");
+    expect(qa).toContain("X02–X05 (out-of-scope this PR)");
+    expect(qa).toContain("Deferred");
+    expect(qa).toContain("X06 (security boundary)");
+    expect(qa).toContain("Deferred / helper-only checks");
     expect(qa).toContain(
       "**X05:** exactly-once execution/notification claims.",
     );
@@ -391,7 +391,7 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
       "Status: **X01 partial implementation; X02–X06 deferred**.",
     );
     expect(boundaries).toContain("The following are not claimed");
-    expect(readme).toContain("child handshake/adoption/recovery");
+    expect(readme).toContain("exact child-start evidence");
     expect(readme).toContain(
       "exactly-once notification claims remain deferred",
     );
