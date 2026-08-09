@@ -112,13 +112,17 @@ describe("production session durable delivery recovery", () => {
       { reason: "startup" },
       { cwd: root, sessionManager, ui: {} },
     );
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await vi.waitFor(
+      async () => {
+        const recovered = await store.readRun(runId);
+        expect(
+          recovered.events.some((event) => event.type === "delivery_receipt"),
+        ).toBe(true);
+      },
+      { timeout: 5000, interval: 25 },
+    );
 
     expect(transportSend).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
-    const recovered = await store.readRun(runId);
-    expect(
-      recovered.events.some((event) => event.type === "delivery_receipt"),
-    ).toBe(true);
   });
 });
