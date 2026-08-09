@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { WorkflowProcessLaunchDispatch } from "../src/workflow-process-handshake";
 import type { SubagentResult } from "../src/helpers";
 import {
   DurableWorkflowController,
@@ -634,5 +635,113 @@ describe("durable sequential plan runner", () => {
     expect(calls.sort()).toEqual(["A", "B", "B"]);
     expect(result.tasks.a).toMatchObject({ status: "succeeded", attempt: 1 });
     expect(result.tasks.b).toMatchObject({ status: "succeeded", attempt: 2 });
+  });
+
+  it("persists a claim-bound process launch intent before invoking the agent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-process-intent-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const seen: Array<{
+      isolation: string;
+      eventTypes: string[];
+      intent: any;
+      dispatch?: WorkflowProcessLaunchDispatch;
+    }> = [];
+
+    const result = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "process-intent-run",
+      plan: {
+        schemaVersion: 1,
+        name: "process-intent",
+        phases: [
+          {
+            id: "phase",
+            mode: "sequential",
+            tasks: [
+              { id: "process-task", prompt: "process", isolation: "process" },
+            ],
+          },
+        ],
+      },
+      runAgent: async ({
+        isolation,
+        processLaunchIntent,
+        onProcessLaunchDispatched,
+      }) => {
+        expect(processLaunchIntent).toMatchObject({
+          runId: "process-intent-run",
+          operationId: "process-task",
+          requestedIsolation: "process",
+          effectiveIsolation: "process",
+        });
+        expect(onProcessLaunchDispatched).toEqual(expect.any(Function));
+        const dispatch: WorkflowProcessLaunchDispatch = {
+          schemaVersion: 1,
+          attemptId: processLaunchIntent?.attemptId ?? "missing",
+          launchMarker: processLaunchIntent?.launchMarker ?? "missing",
+          nonce: processLaunchIntent?.nonce ?? "missing",
+          epoch: processLaunchIntent?.epoch ?? -1,
+          dispatchedAt: Date.now(),
+        };
+        await onProcessLaunchDispatched?.(dispatch);
+        const record = await store.readRun("process-intent-run");
+        const intentEvent = record.events.find(
+          (event) => event.type === "process_launch_intent",
+        );
+        const dispatchEvent = record.events.find(
+          (event) => event.type === "process_launch_dispatched",
+        );
+        seen.push({
+          isolation,
+          eventTypes: record.events.map((event) => event.type),
+          intent: intentEvent?.payload,
+          dispatch: (
+            dispatchEvent?.payload as {
+              dispatch?: WorkflowProcessLaunchDispatch;
+            }
+          ).dispatch,
+        });
+        return success("process");
+      },
+    });
+
+    expect(result.status).toBe("done");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      isolation: "process",
+      eventTypes: [
+        "run_created",
+        "run_started",
+        "task_started",
+        "process_launch_intent",
+        "process_launch_dispatched",
+      ],
+      intent: {
+        taskId: "process-task",
+        attempt: 1,
+        intent: {
+          schemaVersion: 1,
+          runId: "process-intent-run",
+          operationId: "process-task",
+          attemptId: "process-task-1",
+          attemptNumber: 1,
+          requestedIsolation: "process",
+          effectiveIsolation: "process",
+          fallbackMode: "none",
+        },
+      },
+    });
+    expect(seen[0].intent.intent.nonce).toEqual(expect.any(String));
+    expect(seen[0].intent.intent.launchMarker).toMatch(/^wf-launch-/);
+    expect(seen[0].dispatch).toMatchObject({
+      schemaVersion: 1,
+      attemptId: "process-task-1",
+      launchMarker: seen[0].intent.intent.launchMarker,
+      nonce: seen[0].intent.intent.nonce,
+      epoch: seen[0].intent.intent.epoch,
+      dispatchedAt: expect.any(Number),
+    });
   });
 });

@@ -215,7 +215,7 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     expect(harness.session.isIdle).toBe(true);
   }, 30_000);
 
-  it("F18 preserves registered legacy script/name calls and rejects durable JS/process before creation", async () => {
+  it("F18 preserves registered legacy script/name calls and runs durable process tasks", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-f18-compat-"));
     roots.push(root);
     const owner = ownerFor(root);
@@ -318,7 +318,7 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
       vi.spyOn(process, "cwd").mockReturnValue(root);
       const processPlan = {
         schemaVersion: 1,
-        name: "f18-process-rejection",
+        name: "f18-process-launch",
         phases: [
           {
             id: "phase",
@@ -327,23 +327,36 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
           },
         ],
       } as any;
-      await expect(
-        durableTool!.execute(
-          "f18-process",
-          { runId: "f18-process", plan: processPlan },
-          undefined,
-          vi.fn(),
-          { cwd: root },
-        ),
-      ).rejects.toThrow("Process isolation is not supported by the preview");
-      expect(await durableStore.listRunIds()).toEqual(beforeDurableRuns);
+      const processResult = await durableTool!.execute(
+        "f18-process",
+        { runId: "f18-process", plan: processPlan },
+        undefined,
+        vi.fn(),
+        { cwd: root },
+      );
+      expect(processResult).toMatchObject({
+        details: { status: "done", runId: "f18-process" },
+      });
+      const processRecord = await durableStore.readRun("f18-process");
+      const processEventTypes = processRecord.events.map((event) => event.type);
+      expect(processEventTypes).toContain("process_launch_intent");
+      expect(processEventTypes).toContain("process_launch_dispatched");
+      expect(
+        processEventTypes.indexOf("process_launch_intent"),
+      ).toBeGreaterThan(processEventTypes.indexOf("task_started"));
+      expect(
+        processEventTypes.indexOf("process_launch_dispatched"),
+      ).toBeGreaterThan(processEventTypes.indexOf("process_launch_intent"));
+      expect(await durableStore.listRunIds()).toEqual(
+        expect.arrayContaining([...beforeDurableRuns, "f18-process"]),
+      );
     } finally {
       if (hadOriginal) writeFileSync(file, original!);
       else if (existsSync(file)) unlinkSync(file);
     }
-  });
+  }, 30_000);
 
-  it("F20 audits the frozen documents without changing deferred boundaries or claiming X01-X06", () => {
+  it("F20 audits the frozen documents without overclaiming X01-X06", () => {
     const todo = readFileSync(join(repoRoot, "todo.md"), "utf8");
     const qa = readFileSync(join(repoRoot, "qa.md"), "utf8");
     const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
@@ -352,23 +365,36 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
       "utf8",
     );
 
-    expect(todo).toContain("[DEFERRED — PR #84 foundation scope] 22.");
+    expect(todo).toContain(
+      "[x] 22. Persist a claim-bound process launch intent before process dispatch",
+    );
     expect(todo).toContain("[DEFERRED — PR #84 foundation scope] 29.");
     expect(todo).toContain(
       "[x] 60. Reject unsupported durable legacy requests",
     );
-    expect(qa).toContain("X01–X05 (out-of-scope this PR) | Deferred");
+    expect(qa).toContain("X01 (22–23 partial; 24+ deferred) | Partial");
+    expect(qa).toContain("X02–X05 (out-of-scope this PR) | Deferred");
     expect(qa).toContain(
       "X06 (security boundary)        | Deferred / helper-only checks",
     );
     expect(qa).toContain(
       "**X05:** exactly-once execution/notification claims.",
     );
-    expect(frozen).toContain("Status: **merge-ready**");
-    expect(frozen).toContain("X01–X05 remain explicitly deferred");
-    expect(frozen).toContain("X06 remains");
-    expect(readme).toContain("Process-isolated durable launch");
-    expect(readme).toContain("exactly-once notification claims remain");
+    expect(frozen).toContain("Status: **merge-ready for F01–F20**");
+    expect(frozen).toContain("X01 has a proven partial slice");
+    expect(frozen).toContain("X02–X06 remain explicitly deferred");
+    const boundaries = readFileSync(
+      join(repoRoot, "docs/pr84-x-boundaries.md"),
+      "utf8",
+    );
+    expect(boundaries).toContain(
+      "Status: **X01 partial implementation; X02–X06 deferred**.",
+    );
+    expect(boundaries).toContain("The following are not claimed");
+    expect(readme).toContain("child handshake/adoption/recovery");
+    expect(readme).toContain(
+      "exactly-once notification claims remain deferred",
+    );
     expect(readme).not.toContain("exactly-once guarantees");
   });
 });

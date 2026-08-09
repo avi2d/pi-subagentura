@@ -43,7 +43,7 @@ describe("workflow contract foundation", () => {
     ).toThrow();
   });
 
-  it("rejects unsupported process isolation and malformed approval gates", () => {
+  it("accepts process isolation and rejects malformed approval gates", () => {
     expect(() =>
       validateWorkflowPlan({
         ...plan,
@@ -56,7 +56,7 @@ describe("workflow contract foundation", () => {
           },
         ],
       }),
-    ).toThrow("Process isolation is not supported");
+    ).not.toThrow();
     expect(() =>
       validateWorkflowPlan({
         ...plan,

@@ -7,6 +7,8 @@ import {
   adoptWorkflowProcessPane,
   persistWorkflowProcessLaunchIntent,
   persistWorkflowProcessLaunchDispatch,
+  persistWorkflowProcessChildStartedEvidenceSync,
+  awaitWorkflowProcessChildStartedEvidence,
   projectWorkflowProcessUsage,
   readWorkflowProcessLaunchIntent,
   validateWorkflowProcessChildStarted,
@@ -65,6 +67,27 @@ describe("workflow process launch intents", () => {
     ).toThrow("attempt number");
   });
 
+  it("records and validates child-start evidence for the exact launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-child-start-"));
+    const intent = createWorkflowProcessLaunchIntent({
+      runId: "run-1",
+      operationId: "op-1",
+      attemptId: "attempt-1",
+      attemptNumber: 1,
+      epoch: 4,
+    });
+    const path = persistWorkflowProcessChildStartedEvidenceSync(root, intent);
+    expect(path).toBe(join(root, "process-child-started.json"));
+    await expect(
+      awaitWorkflowProcessChildStartedEvidence(root, intent, undefined, 100, 5),
+    ).resolves.toMatchObject({
+      schemaVersion: 1,
+      launchMarker: intent.launchMarker,
+      nonce: intent.nonce,
+      attemptId: intent.attemptId,
+      epoch: intent.epoch,
+    });
+  });
   it("persists dispatch and fences stale child evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-launch-"));
     const intent = createWorkflowProcessLaunchIntent({
