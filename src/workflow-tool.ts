@@ -30,14 +30,18 @@ import {
   presentWorkflowUsage,
   workflowUsageFromUsage,
 } from "./workflow-core";
+import { createWorkflowDispatcher } from "./workflow-dispatcher";
 import {
   getWorkflowCompletionPresentation,
   getWorkflowJobForOwner,
   normalizeCancelledWorkflowState,
   startWorkflowJob,
+  startWorkflowPlanJob,
   workflowJobsForOwner,
   type WorkflowJobState,
 } from "./workflow-jobs";
+import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
+import type { WorkflowPlanState } from "./workflow-plan-state";
 import { renderProgress } from "./workflow-ui";
 import { awaitInteractiveResult, stringify } from "./workflow-worker";
 import { sanitizeOutput } from "./notifications";
@@ -64,6 +68,38 @@ import { attachAsyncJobSettlement } from "./tools/in-process";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
+
+const WORKFLOW_PLAN_ID_PATTERN = "^[A-Za-z][A-Za-z0-9._-]{0,63}$";
+const workflowPlanParameterSchema = Type.Object(
+  {
+    schemaVersion: Type.Literal(1),
+    name: Type.String({ pattern: WORKFLOW_PLAN_ID_PATTERN }),
+    phases: Type.Array(
+      Type.Object(
+        {
+          id: Type.String({ pattern: WORKFLOW_PLAN_ID_PATTERN }),
+          mode: Type.Literal("sequential"),
+          tasks: Type.Array(
+            Type.Object(
+              {
+                id: Type.String({ pattern: WORKFLOW_PLAN_ID_PATTERN }),
+                prompt: Type.String({ minLength: 1 }),
+                label: Type.Optional(Type.String()),
+                isolation: Type.Optional(Type.Literal("in-process")),
+                input: Type.Optional(Type.Unknown()),
+              },
+              { additionalProperties: false },
+            ),
+            { minItems: 1, maxItems: MAX_TOTAL_AGENTS },
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      { minItems: 1, maxItems: 64 },
+    ),
+  },
+  { additionalProperties: false },
+);
 
 function workflowNotFoundMessage(workflowId: string): string {
   return (
@@ -155,13 +191,14 @@ export function registerWorkflowTool(
     sessionScope
       ? { id: sessionScope.id, generation: sessionScope.generation }
       : getActiveSessionOwner();
+  const workflowDispatcher = createWorkflowDispatcher();
   // Build the real spawn function from the tool ctx. Switches backend on `isolation`.
   function makeRunAgent(
     ctx: any,
     ownedWorkflowId: string,
     supervisorOwner: SessionOwnerToken | undefined,
   ): WorkflowAgentRunner {
-    return async ({
+    const runRawAgent: WorkflowAgentRunner = async ({
       prompt,
       persona,
       model,
@@ -337,6 +374,7 @@ export function registerWorkflowTool(
         if (childOwner) removeInProcessJob(childJob.id, childOwner);
       }
     };
+    return (request) => workflowDispatcher.run(request, runRawAgent);
   }
 
   const MAX_WORKFLOW_NOTIFICATION_CHARS = 20_000;
@@ -401,6 +439,8 @@ export function registerWorkflowTool(
       "Do not run untrusted/user-supplied JavaScript as a workflow.",
       "In-process sub-agents cannot invoke this tool; this topology is unsupported",
       "until cross-registry cancellation is implemented (GitHub issue #62).",
+      "Alternatively, pass a validated sequential declarative `plan`; preview tasks run",
+      "in-process only. Durable execution is unavailable in this milestone.",
       "",
       "Script shape:",
       "  export const meta = { name: 'my-flow', description: '...', phases: [{ title: 'Scan' }] };",
@@ -445,12 +485,20 @@ export function registerWorkflowTool(
       script: Type.Optional(
         Type.String({
           description:
-            "The workflow script (export const meta + top-level body). Omit if using `name`.",
+            "The workflow script (export const meta + top-level body). Omit if using `name` or `plan`.",
         }),
       ),
       name: Type.Optional(
         Type.String({
-          description: "Name of a saved workflow to run (instead of `script`).",
+          description:
+            "Name of a saved workflow to run (instead of `script` or `plan`).",
+        }),
+      ),
+      plan: Type.Optional(workflowPlanParameterSchema),
+      durable: Type.Optional(
+        Type.Boolean({
+          description:
+            "Request durable execution. `true` is unavailable in this milestone.",
         }),
       ),
       args: Type.Optional(
@@ -479,6 +527,45 @@ export function registerWorkflowTool(
       onUpdate: any,
       ctx: any,
     ): Promise<any> {
+      const selectedInputs = ["script", "name", "plan"].filter(
+        (key) => params[key] !== undefined,
+      );
+      if (selectedInputs.length !== 1) {
+        const error =
+          "exactly one of `script`, `name`, or `plan` must be provided";
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
+          details: { status: "error", error },
+          isError: true,
+        };
+      }
+      if (params.durable === true) {
+        const error =
+          "durable workflows are unavailable in this milestone; the request was not run";
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${error}.` }],
+          details: { status: "error", error },
+          isError: true,
+        };
+      }
+      const plan = params.plan as WorkflowPlan | undefined;
+      if (plan !== undefined) {
+        try {
+          validateWorkflowPlan(plan);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow plan not started: ${msg}`,
+              },
+            ],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
+      }
       const orchestrationContext = getOrchestrationContext();
       if (orchestrationContext) {
         const error =
@@ -503,6 +590,147 @@ export function registerWorkflowTool(
           details: { status: "session_unavailable", error },
           isError: true,
         };
+      }
+      if (plan !== undefined) {
+        const planOpts = (workflowId: string) => ({
+          budgetTotal: params.budget ?? null,
+          runAgent: makeRunAgent(ctx, workflowId, workflowOwner),
+        });
+
+        if (params.async !== false) {
+          let job: WorkflowJobState;
+          try {
+            job = startWorkflowPlanJob(
+              plan,
+              planOpts,
+              Date.now(),
+              notifyWorkflowCompletion,
+              workflowOwner,
+              "async",
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Workflow plan not started: ${msg}`,
+                },
+              ],
+              details: { status: "error", error: msg },
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Workflow "${plan.name}" started in background as ${job.id}. ` +
+                  `Poll get_workflow_status / get_workflow_result. ${WORKFLOW_SESSION_SCOPE_MESSAGE}`,
+              },
+            ],
+            details: {
+              status: "started",
+              workflowId: job.id,
+              name: plan.name,
+            },
+          };
+        }
+
+        try {
+          const syncPlanState = (planState: WorkflowPlanState) => {
+            try {
+              onUpdate?.({
+                content: [
+                  {
+                    type: "text",
+                    text: `Workflow plan "${plan.name}" [${planState.status}]`,
+                  },
+                ],
+                details: { status: "running", planState },
+              });
+            } catch {
+              /* onUpdate is best-effort */
+            }
+          };
+          const job = startWorkflowPlanJob(
+            plan,
+            (workflowId) => ({
+              ...planOpts(workflowId),
+              signal,
+              onState: syncPlanState,
+            }),
+            Date.now(),
+            undefined,
+            workflowOwner,
+            "sync",
+          );
+          const run = await job.promise;
+          const resultText =
+            typeof run.result === "string" ? run.result : stringify(run.result);
+          const presentation = getWorkflowCompletionPresentation(
+            "done",
+            run.errorCount,
+          );
+          const completionPrefix = presentation.icon
+            ? `${presentation.icon} `
+            : "";
+          const completionLabel = presentation.icon
+            ? presentation.label
+            : "complete";
+          const usage = presentWorkflowUsage(run.usage);
+          const summary =
+            `${completionPrefix}Workflow "${run.meta.name}" ${completionLabel} — ` +
+            `${run.agentsSpawned} agent(s), ${run.errorCount} error(s)${
+              usage
+                ? `, ${formatWorkflowUsage(usage, {
+                    outputBudget: job.snapshot.budgetTotal,
+                  })}`
+                : ""
+            }.`;
+          return {
+            content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
+            details: {
+              status: "done",
+              presentationStatus: presentation.label,
+              name: run.meta.name,
+              agentsSpawned: run.agentsSpawned,
+              errorCount: run.errorCount,
+              tokensSpent: run.tokensSpent,
+              usage: run.usage,
+              budgetTotal: job.snapshot.budgetTotal,
+              phases: run.phases,
+              planState: job.snapshot.planState,
+            },
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const usage = workflowErrorUsage(err);
+          const usageDetails = usage ? { usage } : {};
+          const budgetTotal = params.budget ?? null;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Workflow failed: ${msg}${
+                  usage
+                    ? ` (${formatWorkflowUsage(usage, {
+                        outputBudget: budgetTotal,
+                      })})`
+                    : ""
+                }`,
+              },
+            ],
+            details: {
+              status: "error",
+              error: msg,
+              budgetTotal,
+              ...usageDetails,
+            },
+            isError: true,
+          };
+        }
       }
 
       const script: string | null =

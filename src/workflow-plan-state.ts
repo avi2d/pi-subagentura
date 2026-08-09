@@ -35,6 +35,11 @@ export function reduceWorkflowPlanState(
   };
   if (action.type === "cancel") {
     if (state.status === "done" || state.status === "error") return state;
+    for (const [taskId, status] of Object.entries(next.tasks)) {
+      if (status === "pending" || status === "running") {
+        next.tasks[taskId] = "cancelled";
+      }
+    }
     next.status = "cancelled";
     return next;
   }
@@ -44,6 +49,7 @@ export function reduceWorkflowPlanState(
     if (
       current !== "pending" ||
       state.status === "done" ||
+      state.status === "error" ||
       state.status === "cancelled"
     ) {
       throw new Error(`Task ${action.taskId} cannot start from ${current}`);
@@ -56,12 +62,14 @@ export function reduceWorkflowPlanState(
       throw new Error(`Task ${action.taskId} is not running`);
     next.tasks[action.taskId] =
       action.type === "succeed" ? "succeeded" : "failed";
-    next.status =
-      action.type === "fail"
-        ? "error"
-        : allTasksTerminal(next)
-          ? "done"
-          : "running";
+    if (action.type === "fail") {
+      for (const [taskId, status] of Object.entries(next.tasks)) {
+        if (status === "pending") next.tasks[taskId] = "cancelled";
+      }
+      next.status = "error";
+    } else {
+      next.status = allTasksTerminal(next) ? "done" : "running";
+    }
   }
   return next;
 }

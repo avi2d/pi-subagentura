@@ -11,9 +11,15 @@ import {
   formatWorkflowUsageLegend,
   presentWorkflowUsage,
 } from "./workflow-core";
+import { formatWorkflowPlanRows } from "./workflow-plan-ui";
+import type { WorkflowPlanState } from "./workflow-plan-state";
 import type { SessionOwnerToken } from "./session-scope";
 
 const MAX_WORKFLOW_TREE_AGENT_ROWS = 20;
+
+type WorkflowSnapshotWithPlanState = WorkflowJobState["snapshot"] & {
+  planState?: WorkflowPlanState;
+};
 
 export type WorkflowTreeAction =
   { kind: "cancel"; workflowId: string } | { kind: "close" };
@@ -203,9 +209,9 @@ export async function showWorkflowTree(
 function selectableJobs(owner?: SessionOwnerToken): WorkflowJobState[] {
   return workflowJobsForOwner(owner);
 }
-
 function formatWorkflowSummary(job: WorkflowJobState): string {
   const s = job.snapshot;
+  const planState = (s as WorkflowSnapshotWithPlanState).planState;
   const errorCount = job.result?.errorCount ?? s.errorCount;
   const presentation = getWorkflowCompletionPresentation(
     job.status,
@@ -223,7 +229,8 @@ function formatWorkflowSummary(job: WorkflowJobState): string {
   if (usage) {
     parts.push(formatWorkflowUsage(usage, { outputBudget: s.budgetTotal }));
   }
-  if (s.currentPhase) parts.push(`phase: ${s.currentPhase}`);
+  const currentPhase = planState?.currentPhase ?? s.currentPhase;
+  if (currentPhase) parts.push(`phase: ${currentPhase}`);
   return parts.join(" · ");
 }
 
@@ -248,50 +255,63 @@ function formatWorkflowDetails(job: WorkflowJobState): WorkflowRow[] {
       text: formatWorkflowUsageLegend(),
     });
   }
-  for (const phase of job.snapshot.phases) {
-    rows.push({
-      job,
-      depth: 1,
-      selectable: false,
-      text: `◆ phase: ${phase}`,
-    });
-  }
-  const records = job.snapshot.agentRecords ?? [];
-  const agentRows = records.slice(-MAX_WORKFLOW_TREE_AGENT_ROWS);
-  const omittedForUi =
-    (job.snapshot.agentRecordsOmitted ?? 0) +
-    Math.max(0, records.length - agentRows.length);
-  if (omittedForUi > 0) {
-    rows.push({
-      job,
-      depth: 1,
-      selectable: false,
-      text: `… ${omittedForUi} older agent records omitted`,
-    });
-  }
-  for (const record of agentRows) {
-    const marker =
-      record.status === "running"
-        ? "→"
-        : record.status === "error"
-          ? "✗"
-          : record.status === "cancelled"
-            ? "⊘"
-            : "✓";
-    const label = `${record.label ?? "agent"} #${record.agentId}`;
-    const model = record.model ? ` @${record.model}` : "";
-    const phase = record.phase ? ` (${record.phase})` : "";
-    const recordUsage = presentWorkflowUsage(record.usage);
-    rows.push({
-      job,
-      depth: 1,
-      selectable: false,
-      text: `${marker} ${record.status} ${label}${model}${phase}${
-        recordUsage
-          ? ` — ${formatWorkflowUsage(recordUsage, { ascii: true })}`
-          : ""
-      }`,
-    });
+
+  const planState = (job.snapshot as WorkflowSnapshotWithPlanState).planState;
+  if (planState) {
+    for (const row of formatWorkflowPlanRows(planState)) {
+      rows.push({
+        job,
+        depth: row.depth,
+        selectable: false,
+        text: row.text,
+      });
+    }
+  } else {
+    for (const phase of job.snapshot.phases) {
+      rows.push({
+        job,
+        depth: 1,
+        selectable: false,
+        text: `◆ phase: ${phase}`,
+      });
+    }
+    const records = job.snapshot.agentRecords ?? [];
+    const agentRows = records.slice(-MAX_WORKFLOW_TREE_AGENT_ROWS);
+    const omittedForUi =
+      (job.snapshot.agentRecordsOmitted ?? 0) +
+      Math.max(0, records.length - agentRows.length);
+    if (omittedForUi > 0) {
+      rows.push({
+        job,
+        depth: 1,
+        selectable: false,
+        text: `… ${omittedForUi} older agent records omitted`,
+      });
+    }
+    for (const record of agentRows) {
+      const marker =
+        record.status === "running"
+          ? "→"
+          : record.status === "error"
+            ? "✗"
+            : record.status === "cancelled"
+              ? "⊘"
+              : "✓";
+      const label = `${record.label ?? "agent"} #${record.agentId}`;
+      const model = record.model ? ` @${record.model}` : "";
+      const phase = record.phase ? ` (${record.phase})` : "";
+      const recordUsage = presentWorkflowUsage(record.usage);
+      rows.push({
+        job,
+        depth: 1,
+        selectable: false,
+        text: `${marker} ${record.status} ${label}${model}${phase}${
+          recordUsage
+            ? ` — ${formatWorkflowUsage(recordUsage, { ascii: true })}`
+            : ""
+        }`,
+      });
+    }
   }
   if (job.snapshot.lastMessage) {
     rows.push({

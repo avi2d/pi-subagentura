@@ -1,5 +1,10 @@
-import type { SubagentResult } from "./helpers";
-import type { WorkflowAgentRunner, WorkflowRunResult } from "./workflow-core";
+import {
+  addWorkflowUsage,
+  WorkflowExecutionError,
+  zeroWorkflowUsage,
+  type WorkflowAgentRunner,
+  type WorkflowRunResultWithUsage,
+} from "./workflow-core";
 import {
   createWorkflowPlanState,
   reduceWorkflowPlanState,
@@ -12,17 +17,22 @@ export interface WorkflowPlanRunOptions {
   signal?: AbortSignal;
   onState?: (state: WorkflowPlanState) => void;
 }
+type WorkflowPlanAgentResult = WorkflowAgentRunner extends (
+  ...args: infer _Args
+) => Promise<infer Result>
+  ? Result
+  : never;
 
 export interface WorkflowPlanTaskResult {
   taskId: string;
   output: string;
-  result: SubagentResult;
+  result: WorkflowPlanAgentResult;
 }
 
-export interface WorkflowPlanRunResult extends WorkflowRunResult {
+export type WorkflowPlanRunResult = WorkflowRunResultWithUsage & {
   plan: WorkflowPlan;
   taskResults: WorkflowPlanTaskResult[];
-}
+};
 
 /** Execute the preview plan coordinator. The coordinator owns task settlement. */
 export async function runWorkflowPlan(
@@ -34,11 +44,14 @@ export async function runWorkflowPlan(
   const phases: string[] = [];
   let agentsSpawned = 0;
   let errorCount = 0;
+  let usage = zeroWorkflowUsage();
 
   const publish = (next: WorkflowPlanState) => {
     state = next;
     options.onState?.(state);
   };
+  options.onState?.(state);
+
   const abortIfRequested = () => {
     if (options.signal?.aborted) {
       publish(reduceWorkflowPlanState(state, { type: "cancel" }));
@@ -65,25 +78,38 @@ export async function runWorkflowPlan(
           label: task.label ?? task.id,
           signal: options.signal,
         });
+        usage = addWorkflowUsage(usage, result.usage);
+        abortIfRequested();
         if (result.isError) {
           errorCount++;
           publish(
             reduceWorkflowPlanState(state, { type: "fail", taskId: task.id }),
           );
-          throw new Error(result.errorMessage);
+          const cause = new Error(result.errorMessage);
+          throw new WorkflowExecutionError(cause.message, usage, cause);
         }
         taskResults.push({ taskId: task.id, output: result.output, result });
         publish(
           reduceWorkflowPlanState(state, { type: "succeed", taskId: task.id }),
         );
       } catch (error) {
-        if (state.status !== "error") errorCount++;
-        if (state.status === "running") {
-          publish(
-            reduceWorkflowPlanState(state, { type: "fail", taskId: task.id }),
-          );
+        if (options.signal?.aborted) {
+          if (state.status !== "cancelled") {
+            publish(reduceWorkflowPlanState(state, { type: "cancel" }));
+          }
+          throw options.signal.reason ?? new Error("Workflow plan cancelled");
         }
-        throw error;
+        if (state.status !== "error") {
+          errorCount++;
+          if (state.status === "running") {
+            publish(
+              reduceWorkflowPlanState(state, { type: "fail", taskId: task.id }),
+            );
+          }
+        }
+        if (error instanceof WorkflowExecutionError) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        throw new WorkflowExecutionError(message, usage, error);
       }
     }
   }
@@ -96,10 +122,8 @@ export async function runWorkflowPlan(
     result: taskResults.map(({ taskId, output }) => ({ taskId, output })),
     agentsSpawned,
     errorCount,
-    tokensSpent: taskResults.reduce(
-      (sum, item) => sum + item.result.usage.output,
-      0,
-    ),
+    tokensSpent: usage.output,
+    usage,
     phases,
     plan,
     taskResults,
