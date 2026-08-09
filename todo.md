@@ -36,7 +36,7 @@ Source: `aq.md`, answered against PR #84. Items are kept in checklist order and 
 
 - [x] 22. Persist a claim-bound process launch intent before process dispatch; child-pane adoption remains deferred.
 - [x] 23. Persist attempt nonce, epoch, launch marker, and effective fallback mode before process dispatch.
-- [DEFERRED — PR #84 foundation scope] 24. Persist launch dispatch and validate child start before model work.
+- [x] 24. Persist launch dispatch only after exact child-start identity is validated; pane adoption and reattachment remain deferred under 25+.
 - [DEFERRED — PR #84 foundation scope] 25. Discover, fence, and adopt intended panes after startup crashes.
 - [DEFERRED — PR #84 foundation scope] 26. Probe and fence ambiguous command dispatch before retry.
 - [DEFERRED — PR #84 foundation scope] 27. Reject stale child nonce, attempt, and epoch evidence.

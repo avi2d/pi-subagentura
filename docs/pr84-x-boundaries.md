@@ -17,9 +17,9 @@ counted as production closure unless a registered workflow path exercises it.
   `process_launch_intent` event containing the run/task/attempt identity,
   attempt number, lease epoch, nonce, launch marker, requested/effective
   isolation, and fallback mode.
-- The registered `start_durable_workflow` path has executed a real process task
-  to terminal success and the persisted journal contains the launch intent after
-  `task_started`.
+- The registered `start_durable_workflow` path has admitted a real process task,
+  persisted the launch intent after `task_started`, and reached validated child
+  startup without depending on model completion.
 - The process runner propagates the exact `launchMarker`, `nonce`, `attemptId`,
   and `epoch` to the child environment.
 - The registered process path persists child-start evidence atomically, rejects

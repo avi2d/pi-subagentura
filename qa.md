@@ -4,12 +4,12 @@ This document is the question set for validating the Milestones 3–8 workflow s
 
 ## 1. Frozen plan scope in practice
 
-| Item                              | Scope status                  |
-| --------------------------------- | ----------------------------- |
-| X01 (22–24 partial; 25+ deferred) | Partial                       |
-| X02–X05 (out-of-scope this PR)    | Deferred                      |
-| X06 (security boundary)           | Deferred / helper-only checks |
-| 1–21, 22*, 39–47, 54+, 55+        | In-scope for PR-84            |
+| Item                                      | Scope status                  |
+| ----------------------------------------- | ----------------------------- |
+| X01 (22–24 partial; 25+ deferred)         | Partial                       |
+| X02–X05 (out-of-scope this PR)            | Deferred                      |
+| X06 (security boundary)                   | Deferred / helper-only checks |
+| 1–24 (bounded X01 slice), 39–47, 54+, 55+ | In-scope for PR-84            |
 
 The PR-84 foundation provides declarative durability with a production-reachable
 process launch slice. Supported production behavior:
