@@ -118,9 +118,9 @@ These commands are intended for people at the Pi prompt.
 | `/workflow-resume`      | Resume a durable workflow with a fenced operator authority envelope                                    |
 | `/workflow-cancel`      | Request authoritative cancellation with a fenced operator authority envelope                           |
 | `/workflow-plan`        | Create or view a durable workflow projection and revision; use `create <task>` for host-owned creation |
-| `/workflow-plan-append` | Append a future task with an explicit revision fence                                                   |
-| `/workflow-plan-mutate` | Block, unblock, or skip future work with a revision fence                                              |
-| `/workflow-plan-edit`   | Apply a fenced durable plan edit                                                                       |
+| `/workflow-plan-append` | Append a future task with an owner/session/lease authority envelope and revision fence |
+| `/workflow-plan-mutate` | Block, unblock, or skip future work with an owner/session/lease authority envelope |
+| `/workflow-plan-edit`   | Apply a fenced durable plan edit with an owner/session/lease authority envelope        |
 | `/workflow-plan-export` | Export a durable workflow projection as JSON                                                           |
 | `/workflow-approval`    | Approve or reject a pending durable workflow request                                                   |
 | `/workflow-budget`      | Pause or resume a durable workflow budget gate                                                         |

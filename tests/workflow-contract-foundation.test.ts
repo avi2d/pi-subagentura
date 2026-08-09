@@ -43,6 +43,42 @@ describe("workflow contract foundation", () => {
     ).toThrow();
   });
 
+  it("rejects unsupported process isolation and malformed approval gates", () => {
+    expect(() =>
+      validateWorkflowPlan({
+        ...plan,
+        phases: [
+          {
+            ...plan.phases[0],
+            tasks: [
+              { id: "process-task", prompt: "run", isolation: "process" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("Process isolation is not supported");
+    expect(() =>
+      validateWorkflowPlan({
+        ...plan,
+        phases: [
+          {
+            ...plan.phases[0],
+            tasks: [
+              {
+                id: "approval-task",
+                prompt: "approve",
+                approval: {
+                  policyHash: "",
+                  denial: "pause" as unknown as "stop",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("Invalid approval gate");
+  });
+
   it("keeps terminal task state immutable", () => {
     let state = createWorkflowPlanState(plan);
     state = reduceWorkflowPlanState(state, {
