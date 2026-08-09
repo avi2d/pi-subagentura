@@ -6,14 +6,30 @@ import { WorkflowRunStore } from "./workflow-run-store";
 import type {
   WorkflowApprovalDecision,
   WorkflowApprovalRequest,
+  WorkflowCancellationRequest,
   WorkflowOwnerIdentity,
   WorkflowResumePolicy,
+  WorkflowTerminalResult,
 } from "./workflow-run-types";
 import {
   validateWorkflowApprovalDecision,
   validateWorkflowApprovalRequest,
+  validateWorkflowCancellationRequest,
 } from "./workflow-run-types";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { toDurableValue } from "./workflow-durable-value";
+import { WorkflowSessionDispatcher } from "./workflow-dispatcher";
+import {
+  DurableWorkflowDeliveryBroker,
+  type WorkflowDeliveryTransport,
+} from "./workflow-durable-delivery";
+import {
+  canonicalJson,
+  mutationPayload,
+  type WorkflowTaskClaim,
+} from "./workflow-mutation";
+
+export type { WorkflowTaskClaim } from "./workflow-mutation";
 
 export interface DurableWorkflowPlanOptions {
   store: WorkflowRunStore;
@@ -30,54 +46,38 @@ export interface DurableWorkflowPlanOptions {
   signal?: AbortSignal;
   resume?: boolean;
   onProjection?: (projection: WorkflowProjection) => void;
+  dispatcher?: WorkflowSessionDispatcher;
 }
 
 export interface DurableWorkflowControllerOptions {
   store: WorkflowRunStore;
   owner: WorkflowOwnerIdentity;
+  deliveryTransport?: WorkflowDeliveryTransport;
   onApprovalDecision?: (runId: string, status: "approved" | "rejected") => void;
 }
 
 /** Owner-scoped controller for durable status, result, and cancellation. */
 export class DurableWorkflowController {
+  private readonly deliveryBroker?: DurableWorkflowDeliveryBroker;
+
   public constructor(
     private readonly options: DurableWorkflowControllerOptions,
-  ) {}
+  ) {
+    if (options.deliveryTransport) {
+      this.deliveryBroker = new DurableWorkflowDeliveryBroker({
+        store: options.store,
+        owner: options.owner,
+        transport: options.deliveryTransport,
+      });
+    }
+  }
 
   public async getStatus(
     runId: string,
   ): Promise<WorkflowProjection | undefined> {
     try {
       const projection = await recoverWorkflowRun(this.options, runId);
-      if (projection.status === "error" && !projection.terminal) {
-        const failed = Object.values(projection.tasks).find(
-          (task) => task.status === "failed",
-        );
-        if (failed) {
-          await this.options.store.append(runId, "run_result", {
-            result: {
-              status: "error",
-              error: {
-                code: "task_failed",
-                message: failed.error ?? "Task failed",
-              },
-            },
-          });
-          await this.options.store.append(runId, "run_terminal", {});
-        }
-      }
-      const repaired = await recoverWorkflowRun(this.options, runId);
-      if (isTerminal(repaired.status) && !repaired.delivery) {
-        // A crash may occur after the terminal event and before the outbox
-        // intent. Repair the limbo window before exposing the projection.
-        await appendDeliveryIntent(
-          this.options.store,
-          this.options.owner,
-          runId,
-        );
-        return recoverWorkflowRun(this.options, runId);
-      }
-      return repaired;
+      return compatibleReadProjection(projection);
     } catch (error) {
       if (isMissingRun(error)) return undefined;
       throw error;
@@ -92,15 +92,17 @@ export class DurableWorkflowController {
     return projection.terminal;
   }
 
-  public async cancel(runId: string): Promise<WorkflowProjection | undefined> {
-    const projection = await this.getStatus(runId);
-    if (!projection || isTerminal(projection.status)) return projection;
-    await this.options.store.append(runId, "run_result", {
-      result: { status: "cancelled" },
-    });
-    await this.options.store.append(runId, "run_cancelled", {});
-    await appendDeliveryIntent(this.options.store, this.options.owner, runId);
-    return recoverWorkflowRun(this.options, runId);
+  public async cancel(
+    runId: string,
+    requestId?: string,
+  ): Promise<WorkflowProjection | undefined> {
+    await cancelDurableWorkflowRun(
+      this.options.store,
+      this.options.owner,
+      runId,
+      requestId,
+    );
+    return this.getStatus(runId);
   }
 
   public async pauseForBudget(
@@ -153,19 +155,25 @@ export class DurableWorkflowController {
       if (isTerminal(projection.status)) {
         throw new Error("Cannot append work to a terminal workflow");
       }
+      const mutationPayloadResult = await withMutationHash(
+        this.options.store,
+        this.options.owner,
+        runId,
+        "task_appended",
+        {
+          taskId: mutation.taskId,
+          phaseId: mutation.phaseId,
+          prompt: mutation.prompt,
+          ...(mutation.label ? { label: mutation.label } : {}),
+        },
+        projection,
+      );
       const appendResult = await this.options.store.appendIfCurrent(
         runId,
         projection.lastEventOrdinal,
         "task_appended",
-        withMutationHash(
-          {
-            taskId: mutation.taskId,
-            phaseId: mutation.phaseId,
-            prompt: mutation.prompt,
-            ...(mutation.label ? { label: mutation.label } : {}),
-          },
-          projection.mutationHash,
-        ),
+        mutationPayloadResult.payload,
+        mutationPayloadResult.runEpoch,
       );
       if (appendResult.status === "conflict")
         throw staleWorkflowRevision(
@@ -195,11 +203,20 @@ export class DurableWorkflowController {
         : mutation.type === "unblock"
           ? "task_unblocked"
           : "task_skipped";
+    const mutationPayloadResult = await withMutationHash(
+      this.options.store,
+      this.options.owner,
+      runId,
+      eventType,
+      { taskId: mutation.taskId },
+      projection,
+    );
     const appendResult = await this.options.store.appendIfCurrent(
       runId,
       projection.lastEventOrdinal,
       eventType,
-      withMutationHash({ taskId: mutation.taskId }, projection.mutationHash),
+      mutationPayloadResult.payload,
+      mutationPayloadResult.runEpoch,
     );
     if (appendResult.status === "conflict")
       throw staleWorkflowRevision(
@@ -216,11 +233,16 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection || projection.delivery?.deliveryId !== deliveryId)
       return projection;
-    if (projection.delivery.status !== "delivered") {
-      await this.options.store.append(runId, "delivery_receipt", {
-        deliveryId,
-      });
+    await ensureDeliveryIntent(this.options.store, this.options.owner, runId);
+    if (this.deliveryBroker) {
+      return this.deliveryBroker.acknowledge(runId, deliveryId);
     }
+    await appendDeliveryReceipt(
+      this.options.store,
+      this.options.owner,
+      runId,
+      deliveryId,
+    );
     return this.getStatus(runId);
   }
 
@@ -231,11 +253,16 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection || projection.delivery?.deliveryId !== deliveryId)
       return projection;
-    if (projection.delivery.status === "pending") {
-      await this.options.store.append(runId, "delivery_dispatched", {
-        deliveryId,
-      });
+    await ensureDeliveryIntent(this.options.store, this.options.owner, runId);
+    if (this.deliveryBroker) {
+      return this.deliveryBroker.deliver(runId, deliveryId);
     }
+    await appendDeliveryDispatched(
+      this.options.store,
+      this.options.owner,
+      runId,
+      deliveryId,
+    );
     return this.getStatus(runId);
   }
 
@@ -244,10 +271,33 @@ export class DurableWorkflowController {
     request: WorkflowApprovalRequest,
   ): Promise<WorkflowProjection | undefined> {
     validateWorkflowApprovalRequest(request);
-    const projection = await this.getStatus(runId);
-    if (!projection) return undefined;
-    if (projection.approval?.status === "pending") return projection;
-    await this.options.store.append(runId, "approval_requested", { request });
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const projection = await recoverWorkflowRun(this.options, runId);
+      if (projection.approval?.status === "pending")
+        return compatibleReadProjection(projection);
+      if (isTerminal(projection.status))
+        return compatibleReadProjection(projection);
+      const leaseEpoch = await this.options.store.getLeaseEpoch();
+      const boundRequest: WorkflowApprovalRequest = {
+        ...request,
+        ownerGeneration: this.options.owner.ownerGeneration,
+        leaseEpoch,
+        planRevision: projection.planRevision,
+      };
+      const appendResult = await this.options.store.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "approval_requested",
+        {
+          request: boundRequest,
+          ownerId: this.options.owner.ownerId,
+          ownerGeneration: boundRequest.ownerGeneration,
+          leaseEpoch: boundRequest.leaseEpoch,
+        },
+        leaseEpoch,
+      );
+      if (appendResult.status === "appended") return this.getStatus(runId);
+    }
     return this.getStatus(runId);
   }
 
@@ -259,47 +309,105 @@ export class DurableWorkflowController {
     validateWorkflowApprovalDecision(decision);
     if (decision.requestId !== requestId)
       throw new Error("Workflow approval request mismatch");
-    const projection = await this.getStatus(runId);
-    if (
-      !projection?.approval ||
-      projection.approval.request.requestId !== requestId
-    )
-      throw new Error("Workflow approval request was not found");
-    const request = projection.approval.request;
-    if (
-      (decision.policyHash !== undefined &&
-        decision.policyHash !== request.policyHash) ||
-      (decision.planRevision !== undefined &&
-        decision.planRevision !== request.planRevision) ||
-      (decision.ownerGeneration !== undefined &&
-        decision.ownerGeneration !== request.ownerGeneration) ||
-      (decision.leaseEpoch !== undefined &&
-        decision.leaseEpoch !== request.leaseEpoch) ||
-      (decision.version !== undefined && decision.version !== request.version)
-    ) {
-      return projection;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const projection = await recoverWorkflowRun(this.options, runId);
+      if (
+        !projection.approval ||
+        projection.approval.request.requestId !== requestId
+      )
+        throw new Error("Workflow approval request was not found");
+      if (projection.approval.status !== "pending")
+        return compatibleReadProjection(projection);
+      const request = projection.approval.request;
+      const leaseEpoch = await this.options.store.getLeaseEpoch();
+      if (
+        request.ownerGeneration !== this.options.owner.ownerGeneration ||
+        request.leaseEpoch !== leaseEpoch
+      ) {
+        return compatibleReadProjection(projection);
+      }
+      if (
+        (decision.policyHash !== undefined &&
+          decision.policyHash !== request.policyHash) ||
+        (decision.planRevision !== undefined &&
+          decision.planRevision !== request.planRevision) ||
+        (decision.ownerGeneration !== undefined &&
+          decision.ownerGeneration !== request.ownerGeneration) ||
+        (decision.leaseEpoch !== undefined &&
+          decision.leaseEpoch !== request.leaseEpoch) ||
+        (decision.version !== undefined && decision.version !== request.version)
+      ) {
+        return compatibleReadProjection(projection);
+      }
+      const enrichedDecision: WorkflowApprovalDecision = {
+        ...decision,
+        policyHash: request.policyHash,
+        planRevision: request.planRevision,
+        ownerGeneration: request.ownerGeneration,
+        leaseEpoch: request.leaseEpoch,
+        version: request.version,
+      };
+      const appendResult = await this.options.store.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "approval_decided",
+        enrichedDecision,
+        leaseEpoch,
+      );
+      if (appendResult.status === "conflict") continue;
+      if (decision.status === "rejected") {
+        const afterDecision = await recoverWorkflowRun(this.options, runId);
+        const blockedResult = await this.options.store.appendIfCurrent(
+          runId,
+          afterDecision.lastEventOrdinal,
+          "run_blocked",
+          {
+            reason: decision.reason ?? "Workflow approval rejected",
+            source: "approval",
+            requestId,
+            policyHash: request.policyHash,
+            planRevision: request.planRevision,
+            ownerGeneration: request.ownerGeneration,
+            leaseEpoch: request.leaseEpoch,
+            version: request.version,
+          },
+          leaseEpoch,
+        );
+        if (blockedResult.status === "conflict") {
+          const latest = await recoverWorkflowRun(this.options, runId);
+          if (latest.approval?.status === "rejected")
+            return compatibleReadProjection(latest);
+        }
+      }
+      this.options.onApprovalDecision?.(runId, decision.status);
+      return this.getStatus(runId);
     }
-    if (projection.approval.status !== "pending") return projection;
-    await this.options.store.append(runId, "approval_decided", decision);
-    if (decision.status === "rejected") {
-      await this.options.store.append(runId, "run_blocked", {
-        reason: decision.reason ?? "Workflow approval rejected",
-      });
-    }
-    this.options.onApprovalDecision?.(runId, decision.status);
     return this.getStatus(runId);
   }
 }
 
-function withMutationHash(
+async function withMutationHash(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  eventType: string,
   payload: Record<string, unknown>,
-  previousMutationHash: string | undefined,
-): Record<string, unknown> {
-  const previous = previousMutationHash ?? "";
-  const mutationHash = createHash("sha256")
-    .update(JSON.stringify({ previousMutationHash: previous, payload }))
-    .digest("hex");
-  return { ...payload, previousMutationHash: previous, mutationHash };
+  projection: WorkflowProjection,
+): Promise<{ payload: Record<string, unknown>; runEpoch: number }> {
+  const runEpoch = await store.getLeaseEpoch();
+  return {
+    payload: mutationPayload(payload, {
+      runId,
+      eventType,
+      ownerId: owner.ownerId,
+      ownerGeneration: owner.ownerGeneration,
+      leaseEpoch: runEpoch,
+      baseRevision: projection.revision,
+      baseOrdinal: projection.lastEventOrdinal,
+      previousMutationHash: projection.mutationHash ?? "",
+    }),
+    runEpoch,
+  };
 }
 
 function staleWorkflowRevision(expected: number, current: number): Error {
@@ -324,8 +432,10 @@ export async function runDurableWorkflowPlan(
   options: DurableWorkflowPlanOptions,
 ): Promise<WorkflowProjection> {
   const { store, owner, runId, plan } = options;
+  const digestablePlan = toDurableValue(plan) as unknown as WorkflowPlan;
+  validateWorkflowPlan({ ...digestablePlan, schemaVersion: 1 });
   const planDigest = createHash("sha256")
-    .update(JSON.stringify(plan))
+    .update(JSON.stringify(digestablePlan))
     .digest("hex");
   const publish = (next: WorkflowProjection): WorkflowProjection => {
     options.onProjection?.(next);
@@ -333,41 +443,44 @@ export async function runDurableWorkflowPlan(
   };
   let projection: WorkflowProjection;
   const controller = new DurableWorkflowController({ store, owner });
-  // Validate before recovery so malformed resume input cannot touch an
-  // authoritative run or dispatch work.
-  validateWorkflowPlan({ ...plan, schemaVersion: 1 });
   try {
-    const recovered = await controller.getStatus(runId);
-    if (!recovered) {
-      const missing = new Error("Workflow run not found");
-      Object.assign(missing, { code: "ENOENT" });
-      throw missing;
-    }
-    projection = recovered;
+    projection = await recoverWorkflowRun({ store, owner }, runId);
   } catch (error) {
     if (!isMissingRun(error)) throw error;
     // Do not leave an orphaned run directory for an invalid new plan.
     validateWorkflowPlan(plan);
-    await store.createRun({
-      runId,
-      planRevision: plan.schemaVersion,
-      planDigest,
-      resumePolicy: options.resumePolicy ?? "manual",
-      owner,
-    });
-    await store.append(runId, "run_created", {
-      tasks: plan.phases.flatMap((phase) =>
-        phase.tasks.map((task) => ({
-          id: task.id,
-          phaseId: phase.id,
-          prompt: task.prompt,
-          ...(task.label ? { label: task.label } : {}),
-        })),
-      ),
-    });
-    projection = (await controller.getStatus(runId)) as WorkflowProjection;
+    await store.createRunWithInitialEvent(
+      {
+        runId,
+        planRevision: plan.schemaVersion,
+        planDigest,
+        resumePolicy: options.resumePolicy ?? "manual",
+        owner,
+      },
+      {
+        type: "run_created",
+        payload: { plan },
+      },
+    );
+    projection = await recoverWorkflowRun({ store, owner }, runId);
   }
 
+  if (projection.status === "error" && !projection.terminal) {
+    const failed = Object.values(projection.tasks).find(
+      (task) => task.status === "failed",
+    );
+    if (failed) {
+      await terminalizeWorkflowRun(store, owner, runId, {
+        status: "error",
+        error: {
+          code: "task_failed",
+          message: failed.error ?? "Task failed",
+        },
+      });
+      await ensureDeliveryIntent(store, owner, runId);
+      return publish(await recoverWorkflowRun({ store, owner }, runId));
+    }
+  }
   if (projection.status === "interrupted" && !options.resume) {
     return publish(projection);
   }
@@ -382,9 +495,14 @@ export async function runDurableWorkflowPlan(
     throw new Error("Workflow plan definition mismatch");
   }
   // The stored revision owns mismatch reporting before resume validation.
-  if (isTerminal(projection.status)) return publish(projection);
+  if (isTerminal(projection.status)) {
+    await ensureDeliveryIntent(store, owner, runId);
+    return publish(await recoverWorkflowRun({ store, owner }, runId));
+  }
   if (options.signal?.aborted) {
-    return publish(await commitCancelledRun(store, owner, runId));
+    const cancelled = await cancelDurableWorkflowRun(store, owner, runId);
+    if (!cancelled) throw new Error("Workflow run not found");
+    return publish(cancelled);
   }
   if (isRunDispatchSuspended(projection)) return publish(projection);
   if (projection.status === "created" || projection.status === "interrupted") {
@@ -399,7 +517,9 @@ export async function runDurableWorkflowPlan(
     if (phase.mode === "parallel") {
       const completed = await runDurableParallelPhase(options, phase.id, tasks);
       if (!completed) {
-        await appendDeliveryIntent(store, owner, runId);
+        const latest = await recoverWorkflowRun({ store, owner }, runId);
+        if (isTerminal(latest.status))
+          await ensureDeliveryIntent(store, owner, runId);
         return publish(await recoverWorkflowRun({ store, owner }, runId));
       }
       continue;
@@ -412,62 +532,71 @@ export async function runDurableWorkflowPlan(
       if (isRunDispatchSuspended(projection) || !isTaskDispatchable(existing))
         return publish(projection);
       if (options.signal?.aborted) {
-        await store.append(runId, "run_result", {
-          result: { status: "cancelled" },
-        });
-        await store.append(runId, "run_cancelled", {});
-        return publish(await commitCancelledRun(store, owner, runId));
+        const cancelled = await cancelDurableWorkflowRun(store, owner, runId);
+        if (!cancelled) throw new Error("Workflow run not found");
+        return publish(cancelled);
       }
-      const attempt = (existing?.attempt ?? 0) + 1;
-      await store.append(runId, "task_started", {
-        taskId: task.id,
-        attempt,
-        phaseId: phase.id,
-      });
+      const taskClaim = await claimTask(options, task, phase.id);
+      if (!taskClaim) {
+        const latest = await recoverWorkflowRun({ store, owner }, runId);
+        if (latest.tasks[task.id]?.claim || isRunDispatchSuspended(latest))
+          return publish(latest);
+        if (
+          latest.tasks[task.id]?.status === "succeeded" ||
+          latest.tasks[task.id]?.status === "skipped"
+        )
+          continue;
+        return publish(latest);
+      }
       try {
-        const result = await options.runAgent({
-          prompt: task.prompt,
-          isolation: "in-process",
-          label: task.label ?? task.id,
-          signal: options.signal,
-        });
-        await store.append(runId, "usage_observed", {
-          input: result.usage.input,
-          output: result.usage.output,
-          taskId: task.id,
-          attempt,
-        });
-        if (result.isError) {
-          await store.append(runId, "task_failed", {
+        const result = await runClaimedAgent(options, task, taskClaim);
+        const usageCommitted = await appendClaimEvent(
+          options,
+          taskClaim,
+          "usage_observed",
+          {
+            input: result.usage.input,
+            output: result.usage.output,
             taskId: task.id,
-            attempt,
-            error: result.errorMessage ?? "Task failed",
+            attempt: taskClaim.attempt,
+          },
+        );
+        if (!usageCommitted)
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
+        if (result.isError) {
+          const message = result.errorMessage ?? "Task failed";
+          const failureCommitted = await appendClaimEvent(
+            options,
+            taskClaim,
+            "task_failed",
+            { taskId: task.id, attempt: taskClaim.attempt, error: message },
+          );
+          if (!failureCommitted)
+            return publish(await recoverWorkflowRun({ store, owner }, runId));
+          await terminalizeWorkflowRun(store, owner, runId, {
+            status: "error",
+            error: { code: "task_failed", message },
           });
-          await store.append(runId, "run_result", {
-            result: {
-              status: "error",
-              error: {
-                code: "task_failed",
-                message: result.errorMessage ?? "Task failed",
-              },
-            },
-          });
-          await store.append(runId, "run_terminal", {});
-          await appendDeliveryIntent(store, owner, runId);
+          await ensureDeliveryIntent(store, owner, runId);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
-        await store.append(runId, "task_succeeded", {
-          taskId: task.id,
-          attempt,
-          result: result.output,
-        });
+        const successCommitted = await appendClaimEvent(
+          options,
+          taskClaim,
+          "task_succeeded",
+          {
+            taskId: task.id,
+            attempt: taskClaim.attempt,
+            result: result.output,
+          },
+        );
+        if (!successCommitted)
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
       } catch (error) {
         if (options.signal?.aborted) {
-          await store.append(runId, "run_result", {
-            result: { status: "cancelled" },
-          });
-          await store.append(runId, "run_cancelled", {});
-          return publish(await commitCancelledRun(store, owner, runId));
+          const cancelled = await cancelDurableWorkflowRun(store, owner, runId);
+          if (!cancelled) throw new Error("Workflow run not found");
+          return publish(cancelled);
         }
         await store.append(runId, "run_interrupted", {});
         throw error;
@@ -506,69 +635,326 @@ export async function runDurableWorkflowPlan(
         task.status === "blocked"
       )
         continue;
-      const attempt = task.attempt + 1;
-      await store.append(runId, "task_started", {
-        taskId: task.id,
-        attempt,
-        phaseId: task.phaseId ?? "appended",
-      });
+      const taskClaim = await claimTask(
+        options,
+        task,
+        task.phaseId ?? "appended",
+      );
+      if (!taskClaim) {
+        const latest = await recoverWorkflowRun({ store, owner }, runId);
+        if (latest.tasks[task.id]?.claim) return publish(latest);
+        continue;
+      }
       let result: SubagentResult;
       try {
-        result = await options.runAgent({
-          prompt: task.prompt,
-          isolation: "in-process",
-          label: task.label ?? task.id,
-          signal: options.signal,
+        result = await runClaimedAgent(options, task, taskClaim);
+        const usageCommitted = await appendClaimEvent(
+          options,
+          taskClaim,
+          "usage_observed",
+          {
+            input: result.usage.input,
+            output: result.usage.output,
+            taskId: task.id,
+            attempt: taskClaim.attempt,
+          },
+        );
+        if (!usageCommitted) continue;
+        if (result.isError) {
+          const message = result.errorMessage ?? "Task failed";
+          const failureCommitted = await appendClaimEvent(
+            options,
+            taskClaim,
+            "task_failed",
+            { taskId: task.id, attempt: taskClaim.attempt, error: message },
+          );
+          if (!failureCommitted) continue;
+          await terminalizeWorkflowRun(store, owner, runId, {
+            status: "error",
+            error: { code: "task_failed", message },
+          });
+          await ensureDeliveryIntent(store, owner, runId);
+          return publish(await recoverWorkflowRun({ store, owner }, runId));
+        }
+        await appendClaimEvent(options, taskClaim, "task_succeeded", {
+          taskId: task.id,
+          attempt: taskClaim.attempt,
+          result: result.output,
         });
       } catch (error) {
         if (options.signal?.aborted) {
-          await store.append(runId, "run_result", {
-            result: { status: "cancelled" },
-          });
-          await store.append(runId, "run_cancelled", {});
-          await appendDeliveryIntent(store, owner, runId);
-          return publish(await recoverWorkflowRun({ store, owner }, runId));
+          const cancelled = await cancelDurableWorkflowRun(store, owner, runId);
+          if (!cancelled) throw new Error("Workflow run not found");
+          return publish(cancelled);
         }
         await store.append(runId, "run_interrupted", {});
         throw error;
       }
-      await store.append(runId, "usage_observed", {
-        input: result.usage.input,
-        output: result.usage.output,
-        taskId: task.id,
-        attempt,
-      });
-      if (result.isError) {
-        const message = result.errorMessage ?? "Task failed";
-        await store.append(runId, "task_failed", {
-          taskId: task.id,
-          attempt,
-          error: message,
-        });
-        await store.append(runId, "run_result", {
-          result: { status: "error", error: { code: "task_failed", message } },
-        });
-        await store.append(runId, "run_terminal", {});
-        await appendDeliveryIntent(store, owner, runId);
-        return publish(await recoverWorkflowRun({ store, owner }, runId));
-      }
-      await store.append(runId, "task_succeeded", {
-        taskId: task.id,
-        attempt,
-        result: result.output,
-      });
     }
   }
 
   projection = await recoverWorkflowRun({ store, owner }, runId);
   if (isRunDispatchSuspended(projection)) return publish(projection);
-  await store.append(runId, "run_result", {
-    result: { status: "done", result: "Workflow completed" },
+  await terminalizeWorkflowRun(store, owner, runId, {
+    status: "done",
+    result: "Workflow completed",
   });
-  await store.append(runId, "run_terminal", {});
-  await appendDeliveryIntent(store, owner, runId);
+  await ensureDeliveryIntent(store, owner, runId);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
+}
+
+function compatibleReadProjection(
+  projection: WorkflowProjection,
+): WorkflowProjection {
+  let compatible = projection;
+  if (compatible.status === "error" && !compatible.terminal) {
+    const failed = Object.values(compatible.tasks).find(
+      (task) => task.status === "failed",
+    );
+    if (failed) {
+      compatible = {
+        ...compatible,
+        terminal: {
+          status: "error",
+          error: {
+            code: "task_failed",
+            message: failed.error ?? "Task failed",
+          },
+        },
+      };
+    }
+  }
+  if (isTerminal(compatible.status) && !compatible.delivery) {
+    compatible = {
+      ...compatible,
+      delivery: {
+        deliveryId: workflowDeliveryId(compatible.runId),
+        kind: "terminal",
+        status: "pending",
+        message: workflowDeliveryMessage(compatible),
+      },
+    };
+  }
+  return compatible;
+}
+
+export async function terminalizeWorkflowRun(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  result: WorkflowTerminalResult,
+  options: { cancellationRequestId?: string } = {},
+): Promise<WorkflowProjection> {
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const projection = await recoverWorkflowRun({ store, owner }, runId);
+    const cancellation = projection.cancellation;
+    if (cancellation) {
+      const currentLeaseEpoch = await store.getLeaseEpoch();
+      if (
+        result.status !== "cancelled" ||
+        cancellation.requestId !== options.cancellationRequestId ||
+        cancellation.ownerId !== owner.ownerId ||
+        cancellation.ownerGeneration !== owner.ownerGeneration ||
+        cancellation.leaseEpoch !== currentLeaseEpoch
+      )
+        return projection;
+    } else if (options.cancellationRequestId !== undefined) {
+      return projection;
+    }
+
+    if (!projection.terminal) {
+      const leaseEpoch = await store.getLeaseEpoch();
+      const appendResult = await store.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "run_result",
+        {
+          result,
+          ...(cancellation === undefined ? {} : { cancellation }),
+        },
+        leaseEpoch,
+      );
+      if (appendResult.status === "conflict") continue;
+    } else if (projection.terminal.status !== result.status) {
+      return projection;
+    }
+
+    const afterResult = await recoverWorkflowRun({ store, owner }, runId);
+    const record = await store.readRun(runId);
+    const markerType =
+      result.status === "cancelled" ? "run_cancelled" : "run_terminal";
+    if (record.events.some((event) => event.type === markerType))
+      return afterResult;
+    const leaseEpoch = await store.getLeaseEpoch();
+    const markerPayload =
+      result.status === "cancelled" && afterResult.cancellation
+        ? afterResult.cancellation
+        : {};
+    const markerResult = await store.appendIfCurrent(
+      runId,
+      afterResult.lastEventOrdinal,
+      markerType,
+      markerPayload,
+      leaseEpoch,
+    );
+    if (markerResult.status === "conflict") continue;
+    return recoverWorkflowRun({ store, owner }, runId);
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+export async function ensureDeliveryIntent(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+): Promise<WorkflowProjection> {
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const projection = await recoverWorkflowRun({ store, owner }, runId);
+    if (!isTerminal(projection.status)) return projection;
+    if (projection.delivery) return projection;
+    const leaseEpoch = await store.getLeaseEpoch();
+    const appendResult = await store.appendIfCurrent(
+      runId,
+      projection.lastEventOrdinal,
+      "delivery_intent",
+      {
+        deliveryId: workflowDeliveryId(runId),
+        kind: "terminal",
+        message: workflowDeliveryMessage(projection),
+        ownerId: owner.ownerId,
+        ownerGeneration: owner.ownerGeneration,
+        leaseEpoch,
+      },
+      leaseEpoch,
+    );
+    if (appendResult.status === "appended")
+      return recoverWorkflowRun({ store, owner }, runId);
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+async function appendDeliveryDispatched(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  deliveryId: string,
+): Promise<WorkflowProjection> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const projection = await recoverWorkflowRun({ store, owner }, runId);
+    if (projection.delivery?.deliveryId !== deliveryId) return projection;
+    if (["dispatched", "delivered"].includes(projection.delivery.status))
+      return projection;
+    const leaseEpoch = await store.getLeaseEpoch();
+    const appendResult = await store.appendIfCurrent(
+      runId,
+      projection.lastEventOrdinal,
+      "delivery_dispatched",
+      {
+        deliveryId,
+        ownerId: owner.ownerId,
+        ownerGeneration: owner.ownerGeneration,
+        leaseEpoch,
+      },
+      leaseEpoch,
+    );
+    if (appendResult.status === "appended")
+      return recoverWorkflowRun({ store, owner }, runId);
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+async function appendDeliveryReceipt(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  deliveryId: string,
+): Promise<WorkflowProjection> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const projection = await recoverWorkflowRun({ store, owner }, runId);
+    if (projection.delivery?.deliveryId !== deliveryId) return projection;
+    if (projection.delivery.status === "delivered") return projection;
+    const leaseEpoch = await store.getLeaseEpoch();
+    const appendResult = await store.appendIfCurrent(
+      runId,
+      projection.lastEventOrdinal,
+      "delivery_receipt",
+      {
+        deliveryId,
+        ownerId: owner.ownerId,
+        ownerGeneration: owner.ownerGeneration,
+        leaseEpoch,
+      },
+      leaseEpoch,
+    );
+    if (appendResult.status === "appended")
+      return recoverWorkflowRun({ store, owner }, runId);
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+export async function cancelDurableWorkflowRun(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  requestId: string = randomUUID(),
+): Promise<WorkflowProjection | undefined> {
+  validateWorkflowCancellationRequest({
+    ownerId: owner.ownerId,
+    ownerGeneration: owner.ownerGeneration,
+    leaseEpoch: 0,
+    requestId,
+  });
+  for (let attempt = 0; attempt < 16; attempt++) {
+    let projection: WorkflowProjection;
+    try {
+      projection = await recoverWorkflowRun({ store, owner }, runId);
+    } catch (error) {
+      if (isMissingRun(error)) return undefined;
+      throw error;
+    }
+    if (isTerminal(projection.status)) return projection;
+    if (
+      projection.cancellation &&
+      projection.cancellation.requestId !== requestId
+    )
+      return projection;
+    const leaseEpoch = await store.getLeaseEpoch();
+    if (
+      projection.cancellation &&
+      (projection.cancellation.ownerId !== owner.ownerId ||
+        projection.cancellation.ownerGeneration !== owner.ownerGeneration ||
+        projection.cancellation.leaseEpoch !== leaseEpoch)
+    )
+      return projection;
+    const request: WorkflowCancellationRequest = {
+      ownerId: owner.ownerId,
+      ownerGeneration: owner.ownerGeneration,
+      leaseEpoch,
+      requestId,
+    };
+    if (!projection.cancellation) {
+      const appendResult = await store.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "run_cancel_requested",
+        request,
+        leaseEpoch,
+      );
+      if (appendResult.status === "conflict") continue;
+    }
+    const terminal = await terminalizeWorkflowRun(
+      store,
+      owner,
+      runId,
+      { status: "cancelled" },
+      { cancellationRequestId: requestId },
+    );
+    if (terminal.status === "cancelled")
+      await ensureDeliveryIntent(store, owner, runId);
+    return recoverWorkflowRun({ store, owner }, runId);
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
 }
 
 async function runDurableParallelPhase(
@@ -576,61 +962,55 @@ async function runDurableParallelPhase(
   phaseId: string,
   tasks: WorkflowPlan["phases"][number]["tasks"],
 ): Promise<boolean> {
-  const limit = Math.max(1, Math.min(4, tasks.length));
+  const limit = options.dispatcher
+    ? Math.max(1, tasks.length)
+    : Math.max(1, Math.min(4, tasks.length));
   let nextIndex = 0;
   let firstError: unknown;
   let interrupted = false;
+  let abandoned = false;
   const worker = async (): Promise<void> => {
     while (firstError === undefined) {
       const task = tasks[nextIndex++];
       if (!task) return;
-      const projection = await recoverWorkflowRun(
-        { store: options.store, owner: options.owner },
-        options.runId,
-      );
-      const attempt = (projection.tasks[task.id]?.attempt ?? 0) + 1;
-      if (
-        isRunDispatchSuspended(projection) ||
-        !isTaskDispatchable(projection.tasks[task.id])
-      )
-        return;
-      if (options.signal?.aborted) {
-        firstError = options.signal.reason ?? new Error("Workflow cancelled");
-        return;
+      const taskClaim = await claimTask(options, task, phaseId);
+      if (!taskClaim) {
+        const latest = await recoverWorkflowRun(
+          { store: options.store, owner: options.owner },
+          options.runId,
+        );
+        if (latest.tasks[task.id]?.claim) abandoned = true;
+        continue;
       }
-      await options.store.append(options.runId, "task_started", {
-        taskId: task.id,
-        attempt,
-        phaseId,
-      });
       try {
-        const result = await options.runAgent({
-          prompt: task.prompt,
-          isolation: "in-process",
-          label: task.label ?? task.id,
-          signal: options.signal,
-        });
-        await options.store.append(options.runId, "usage_observed", {
-          input: result.usage.input,
-          output: result.usage.output,
-          taskId: task.id,
-          attempt,
-        });
+        const result = await runClaimedAgent(options, task, taskClaim);
+        const usageCommitted = await appendClaimEvent(
+          options,
+          taskClaim,
+          "usage_observed",
+          {
+            input: result.usage.input,
+            output: result.usage.output,
+            taskId: task.id,
+            attempt: taskClaim.attempt,
+          },
+        );
+        if (!usageCommitted) continue;
         if (result.isError) {
           const message = result.errorMessage ?? "Task failed";
-          await options.store.append(options.runId, "task_failed", {
-            taskId: task.id,
-            attempt,
-            error: message,
-          });
-          if (firstError === undefined) {
+          const failureCommitted = await appendClaimEvent(
+            options,
+            taskClaim,
+            "task_failed",
+            { taskId: task.id, attempt: taskClaim.attempt, error: message },
+          );
+          if (failureCommitted && firstError === undefined)
             firstError = new Error(message);
-          }
-          return;
+          continue;
         }
-        await options.store.append(options.runId, "task_succeeded", {
+        await appendClaimEvent(options, taskClaim, "task_succeeded", {
           taskId: task.id,
-          attempt,
+          attempt: taskClaim.attempt,
           result: result.output,
         });
       } catch (error) {
@@ -644,77 +1024,182 @@ async function runDurableParallelPhase(
         if (firstError === undefined) {
           interrupted = true;
           firstError = error;
-          await options.store.append(options.runId, "run_interrupted", {});
         }
         return;
       }
     }
   };
   await Promise.all(Array.from({ length: limit }, () => worker()));
+  if (firstError === undefined && abandoned) return false;
   if (firstError !== undefined) {
-    if (interrupted) throw firstError;
+    if (interrupted) {
+      await options.store.append(options.runId, "run_interrupted", {});
+      throw firstError;
+    }
     if (options.signal?.aborted) {
-      await commitCancelledRun(options.store, options.owner, options.runId);
+      const cancelled = await cancelDurableWorkflowRun(
+        options.store,
+        options.owner,
+        options.runId,
+      );
+      if (!cancelled) throw new Error("Workflow run not found");
       return false;
     }
-    await options.store.append(options.runId, "run_result", {
-      result: {
-        status: "error",
-        error: {
-          code: "task_failed",
-          message:
-            firstError instanceof Error
-              ? firstError.message
-              : String(firstError),
-        },
+    await terminalizeWorkflowRun(options.store, options.owner, options.runId, {
+      status: "error",
+      error: {
+        code: "task_failed",
+        message:
+          firstError instanceof Error ? firstError.message : String(firstError),
       },
     });
-    await options.store.append(options.runId, "run_terminal", {});
-    await appendDeliveryIntent(options.store, options.owner, options.runId);
-    // The coordinator has already committed the terminal result. Returning
-    // the projection keeps the public result aligned with durable state.
+    await ensureDeliveryIntent(options.store, options.owner, options.runId);
     return false;
   }
   return true;
 }
 
-async function appendDeliveryIntent(
-  store: WorkflowRunStore,
-  owner: WorkflowOwnerIdentity,
-  runId: string,
-): Promise<void> {
-  const projection = await recoverWorkflowRun({ store, owner }, runId);
-  if (projection.delivery) return;
-  await store.append(runId, "delivery_intent", {
-    deliveryId: workflowDeliveryId(runId),
-    message: workflowDeliveryMessage(projection),
-  });
+export async function claimTask(
+  options: DurableWorkflowPlanOptions,
+  task:
+    | WorkflowPlan["phases"][number]["tasks"][number]
+    | WorkflowProjectionTaskLike,
+  phaseId: string,
+): Promise<WorkflowTaskClaim | undefined> {
+  for (let retry = 0; retry < 3; retry++) {
+    const projection = await recoverWorkflowRun(
+      { store: options.store, owner: options.owner },
+      options.runId,
+    );
+    const existing = projection.tasks[task.id];
+    if (isRunDispatchSuspended(projection) || !isTaskDispatchable(existing))
+      return undefined;
+    const leaseEpoch = await options.store.getLeaseEpoch();
+    if (
+      existing?.claim &&
+      existing.claim.ownerId === options.owner.ownerId &&
+      existing.claim.ownerGeneration === options.owner.ownerGeneration &&
+      existing.claim.leaseEpoch === leaseEpoch
+    )
+      return undefined;
+    const attempt = (existing?.attempt ?? 0) + 1;
+    const taskClaim = createTaskClaim(options, task.id, attempt, leaseEpoch);
+    const appendResult = await options.store.appendIfCurrent(
+      options.runId,
+      projection.lastEventOrdinal,
+      "task_started",
+      { taskId: task.id, attempt, phaseId, claim: taskClaim },
+      leaseEpoch,
+    );
+    if (appendResult.status === "appended") return taskClaim;
+    const latest = await recoverWorkflowRun(
+      { store: options.store, owner: options.owner },
+      options.runId,
+    );
+    if (latest.tasks[task.id]?.claim) return undefined;
+  }
+  return undefined;
 }
 
-async function commitCancelledRun(
-  store: WorkflowRunStore,
-  owner: WorkflowOwnerIdentity,
-  runId: string,
-): Promise<WorkflowProjection> {
-  const current = await recoverWorkflowRun({ store, owner }, runId);
-  if (!current.terminal)
-    await store.append(runId, "run_result", {
-      result: { status: "cancelled" },
+async function appendClaimEvent(
+  options: DurableWorkflowPlanOptions,
+  taskClaim: WorkflowTaskClaim,
+  type: "task_succeeded" | "task_failed" | "usage_observed",
+  payload: Record<string, unknown>,
+): Promise<boolean> {
+  for (let retry = 0; retry < 16; retry++) {
+    const projection = await recoverWorkflowRun(
+      { store: options.store, owner: options.owner },
+      options.runId,
+    );
+    const current = projection.tasks[taskClaim.taskId];
+    if (!current?.claim || !sameClaim(current.claim, taskClaim)) return false;
+    const appendResult = await options.store.appendIfCurrent(
+      options.runId,
+      projection.lastEventOrdinal,
+      type,
+      { ...payload, claim: taskClaim },
+      taskClaim.leaseEpoch,
+    );
+    if (appendResult.status === "appended") return true;
+  }
+  return false;
+}
+
+async function runClaimedAgent(
+  options: DurableWorkflowPlanOptions,
+  task:
+    | WorkflowPlan["phases"][number]["tasks"][number]
+    | WorkflowProjectionTaskLike,
+  _taskClaim: WorkflowTaskClaim,
+): Promise<SubagentResult> {
+  const prompt = task.prompt;
+  if (!prompt) throw new Error(`Workflow task ${task.id} has no prompt`);
+  const work = (): Promise<SubagentResult> =>
+    options.runAgent({
+      prompt,
+      isolation: "in-process",
+      label: task.label ?? task.id,
+      signal: options.signal,
     });
-  const afterResult = await recoverWorkflowRun({ store, owner }, runId);
-  const hasCancellationMarker = (await store.readRun(runId)).events.some(
-    (event) => event.type === "run_cancelled",
+  return options.dispatcher?.run(work, options.signal) ?? work();
+}
+
+function createTaskClaim(
+  options: DurableWorkflowPlanOptions,
+  taskId: string,
+  attempt: number,
+  leaseEpoch: number,
+): WorkflowTaskClaim {
+  const token = createHash("sha256")
+    .update(
+      canonicalJson({
+        runId: options.runId,
+        taskId,
+        attempt,
+        ownerId: options.owner.ownerId,
+        ownerGeneration: options.owner.ownerGeneration,
+        leaseEpoch,
+        leaseToken: options.owner.leaseToken,
+      }),
+    )
+    .digest("hex");
+  return {
+    runId: options.runId,
+    taskId,
+    attempt,
+    ownerId: options.owner.ownerId,
+    ownerGeneration: options.owner.ownerGeneration,
+    leaseEpoch,
+    token,
+  };
+}
+
+function sameClaim(left: WorkflowTaskClaim, right: WorkflowTaskClaim): boolean {
+  return (
+    left.runId === right.runId &&
+    left.taskId === right.taskId &&
+    left.attempt === right.attempt &&
+    left.ownerId === right.ownerId &&
+    left.ownerGeneration === right.ownerGeneration &&
+    left.leaseEpoch === right.leaseEpoch &&
+    left.token === right.token
   );
-  if (!hasCancellationMarker) await store.append(runId, "run_cancelled", {});
-  await appendDeliveryIntent(store, owner, runId);
-  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+interface WorkflowProjectionTaskLike {
+  id: string;
+  prompt?: string;
+  label?: string;
+  attempt: number;
 }
 
 function isRunDispatchSuspended(projection: WorkflowProjection): boolean {
-  return (
-    projection.status === "blocked" ||
-    projection.status === "awaiting_budget" ||
-    projection.approval?.status === "pending"
+  return Boolean(
+    projection.blockers?.budget ||
+    projection.blockers?.approval ||
+    projection.blockers?.runtime ||
+    projection.cancellation,
   );
 }
 

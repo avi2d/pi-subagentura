@@ -4,10 +4,17 @@ import type {
   WorkflowRunStatus,
   WorkflowTerminalResult,
   WorkflowDeliveryIntent,
+  WorkflowDeliveryClaim,
   WorkflowApprovalRequest,
   WorkflowApprovalDecision,
+  WorkflowCancellationRequest,
 } from "./workflow-run-types";
-import { createHash } from "node:crypto";
+import {
+  verifyMutationPayload,
+  type WorkflowTaskClaim,
+} from "./workflow-mutation";
+
+export type { WorkflowTaskClaim } from "./workflow-mutation";
 
 export interface WorkflowProjectionTask {
   id: string;
@@ -19,6 +26,18 @@ export interface WorkflowProjectionTask {
   label?: string;
   result?: unknown;
   error?: string;
+  claim?: WorkflowTaskClaim;
+}
+export interface WorkflowProjectionBlockers {
+  budget?: { reason?: string };
+  approval?: {
+    requestId?: string;
+    reason?: string;
+    source: "approval";
+  };
+  runtime?: { reason: string };
+  tasks: Record<string, { reason?: string }>;
+  claims: Record<string, WorkflowTaskClaim>;
 }
 
 export interface WorkflowProjection {
@@ -29,11 +48,13 @@ export interface WorkflowProjection {
   revision: number;
   currentPhase?: string;
   tasks: Record<string, WorkflowProjectionTask>;
+  blockers: WorkflowProjectionBlockers;
   terminal?: WorkflowTerminalResult;
   usage: { input: number; output: number };
   usageLowerBound?: boolean;
   lastEventOrdinal: number;
   delivery?: WorkflowDeliveryIntent;
+  cancellation?: WorkflowCancellationRequest;
   approval?: {
     request: WorkflowApprovalRequest;
     status: "pending" | "approved" | "rejected";
@@ -62,6 +83,7 @@ export function projectWorkflowRun(
     status: "created",
     revision: 0,
     tasks: Object.create(null) as Record<string, WorkflowProjectionTask>,
+    blockers: { tasks: {}, claims: {} },
     usage: { input: 0, output: 0 },
     lastEventOrdinal: -1,
   };
@@ -72,28 +94,26 @@ export function projectWorkflowRun(
 
   for (const [ordinal, event] of events.entries()) {
     if (appliedEventIds.has(event.eventId)) continue;
-    appliedEventIds.add(event.eventId);
+    const baseRevision = projection.revision;
+    const baseOrdinal = projection.lastEventOrdinal;
     projection.lastEventOrdinal = ordinal;
-    projection.revision++;
     if (isMutationEvent(event.type)) {
-      const payload = event.payload ?? {};
-      const {
-        previousMutationHash,
-        mutationHash: candidate,
-        ...data
-      } = payload;
-      const expected = createHash("sha256")
-        .update(JSON.stringify({ previousMutationHash, payload: data }))
-        .digest("hex");
-      const hasHashEvidence =
-        previousMutationHash !== undefined || candidate !== undefined;
-      if (hasHashEvidence) {
-        if (previousMutationHash !== mutationHash || candidate !== expected)
-          continue;
-        mutationHash = candidate;
-        projection.mutationHash = candidate;
+      const verification = verifyMutationPayload(
+        event,
+        launch.owner,
+        baseRevision,
+        baseOrdinal,
+        mutationHash,
+      );
+      if (!verification.valid) continue;
+      const payload = event.payload;
+      if (isRecord(payload) && typeof payload.mutationHash === "string") {
+        mutationHash = verification.hash;
+        projection.mutationHash = verification.hash;
       }
     }
+    appliedEventIds.add(event.eventId);
+    projection.revision++;
     applyEvent(projection, event, usageKeys);
   }
   projection.tasks = Object.fromEntries(
@@ -128,13 +148,14 @@ function applyEvent(
     event.type !== "run_terminal" &&
     event.type !== "delivery_intent" &&
     event.type !== "delivery_dispatched" &&
-    event.type !== "delivery_receipt"
+    event.type !== "delivery_receipt" &&
+    event.type !== "run_cancelled"
   )
     return;
   switch (event.type) {
     case "run_created":
       projection.status = "created";
-      for (const task of payload.tasks ?? []) {
+      for (const task of creationTasks(payload)) {
         const id = String(task.id);
         if (!projection.tasks[id]) {
           projection.tasks[id] = {
@@ -150,37 +171,81 @@ function applyEvent(
       break;
     case "run_started":
       projection.status = "running";
+      delete projection.blockers.runtime;
+      refreshStatus(projection);
       break;
     case "run_awaiting_budget":
+      projection.blockers.budget = {
+        ...(payload.reason === undefined
+          ? {}
+          : { reason: String(payload.reason) }),
+      };
       projection.status = "awaiting_budget";
       break;
     case "run_budget_resumed":
-      projection.status = "running";
+      delete projection.blockers.budget;
+      refreshStatus(projection);
       break;
-    case "approval_requested":
-      projection.approval = {
-        request: payload.request as WorkflowApprovalRequest,
-        status: "pending",
+    case "approval_requested": {
+      const request = payload.request as WorkflowApprovalRequest;
+      projection.approval = { request, status: "pending" };
+      projection.blockers.approval = {
+        requestId: String(request.requestId),
+        source: "approval",
       };
+      if (!isTerminal(projection.status)) projection.status = "blocked";
       break;
+    }
     case "approval_decided":
       if (!projection.approval) return;
       projection.approval.status = payload.status;
       projection.approval.decision = payload as WorkflowApprovalDecision;
+      if (payload.status === "rejected") {
+        projection.blockers.approval = {
+          requestId: projection.approval.request.requestId,
+          source: "approval",
+          ...(payload.reason === undefined
+            ? {}
+            : { reason: String(payload.reason) }),
+        };
+        projection.status = "blocked";
+      } else {
+        delete projection.blockers.approval;
+        refreshStatus(projection);
+      }
+      break;
+    case "run_cancel_requested":
+      if (!projection.cancellation) {
+        projection.cancellation = payload as WorkflowCancellationRequest;
+      }
       break;
     case "task_started": {
       const id = String(payload.taskId);
       const previous = projection.tasks[id];
       const attempt = Number(payload.attempt ?? (previous?.attempt ?? 0) + 1);
+      const parsedClaim =
+        payload.claim === undefined
+          ? undefined
+          : parseClaim(payload.claim, projection.runId, id, attempt);
+      if (payload.claim !== undefined && !parsedClaim) return;
       if (previous && isTerminalTask(previous.status)) return;
       if (previous?.status === "blocked") return;
       if (previous && attempt < previous.attempt) return;
+      if (
+        previous?.claim &&
+        attempt === previous.attempt &&
+        (!parsedClaim || !sameClaim(previous.claim, parsedClaim))
+      )
+        return;
       projection.tasks[id] = {
         id,
         status: "running",
         attempt,
         ...definitionFields(previous),
+        ...(parsedClaim === undefined ? {} : { claim: parsedClaim }),
       };
+      if (parsedClaim) projection.blockers.claims[id] = parsedClaim;
+      else delete projection.blockers.claims[id];
       projection.status = "running";
       projection.currentPhase = payload.phaseId ?? projection.currentPhase;
       break;
@@ -192,6 +257,7 @@ function applyEvent(
       const attempt = Number(payload.attempt ?? previous?.attempt ?? 1);
       if (previous && attempt < previous.attempt) return;
       if (previous?.status === "succeeded") return;
+      if (!settlementMatches(previous, payload.claim, attempt)) return;
       projection.tasks[id] = {
         id,
         status: "succeeded",
@@ -199,6 +265,7 @@ function applyEvent(
         ...definitionFields(previous),
         ...(payload.result === undefined ? {} : { result: payload.result }),
       };
+      delete projection.blockers.claims[id];
       break;
     }
     case "task_failed": {
@@ -207,6 +274,7 @@ function applyEvent(
       const attempt = Number(payload.attempt ?? previous?.attempt ?? 1);
       if (previous && attempt < previous.attempt) return;
       if (previous && isTerminalTask(previous.status)) return;
+      if (!settlementMatches(previous, payload.claim, attempt)) return;
       projection.tasks[id] = {
         id,
         status: "failed",
@@ -214,6 +282,7 @@ function applyEvent(
         ...definitionFields(previous),
         error: String(payload.error ?? payload.message ?? "Task failed"),
       };
+      delete projection.blockers.claims[id];
       projection.status = "error";
       break;
     }
@@ -235,16 +304,18 @@ function applyEvent(
         attempt: previous?.attempt ?? 0,
         ...definitionFields(previous),
       };
-      projection.status =
-        event.type === "task_blocked"
-          ? "blocked"
-          : projection.status === "blocked" &&
-              !projection.runBlock &&
-              !Object.values(projection.tasks).some(
-                (task) => task.status === "blocked",
-              )
-            ? "running"
-            : projection.status;
+      delete projection.blockers.claims[id];
+      if (event.type === "task_blocked") {
+        projection.blockers.tasks[id] = {
+          ...(payload.reason === undefined
+            ? {}
+            : { reason: String(payload.reason) }),
+        };
+        projection.status = "blocked";
+      } else {
+        delete projection.blockers.tasks[id];
+        refreshStatus(projection);
+      }
       break;
     }
     case "task_appended": {
@@ -265,6 +336,22 @@ function applyEvent(
     case "usage_observed": {
       const taskId = payload.taskId;
       const attempt = payload.attempt;
+      const task =
+        taskId === undefined ? undefined : projection.tasks[String(taskId)];
+      if (payload.claim !== undefined) {
+        const parsedClaim =
+          task === undefined ||
+          !task.claim ||
+          !sameClaim(task.claim, payload.claim)
+            ? undefined
+            : parseClaim(
+                payload.claim,
+                projection.runId,
+                String(taskId),
+                Number(attempt),
+              );
+        if (!parsedClaim) return;
+      } else if (task?.claim) return;
       const key =
         taskId === undefined || attempt === undefined
           ? event.eventId
@@ -278,17 +365,37 @@ function applyEvent(
     case "run_interrupted":
       projection.status = "interrupted";
       projection.usageLowerBound = true;
+      for (const [id, task] of Object.entries(projection.tasks)) {
+        if (!task.claim) continue;
+        const { claim: _claim, ...withoutClaim } = task;
+        projection.tasks[id] = withoutClaim;
+        delete projection.blockers.claims[id];
+      }
       break;
-    case "run_blocked":
+    case "run_blocked": {
+      const source = payload.source === "approval" ? "approval" : "runtime";
+      const reason = String(payload.reason ?? "Workflow blocked");
       projection.status = "blocked";
-      projection.runBlock = {
-        reason: String(payload.reason ?? "Workflow blocked"),
-        source: payload.source === "approval" ? "approval" : "runtime",
-      };
+      projection.runBlock = { reason, source };
+      if (source === "approval") {
+        projection.blockers.approval = {
+          ...(projection.approval?.request.requestId === undefined
+            ? {}
+            : { requestId: projection.approval.request.requestId }),
+          source: "approval",
+          reason,
+        };
+      } else {
+        projection.blockers.runtime = { reason };
+      }
       break;
+    }
     case "run_cancelled":
-      projection.status = "cancelled";
-      projection.terminal = { status: "cancelled" };
+      if (!projection.terminal) {
+        projection.status = "cancelled";
+        projection.terminal = { status: "cancelled" };
+      }
+      projection.blockers.claims = {};
       break;
     case "run_result":
     case "run_terminal": {
@@ -298,6 +405,7 @@ function applyEvent(
       const terminal = (payload.result ?? payload) as WorkflowTerminalResult;
       projection.terminal = terminal;
       projection.status = terminal.status;
+      projection.blockers.claims = {};
       break;
     }
     case "delivery_intent":
@@ -314,14 +422,126 @@ function applyEvent(
       if (
         projection.delivery?.deliveryId === String(payload.deliveryId) &&
         projection.delivery.status !== "delivered"
-      )
+      ) {
         projection.delivery.status = "dispatched";
+        const claim = parseDeliveryClaim(payload);
+        if (claim) projection.delivery.claim = claim;
+      }
       break;
     case "delivery_receipt":
       if (projection.delivery?.deliveryId === String(payload.deliveryId))
         projection.delivery.status = "delivered";
       break;
   }
+}
+
+function creationTasks(
+  payload: Record<string, any>,
+): readonly Record<string, any>[] {
+  if (payload.plan && Array.isArray(payload.plan.phases)) {
+    return payload.plan.phases.flatMap((phase: Record<string, any>) =>
+      (Array.isArray(phase.tasks) ? phase.tasks : []).map(
+        (task: Record<string, any>) => ({
+          id: task.id,
+          phaseId: phase.id,
+          prompt: task.prompt,
+          ...(task.label === undefined ? {} : { label: task.label }),
+        }),
+      ),
+    );
+  }
+  return Array.isArray(payload.tasks) ? payload.tasks : [];
+}
+
+function parseDeliveryClaim(value: unknown): WorkflowDeliveryClaim | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.ownerId !== "string" ||
+    value.ownerId.length === 0 ||
+    !Number.isSafeInteger(value.ownerGeneration) ||
+    value.ownerGeneration < 0 ||
+    !Number.isSafeInteger(value.leaseEpoch) ||
+    value.leaseEpoch < 0
+  )
+    return undefined;
+  return {
+    ownerId: value.ownerId,
+    ownerGeneration: value.ownerGeneration,
+    leaseEpoch: value.leaseEpoch,
+  };
+}
+
+function parseClaim(
+  value: unknown,
+  runId: string,
+  taskId: string,
+  attempt: number,
+): WorkflowTaskClaim | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    value.runId !== runId ||
+    value.taskId !== taskId ||
+    value.attempt !== attempt ||
+    typeof value.ownerId !== "string" ||
+    !Number.isSafeInteger(value.ownerGeneration) ||
+    value.ownerGeneration < 0 ||
+    !Number.isSafeInteger(value.leaseEpoch) ||
+    value.leaseEpoch < 0 ||
+    typeof value.token !== "string" ||
+    value.token.length === 0
+  )
+    return undefined;
+  return value as unknown as WorkflowTaskClaim;
+}
+
+function settlementMatches(
+  previous: WorkflowProjectionTask | undefined,
+  candidate: unknown,
+  attempt: number,
+): boolean {
+  if (!previous?.claim) return candidate === undefined;
+  const parsed = parseClaim(
+    candidate,
+    previous.claim.runId,
+    previous.claim.taskId,
+    attempt,
+  );
+  return parsed !== undefined && sameClaim(previous.claim, parsed);
+}
+
+function sameClaim(left: WorkflowTaskClaim, right: unknown): boolean {
+  if (!isRecord(right)) return false;
+  return (
+    left.runId === right.runId &&
+    left.taskId === right.taskId &&
+    left.attempt === right.attempt &&
+    left.ownerId === right.ownerId &&
+    left.ownerGeneration === right.ownerGeneration &&
+    left.leaseEpoch === right.leaseEpoch &&
+    left.token === right.token
+  );
+}
+
+function refreshStatus(projection: WorkflowProjection): void {
+  if (isTerminal(projection.status)) return;
+  if (projection.blockers.budget) {
+    projection.status = "awaiting_budget";
+    return;
+  }
+  if (
+    projection.blockers.runtime ||
+    Object.keys(projection.blockers.tasks).length > 0
+  ) {
+    projection.status = "blocked";
+    return;
+  }
+  if (projection.status === "blocked" && projection.blockers.approval) return;
+  if (
+    ["blocked", "awaiting_budget", "interrupted", "created"].includes(
+      projection.status,
+    )
+  )
+    projection.status = "running";
 }
 
 function finite(value: unknown): number {
@@ -338,6 +558,10 @@ function definitionFields(
     ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
     ...(previous?.label === undefined ? {} : { label: previous.label }),
   };
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isTerminal(status: WorkflowRunStatus): boolean {

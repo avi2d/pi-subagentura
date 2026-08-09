@@ -1,5 +1,7 @@
-import { mkdir, open, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, mkdir, open, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 
 export interface WorkflowNamespaceLeaseRecord {
   schemaVersion: 1;
@@ -22,19 +24,42 @@ export interface WorkflowNamespaceLeaseOptions {
   processStartTime?: number;
 }
 
+interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface InterlockRecord {
+  schemaVersion: 1;
+  ownerId: string;
+  leaseToken: string;
+  lockToken: string;
+  acquiredAt: number;
+  processId?: number;
+  processStartTime?: number;
+}
+
 /**
  * Exclusive writer lease for one workflow namespace.
  *
  * Acquisition is create-only. A stale lease may be replaced only when its
  * record is valid and older than the configured threshold. Invalid or
  * ambiguous lease evidence fails closed rather than being overwritten.
+ * Every authoritative operation also holds an interlock. This closes the
+ * check-then-mutate window between lease validation and filesystem mutation.
  */
 export class WorkflowNamespaceLease {
   private readonly path: string;
+  private readonly interlockPath: string;
   private readonly now: () => number;
   private readonly staleAfterMs: number;
   private epoch = 0;
   private held = false;
+  private interlockDepth = 0;
+  private interlockFile?: Awaited<ReturnType<typeof open>>;
+  private interlockIdentity?: FileIdentity;
+  private interlockIdle: Promise<void> = Promise.resolve();
+  private resolveInterlockIdle?: () => void;
 
   public constructor(private readonly options: WorkflowNamespaceLeaseOptions) {
     if (!options.ownerId || !options.leaseToken || !options.namespace) {
@@ -48,7 +73,9 @@ export class WorkflowNamespaceLease {
     }
     this.now = options.now ?? Date.now;
     this.staleAfterMs = options.staleAfterMs ?? 5 * 60_000;
-    this.path = join(options.rootDir, options.namespace, "namespace.lease");
+    const namespaceDir = join(options.rootDir, options.namespace);
+    this.path = join(namespaceDir, "namespace.lease");
+    this.interlockPath = join(namespaceDir, "namespace.interlock");
   }
 
   public get leaseEpoch(): number {
@@ -66,68 +93,101 @@ export class WorkflowNamespaceLease {
   }
 
   public async acquire(): Promise<WorkflowNamespaceLeaseRecord> {
-    await mkdir(join(this.options.rootDir, this.options.namespace), {
-      recursive: true,
-      mode: 0o700,
-    });
-    const record = this.record(1);
-    try {
-      await this.writeExclusive(record);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (this.held) {
+      await this.assertHeld();
       const current = await this.read();
-      if (!current || this.now() - current.acquiredAt < this.staleAfterMs) {
-        throw new Error("Workflow namespace lease is held");
-      }
-      if (
-        current.processId !== undefined &&
-        isProcessAlive(current.processId)
-      ) {
-        if (
-          current.processId === process.pid &&
-          current.processStartTime !== undefined &&
-          current.processStartTime !==
-            Math.floor(Date.now() - process.uptime() * 1000)
-        ) {
-          throw new Error("Workflow namespace lease process identity changed");
-        }
-        throw new Error("Workflow namespace lease is held by a live process");
-      }
-      if (current.processId === undefined) {
-        throw new Error("Workflow namespace lease identity is ambiguous");
-      }
-      const replacement = this.record(current.epoch + 1);
-      await rm(this.path, { force: true });
-      try {
-        await this.writeExclusive(replacement);
-      } catch (retryError) {
-        throw new Error("Workflow namespace lease takeover raced", {
-          cause: retryError,
-        });
-      }
-      this.epoch = replacement.epoch;
-      this.held = true;
-      return replacement;
+      if (!current) throw new Error("Workflow namespace lease disappeared");
+      return current;
     }
-    this.epoch = record.epoch;
-    this.held = true;
-    return record;
+    const namespaceDir = dirname(this.path);
+    await mkdir(namespaceDir, { recursive: true, mode: 0o700 });
+    await syncDirectory(this.options.rootDir);
+    return this.withInterlock(async () => {
+      const record = this.record(1);
+      try {
+        await this.writeExclusive(record);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const current = await this.read();
+        if (!current || this.now() - current.acquiredAt < this.staleAfterMs) {
+          throw new Error("Workflow namespace lease is held");
+        }
+        if (
+          current.processId !== undefined &&
+          isProcessAlive(current.processId)
+        ) {
+          if (
+            current.processId === process.pid &&
+            current.processStartTime !== undefined &&
+            current.processStartTime !== currentProcessStartTime()
+          ) {
+            throw new Error(
+              "Workflow namespace lease process identity changed",
+            );
+          }
+          throw new Error("Workflow namespace lease is held by a live process");
+        }
+        if (current.processId === undefined) {
+          throw new Error("Workflow namespace lease identity is ambiguous");
+        }
+        const replacement = this.record(current.epoch + 1);
+        await rm(this.path, { force: false });
+        await syncDirectory(namespaceDir);
+        try {
+          await this.writeExclusive(replacement);
+        } catch (retryError) {
+          throw new Error("Workflow namespace lease takeover raced", {
+            cause: retryError,
+          });
+        }
+        this.epoch = replacement.epoch;
+        this.held = true;
+        return replacement;
+      }
+      this.epoch = record.epoch;
+      this.held = true;
+      return record;
+    });
   }
 
   public async release(): Promise<void> {
     if (!this.held) return;
-    const current = await this.read();
-    if (
-      current?.ownerId === this.options.ownerId &&
-      current.leaseToken === this.options.leaseToken &&
-      current.epoch === this.epoch
-    ) {
-      await rm(this.path, { force: true });
-    }
-    this.held = false;
+    if (this.interlockDepth > 0) await this.interlockIdle;
+    if (!this.held) return;
+    await this.withInterlock(async () => {
+      const current = await this.read();
+      if (
+        current?.ownerId === this.options.ownerId &&
+        current.leaseToken === this.options.leaseToken &&
+        current.epoch === this.epoch
+      ) {
+        await rm(this.path, { force: false });
+        await syncDirectory(dirname(this.path));
+      }
+      this.held = false;
+    });
   }
 
   public async assertHeld(): Promise<void> {
+    if (this.interlockDepth > 0) {
+      await this.assertHeldUnlocked();
+      return;
+    }
+    await this.withInterlock(async () => this.assertHeldUnlocked());
+  }
+
+  /** Run one filesystem mutation while the lease authority is interlocked. */
+  public async withAuthority<T>(operation: () => Promise<T>): Promise<T> {
+    await this.enterInterlock();
+    try {
+      await this.assertHeldUnlocked();
+      return await operation();
+    } finally {
+      await this.leaveInterlock();
+    }
+  }
+
+  private async assertHeldUnlocked(): Promise<void> {
     const current = await this.read();
     if (
       !this.held ||
@@ -158,31 +218,162 @@ export class WorkflowNamespaceLease {
     };
   }
 
+  private interlockRecord(): InterlockRecord {
+    return {
+      schemaVersion: 1,
+      ownerId: this.options.ownerId,
+      leaseToken: this.options.leaseToken,
+      lockToken: randomUUID(),
+      acquiredAt: this.now(),
+      ...(this.options.processId === undefined
+        ? {}
+        : {
+            processId: this.options.processId,
+            ...(this.options.processStartTime === undefined
+              ? {}
+              : { processStartTime: this.options.processStartTime }),
+          }),
+    };
+  }
+
+  private async withInterlock<T>(operation: () => Promise<T>): Promise<T> {
+    await this.enterInterlock();
+    try {
+      return await operation();
+    } finally {
+      await this.leaveInterlock();
+    }
+  }
+
+  private async enterInterlock(): Promise<void> {
+    if (this.interlockDepth > 0) {
+      this.interlockDepth++;
+      return;
+    }
+    await mkdir(dirname(this.interlockPath), { recursive: true, mode: 0o700 });
+    let file;
+    try {
+      file = await open(
+        this.interlockPath,
+        fsConstants.O_WRONLY |
+          fsConstants.O_CREAT |
+          fsConstants.O_EXCL |
+          fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("Workflow namespace lease interlock is held", {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+    try {
+      const identity = fileIdentity(await file.stat());
+      await writeFully(
+        file,
+        Buffer.from(`${JSON.stringify(this.interlockRecord())}\n`, "utf8"),
+      );
+      await file.sync();
+      await assertDescriptorAndTarget(file, this.interlockPath, identity);
+      this.interlockFile = file;
+      this.interlockIdentity = identity;
+      this.interlockIdle = new Promise<void>((resolve) => {
+        this.resolveInterlockIdle = resolve;
+      });
+      this.interlockDepth = 1;
+    } catch (error) {
+      try {
+        await file.close();
+      } catch (closeError) {
+        throw new Error("Failed to close workflow namespace interlock", {
+          cause: closeError,
+        });
+      }
+      try {
+        await rm(this.interlockPath, { force: false });
+      } catch (cleanupError) {
+        throw new Error("Failed to remove workflow namespace interlock", {
+          cause: new AggregateError([error, cleanupError]),
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async leaveInterlock(): Promise<void> {
+    if (this.interlockDepth === 0) return;
+    this.interlockDepth--;
+    if (this.interlockDepth > 0) return;
+    const file = this.interlockFile;
+    const identity = this.interlockIdentity;
+    this.interlockFile = undefined;
+    this.interlockIdentity = undefined;
+    try {
+      if (!file || !identity)
+        throw new Error("Workflow namespace interlock state is missing");
+      await assertDescriptorAndTarget(file, this.interlockPath, identity);
+      await rm(this.interlockPath, { force: false });
+      await syncDirectory(dirname(this.interlockPath));
+    } finally {
+      await file?.close();
+      this.resolveInterlockIdle?.();
+      this.resolveInterlockIdle = undefined;
+      this.interlockIdle = Promise.resolve();
+    }
+  }
+
   private async writeExclusive(
     record: WorkflowNamespaceLeaseRecord,
   ): Promise<void> {
-    const file = await open(this.path, "wx", 0o600);
+    const file = await open(
+      this.path,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW,
+      0o600,
+    );
     try {
-      await file.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await writeFully(
+        file,
+        Buffer.from(`${JSON.stringify(record)}\n`, "utf8"),
+      );
       await file.sync();
     } finally {
       await file.close();
     }
+    await syncDirectory(dirname(this.path));
   }
 
   private async read(): Promise<WorkflowNamespaceLeaseRecord | undefined> {
+    let file;
     try {
-      const parsed = JSON.parse(await readFile(this.path, "utf8")) as
+      file = await open(
+        this.path,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      );
+      const identity = fileIdentity(await file.stat());
+      const parsed = JSON.parse((await file.readFile()).toString("utf8")) as
         WorkflowNamespaceLeaseRecord | undefined;
+      await assertDescriptorAndTarget(file, this.path, identity);
       if (
         !parsed ||
         parsed.schemaVersion !== 1 ||
         typeof parsed.ownerId !== "string" ||
+        parsed.ownerId.length === 0 ||
         typeof parsed.leaseToken !== "string" ||
+        parsed.leaseToken.length === 0 ||
         !Number.isSafeInteger(parsed.epoch) ||
+        parsed.epoch < 1 ||
         !Number.isSafeInteger(parsed.acquiredAt) ||
+        parsed.acquiredAt < 0 ||
         (parsed.processId !== undefined &&
-          (!Number.isSafeInteger(parsed.processId) || parsed.processId <= 0))
+          (!Number.isSafeInteger(parsed.processId) || parsed.processId <= 0)) ||
+        (parsed.processStartTime !== undefined &&
+          (!Number.isSafeInteger(parsed.processStartTime) ||
+            parsed.processStartTime < 0))
       ) {
         return undefined;
       }
@@ -190,6 +381,8 @@ export class WorkflowNamespaceLease {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw new Error("Workflow namespace lease is corrupt", { cause: error });
+    } finally {
+      await file?.close();
     }
   }
 }
@@ -204,5 +397,68 @@ function isProcessAlive(processId: number): boolean {
     if (code === "EPERM") return true;
     if (code === "ESRCH") return false;
     throw error;
+  }
+}
+
+function currentProcessStartTime(): number {
+  return Math.floor(Date.now() - process.uptime() * 1000);
+}
+
+function fileIdentity(info: { dev: number; ino: number }): FileIdentity {
+  return { dev: info.dev, ino: info.ino };
+}
+
+async function assertDescriptorAndTarget(
+  file: Awaited<ReturnType<typeof open>>,
+  path: string,
+  expected: FileIdentity,
+): Promise<void> {
+  const descriptor = await file.stat();
+  if (!descriptor.isFile() || descriptor.nlink !== 1)
+    throw new Error(`Workflow storage path is not regular: ${path}`);
+  const target = await lstat(path);
+  if (!target.isFile() || target.nlink !== 1)
+    throw new Error(`Workflow storage path is not regular: ${path}`);
+  const targetIdentity = fileIdentity(target);
+  if (
+    expected.dev !== targetIdentity.dev ||
+    expected.ino !== targetIdentity.ino
+  )
+    throw new Error(`Workflow storage descriptor changed: ${path}`);
+  const descriptorIdentity = fileIdentity(descriptor);
+  if (
+    descriptorIdentity.dev !== targetIdentity.dev ||
+    descriptorIdentity.ino !== targetIdentity.ino
+  )
+    throw new Error(`Workflow storage target changed: ${path}`);
+}
+
+async function writeFully(
+  file: Awaited<ReturnType<typeof open>>,
+  bytes: Buffer,
+): Promise<void> {
+  let written = 0;
+  while (written < bytes.length) {
+    const result = await file.write(
+      bytes,
+      written,
+      bytes.length - written,
+      written,
+    );
+    if (!Number.isSafeInteger(result.bytesWritten) || result.bytesWritten <= 0)
+      throw new Error("Workflow namespace lease short write");
+    written += result.bytesWritten;
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const directory = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }

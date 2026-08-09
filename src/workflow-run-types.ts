@@ -61,6 +61,7 @@ export interface WorkflowAppendReceipt {
 export interface WorkflowEventEnvelope<T extends string = string, P = unknown> {
   schemaVersion: typeof WORKFLOW_RUN_TYPES_VERSION;
   eventId: string;
+  eventOrdinal?: number;
   runId: string;
   runEpoch: number;
   type: T;
@@ -73,11 +74,25 @@ export interface WorkflowTerminalResult {
   error?: { code: string; message: string };
 }
 
+export interface WorkflowDeliveryClaim {
+  ownerId: string;
+  ownerGeneration: number;
+  leaseEpoch: number;
+}
+
 export interface WorkflowDeliveryIntent {
   deliveryId: string;
   kind: "terminal";
   status: "pending" | "dispatched" | "delivered";
   message: string;
+  claim?: WorkflowDeliveryClaim;
+}
+
+export interface WorkflowCancellationRequest {
+  ownerId: string;
+  ownerGeneration: number;
+  leaseEpoch: number;
+  requestId: string;
 }
 
 export interface WorkflowApprovalRequest {
@@ -101,6 +116,19 @@ export interface WorkflowApprovalDecision {
   ownerGeneration?: number;
   leaseEpoch?: number;
   version?: number;
+}
+
+export function validateWorkflowCancellationRequest(
+  request: WorkflowCancellationRequest,
+): void {
+  if (!request.requestId || !request.ownerId) {
+    throw new Error("Invalid workflow cancellation request");
+  }
+  for (const value of [request.ownerGeneration, request.leaseEpoch]) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Invalid workflow cancellation request authority");
+    }
+  }
 }
 
 export function validateWorkflowApprovalRequest(

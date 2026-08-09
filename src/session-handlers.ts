@@ -263,6 +263,24 @@ function cleanupScopeGeneration(
   return durableJobsDrained;
 }
 
+async function releaseDurableWorkflowAuthorityWithRetry(
+  scope: SessionScope,
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await releaseDurableWorkflowAuthority(scope);
+      return;
+    } catch (error) {
+      if (attempt === 2) {
+        console.error(
+          "[subagentura] durable workflow authority release failed during shutdown",
+          error,
+        );
+      }
+    }
+  }
+}
+
 export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
   const scope = createSessionScope(pi);
   const globalState = getGlobalState() as any;
@@ -404,9 +422,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
       closeActiveInteractiveSupervisor(owner);
       clearSessionParsers(owner);
       cleanupScopeGeneration(scope, owner, event, ctx);
-      void releaseDurableWorkflowAuthority(scope).catch(() => {
-        /* shutdown must not block session teardown */
-      });
+      const releasePromise = releaseDurableWorkflowAuthorityWithRetry(scope);
       scope.parentStreaming = false;
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
@@ -433,9 +449,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
           }
         }
       }
-
-      await durableJobsDrained;
-      await revokeAndReleaseDurableWorkflowAuthoritySafely(scope, durableStore);
+      await releasePromise;
     },
   );
 

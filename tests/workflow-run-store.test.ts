@@ -1,6 +1,7 @@
 import { mkdtemp, appendFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { workflowDeliveryId } from "../src/workflow-durable-plan-runner";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   WorkflowRunCorruptionError,
@@ -76,7 +77,7 @@ describe("WorkflowRunStore", () => {
       result: { status: "done" },
     });
     await store.append("old-terminal", "delivery_receipt", {
-      deliveryId: "terminal-delivery",
+      deliveryId: workflowDeliveryId("old-terminal"),
     });
     await store.createRun({
       runId: "active",

@@ -115,6 +115,8 @@ These commands are intended for people at the Pi prompt.
 | `/workflows`            | Select and run a saved workflow                                                                        |
 | `/list-workflows`       | Alias for `/workflows`                                                                                 |
 | `/workflow-status`      | List workflow jobs and their live or terminal status                                                   |
+| `/workflow-resume`      | Resume a durable workflow with a fenced operator authority envelope                                    |
+| `/workflow-cancel`      | Request authoritative cancellation with a fenced operator authority envelope                           |
 | `/workflow-plan`        | Create or view a durable workflow projection and revision; use `create <task>` for host-owned creation |
 | `/workflow-plan-append` | Append a future task with an explicit revision fence                                                   |
 | `/workflow-plan-mutate` | Block, unblock, or skip future work with a revision fence                                              |

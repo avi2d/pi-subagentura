@@ -495,4 +495,24 @@ describe("session handler lifecycle callbacks", () => {
     expect(aState.eventByteCursor).toBeGreaterThan(0);
     expect(bState.eventByteCursor).toBeGreaterThan(0);
   });
+
+  it("awaits and retries durable authority release on the production shutdown path", async () => {
+    const registration = registerHandlers();
+    const ctx = startSession(registration, root, "session-a");
+    const release = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("transient release failure"))
+      .mockResolvedValueOnce(undefined);
+    registration.sessionScope.durableWorkflowStore = { release } as any;
+    registration.sessionScope.durableWorkflowController = {} as any;
+
+    const shutdown = registration.handlers.get("session_shutdown")![0];
+    const result = shutdown({ reason: "quit" }, ctx);
+
+    expect(result).toBeInstanceOf(Promise);
+    await result;
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(registration.sessionScope.durableWorkflowStore).toBeUndefined();
+    expect(registration.sessionScope.durableWorkflowController).toBeUndefined();
+  });
 });
