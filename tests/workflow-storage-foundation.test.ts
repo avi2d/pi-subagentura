@@ -987,7 +987,9 @@ describe("workflow storage foundation", () => {
       Buffer.from(`${JSON.stringify({ ...valid, schemaVersion: 2 })}\n`),
       Buffer.from(`${JSON.stringify({ ...valid, unexpected: true })}\n`),
       Buffer.concat([
-        Buffer.from('{"schemaVersion":1,"eventId":"event-0","eventOrdinal":0,"runId":"record-faults","runEpoch":0,"type":"run_started","payload":"'),
+        Buffer.from(
+          '{"schemaVersion":1,"eventId":"event-0","eventOrdinal":0,"runId":"record-faults","runEpoch":0,"type":"run_started","payload":"',
+        ),
         Buffer.from([0xff]),
         Buffer.from('"}\n'),
       ]),
