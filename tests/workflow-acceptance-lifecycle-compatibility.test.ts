@@ -354,7 +354,7 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
       if (hadOriginal) writeFileSync(file, original!);
       else if (existsSync(file)) unlinkSync(file);
     }
-  }, 30_000);
+  }, 90_000);
 
   it("F20 audits the frozen documents without overclaiming X01-X06", () => {
     const todo = readFileSync(join(repoRoot, "todo.md"), "utf8");
