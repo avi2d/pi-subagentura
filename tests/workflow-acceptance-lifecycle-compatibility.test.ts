@@ -364,7 +364,7 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     expect(qa).toContain(
       "**X05:** exactly-once execution/notification claims.",
     );
-    expect(frozen).toContain("Status: **not merge-ready**");
+    expect(frozen).toContain("Status: **merge-ready**");
     expect(frozen).toContain("X01–X05 remain explicitly deferred");
     expect(frozen).toContain("X06 remains");
     expect(readme).toContain("Process-isolated durable launch");
