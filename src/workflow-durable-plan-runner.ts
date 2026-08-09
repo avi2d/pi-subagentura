@@ -420,6 +420,22 @@ export class DurableWorkflowController {
     return this.getStatus(runId);
   }
 
+  public async reconcileDelivery(
+    runId: string,
+    entries: readonly unknown[],
+  ): Promise<WorkflowProjection | undefined> {
+    let projection = await this.getStatus(runId);
+    if (!projection?.terminal) return projection;
+    projection = await ensureDeliveryIntent(
+      this.options.store,
+      this.options.owner,
+      runId,
+    );
+    const deliveryId = projection.delivery?.deliveryId;
+    if (!deliveryId || !this.deliveryBroker) return projection;
+    return this.deliveryBroker.reconcile(runId, entries);
+  }
+
   public async requestApproval(
     runId: string,
     request: WorkflowApprovalRequest,

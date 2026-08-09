@@ -25,6 +25,8 @@ export interface DurableWorkflowDeliveryTransportObject {
     message: DurableWorkflowDeliveryMessage,
     idempotencyKey: string,
   ): Promise<void>;
+  /** Read entries persisted by the owning session, never transport return data. */
+  getPersistedEntries?: () => readonly unknown[];
 }
 
 export type WorkflowDeliveryTransport =
@@ -83,6 +85,24 @@ export class DurableWorkflowDeliveryBroker {
     );
   }
 
+  /**
+   * Reconcile a delivery against entries already persisted in the owning Pi
+   * session. A matching custom entry is the only evidence that permits a
+   * receipt without another transport call; otherwise the normal retry path
+   * is used.
+   */
+  public async reconcile(
+    runId: string,
+    entries: readonly unknown[],
+  ): Promise<WorkflowProjection | undefined> {
+    const projection = await this.recover(runId);
+    const deliveryId = projection?.delivery?.deliveryId;
+    if (!deliveryId) return projection;
+    return this.serialized(deliveryId, () =>
+      this.reconcileOnce(runId, deliveryId, entries),
+    );
+  }
+
   /** Alias used by callers that name the operation after its outbox event. */
   public dispatch(
     runId: string,
@@ -136,7 +156,9 @@ export class DurableWorkflowDeliveryBroker {
     if (projection.delivery.status === "delivered") return projection;
 
     const remembered = this.successful.get(deliveryId);
-    if (remembered) return this.appendReceipt(runId, deliveryId);
+    if (remembered) {
+      return this.appendReceipt(runId, deliveryId, this.persistedEntries());
+    }
 
     let claim = this.claimed.get(deliveryId);
     if (projection.delivery.status === "pending") {
@@ -169,7 +191,11 @@ export class DurableWorkflowDeliveryBroker {
     try {
       await this.send(claim.message);
       this.successful.set(deliveryId, claim);
-      projection = await this.appendReceipt(runId, deliveryId);
+      projection = await this.appendReceipt(
+        runId,
+        deliveryId,
+        this.persistedEntries(),
+      );
       this.claimed.delete(deliveryId);
       return projection;
     } catch (error) {
@@ -177,6 +203,53 @@ export class DurableWorkflowDeliveryBroker {
       this.claimed.delete(deliveryId);
       throw error;
     }
+  }
+
+  private async reconcileOnce(
+    runId: string,
+    deliveryId: string,
+    entries: readonly unknown[],
+  ): Promise<WorkflowProjection | undefined> {
+    let projection = await this.recover(runId);
+    if (!projection || projection.delivery?.deliveryId !== deliveryId)
+      return projection;
+    if (projection.delivery.status === "delivered") return projection;
+
+    if (!hasPersistedDeliveryEvidence(entries, deliveryId)) {
+      return this.deliverOnce(runId, deliveryId);
+    }
+
+    let claim = this.claimed.get(deliveryId);
+    if (projection.delivery.status === "pending") {
+      claim = await this.claimPending(runId, deliveryId);
+    } else if (projection.delivery.status === "dispatched") {
+      const persistedClaim = projection.delivery.claim;
+      const leaseEpoch = await this.options.store.getLeaseEpoch();
+      if (
+        persistedClaim &&
+        persistedClaim.ownerId === this.options.owner.ownerId &&
+        persistedClaim.ownerGeneration === this.options.owner.ownerGeneration &&
+        persistedClaim.leaseEpoch === leaseEpoch
+      ) {
+        claim = {
+          runId,
+          deliveryId,
+          ownerId: persistedClaim.ownerId,
+          ownerGeneration: persistedClaim.ownerGeneration,
+          leaseEpoch: persistedClaim.leaseEpoch,
+          message: this.messageFor(projection),
+        };
+        this.claimed.set(deliveryId, claim);
+      } else {
+        claim = await this.reclaimDispatched(runId, deliveryId);
+      }
+    }
+    if (!claim) return this.recover(runId);
+
+    this.successful.set(deliveryId, claim);
+    projection = await this.appendReceipt(runId, deliveryId, entries);
+    this.claimed.delete(deliveryId);
+    return projection;
   }
 
   private async reclaimDispatched(
@@ -268,13 +341,16 @@ export class DurableWorkflowDeliveryBroker {
     if (projection.delivery.status === "delivered") return projection;
     if (!this.successful.has(deliveryId))
       return this.deliverOnce(runId, deliveryId);
-    return this.appendReceipt(runId, deliveryId);
+    return this.appendReceipt(runId, deliveryId, this.persistedEntries());
   }
 
   private async appendReceipt(
     runId: string,
     deliveryId: string,
+    evidenceEntries: readonly unknown[] = this.persistedEntries(),
   ): Promise<WorkflowProjection | undefined> {
+    if (!hasPersistedDeliveryEvidence(evidenceEntries, deliveryId))
+      return this.recover(runId);
     for (let attempt = 0; attempt < 8; attempt++) {
       const projection = await this.recover(runId);
       if (!projection || projection.delivery?.deliveryId !== deliveryId)
@@ -310,6 +386,16 @@ export class DurableWorkflowDeliveryBroker {
       if (appendResult.status === "appended") return this.recover(runId);
     }
     return this.recover(runId);
+  }
+
+  private persistedEntries(): readonly unknown[] {
+    const transport = this.options.transport;
+    if (typeof transport === "function") return [];
+    try {
+      return transport.getPersistedEntries?.() ?? [];
+    } catch {
+      return [];
+    }
   }
 
   private async send(message: DurableWorkflowDeliveryMessage): Promise<void> {
@@ -351,4 +437,29 @@ export class DurableWorkflowDeliveryBroker {
       throw error;
     }
   }
+}
+
+function hasPersistedDeliveryEvidence(
+  entries: readonly unknown[],
+  deliveryId: string,
+): boolean {
+  return entries.some((entry) => {
+    if (!isRecord(entry)) return false;
+    const message = isRecord(entry.message) ? entry.message : undefined;
+    const customType =
+      entry.customType ?? message?.customType ?? entry.type ?? undefined;
+    if (customType !== "workflow-notify") return false;
+    const details = [
+      entry.details,
+      message?.details,
+      isRecord(entry.data) ? entry.data.details : undefined,
+    ];
+    return details.some(
+      (value) => isRecord(value) && value.deliveryId === deliveryId,
+    );
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null;
 }

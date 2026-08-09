@@ -1,12 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSessionScope } from "../src/session-scope";
 import { DurableWorkflowDeliveryBroker } from "../src/workflow-durable-delivery";
 import {
   runDurableWorkflowForSession,
   resumeDurableWorkflowForSession,
+  dispatchTerminalDeliveryForSession,
 } from "../src/workflow-owner";
 import {
   DurableWorkflowController as RunnerController,
@@ -107,17 +108,28 @@ describe("durable workflow control plane", () => {
     const secondStarted = new Promise<void>((resolve) => {
       secondCall = resolve;
     });
-    const transport = async (_message: unknown, key: string): Promise<void> => {
+    const entries: unknown[] = [];
+    const send = async (
+      message: { deliveryId: string },
+      key: string,
+    ): Promise<void> => {
       calls++;
       expect(key).toBe(deliveryId);
       if (calls === 1) throw new Error("transport unavailable");
+      entries.push({
+        customType: "workflow-notify",
+        details: { deliveryId: message.deliveryId },
+      });
       secondCall!();
       await entered;
     };
     const broker = new DurableWorkflowDeliveryBroker({
       store,
       owner,
-      transport,
+      transport: {
+        send,
+        getPersistedEntries: () => entries,
+      },
     });
 
     await expect(broker.deliver(runId, deliveryId)).rejects.toThrow(
@@ -274,12 +286,20 @@ describe("durable workflow control plane", () => {
     });
 
     let calls = 0;
+    const entries: unknown[] = [];
     const broker = new DurableWorkflowDeliveryBroker({
       store,
       owner,
-      transport: async (_message, key) => {
-        expect(key).toBe(deliveryId);
-        calls++;
+      transport: {
+        send: async (message, key) => {
+          expect(key).toBe(deliveryId);
+          calls++;
+          entries.push({
+            customType: "workflow-notify",
+            details: { deliveryId: message.deliveryId },
+          });
+        },
+        getPersistedEntries: () => entries,
       },
     });
 
@@ -332,6 +352,70 @@ describe("durable workflow control plane", () => {
     expect(record.events.at(-1)?.payload).toMatchObject({
       ownerGeneration: owner.ownerGeneration + 1,
     });
+  });
+
+  it("reconciles a persisted matching session entry without sending again", async () => {
+    const runId = "delivery-reconcile";
+    const deliveryId = workflowDeliveryId(runId);
+    const store = await createStoreRun(runId, {
+      terminal: true,
+      delivery: true,
+    });
+    await store.append(runId, "delivery_dispatched", {
+      deliveryId,
+      ownerId: "dead-broker",
+      ownerGeneration: 1,
+      leaseEpoch: await store.getLeaseEpoch(),
+    });
+    const send = vi.fn(async () => {
+      throw new Error("transport must not run for persisted evidence");
+    });
+    const broker = new DurableWorkflowDeliveryBroker({
+      store,
+      owner,
+      transport: send,
+    });
+
+    const result = await broker.reconcile(runId, [
+      {
+        customType: "workflow-notify",
+        details: { deliveryId },
+      },
+    ]);
+
+    expect(result?.delivery?.status).toBe("delivered");
+    expect(send).not.toHaveBeenCalled();
+    const record = await store.readRun(runId);
+    expect(
+      record.events.filter((event) => event.type === "delivery_receipt"),
+    ).toHaveLength(1);
+  });
+
+  it("uses one broker path for terminal delivery from the session runner", async () => {
+    const entries: unknown[] = [];
+    const sendMessage = vi.fn().mockImplementation((message) => {
+      entries.push(message);
+      return undefined;
+    });
+    const scope = createSessionScope({ sendMessage } as any);
+    scope.durableWorkflowOwner = owner;
+    scope.sessionManager = { getEntries: () => entries };
+    const root = await mkdtemp(join(tmpdir(), "workflow-runner-delivery-"));
+    roots.push(root);
+    const result = await runDurableWorkflowForSession(root, scope, {
+      runId: "runner-delivery",
+      plan,
+      runAgent: async () => success("runner"),
+    });
+
+    expect(result.delivery?.status).toBe("delivered");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toMatchObject({
+      customType: "workflow-notify",
+      details: { deliveryId: workflowDeliveryId("runner-delivery") },
+    });
+    await dispatchTerminalDeliveryForSession(root, scope, result);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("resumes from the declarative plan persisted in run_created", async () => {

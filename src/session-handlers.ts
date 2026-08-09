@@ -53,17 +53,10 @@ import {
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
 import {
-  canonicalWorkflowProjectKey,
-  runDurableWorkflowForSession,
-  workflowLeaseToken,
+  durableWorkflowControllerForSession,
+  durableWorkflowStoreForSession,
   workflowOwnerFromSessionContext,
-  workflowSessionOwnerId,
 } from "./workflow-owner";
-import { recoverWorkflowRunsAtStartup } from "./workflow-recovery";
-import {
-  activeDurableExecutionRegistry,
-  drainActiveDurableExecutions,
-} from "./workflow-durable-plan-runner";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -280,6 +273,26 @@ async function runRecoveryAgent(
   } finally {
     input.signal?.removeEventListener("abort", forwardAbort);
     removeInProcessJob(job.id, owner);
+  }
+}
+
+async function reconcileDurableWorkflowDeliveries(
+  scope: SessionScope,
+  cwd: string,
+): Promise<void> {
+  const controller = durableWorkflowControllerForSession(cwd, scope);
+  const store = durableWorkflowStoreForSession(cwd, scope);
+  if (!controller || !store) return;
+  const entries = scope.sessionManager?.getEntries?.() ?? [];
+  for (const runId of await store.listRunIds()) {
+    try {
+      await controller.reconcileDelivery(runId, entries);
+    } catch (error) {
+      console.error(
+        `[subagentura] durable workflow delivery reconciliation failed for ${runId}`,
+        error,
+      );
+    }
   }
 }
 
@@ -523,6 +536,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
         );
       }
     }
+    void reconcileDurableWorkflowDeliveries(scope, ctx.cwd);
     ensureInteractivePoller(globalState);
     const recoveryReason = event.reason;
     if (
