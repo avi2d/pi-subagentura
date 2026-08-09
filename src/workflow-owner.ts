@@ -12,6 +12,7 @@ import type {
 import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import type { SessionScope } from "./session-scope";
 import { WorkflowSessionDispatcher } from "./workflow-dispatcher";
+import type { WorkflowProjection } from "./workflow-projection-repository";
 
 export interface WorkflowOwnerIdentityInput {
   projectKey: string;
@@ -110,33 +111,58 @@ export function durableWorkflowControllerForSession(
 function sessionWorkflowDeliveryTransport(
   scope: SessionScope,
 ): WorkflowDeliveryTransport {
-  return async (
-    delivery: DurableWorkflowDeliveryMessage,
-    idempotencyKey: string,
-  ): Promise<void> => {
-    const sendMessage = scope.pi.sendMessage;
-    if (typeof sendMessage !== "function") {
-      throw new Error("Parent-session workflow delivery is unavailable.");
-    }
-    await Promise.resolve(
-      sendMessage.call(
-        scope.pi,
-        {
-          customType: "workflow-notify",
-          content: delivery.message,
-          display: true,
-          details: {
-            workflowId: delivery.runId,
-            status: delivery.status,
-            durable: true,
-            deliveryId: delivery.deliveryId,
-            idempotencyKey,
+  return {
+    send: async (
+      delivery: DurableWorkflowDeliveryMessage,
+      idempotencyKey: string,
+    ): Promise<void> => {
+      const sendMessage = scope.pi.sendMessage;
+      if (typeof sendMessage !== "function") {
+        throw new Error("Parent-session workflow delivery is unavailable.");
+      }
+      await Promise.resolve(
+        sendMessage.call(
+          scope.pi,
+          {
+            customType: "workflow-notify",
+            content: delivery.message,
+            display: true,
+            details: {
+              workflowId: delivery.runId,
+              status: delivery.status,
+              durable: true,
+              deliveryId: delivery.deliveryId,
+              idempotencyKey,
+            },
           },
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      ),
-    );
+          { deliverAs: "followUp", triggerTurn: true },
+        ),
+      );
+    },
+    getPersistedEntries: () => scope.sessionManager?.getEntries?.() ?? [],
   };
+}
+
+export async function dispatchTerminalDeliveryForSession(
+  rootDir: string,
+  scope: SessionScope,
+  projection: WorkflowProjection,
+): Promise<WorkflowProjection> {
+  if (
+    !projection.terminal ||
+    !projection.delivery ||
+    projection.delivery.status === "delivered"
+  ) {
+    return projection;
+  }
+  const controller = durableWorkflowControllerForSession(rootDir, scope);
+  if (!controller) return projection;
+  return (
+    (await controller.dispatchDelivery(
+      projection.runId,
+      projection.delivery.deliveryId,
+    )) ?? projection
+  );
 }
 
 export function durableWorkflowStoreForSession(
@@ -160,6 +186,16 @@ export function runDurableWorkflowForSession(
     store,
     owner,
     dispatcher: durableWorkflowDispatcherForSession(scope),
+  }).then(async (projection) => {
+    try {
+      return await dispatchTerminalDeliveryForSession(
+        rootDir,
+        scope,
+        projection,
+      );
+    } catch {
+      return projection;
+    }
   });
 }
 
@@ -198,6 +234,16 @@ export async function resumeDurableWorkflowForSession(
     store,
     owner,
     dispatcher: durableWorkflowDispatcherForSession(scope),
+  }).then(async (projection) => {
+    try {
+      return await dispatchTerminalDeliveryForSession(
+        rootDir,
+        scope,
+        projection,
+      );
+    } catch {
+      return projection;
+    }
   });
 }
 

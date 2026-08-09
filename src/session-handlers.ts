@@ -44,7 +44,11 @@ import {
   releaseDurableWorkflowAuthority,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
-import { workflowOwnerFromSessionContext } from "./workflow-owner";
+import {
+  durableWorkflowControllerForSession,
+  durableWorkflowStoreForSession,
+  workflowOwnerFromSessionContext,
+} from "./workflow-owner";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -167,6 +171,26 @@ async function revokeAndReleaseDurableWorkflowAuthoritySafely(
   if (scope.durableWorkflowStore === store) {
     scope.durableWorkflowStore = undefined;
     scope.durableWorkflowController = undefined;
+  }
+}
+
+async function reconcileDurableWorkflowDeliveries(
+  scope: SessionScope,
+  cwd: string,
+): Promise<void> {
+  const controller = durableWorkflowControllerForSession(cwd, scope);
+  const store = durableWorkflowStoreForSession(cwd, scope);
+  if (!controller || !store) return;
+  const entries = scope.sessionManager?.getEntries?.() ?? [];
+  for (const runId of await store.listRunIds()) {
+    try {
+      await controller.reconcileDelivery(runId, entries);
+    } catch (error) {
+      console.error(
+        `[subagentura] durable workflow delivery reconciliation failed for ${runId}`,
+        error,
+      );
+    }
   }
 }
 
@@ -407,6 +431,8 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
         );
       }
     }
+    void reconcileDurableWorkflowDeliveries(scope, ctx.cwd);
+    ensureInteractivePoller(globalState);
   });
 
   (pi as any).on?.(

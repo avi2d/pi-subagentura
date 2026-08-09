@@ -74,6 +74,7 @@ import { attachAsyncJobSettlement } from "./tools/in-process";
 import {
   durableWorkflowControllerForSession,
   durableWorkflowStoreForSession,
+  dispatchTerminalDeliveryForSession,
   resumeDurableWorkflowForSession,
   runDurableWorkflowForSession,
 } from "./workflow-owner";
@@ -2285,8 +2286,15 @@ export function registerWorkflowTool(
           envelope.expectedRevision,
         );
         const result = await controller.cancel(envelope.runId, randomUUID());
-        const text = result
-          ? `Cancelled durable workflow ${envelope.runId}: ${result.status}`
+        const delivered = result
+          ? await dispatchTerminalDeliveryForSession(
+              process.cwd(),
+              scope,
+              result,
+            )
+          : result;
+        const text = delivered
+          ? `Cancelled durable workflow ${envelope.runId}: ${delivered.status}`
           : `Durable workflow ${envelope.runId} was not found.`;
         ctx.ui.notify(text);
         sendCommandMessage(text);
