@@ -185,6 +185,72 @@ describe("workflow storage foundation", () => {
     expect(runAgent).not.toHaveBeenCalled();
   });
 
+  it("F01 publishes run_created before run_started and dispatch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const runAgent = vi.fn(async () => success());
+    const originalAppend = store.append.bind(store);
+    vi.spyOn(store, "append").mockImplementation(async (...args: any[]) => {
+      if (args[1] === "run_started")
+        throw new Error("injected failure before run_started");
+      return (originalAppend as any)(...args);
+    });
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "before-run-started",
+        plan: {
+          schemaVersion: 1,
+          name: "before-run-started",
+          phases: [
+            {
+              id: "phase",
+              mode: "sequential",
+              tasks: [{ id: "task", prompt: "prompt" }],
+            },
+          ],
+        },
+        runAgent,
+      }),
+    ).rejects.toThrow("before run_started");
+
+    expect(runAgent).not.toHaveBeenCalled();
+    await expect(store.readRun("before-run-started")).resolves.toMatchObject({
+      events: [{ type: "run_created", eventOrdinal: 0 }],
+    });
+  });
+
+  it("F01 removes a private prefix when event publication fails before rename", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const originalAssert = (store as any).assertRegularDirectory.bind(store);
+    vi.spyOn(store as any, "assertRegularDirectory").mockImplementation(
+      async (...args: unknown[]) => {
+        const path = String(args[0]);
+        if (path === join(root, owner.projectKey, owner.piSessionId, "runs"))
+          throw new Error("injected failure after event publication");
+        return originalAssert(path);
+      },
+    );
+
+    await expect(
+      store.createRunWithInitialEvent(
+        {
+          runId: "before-rename",
+          planRevision: 1,
+          resumePolicy: "manual",
+          owner,
+        },
+        { type: "run_created", payload: { plan: { schemaVersion: 1 } } },
+      ),
+    ).rejects.toThrow("after event publication");
+    await expect(store.listRunIds()).resolves.toEqual([]);
+  });
+
   it("publishes launch and run_created as one durable creation prefix", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-foundation-"));
     roots.push(root);
