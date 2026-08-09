@@ -943,6 +943,35 @@ describe("workflow storage foundation", () => {
     }
   });
 
+  it("F06 preserves the committed prefix when event fsync fails", async () => {
+    const { store, eventsPath, root } = await makeStore("fsync-fault");
+    const prefix = await readFile(eventsPath);
+    const probe = await (
+      await import("node:fs/promises")
+    ).open(join(root, "fsync-probe"), "w+");
+    const prototype = Object.getPrototypeOf(probe) as {
+      sync: (...args: any[]) => Promise<void>;
+    };
+    await probe.close();
+    const originalSync = prototype.sync;
+    let injected = true;
+    vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: unknown,
+      ...args: any[]
+    ) {
+      if (injected) {
+        injected = false;
+        throw new Error("simulated fsync failure");
+      }
+      return originalSync.apply(this, args);
+    });
+
+    await expect(
+      store.append("fsync-fault", "must_not_commit", {}),
+    ).rejects.toThrow("fsync failure");
+    await expect(readFile(eventsPath)).resolves.toEqual(prefix);
+  });
+
   it("fails closed when the run directory descriptor is replaced before prune", async () => {
     const { store, root } = await makeStore("descriptor-run");
     const runsDir = join(root, owner.projectKey, owner.piSessionId, "runs");

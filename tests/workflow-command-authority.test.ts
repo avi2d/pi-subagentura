@@ -33,6 +33,8 @@ describe("registered durable plan command authority", () => {
   it("rejects a stale plan editor before invoking mutation", async () => {
     const commands: Array<{ name: string; handler: Function }> = [];
     const mutateTask = vi.fn();
+    let journal = '{"eventOrdinal":5,"taskId":"task-1"}\n';
+    const journalBefore = journal;
     const pi = {
       registerTool: vi.fn(),
       registerCommand: (name: string, command: { handler: Function }) =>
@@ -57,6 +59,14 @@ describe("registered durable plan command authority", () => {
     );
 
     expect(mutateTask).not.toHaveBeenCalled();
+    expect(journal).toBe(journalBefore);
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "workflow-command",
+        content: expect.stringContaining("stale"),
+      }),
+      { deliverAs: "followUp" },
+    );
   });
 
   it("passes the complete authority envelope to a current plan editor", async () => {
