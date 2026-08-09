@@ -83,24 +83,20 @@ import {
   decideWorkflowRouting,
   parseWorkflowEagerMode,
 } from "./workflow-routing";
+import {
+  workflowContinuitySnapshot,
+  type WorkflowContinuitySnapshot,
+} from "./workflow-continuity";
 import type { WorkflowProjection } from "./workflow-projection-repository";
 
-function publishWorkflowContinuity(projection: WorkflowProjection): void {
-  const tasks = Object.values(projection.tasks);
-  const globalState = globalThis as typeof globalThis & {
-    __piSubagenturaWorkflowContinuity?: unknown;
-  };
-  globalState.__piSubagenturaWorkflowContinuity = {
-    runId: projection.runId,
-    revision: projection.revision,
-    status: projection.status,
-    phase: projection.currentPhase,
-    tasks: tasks.map((task) => ({ id: task.id, status: task.status })),
-    pendingCount: tasks.filter((task) => task.status === "pending").length,
-    blockedCount: tasks.filter((task) => task.status === "blocked").length,
-    approvalPendingCount: projection.approval?.status === "pending" ? 1 : 0,
-    awaitingBudget: projection.status === "awaiting_budget",
-  };
+function publishWorkflowContinuity(
+  projection: WorkflowProjection,
+  scope?: SessionScope,
+): WorkflowContinuitySnapshot | undefined {
+  if (!scope) return undefined;
+  const snapshot = workflowContinuitySnapshot(projection);
+  scope.durableWorkflowContinuity = snapshot;
+  return snapshot;
 }
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
@@ -312,7 +308,7 @@ export function registerWorkflowTool(
           isError: true,
         };
       }
-      publishWorkflowContinuity(projection);
+      publishWorkflowContinuity(projection, sessionScope);
       return {
         content: [
           {
