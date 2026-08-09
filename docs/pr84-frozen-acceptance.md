@@ -1,7 +1,9 @@
 # PR #84 frozen acceptance evidence
 
-Status: **merge-ready**. This matrix is the authoritative snapshot for the
-current `0bd6efb..PR_HEAD` worktree. A green targeted suite is not treated as
+Status: **merge-ready for F01–F20**. X01–X06 have a separate boundary matrix in
+`docs/pr84-x-boundaries.md`; this status does not claim those boundaries closed.
+This matrix is the authoritative snapshot for the current `PR_BASE..PR_HEAD`
+worktree. A green targeted suite is not treated as
 closure when the frozen requirement calls for a crash, child-process, packed,
 or production command lane.
 
@@ -24,13 +26,16 @@ or production command lane.
 | F15 | PASS           | `workflow-acceptance-authority.integration.test.ts`: registered exact approval/resume envelopes, idempotency, persisted receipts, and reload behavior                                                                                                                      | —                      |
 | F16 | PASS           | `workflow-acceptance-lifecycle-compatibility.test.ts`: real Pi startup, prompt, reload, shutdown, session-scope transition, and bounded continuity audit                                                                                                                   | —                      |
 | F17 | PASS           | `workflow-acceptance-authority.integration.test.ts`: registered durable reload/refresh data, stale edit rejection before mutation, and export verification                                                                                                                 | —                      |
-| F18 | PASS           | `workflow-acceptance-lifecycle-compatibility.test.ts`: registered legacy script/name calls and durable JavaScript/process rejection before creation/dispatch                                                                                                               | —                      |
+| F18 | PASS           | `workflow-acceptance-lifecycle-compatibility.test.ts`: registered legacy script/name calls, durable JavaScript rejection, and a real durable process task with persisted launch intent before agent dispatch                                                                                  | —                      |
 | F19 | PASS           | Parent-side `typecheck`, `format:check`, `pack:check`, `coverage:check`; full `npm test` 90 files/1626 tests; tmux 10/10; Pi delivery 24/24; zellij v0.44.3 13/13; exact PR-head CI from `.github/workflows/ci.yml` passed both `Test (Pi latest)` and `Test (Pi 0.80.6)`. | —                      |
 | F20 | PASS           | `workflow-acceptance-lifecycle-compatibility.test.ts`: non-mutating audit of `todo.md`, `qa.md`, README, frozen status, deferred X01–X06 boundaries, and public-language claims                                                                                            | —                      |
 
-Deferred boundaries: X01–X05 remain explicitly deferred. X06 remains the
-helper-only threat-model boundary; this worktree does not claim `openat2`-class
-containment against a malicious same-user parent-directory rename race.
+X-boundary status: X01 has a proven partial slice (durable process-task
+admission and claim-bound launch intent); child handshake/adoption/recovery
+remains deferred. X02–X06 remain explicitly deferred. See
+`docs/pr84-x-boundaries.md` for the evidence and non-claims. This worktree does
+not claim `openat2`-class containment against a malicious same-user
+parent-directory rename race.
 
 Required final verdict: every F01–F20 must become `PASS` with named permanent
 evidence. `PARTIAL`, inferred helper existence, or targeted-only evidence is not

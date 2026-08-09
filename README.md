@@ -79,10 +79,11 @@ the workflow's final result returns to the parent.
 
 Workflow scripts are trusted agent-authored JavaScript. The VM improves determinism but is not a security boundary, so never run untrusted JavaScript.
 
-For this PR, the foundation contract is declarative **in-process** durability with
-trusted-command resume and explicit authority. Process-isolated durable launch,
-durable JavaScript replay, and exactly-once notification claims remain
-out-of-scope and may appear as helper modules only.
+For this PR, the foundation contract is declarative durability with trusted-command
+resume and explicit authority. Durable process tasks now persist a claim-bound
+launch intent before process dispatch, but child handshake/adoption/recovery,
+durable JavaScript replay, and exactly-once notification claims remain deferred;
+see [`docs/pr84-x-boundaries.md`](./docs/pr84-x-boundaries.md).
 
 Background workflow jobs are scoped to the current parent session and are
 cancelled by reload, resume, quit, or a new session. Attachable interactive
