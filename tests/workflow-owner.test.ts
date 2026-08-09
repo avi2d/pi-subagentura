@@ -1,12 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDurableWorkflowController,
   createWorkflowOwnerIdentity,
   createWorkflowRunStore,
   durableWorkflowControllerForSession,
+  durableWorkflowDispatcherForSession,
   durableWorkflowStoreForSession,
   runDurableWorkflowForSession,
   workflowOwnerFromSessionContext,
@@ -125,6 +126,25 @@ describe("workflow owner identity", () => {
         {} as any,
       ),
     ).toThrow("unavailable");
+  });
+
+  it("reuses the session-scoped durable dispatcher", () => {
+    const sessionScope = {
+      durableWorkflowOwner: workflowOwnerFromSessionContext({
+        projectKey: "project",
+        cwd: "/repo",
+        sessionId: "session-dispatcher",
+        ownerId: "owner",
+        generation: 1,
+        leaseToken: "lease",
+      }),
+    };
+
+    const first = durableWorkflowDispatcherForSession(sessionScope as any, 2);
+    const second = durableWorkflowDispatcherForSession(sessionScope as any, 8);
+
+    expect(second).toBe(first);
+    expect(second.snapshot()).toEqual({ active: 0, queued: 0, max: 2 });
   });
 
   it("reuses cached durable run store and controller within one session scope", () => {
@@ -249,5 +269,29 @@ describe("workflow owner identity", () => {
         owner: migratedOwner,
       }),
     ).resolves.toMatchObject({ runId: "run-migrated" });
+  });
+
+  it("retains the scoped release handle when awaited release fails", async () => {
+    const release = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("release failed"))
+      .mockResolvedValueOnce(undefined);
+    const store = { release } as any;
+    const controller = {} as any;
+    const scope = {
+      durableWorkflowStore: store,
+      durableWorkflowController: controller,
+    } as any;
+
+    await expect(releaseDurableWorkflowAuthority(scope)).rejects.toThrow(
+      "release failed",
+    );
+    expect(scope.durableWorkflowStore).toBe(store);
+    expect(scope.durableWorkflowController).toBe(controller);
+
+    await releaseDurableWorkflowAuthority(scope);
+    expect(scope.durableWorkflowStore).toBeUndefined();
+    expect(scope.durableWorkflowController).toBeUndefined();
+    expect(release).toHaveBeenCalledTimes(2);
   });
 });
