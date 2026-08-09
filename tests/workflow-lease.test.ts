@@ -57,6 +57,35 @@ describe("WorkflowNamespaceLease", () => {
     await expect(first.assertHeld()).rejects.toThrow("not held");
   });
 
+  it("stale-owner release cannot delete a replacement lease", async () => {
+    const rootDir = await root();
+    let now = 100;
+    const first = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "one",
+      leaseToken: "token-one",
+      staleAfterMs: 10,
+      now: () => now,
+      processId: 2_000_000_000,
+    });
+    const replacement = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "replacement",
+      leaseToken: "token-replacement",
+      staleAfterMs: 10,
+      now: () => now,
+    });
+
+    await first.acquire();
+    now = 111;
+    await expect(replacement.acquire()).resolves.toMatchObject({ epoch: 2 });
+    await first.release();
+    await expect(replacement.assertHeld()).resolves.toBeUndefined();
+    await replacement.release();
+  });
+
   it("recovers an abandoned interlock only when its process is dead", async () => {
     const rootDir = await root();
     const dir = join(rootDir, "project");
