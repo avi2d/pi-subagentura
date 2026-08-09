@@ -97,11 +97,13 @@ export interface WorkflowCancellationRequest {
 
 export interface WorkflowApprovalRequest {
   requestId: string;
+  taskId?: string;
   policyHash: string;
   planRevision: number;
   ownerGeneration: number;
   leaseEpoch: number;
   version: number;
+  denial?: "stop" | "skip";
 }
 
 export type WorkflowApprovalStatus = "pending" | "approved" | "rejected";

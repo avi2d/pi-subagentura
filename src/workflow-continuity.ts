@@ -1,4 +1,6 @@
+import type { WorkflowPlan } from "./workflow-plan";
 import type { WorkflowRunStatus } from "./workflow-run-types";
+import type { WorkflowProjection } from "./workflow-projection-repository";
 
 export interface WorkflowContinuityTask {
   id: string;
@@ -27,6 +29,37 @@ export interface WorkflowReminderState {
 export const MAX_CONTINUITY_TASKS = 12;
 export const MAX_CONTINUITY_CHARS = 1800;
 export const MAX_REMINDERS_PER_GENERATION = 1;
+
+export function workflowContinuitySnapshot(
+  projection: WorkflowProjection,
+  plan?: WorkflowPlan,
+): WorkflowContinuitySnapshot {
+  const tasks = Object.values(projection.tasks);
+  const phase = plan?.phases.find(
+    (candidate) => candidate.id === projection.currentPhase,
+  );
+  return {
+    runId: projection.runId,
+    revision: projection.revision,
+    status: projection.status,
+    phase: projection.currentPhase,
+    phaseMode: phase?.mode,
+    tasks: tasks.slice(0, MAX_CONTINUITY_TASKS).map((task) => ({
+      id: task.id,
+      status: task.status,
+    })),
+    pendingCount: tasks.filter((task) => task.status === "pending").length,
+    blockedCount: tasks.filter((task) => task.status === "blocked").length,
+    approvalPendingCount: projection.approval?.status === "pending" ? 1 : 0,
+    awaitingBudget: projection.status === "awaiting_budget",
+  };
+}
+
+export function clearWorkflowContinuity(scope: {
+  durableWorkflowContinuity?: WorkflowContinuitySnapshot;
+}): void {
+  scope.durableWorkflowContinuity = undefined;
+}
 
 export function formatWorkflowContinuity(
   snapshot: WorkflowContinuitySnapshot,

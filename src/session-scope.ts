@@ -9,6 +9,7 @@ import type { WorkflowOwnerIdentity } from "./workflow-run-types";
 import type { WorkflowRunStore } from "./workflow-run-store";
 import type { DurableWorkflowController } from "./workflow-durable-plan-runner";
 import type { WorkflowSessionDispatcher } from "./workflow-dispatcher";
+import type { WorkflowContinuitySnapshot } from "./workflow-continuity";
 
 const SESSION_SCOPE_REGISTRY_KEY = "__piSubagenturaSessionScopes";
 const SESSION_SCOPE_ID_COUNTER_KEY = "__piSubagenturaSessionScopeIdCounter";
@@ -40,6 +41,7 @@ export interface SessionScope {
   durableWorkflowStore?: WorkflowRunStore;
   durableWorkflowController?: DurableWorkflowController;
   durableWorkflowDispatcher?: WorkflowSessionDispatcher;
+  durableWorkflowContinuity?: WorkflowContinuitySnapshot;
 }
 
 /** External registrations may omit runtime-owned collections and streaming state. */
@@ -58,6 +60,7 @@ export interface SessionScopeRegistration {
   durableWorkflowStore?: WorkflowRunStore;
   durableWorkflowController?: DurableWorkflowController;
   durableWorkflowDispatcher?: WorkflowSessionDispatcher;
+  durableWorkflowContinuity?: WorkflowContinuitySnapshot;
 }
 
 export interface SessionOwnerToken {
@@ -173,6 +176,10 @@ export function registerSessionScope(
       existing.durableWorkflowDispatcher =
         registration.durableWorkflowDispatcher;
     }
+    if (registration.durableWorkflowContinuity !== undefined) {
+      existing.durableWorkflowContinuity =
+        registration.durableWorkflowContinuity;
+    }
     return existing;
   }
 
@@ -192,6 +199,7 @@ export function registerSessionScope(
         interactiveStates: registration.interactiveStates ?? new Map(),
         durableWorkflowOwner: registration.durableWorkflowOwner,
         durableWorkflowDispatcher: registration.durableWorkflowDispatcher,
+        durableWorkflowContinuity: registration.durableWorkflowContinuity,
       };
   registry.set(scope.id, scope);
   return scope;
@@ -214,6 +222,7 @@ export function advanceSessionScopeGeneration(id: number): number {
   const scope = findSessionScope(id);
   if (!scope) return 0;
   scope.generation++;
+  scope.durableWorkflowContinuity = undefined;
   const state = getGlobalState();
   if (state[ACTIVE_SESSION_SCOPE_ID_KEY] === id) {
     state[ACTIVE_SESSION_SCOPE_GENERATION_KEY] = scope.generation;
@@ -300,6 +309,7 @@ export function setDurableWorkflowOwner(
     scope.durableWorkflowStore = undefined;
     scope.durableWorkflowController = undefined;
     scope.durableWorkflowDispatcher = undefined;
+    scope.durableWorkflowContinuity = undefined;
   }
   scope.durableWorkflowOwner = owner;
 }
@@ -317,6 +327,7 @@ export async function releaseDurableWorkflowAuthority(
   if (!store) {
     scope.durableWorkflowController = undefined;
     scope.durableWorkflowDispatcher = undefined;
+    scope.durableWorkflowContinuity = undefined;
     return;
   }
   await store.release();
@@ -324,7 +335,19 @@ export async function releaseDurableWorkflowAuthority(
     scope.durableWorkflowStore = undefined;
     scope.durableWorkflowController = undefined;
     scope.durableWorkflowDispatcher = undefined;
+    scope.durableWorkflowContinuity = undefined;
   }
+}
+
+/** Return continuity only for a live scope belonging to this Pi instance. */
+export function workflowContinuityForPi(
+  pi: SessionScope["pi"],
+): WorkflowContinuitySnapshot | undefined {
+  const scopes = getStartedSessionScopes().filter((scope) => scope.pi === pi);
+  if (scopes.length === 1) return scopes[0].durableWorkflowContinuity;
+  const activeId = getActiveSessionScopeId();
+  return scopes.find((scope) => scope.id === activeId)
+    ?.durableWorkflowContinuity;
 }
 
 /** Resolve an exact owner only while that lifecycle generation remains live. */

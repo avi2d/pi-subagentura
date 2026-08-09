@@ -24,6 +24,7 @@ export interface WorkflowProjectionTask {
   phaseId?: string;
   prompt?: string;
   label?: string;
+  approval?: { policyHash: string; denial: "stop" | "skip" };
   result?: unknown;
   error?: string;
   claim?: WorkflowTaskClaim;
@@ -165,6 +166,9 @@ function applyEvent(
             phaseId: String(task.phaseId),
             prompt: String(task.prompt),
             ...(task.label === undefined ? {} : { label: String(task.label) }),
+            ...(isApprovalGate(task.approval)
+              ? { approval: task.approval }
+              : {}),
           };
         }
       }
@@ -201,6 +205,11 @@ function applyEvent(
       projection.approval.status = payload.status;
       projection.approval.decision = payload as WorkflowApprovalDecision;
       if (payload.status === "rejected") {
+        if (projection.approval.request.denial === "skip") {
+          delete projection.blockers.approval;
+          refreshStatus(projection);
+          break;
+        }
         projection.blockers.approval = {
           requestId: projection.approval.request.requestId,
           source: "approval",
@@ -446,11 +455,23 @@ function creationTasks(
           phaseId: phase.id,
           prompt: task.prompt,
           ...(task.label === undefined ? {} : { label: task.label }),
+          ...(isApprovalGate(task.approval) ? { approval: task.approval } : {}),
         }),
       ),
     );
   }
   return Array.isArray(payload.tasks) ? payload.tasks : [];
+}
+
+function isApprovalGate(
+  value: unknown,
+): value is { policyHash: string; denial: "stop" | "skip" } {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.policyHash === "string" &&
+    value.policyHash.length > 0 &&
+    (value.denial === "stop" || value.denial === "skip")
+  );
 }
 
 function parseDeliveryClaim(value: unknown): WorkflowDeliveryClaim | undefined {
@@ -552,11 +573,14 @@ function finite(value: unknown): number {
 
 function definitionFields(
   previous: WorkflowProjectionTask | undefined,
-): Pick<WorkflowProjectionTask, "phaseId" | "prompt" | "label"> {
+): Pick<WorkflowProjectionTask, "phaseId" | "prompt" | "label" | "approval"> {
   return {
     ...(previous?.phaseId === undefined ? {} : { phaseId: previous.phaseId }),
     ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
     ...(previous?.label === undefined ? {} : { label: previous.label }),
+    ...(previous?.approval === undefined
+      ? {}
+      : { approval: previous.approval }),
   };
 }
 

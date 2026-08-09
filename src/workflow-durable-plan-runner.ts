@@ -373,22 +373,41 @@ export class DurableWorkflowController {
       if (appendResult.status === "conflict") continue;
       if (decision.status === "rejected") {
         const afterDecision = await recoverWorkflowRun(this.options, runId);
-        const blockedResult = await this.options.store.appendIfCurrent(
-          runId,
-          afterDecision.lastEventOrdinal,
-          "run_blocked",
-          {
-            reason: decision.reason ?? "Workflow approval rejected",
-            source: "approval",
-            requestId,
-            policyHash: request.policyHash,
-            planRevision: request.planRevision,
-            ownerGeneration: request.ownerGeneration,
-            leaseEpoch: request.leaseEpoch,
-            version: request.version,
-          },
-          leaseEpoch,
-        );
+        let blockedResult;
+        if (request.denial === "skip" && request.taskId) {
+          const mutation = await withMutationHash(
+            this.options.store,
+            this.options.owner,
+            runId,
+            "task_skipped",
+            { taskId: request.taskId, approvalRequestId: requestId },
+            afterDecision,
+          );
+          blockedResult = await this.options.store.appendIfCurrent(
+            runId,
+            afterDecision.lastEventOrdinal,
+            "task_skipped",
+            mutation.payload,
+            mutation.runEpoch,
+          );
+        } else {
+          blockedResult = await this.options.store.appendIfCurrent(
+            runId,
+            afterDecision.lastEventOrdinal,
+            "run_blocked",
+            {
+              reason: decision.reason ?? "Workflow approval rejected",
+              source: "approval",
+              requestId,
+              policyHash: request.policyHash,
+              planRevision: request.planRevision,
+              ownerGeneration: request.ownerGeneration,
+              leaseEpoch: request.leaseEpoch,
+              version: request.version,
+            },
+            leaseEpoch,
+          );
+        }
         if (blockedResult.status === "conflict") {
           const latest = await recoverWorkflowRun(this.options, runId);
           if (latest.approval?.status === "rejected")
@@ -547,6 +566,9 @@ export async function runDurableWorkflowPlan(
         continue;
       if (isRunDispatchSuspended(projection) || !isTaskDispatchable(existing))
         return publish(projection);
+      if (!(await ensureTaskApproval(options, controller, task, projection))) {
+        return publish(await recoverWorkflowRun({ store, owner }, runId));
+      }
       if (options.signal?.aborted) {
         const cancelled = await cancelDurableWorkflowRun(store, owner, runId);
         if (!cancelled) throw new Error("Workflow run not found");
@@ -718,6 +740,31 @@ export async function runDurableWorkflowPlan(
   await ensureDeliveryIntent(store, owner, runId);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
+}
+
+async function ensureTaskApproval(
+  options: DurableWorkflowPlanOptions,
+  controller: DurableWorkflowController,
+  task: WorkflowPlan["phases"][number]["tasks"][number],
+  projection: WorkflowProjection,
+): Promise<boolean> {
+  if (!task.approval) return true;
+  const current = projection.approval;
+  if (current?.request.taskId === task.id) {
+    return current.status === "approved";
+  }
+  if (current?.status === "pending") return false;
+  await controller.requestApproval(options.runId, {
+    requestId: randomUUID(),
+    taskId: task.id,
+    policyHash: task.approval.policyHash,
+    planRevision: projection.planRevision,
+    ownerGeneration: options.owner.ownerGeneration,
+    leaseEpoch: await options.store.getLeaseEpoch(),
+    version: 1,
+    denial: task.approval.denial,
+  });
+  return false;
 }
 
 function compatibleReadProjection(
@@ -989,6 +1036,24 @@ async function runDurableParallelPhase(
     while (firstError === undefined) {
       const task = tasks[nextIndex++];
       if (!task) return;
+      const latest = await recoverWorkflowRun(
+        { store: options.store, owner: options.owner },
+        options.runId,
+      );
+      if (
+        !(await ensureTaskApproval(
+          options,
+          new DurableWorkflowController({
+            store: options.store,
+            owner: options.owner,
+          }),
+          task,
+          latest,
+        ))
+      ) {
+        abandoned = true;
+        return;
+      }
       const taskClaim = await claimTask(options, task, phaseId);
       if (!taskClaim) {
         const latest = await recoverWorkflowRun(

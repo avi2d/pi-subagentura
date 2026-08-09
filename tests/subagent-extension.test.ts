@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import registerExtension from "../src/subagent";
+import { clearSessionScopes, registerSessionScope } from "../src/session-scope";
 
 const BASE_INTERACTIVE_TOOL_NAMES = [
   "cancel_interactive_subagent",
@@ -64,6 +65,7 @@ describe("extension registration", () => {
     delete process.env.PI_SUBAGENTURA_CHILD;
   });
   afterEach(() => {
+    clearSessionScopes();
     if (previousChild === undefined) {
       delete process.env.PI_SUBAGENTURA_CHILD;
     } else {
@@ -155,6 +157,52 @@ describe("extension registration", () => {
       "Automatic durable workflow routing is enabled in preferred mode",
     );
     expect(result.systemPrompt).toContain("routing is unconfirmed");
+  });
+
+  it("injects continuity only from the live session scope belonging to this Pi", async () => {
+    const api = mockApi();
+    registerSessionScope({
+      id: 701,
+      generation: 1,
+      lifecycle: "started",
+      pi: api as any,
+      durableWorkflowContinuity: {
+        runId: "scoped-run",
+        revision: 3,
+        status: "running",
+        phase: "build",
+        phaseMode: "sequential",
+        tasks: [{ id: "task", status: "running" }],
+        pendingCount: 0,
+        blockedCount: 0,
+        approvalPendingCount: 0,
+        awaitingBudget: false,
+      },
+    });
+    registerSessionScope({
+      id: 702,
+      generation: 1,
+      lifecycle: "started",
+      pi: {} as any,
+      durableWorkflowContinuity: {
+        runId: "peer-run",
+        revision: 1,
+        status: "running",
+        tasks: [],
+        pendingCount: 0,
+        blockedCount: 0,
+        approvalPendingCount: 0,
+        awaitingBudget: false,
+      },
+    });
+
+    registerExtension(api as any);
+    const beforeAgentStart = api.on.mock.calls.find(
+      ([event]: any[]) => event === "before_agent_start",
+    )?.[1];
+    const result = await beforeAgentStart({ systemPrompt: "base prompt" }, {});
+    expect(result.systemPrompt).toContain("run=scoped-run revision=3");
+    expect(result.systemPrompt).not.toContain("peer-run");
   });
 
   it("registers a minimal interactive runtime in child mode", () => {

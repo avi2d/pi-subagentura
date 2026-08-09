@@ -1161,7 +1161,7 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
           );
           assertAllowedKeys(
             sourceTask,
-            ["id", "prompt", "label", "isolation", "input"],
+            ["id", "prompt", "label", "isolation", "input", "approval"],
             "workflow task",
           );
           const taskId = readDataProperty(sourceTask, "id", "task");
@@ -1173,6 +1173,11 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
             "task",
           );
           const input = readOptionalDataProperty(sourceTask, "input", "task");
+          const approval = readOptionalDataProperty(
+            sourceTask,
+            "approval",
+            "task",
+          );
           if (typeof taskId !== "string" || typeof prompt !== "string")
             throw new Error("Invalid workflow task definition");
           if (Buffer.byteLength(prompt, "utf8") > 64 * 1024)
@@ -1192,6 +1197,7 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
             throw new Error("Invalid workflow task isolation");
           const normalizedInput =
             input === undefined ? undefined : toDurableValue(input);
+          const normalizedApproval = normalizeTaskApproval(approval);
           return {
             id: taskId,
             prompt,
@@ -1202,6 +1208,9 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
             ...(normalizedInput === undefined
               ? {}
               : { input: normalizedInput }),
+            ...(normalizedApproval === undefined
+              ? {}
+              : { approval: normalizedApproval }),
           };
         }),
       };
@@ -1210,6 +1219,25 @@ function normalizeCreationPlan(value: unknown): WorkflowPlan {
   const plan = { schemaVersion: 1 as const, name, phases: normalizedPhases };
   validateWorkflowPlan(plan);
   return plan;
+}
+
+function normalizeTaskApproval(
+  value: unknown,
+): { policyHash: string; denial: "stop" | "skip" } | undefined {
+  if (value === undefined) return undefined;
+  const source = requirePlainRecord(value, "workflow task approval");
+  assertExactKeys(source, ["policyHash", "denial"], "workflow task approval");
+  const policyHash = readDataProperty(source, "policyHash", "approval");
+  const denial = readDataProperty(source, "denial", "approval");
+  if (
+    typeof policyHash !== "string" ||
+    !policyHash.trim() ||
+    Buffer.byteLength(policyHash, "utf8") > 4 * 1024 ||
+    (denial !== "stop" && denial !== "skip")
+  ) {
+    throw new Error("Invalid workflow task approval");
+  }
+  return { policyHash, denial };
 }
 
 function requirePlainRecord(
