@@ -2393,6 +2393,138 @@ export function registerWorkflowTool(
       }
     };
 
+    const handleDurablePlanAppend = async (
+      args: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> => {
+      const scope = durableOperatorScope(ctx);
+      if (!scope) return;
+      const usage =
+        "/workflow-plan-append <runId> <expectedRevision> <ownerGeneration> <leaseEpoch> <sessionGeneration> <taskId> <phaseId> <prompt>";
+      try {
+        const envelope = parseDurableAuthority(
+          args,
+          { min: 8, max: 512 },
+          usage,
+        );
+        if (envelope.rest.length < 3) throw new Error(`Usage: ${usage}`);
+        const { controller, projection } = await assertDurableAuthority(
+          scope,
+          envelope,
+          envelope.expectedRevision,
+        );
+        const [taskId, phaseId, ...promptParts] = envelope.rest;
+        const updated = await controller.mutateTask(envelope.runId, {
+          type: "append",
+          taskId,
+          phaseId,
+          prompt: promptParts.join(" "),
+          expectedRevision: envelope.expectedRevision,
+        });
+        const text = `Appended ${taskId} to durable workflow ${envelope.runId} (revision ${updated?.revision ?? projection.revision}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const text = `Durable workflow append failed: ${message}`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      }
+    };
+
+    const handleDurablePlanMutate = async (
+      args: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> => {
+      const scope = durableOperatorScope(ctx);
+      if (!scope) return;
+      const usage =
+        "/workflow-plan-mutate <runId> <expectedRevision> <ownerGeneration> <leaseEpoch> <sessionGeneration> <block|unblock|skip> <taskId>";
+      try {
+        const envelope = parseDurableAuthority(args, { min: 7, max: 7 }, usage);
+        const [operation, taskId] = envelope.rest;
+        if (
+          !operation ||
+          !taskId ||
+          !["block", "unblock", "skip"].includes(operation)
+        ) {
+          throw new Error(`Usage: ${usage}`);
+        }
+        const { controller, projection } = await assertDurableAuthority(
+          scope,
+          envelope,
+          envelope.expectedRevision,
+        );
+        const updated = await controller.mutateTask(envelope.runId, {
+          type: operation as "block" | "unblock" | "skip",
+          taskId,
+          expectedRevision: envelope.expectedRevision,
+        });
+        const text = `${operation}d ${taskId} in durable workflow ${envelope.runId} (revision ${updated?.revision ?? projection.revision}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const text = `Durable workflow mutation failed: ${message}`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      }
+    };
+
+    const handleDurablePlanEdit = async (
+      args: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> => {
+      const scope = durableOperatorScope(ctx);
+      if (!scope) return;
+      const usage =
+        "/workflow-plan-edit <runId> <expectedRevision> <ownerGeneration> <leaseEpoch> <sessionGeneration> <append <taskId> <phaseId> <prompt>|block|unblock|skip <taskId>>";
+      try {
+        const envelope = parseDurableAuthority(
+          args,
+          { min: 7, max: 512 },
+          usage,
+        );
+        const [operation, taskId, phaseId, ...promptParts] = envelope.rest;
+        const isAppend = operation === "append";
+        const valid = isAppend
+          ? Boolean(taskId && phaseId && promptParts.length > 0)
+          : Boolean(
+              taskId &&
+              envelope.rest.length === 2 &&
+              ["block", "unblock", "skip"].includes(operation),
+            );
+        if (!valid) throw new Error(`Usage: ${usage}`);
+        const { controller, projection } = await assertDurableAuthority(
+          scope,
+          envelope,
+          envelope.expectedRevision,
+        );
+        const mutation = isAppend
+          ? {
+              type: "append" as const,
+              taskId,
+              phaseId,
+              prompt: promptParts.join(" "),
+              expectedRevision: envelope.expectedRevision,
+            }
+          : {
+              type: operation as "block" | "unblock" | "skip",
+              taskId,
+              expectedRevision: envelope.expectedRevision,
+            };
+        const updated = await controller.mutateTask(envelope.runId, mutation);
+        const text = `${operation}d ${taskId} in durable workflow ${envelope.runId} (revision ${updated?.revision ?? projection.revision}).`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const text = `Durable workflow edit failed: ${message}`;
+        ctx.ui.notify(text);
+        sendCommandMessage(text);
+      }
+    };
+
     pi.registerCommand("workflow", {
       description:
         "Create a reusable workflow from a task, save it, and run it immediately.",
@@ -2558,140 +2690,21 @@ export function registerWorkflowTool(
     });
 
     pi.registerCommand("workflow-plan-append", {
-      description: "Append one future task to a durable workflow.",
-      handler: async (args: string, ctx: ExtensionCommandContext) => {
-        const parts = args.trim().split(/\s+/);
-        const [runId, revisionText, taskId, phaseId, ...promptParts] = parts;
-        const controller = sessionScope
-          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
-          : undefined;
-        const expectedRevision = Number(revisionText);
-        if (
-          !controller ||
-          !runId ||
-          !Number.isSafeInteger(expectedRevision) ||
-          !taskId ||
-          !phaseId ||
-          promptParts.length === 0
-        ) {
-          const text =
-            "Usage: /workflow-plan-append <runId> <revision> <taskId> <phaseId> <prompt>";
-          ctx.ui.notify(text);
-          sendCommandMessage(text);
-          return;
-        }
-        const projection = await controller.getStatus(runId);
-        if (!projection) {
-          ctx.ui.notify(`Durable workflow ${runId} was not found.`);
-          return;
-        }
-        const updated = await controller.mutateTask(runId, {
-          type: "append",
-          taskId,
-          phaseId,
-          prompt: promptParts.join(" "),
-          expectedRevision,
-        });
-        const text = `Appended ${taskId} to durable workflow ${runId} (revision ${updated?.revision ?? projection.revision}).`;
-        ctx.ui.notify(text);
-        sendCommandMessage(text);
-      },
+      description:
+        "Append one future task to a durable workflow using an authority envelope.",
+      handler: handleDurablePlanAppend,
     });
 
     pi.registerCommand("workflow-plan-mutate", {
-      description: "Block, unblock, or skip future durable workflow work.",
-      handler: async (args: string, ctx: ExtensionCommandContext) => {
-        const [runId, revisionText, type, taskId] = args.trim().split(/\s+/);
-        const expectedRevision = Number(revisionText);
-        const controller = sessionScope
-          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
-          : undefined;
-        if (
-          !controller ||
-          !runId ||
-          !Number.isSafeInteger(expectedRevision) ||
-          !["block", "unblock", "skip"].includes(type) ||
-          !taskId
-        ) {
-          const text =
-            "Usage: /workflow-plan-mutate <runId> <revision> <block|unblock|skip> <taskId>";
-          ctx.ui.notify(text);
-          sendCommandMessage(text);
-          return;
-        }
-        const updated = await controller.mutateTask(runId, {
-          type: type as "block" | "unblock" | "skip",
-          taskId,
-          expectedRevision,
-        });
-        const text = `${type}d ${taskId} in durable workflow ${runId} (revision ${updated?.revision ?? expectedRevision}).`;
-        ctx.ui.notify(text);
-        sendCommandMessage(text);
-      },
+      description:
+        "Block, unblock, or skip future durable workflow work using an authority envelope.",
+      handler: handleDurablePlanMutate,
     });
 
     pi.registerCommand("workflow-plan-edit", {
-      description: "Edit future durable workflow work using a revision fence.",
-      handler: async (args: string, ctx: ExtensionCommandContext) => {
-        const inputText = args.trim();
-        if (!inputText) {
-          const usage =
-            "Usage: /workflow-plan-edit <runId> <revision> <append <taskId> <phaseId> <prompt>|block|unblock|skip <taskId>>";
-          ctx.ui.notify(usage);
-          sendCommandMessage(usage);
-          return;
-        }
-        const parts = inputText.split(/\s+/);
-        const [
-          runId,
-          revisionText,
-          operation,
-          taskId,
-          phaseId,
-          ...promptParts
-        ] = parts;
-        const expectedRevision = Number(revisionText);
-        const controller = sessionScope
-          ? durableWorkflowControllerForSession(process.cwd(), sessionScope)
-          : undefined;
-        const validOperation = ["append", "block", "unblock", "skip"].includes(
-          operation,
-        );
-        const validArgs =
-          controller &&
-          runId &&
-          Number.isSafeInteger(expectedRevision) &&
-          validOperation &&
-          taskId &&
-          (operation === "append"
-            ? phaseId && promptParts.length > 0
-            : parts.length === 4);
-        if (!validArgs) {
-          const usage =
-            "Usage: /workflow-plan-edit <runId> <revision> <append <taskId> <phaseId> <prompt>|block|unblock|skip <taskId>>";
-          ctx.ui.notify(usage);
-          sendCommandMessage(usage);
-          return;
-        }
-        const mutation =
-          operation === "append"
-            ? {
-                type: "append" as const,
-                taskId,
-                phaseId,
-                prompt: promptParts.join(" "),
-                expectedRevision,
-              }
-            : {
-                type: operation as "block" | "unblock" | "skip",
-                taskId,
-                expectedRevision,
-              };
-        const updated = await controller.mutateTask(runId, mutation);
-        const text = `${operation}d ${taskId} in durable workflow ${runId} (revision ${updated?.revision ?? expectedRevision}).`;
-        ctx.ui.notify(text);
-        sendCommandMessage(text);
-      },
+      description:
+        "Edit future durable workflow work using an authority envelope and revision fence.",
+      handler: handleDurablePlanEdit,
     });
 
     pi.registerCommand("workflow-plan-export", {
