@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -215,7 +217,8 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     expect(harness.session.isIdle).toBe(true);
   }, 30_000);
 
-  it("F18 preserves registered legacy script/name calls and runs durable process tasks", async () => {
+  it("F18 preserves registered legacy calls and proves durable process admission without model completion", async () => {
+    const tmuxSocket = `pr84-f18-${process.pid}-${randomUUID()}`;
     const root = await mkdtemp(join(tmpdir(), "workflow-f18-compat-"));
     roots.push(root);
     const owner = ownerFor(root);
@@ -244,6 +247,14 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     const file = join(WORKFLOWS_DIR, `${name}.js`);
     const hadOriginal = existsSync(file);
     const original = hadOriginal ? readFileSync(file) : undefined;
+    const previousTmuxSocket = process.env.PI_SUBAGENTURA_TMUX_SOCKET;
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousZellijSession = process.env.ZELLIJ_SESSION_NAME;
+    process.env.PI_SUBAGENTURA_TMUX_SOCKET = tmuxSocket;
+    delete process.env.TMUX;
+    delete process.env.TMUX_PANE;
+    delete process.env.ZELLIJ_SESSION_NAME;
     try {
       const script = legacyScript();
       const direct = await workflowTool!.execute(
@@ -327,32 +338,149 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
           },
         ],
       } as any;
-      const processResult = await durableTool!.execute(
+      const processAbort = new AbortController();
+      const processPromise = durableTool!.execute(
         "f18-process",
         { runId: "f18-process", plan: processPlan },
-        undefined,
+        processAbort.signal,
         vi.fn(),
         { cwd: root },
       );
+      const processRejection = new Promise<never>((_, reject) => {
+        void processPromise.catch(reject);
+      });
+      let dispatchWaitError: unknown;
+      let registeredArtifactDir: string | undefined;
+      let childStartedBeforeAbort: Record<string, unknown> | undefined;
+      try {
+        await Promise.race([
+          vi.waitFor(
+            async () => {
+              const record = await durableStore.readRun("f18-process");
+              expect(record.events.map((event) => event.type)).toContain(
+                "process_launch_dispatched",
+              );
+              const registered = [...scope.interactiveStates.values()].filter(
+                (state) => state.workflowId === "f18-process",
+              );
+              expect(registered).toHaveLength(1);
+              expect(registered[0]!.mux).toBe("tmux");
+              registeredArtifactDir = registered[0]!.artifactDir;
+              childStartedBeforeAbort = JSON.parse(
+                readFileSync(
+                  join(registeredArtifactDir, "process-child-started.json"),
+                  "utf8",
+                ),
+              );
+            },
+            { timeout: 30_000, interval: 50 },
+          ),
+          processRejection,
+        ]);
+      } catch (error) {
+        dispatchWaitError = error;
+      } finally {
+        processAbort.abort();
+      }
+      const processResult = await processPromise;
+      if (dispatchWaitError) throw dispatchWaitError;
       expect(processResult).toMatchObject({
-        details: { status: "done", runId: "f18-process" },
+        details: {
+          status: "error",
+          runId: "f18-process",
+          terminal: {
+            status: "error",
+            error: { code: "task_failed", message: "aborted" },
+          },
+        },
       });
       const processRecord = await durableStore.readRun("f18-process");
       const processEventTypes = processRecord.events.map((event) => event.type);
-      expect(processEventTypes).toContain("process_launch_intent");
-      expect(processEventTypes).toContain("process_launch_dispatched");
+      const intentEvent = processRecord.events.find(
+        (event) => event.type === "process_launch_intent",
+      );
+      const dispatchEvent = processRecord.events.find(
+        (event) => event.type === "process_launch_dispatched",
+      );
+      const intent = (intentEvent?.payload as any).intent;
+      const dispatch = (dispatchEvent?.payload as any).dispatch;
+      expect(intent).toBeDefined();
+      expect(dispatch).toBeDefined();
+      for (const type of [
+        "task_started",
+        "process_launch_intent",
+        "process_launch_dispatched",
+        "usage_observed",
+        "task_failed",
+        "run_terminal",
+      ]) {
+        expect(
+          processEventTypes.filter((candidate) => candidate === type),
+        ).toHaveLength(1);
+      }
+      expect(processEventTypes).not.toContain("task_succeeded");
+      expect(processEventTypes).not.toContain("run_cancelled");
       expect(
         processEventTypes.indexOf("process_launch_intent"),
       ).toBeGreaterThan(processEventTypes.indexOf("task_started"));
       expect(
         processEventTypes.indexOf("process_launch_dispatched"),
       ).toBeGreaterThan(processEventTypes.indexOf("process_launch_intent"));
+      expect(intent).toMatchObject({
+        schemaVersion: 1,
+        runId: "f18-process",
+        operationId: "task",
+        attemptId: "task-1",
+        attemptNumber: 1,
+        requestedIsolation: "process",
+        effectiveIsolation: "process",
+        fallbackMode: "none",
+        epoch: expect.any(Number),
+        launchMarker: expect.stringMatching(/^wf-launch-/),
+        nonce: expect.any(String),
+      });
+      expect(dispatch).toMatchObject({
+        schemaVersion: 1,
+        attemptId: intent.attemptId,
+        launchMarker: intent.launchMarker,
+        nonce: intent.nonce,
+        epoch: intent.epoch,
+        dispatchedAt: expect.any(Number),
+      });
+      expect(Number.isSafeInteger(dispatch.dispatchedAt)).toBe(true);
+      expect(dispatch.dispatchedAt).toBeGreaterThan(0);
+      expect(registeredArtifactDir).toBeDefined();
+      expect(childStartedBeforeAbort).toMatchObject({
+        schemaVersion: 1,
+        attemptId: intent.attemptId,
+        launchMarker: intent.launchMarker,
+        nonce: intent.nonce,
+        epoch: intent.epoch,
+      });
       expect(await durableStore.listRunIds()).toEqual(
         expect.arrayContaining([...beforeDurableRuns, "f18-process"]),
       );
     } finally {
       if (hadOriginal) writeFileSync(file, original!);
       else if (existsSync(file)) unlinkSync(file);
+      try {
+        execFileSync("tmux", ["-L", tmuxSocket, "kill-server"], {
+          stdio: "ignore",
+          timeout: 5_000,
+        });
+      } catch {
+        // The child may already have exited and removed its isolated server.
+      }
+      if (previousTmuxSocket === undefined)
+        delete process.env.PI_SUBAGENTURA_TMUX_SOCKET;
+      else process.env.PI_SUBAGENTURA_TMUX_SOCKET = previousTmuxSocket;
+      if (previousTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = previousTmux;
+      if (previousTmuxPane === undefined) delete process.env.TMUX_PANE;
+      else process.env.TMUX_PANE = previousTmuxPane;
+      if (previousZellijSession === undefined)
+        delete process.env.ZELLIJ_SESSION_NAME;
+      else process.env.ZELLIJ_SESSION_NAME = previousZellijSession;
     }
   }, 90_000);
 
@@ -368,11 +496,17 @@ describe("frozen durable workflow lifecycle and compatibility acceptance", () =>
     expect(todo).toContain(
       "[x] 22. Persist a claim-bound process launch intent before process dispatch",
     );
+    expect(todo).toContain(
+      "[x] 24. Persist launch dispatch only after exact child-start identity is validated",
+    );
+    expect(todo).toContain("[DEFERRED — PR #84 foundation scope] 25.");
     expect(todo).toContain("[DEFERRED — PR #84 foundation scope] 29.");
     expect(todo).toContain(
       "[x] 60. Reject unsupported durable legacy requests",
     );
-    expect(qa).toContain("X01 (22–24 partial; 25+ deferred) | Partial");
+    expect(qa).toMatch(
+      /\|\s*X01 \(22–24 partial; 25\+ deferred\)\s*\|\s*Partial\s*\|/,
+    );
     expect(qa).toContain("X02–X05 (out-of-scope this PR)");
     expect(qa).toContain("Deferred");
     expect(qa).toContain("X06 (security boundary)");
