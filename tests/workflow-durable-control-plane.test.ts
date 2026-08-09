@@ -253,14 +253,8 @@ describe("durable workflow control plane", () => {
     });
     const controller = new RunnerController({ store, owner });
 
-    const repaired = await controller.cancel(
-      runId,
-      "cancel-recovery-request",
-    );
-    const replayed = await controller.cancel(
-      runId,
-      "cancel-recovery-request",
-    );
+    const repaired = await controller.cancel(runId, "cancel-recovery-request");
+    const replayed = await controller.cancel(runId, "cancel-recovery-request");
     const record = await store.readRun(runId);
 
     expect(repaired?.status).toBe("cancelled");
@@ -268,15 +262,15 @@ describe("durable workflow control plane", () => {
     expect(
       record.events.filter((event) => event.type === "run_cancel_requested"),
     ).toHaveLength(1);
-    expect(record.events.filter((event) => event.type === "run_result")).toHaveLength(
-      1,
-    );
-    expect(record.events.filter((event) => event.type === "run_cancelled")).toHaveLength(
-      1,
-    );
-    expect(record.events.filter((event) => event.type === "delivery_intent")).toHaveLength(
-      1,
-    );
+    expect(
+      record.events.filter((event) => event.type === "run_result"),
+    ).toHaveLength(1);
+    expect(
+      record.events.filter((event) => event.type === "run_cancelled"),
+    ).toHaveLength(1);
+    expect(
+      record.events.filter((event) => event.type === "delivery_intent"),
+    ).toHaveLength(1);
   });
 
   it("binds approvals to the current authority and keeps rejection blocked but non-terminal", async () => {
