@@ -13,6 +13,10 @@ export interface WorkflowPlanTask {
   label?: string;
   isolation?: "in-process" | "process";
   input?: DurableValue;
+  approval?: {
+    policyHash: string;
+    denial: "stop" | "skip";
+  };
 }
 
 export interface WorkflowPlanPhase {
@@ -75,10 +79,15 @@ export function validateWorkflowPlan(
       ) {
         throw new Error(`Invalid or duplicate task id: ${task.id}`);
       }
-      if (options.durable && task.isolation === "process")
-        throw new Error(
-          "Process isolation is not supported for durable workflow plans",
-        );
+      if (task.isolation === "process")
+        throw new Error("Process isolation is not supported by the preview");
+      if (
+        task.approval !== undefined &&
+        (!task.approval.policyHash.trim() ||
+          !["stop", "skip"].includes(task.approval.denial))
+      ) {
+        throw new Error(`Invalid approval gate for task: ${task.id}`);
+      }
       ids.add(task.id);
     }
   }

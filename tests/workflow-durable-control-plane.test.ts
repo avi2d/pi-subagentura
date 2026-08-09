@@ -39,6 +39,24 @@ const plan: WorkflowPlan = {
   ],
 };
 
+const approvalPlan: WorkflowPlan = {
+  schemaVersion: 1,
+  name: "approval",
+  phases: [
+    {
+      id: "phase",
+      mode: "sequential",
+      tasks: [
+        {
+          id: "gated",
+          prompt: "gated task",
+          approval: { policyHash: "policy-v1", denial: "skip" },
+        },
+      ],
+    },
+  ],
+};
+
 const success = (output = "ok"): SubagentResult => ({
   isError: false,
   output,
@@ -269,6 +287,54 @@ describe("durable workflow control plane", () => {
       reason: "Needs review",
     });
     expect(rejected?.runBlock).toMatchObject({ source: "approval" });
+  });
+
+  it("persists declarative task approval gates and skips only the matching task", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-approval-gate-"));
+    roots.push(root);
+    const scope = createSessionScope({} as any);
+    scope.durableWorkflowOwner = owner;
+    const runAgent = vi.fn(async () => success("must not run"));
+
+    const blocked = await runDurableWorkflowForSession(root, scope, {
+      runId: "approval-gate",
+      plan: approvalPlan,
+      runAgent,
+    });
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.approval?.request).toMatchObject({
+      taskId: "gated",
+      policyHash: "policy-v1",
+      denial: "skip",
+    });
+    expect(runAgent).not.toHaveBeenCalled();
+
+    const controller = new RunnerController({
+      store: new WorkflowRunStore({ rootDir: root, owner }),
+      owner,
+    });
+    const requestId = blocked.approval!.request.requestId;
+    const skipped = await controller.decideApproval(
+      "approval-gate",
+      requestId,
+      {
+        requestId,
+        status: "rejected",
+        decidedBy: "operator",
+        policyHash: "policy-v1",
+        planRevision: blocked.planRevision,
+        version: 1,
+      },
+    );
+    expect(skipped?.tasks.gated.status).toBe("skipped");
+
+    const resumed = await resumeDurableWorkflowForSession(root, scope, {
+      runId: "approval-gate",
+      runAgent,
+    });
+    expect(resumed.status).toBe("done");
+    expect(resumed.tasks.gated.status).toBe("skipped");
+    expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("reclaims a dispatched delivery after the previous broker disappears", async () => {

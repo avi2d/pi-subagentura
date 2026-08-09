@@ -14,6 +14,7 @@ import type {
 import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
 import type { SessionScope } from "./session-scope";
 import { WorkflowSessionDispatcher } from "./workflow-dispatcher";
+import { workflowContinuitySnapshot } from "./workflow-continuity";
 import type { WorkflowProjection } from "./workflow-projection-repository";
 
 export interface WorkflowOwnerIdentityInput {
@@ -209,8 +210,16 @@ export function runDurableWorkflowForSession(
   if (!owner) throw new Error("Durable workflow storage is unavailable.");
   const store = sessionScopeDurableStore(rootDir, scope);
   if (!store) throw new Error("Durable workflow storage is unavailable.");
+  const onProjection = (projection: WorkflowProjection): void => {
+    scope.durableWorkflowContinuity = workflowContinuitySnapshot(
+      projection,
+      options.plan,
+    );
+    options.onProjection?.(projection);
+  };
   return runDurableWorkflowPlan({
     ...options,
+    onProjection,
     store,
     owner,
     dispatcher: durableWorkflowDispatcherForSession(scope),
@@ -252,12 +261,19 @@ export async function resumeDurableWorkflowForSession(
   }
   const plan = (payload as { plan?: unknown }).plan;
   validateWorkflowPlan(plan as WorkflowPlan);
+  const onProjection = (projection: WorkflowProjection): void => {
+    scope.durableWorkflowContinuity = workflowContinuitySnapshot(
+      projection,
+      plan as WorkflowPlan,
+    );
+    options.onProjection?.(projection);
+  };
   return runDurableWorkflowPlan({
     runId: options.runId,
     plan: plan as WorkflowPlan,
     runAgent: options.runAgent,
     signal: options.signal,
-    onProjection: options.onProjection,
+    onProjection,
     resume: true,
     store,
     owner,
