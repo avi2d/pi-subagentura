@@ -55,6 +55,8 @@ interface InterlockRecord {
   processStartTime?: number;
 }
 
+const activeInterlockPaths = new Set<string>();
+
 /**
  * Exclusive writer lease for one workflow namespace.
  *
@@ -300,6 +302,8 @@ export class WorkflowNamespaceLease {
       this.interlockDepth++;
       return;
     }
+    if (activeInterlockPaths.has(this.interlockPath))
+      throw new Error("Workflow namespace lease interlock is held");
     await mkdir(dirname(this.interlockPath), { recursive: true, mode: 0o700 });
     for (let attempt = 0; attempt < 2; attempt++) {
       let file;
@@ -312,6 +316,7 @@ export class WorkflowNamespaceLease {
             fsConstants.O_NOFOLLOW,
           0o600,
         );
+        activeInterlockPaths.add(this.interlockPath);
       } catch (error) {
         if (
           (error as NodeJS.ErrnoException).code === "EEXIST" &&
@@ -347,6 +352,7 @@ export class WorkflowNamespaceLease {
         this.interlockDepth = 1;
         return;
       } catch (error) {
+        activeInterlockPaths.delete(this.interlockPath);
         try {
           await file.close();
         } catch (closeError) {
@@ -382,6 +388,7 @@ export class WorkflowNamespaceLease {
       await rm(this.interlockPath, { force: false });
       await syncDirectory(dirname(this.interlockPath));
     } finally {
+      activeInterlockPaths.delete(this.interlockPath);
       await file?.close();
       this.resolveInterlockIdle?.();
       this.resolveInterlockIdle = undefined;

@@ -302,6 +302,87 @@ describe("workflow storage foundation", () => {
     await expect(store.readRun("terminal-run")).resolves.toBeDefined();
   });
 
+  it("does not prune a terminal run with an interrupted post-terminal prefix", async () => {
+    const { store, root } = await makeStore("interrupted-run");
+    const launchPath = join(
+      root,
+      owner.projectKey,
+      owner.piSessionId,
+      "runs",
+      "interrupted-run",
+      "launch.json",
+    );
+    const launch = JSON.parse(await readFile(launchPath, "utf8")) as {
+      createdAt: number;
+    };
+    launch.createdAt = 0;
+    await writeFile(launchPath, `${JSON.stringify(launch)}\n`);
+    await store.append("interrupted-run", "run_terminal", {
+      result: { status: "done", result: "ok" },
+    });
+    await store.append("interrupted-run", "run_interrupted", {});
+    await store.append("interrupted-run", "delivery_receipt", {
+      deliveryId: workflowDeliveryId("interrupted-run"),
+    });
+
+    await expect(store.pruneTerminalRuns({ olderThanMs: 0 })).resolves.toEqual(
+      [],
+    );
+  });
+
+  it("does not prune a blocked non-terminal run", async () => {
+    const { store, root } = await makeStore("blocked-run");
+    const launchPath = join(
+      root,
+      owner.projectKey,
+      owner.piSessionId,
+      "runs",
+      "blocked-run",
+      "launch.json",
+    );
+    const launch = JSON.parse(await readFile(launchPath, "utf8")) as {
+      createdAt: number;
+    };
+    launch.createdAt = 0;
+    await writeFile(launchPath, `${JSON.stringify(launch)}\n`);
+    await store.append("blocked-run", "run_started", {});
+    await store.append("blocked-run", "task_blocked", {
+      taskId: "task",
+      reason: "approval",
+    });
+
+    await expect(store.pruneTerminalRuns({ olderThanMs: 0 })).resolves.toEqual(
+      [],
+    );
+  });
+
+  it("requires the matching intent and dispatch prefix before deleting a receipt", async () => {
+    const { store, root } = await makeStore("prefix-run");
+    const launchPath = join(
+      root,
+      owner.projectKey,
+      owner.piSessionId,
+      "runs",
+      "prefix-run",
+      "launch.json",
+    );
+    const launch = JSON.parse(await readFile(launchPath, "utf8")) as {
+      createdAt: number;
+    };
+    launch.createdAt = 0;
+    await writeFile(launchPath, `${JSON.stringify(launch)}\n`);
+    await store.append("prefix-run", "run_terminal", {
+      result: { status: "done", result: "ok" },
+    });
+    await store.append("prefix-run", "delivery_receipt", {
+      deliveryId: workflowDeliveryId("prefix-run"),
+    });
+
+    await expect(store.pruneTerminalRuns({ olderThanMs: 0 })).resolves.toEqual(
+      [],
+    );
+  });
+
   it("requires the deterministic terminal delivery receipt before pruning", async () => {
     const { store, root } = await makeStore("delivered-run");
     const launchPath = join(
@@ -319,6 +400,14 @@ describe("workflow storage foundation", () => {
     await writeFile(launchPath, `${JSON.stringify(launch)}\n`);
     await store.append("delivered-run", "run_terminal", {
       result: { status: "done", result: "ok" },
+    });
+    await store.append("delivered-run", "delivery_intent", {
+      deliveryId: workflowDeliveryId("delivered-run"),
+      kind: "terminal",
+      message: "Workflow delivered-run done",
+    });
+    await store.append("delivered-run", "delivery_dispatched", {
+      deliveryId: workflowDeliveryId("delivered-run"),
     });
     await store.append("delivered-run", "delivery_receipt", {
       deliveryId: workflowDeliveryId("delivered-run"),
@@ -555,6 +644,14 @@ describe("workflow storage foundation", () => {
     await writeFile(launchPath, `${JSON.stringify(launch)}\n`);
     await store.append("descriptor-run", "run_terminal", {
       result: { status: "done", result: "ok" },
+    });
+    await store.append("descriptor-run", "delivery_intent", {
+      deliveryId: workflowDeliveryId("descriptor-run"),
+      kind: "terminal",
+      message: "Workflow descriptor-run done",
+    });
+    await store.append("descriptor-run", "delivery_dispatched", {
+      deliveryId: workflowDeliveryId("descriptor-run"),
     });
     await store.append("descriptor-run", "delivery_receipt", {
       deliveryId: workflowDeliveryId("descriptor-run"),
