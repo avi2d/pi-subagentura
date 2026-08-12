@@ -43,6 +43,7 @@ import { registerCancelAllFlows } from "./cancel-all-flows-registration";
 import { renderSubagentNotify } from "./rendering";
 import { registerInteractiveSupervisor } from "./interactive-supervisor-registration";
 import { parseWorkflowEagerMode } from "./workflow-routing";
+import { registerWorkflowRoutingRuntime } from "./workflow-routing-runtime";
 import {
   formatWorkflowContinuity,
   type WorkflowContinuitySnapshot,
@@ -149,6 +150,38 @@ export default function (pi: ExtensionAPI) {
     return {
       systemPrompt: `${event.systemPrompt}\n\n${additions.join("\n\n")}`,
     };
+  });
+  registerWorkflowRoutingRuntime(pi, {
+    getMode: () => pi.getFlag("workflow-eager"),
+    childContext: () => process.env.PI_SUBAGENTURA_CHILD === "1",
+    hasActiveWorkflow: () => {
+      const continuity = (
+        globalThis as typeof globalThis & {
+          __piSubagenturaWorkflowContinuity?: WorkflowContinuitySnapshot;
+        }
+      ).__piSubagenturaWorkflowContinuity;
+      return Boolean(
+        continuity &&
+        !["done", "error", "cancelled"].includes(continuity.status),
+      );
+    },
+    managementCommand: (prompt) => /^\/(?:workflow|wf)\b/i.test(prompt.trim()),
+    planOnly: (prompt) => /^(?:plan|outline|design)\b/i.test(prompt.trim()),
+    notify: (observation) => {
+      try {
+        pi.sendMessage?.(
+          {
+            customType: "workflow-routing",
+            content: `workflow routing ${observation.status}: ${observation.reason}`,
+            display: true,
+            details: observation,
+          },
+          { deliverAs: "followUp", triggerTurn: false },
+        );
+      } catch {
+        /* routing evidence is best-effort and must not interrupt the turn */
+      }
+    },
   });
   pi.registerMessageRenderer("subagent-notify", renderSubagentNotify);
   const sessionScope = registerSessionHandlers(pi);

@@ -5,11 +5,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { SubagentResult } from "../src/helpers";
 import {
   DurableWorkflowController,
+  drainActiveDurableExecutions,
   runDurableWorkflowPlan,
 } from "../src/workflow-durable-plan-runner";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
-import type { WorkflowPlan } from "../src/workflow-plan";
+import { workflowPlanDigest, type WorkflowPlan } from "../src/workflow-plan";
 
 const roots: string[] = [];
 const owner: WorkflowOwnerIdentity = {
@@ -332,6 +333,11 @@ describe("durable sequential plan runner", () => {
 
     expect(result.status).toBe("cancelled");
     expect(result.terminal).toMatchObject({ status: "cancelled" });
+    expect(
+      Object.values(result.tasks).every(
+        (task) => task.status !== "pending" && task.status !== "running",
+      ),
+    ).toBe(true);
   });
 
   it("commits cancellation when an active task observes an aborted signal", async () => {
@@ -365,6 +371,11 @@ describe("durable sequential plan runner", () => {
 
     expect(result.status).toBe("cancelled");
     expect(result.terminal).toMatchObject({ status: "cancelled" });
+    expect(
+      Object.values(result.tasks).every(
+        (task) => task.status !== "pending" && task.status !== "running",
+      ),
+    ).toBe(true);
   });
 
   it("rejects an invalid plan before creating a durable run", async () => {
@@ -429,21 +440,39 @@ describe("durable sequential plan runner", () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
     roots.push(root);
     const store = new WorkflowRunStore({ rootDir: root, owner });
+    const launchPlan: WorkflowPlan = {
+      ...plan,
+      name: "launch-snapshot",
+      phases: [
+        {
+          id: "parallel",
+          mode: "parallel",
+          tasks: [
+            {
+              id: "task",
+              prompt: "snapshot",
+              label: "Snapshot task",
+              isolation: "in-process",
+              input: { nested: { value: true }, count: 2 },
+            },
+          ],
+        },
+      ],
+    };
 
     await runDurableWorkflowPlan({
       store,
       owner,
       runId: "auto-resume-run",
-      plan: {
-        ...plan,
-        phases: [{ ...plan.phases[0], tasks: [plan.phases[0].tasks[0]] }],
-      },
+      plan: launchPlan,
       resumePolicy: "on-session-start",
       runAgent: async () => success("done"),
     });
 
     const record = await store.readRun("auto-resume-run");
     expect(record.launch.resumePolicy).toBe("on-session-start");
+    expect(record.launch.plan).toEqual(launchPlan);
+    expect(record.launch.planDigest).toBe(workflowPlanDigest(launchPlan));
   });
 
   it("executes parallel siblings once and folds their usage", async () => {
@@ -634,5 +663,188 @@ describe("durable sequential plan runner", () => {
     expect(calls.sort()).toEqual(["A", "B", "B"]);
     expect(result.tasks.a).toMatchObject({ status: "succeeded", attempt: 1 });
     expect(result.tasks.b).toMatchObject({ status: "succeeded", attempt: 2 });
+  });
+  it("hashes canonical-equivalent plan objects identically", () => {
+    const left: WorkflowPlan = {
+      schemaVersion: 1,
+      name: "canonical",
+      phases: [
+        {
+          id: "phase",
+          mode: "sequential",
+          tasks: [
+            {
+              id: "task",
+              prompt: "prompt",
+              input: { z: 1, a: { y: true, b: "value" } },
+            },
+          ],
+        },
+      ],
+    };
+    const right: WorkflowPlan = {
+      phases: [
+        {
+          tasks: [
+            {
+              input: { a: { b: "value", y: true }, z: 1 },
+              prompt: "prompt",
+              id: "task",
+            },
+          ],
+          mode: "sequential",
+          id: "phase",
+        },
+      ],
+      name: "canonical",
+      schemaVersion: 1,
+    };
+    expect(workflowPlanDigest(left)).toBe(workflowPlanDigest(right));
+  });
+
+  it("rejects durable process isolation before run creation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const processPlan: WorkflowPlan = {
+      ...plan,
+      phases: [
+        {
+          ...plan.phases[0],
+          tasks: [{ ...plan.phases[0].tasks[0], isolation: "process" }],
+        },
+      ],
+    };
+
+    await expect(
+      runDurableWorkflowPlan({
+        store,
+        owner,
+        runId: "process-run",
+        plan: processPlan,
+        runAgent: async () => {
+          throw new Error("must not dispatch");
+        },
+      }),
+    ).rejects.toThrow("Process isolation");
+    await expect(store.listRunIds()).resolves.toEqual([]);
+  });
+
+  it("drains active execution before committing cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const controller = new DurableWorkflowController({ store, owner });
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let drained = false;
+    const execution = runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "drain-run",
+      plan: {
+        ...plan,
+        phases: [{ ...plan.phases[0], tasks: [plan.phases[0].tasks[0]] }],
+      },
+      runAgent: async ({ signal }) => {
+        signalStarted();
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              drained = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        return success("late");
+      },
+    });
+    await started;
+
+    const cancelled = await controller.cancel("drain-run");
+    expect(drained).toBe(true);
+    expect(cancelled?.status).toBe("cancelled");
+    const eventCount = (await store.readRun("drain-run")).events.length;
+    await expect(controller.cancel("drain-run")).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    expect((await store.readRun("drain-run")).events).toHaveLength(eventCount);
+    await execution;
+  });
+  it("drains session shutdown as an interruption and resumes committed work", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-durable-"));
+    roots.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const calls: string[] = [];
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+
+    const execution = runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "shutdown-run",
+      plan,
+      runAgent: async ({ prompt, signal }) => {
+        calls.push(prompt);
+        if (prompt === "A") return success("done:A");
+        signalStarted();
+        return new Promise<SubagentResult>((_, reject) => {
+          const abort = () => reject(new Error("provider aborted"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
+    });
+    await started;
+
+    const drained = await drainActiveDurableExecutions(
+      owner,
+      "session_shutdown",
+    );
+    expect(drained).toHaveLength(1);
+    expect(drained[0]?.status).toBe("interrupted");
+    await expect(execution).resolves.toMatchObject({ status: "interrupted" });
+
+    const interrupted = await new DurableWorkflowController({
+      store,
+      owner,
+    }).getStatus("shutdown-run");
+    expect(interrupted?.status).toBe("interrupted");
+    expect(interrupted?.tasks.a).toMatchObject({
+      status: "succeeded",
+      attempt: 1,
+    });
+    expect(interrupted?.tasks.b).toMatchObject({
+      status: "running",
+      attempt: 1,
+    });
+
+    const resumed = await runDurableWorkflowPlan({
+      store,
+      owner,
+      runId: "shutdown-run",
+      plan,
+      resume: true,
+      runAgent: async ({ prompt }) => {
+        calls.push(prompt);
+        return success(`done:${prompt}`);
+      },
+    });
+    expect(resumed.status).toBe("done");
+    expect(resumed.tasks.a).toMatchObject({
+      status: "succeeded",
+      attempt: 1,
+    });
+    expect(resumed.tasks.b).toMatchObject({
+      status: "succeeded",
+      attempt: 2,
+    });
+    expect(calls).toEqual(["A", "B", "B"]);
   });
 });

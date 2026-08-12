@@ -9,8 +9,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
 import type {
   WorkflowAppendReceipt,
   WorkflowEventEnvelope,
@@ -18,8 +18,10 @@ import type {
   WorkflowRunLaunch,
 } from "./workflow-run-types";
 import { validateWorkflowRunId } from "./workflow-run-types";
-import { WorkflowNamespaceLease } from "./workflow-lease";
-
+import {
+  WorkflowNamespaceLease,
+  type WorkflowOwnerFence,
+} from "./workflow-lease";
 export type WorkflowConditionalAppendResult =
   | { status: "appended"; receipt: WorkflowAppendReceipt }
   | { status: "conflict"; actualLastEventOrdinal: number };
@@ -100,6 +102,7 @@ export class WorkflowRunStore {
   private readonly root: string;
   private readonly locks = new Map<string, Promise<void>>();
   private readonly leaseKey: string;
+  private observedLeaseEpoch: number | undefined;
 
   public static async releaseAllLeases(): Promise<void> {
     const leases = [...WorkflowRunStore.leases.entries()];
@@ -108,15 +111,11 @@ export class WorkflowRunStore {
   }
 
   constructor(private readonly options: WorkflowRunStoreOptions) {
-    this.root = join(
-      options.rootDir,
-      safePart(options.owner.projectKey, "project key"),
-      safePart(options.owner.piSessionId, "session id"),
-    );
+    this.root = workflowRunStoreRoot(options.rootDir, options.owner);
     this.leaseKey = this.root;
   }
 
-  private async assertNamespaceLease(): Promise<void> {
+  private async assertNamespaceLease(): Promise<WorkflowNamespaceLease> {
     let lease = WorkflowRunStore.leases.get(this.leaseKey);
     if (lease && !lease.isHeld) {
       WorkflowRunStore.leases.delete(this.leaseKey);
@@ -127,9 +126,29 @@ export class WorkflowRunStore {
       !lease.belongsTo(
         this.options.owner.ownerId,
         this.options.owner.leaseToken,
+        this.options.owner.ownerGeneration,
       )
     ) {
-      throw new Error("Workflow namespace lease is held by a different owner");
+      const heldFence = lease.activeOwnerFence;
+      if (
+        !heldFence ||
+        heldFence.ownerId !== this.options.owner.ownerId ||
+        heldFence.ownerGeneration === undefined ||
+        this.options.owner.ownerGeneration <= heldFence.ownerGeneration
+      ) {
+        throw new Error(
+          "Workflow namespace lease is held by a different owner",
+        );
+      }
+      // A lifecycle generation in this process may rotate the live owner while
+      // retaining the durable lookup namespace. Release only that local lease;
+      // an external lease remains protected by the lease file's identity check.
+      await lease.release();
+      WorkflowRunStore.leases.delete(this.leaseKey);
+      lease = undefined;
+    }
+    if (!lease && this.observedLeaseEpoch !== undefined) {
+      throw new Error("Workflow namespace lease epoch changed");
     }
     if (!lease) {
       lease = new WorkflowNamespaceLease({
@@ -137,6 +156,7 @@ export class WorkflowRunStore {
         namespace: "namespace",
         ownerId: this.options.owner.ownerId,
         leaseToken: this.options.owner.leaseToken,
+        ownerGeneration: this.options.owner.ownerGeneration,
         processId: process.pid,
         processStartTime: Math.floor(Date.now() - process.uptime() * 1000),
       });
@@ -144,6 +164,35 @@ export class WorkflowRunStore {
     }
     if (!lease.isHeld) await lease.acquire();
     await lease.assertHeld();
+    if (
+      this.observedLeaseEpoch !== undefined &&
+      this.observedLeaseEpoch !== lease.leaseEpoch
+    ) {
+      throw new Error("Workflow namespace lease epoch changed");
+    }
+    this.observedLeaseEpoch ??= lease.leaseEpoch;
+    return lease;
+  }
+
+  public async getLeaseEpoch(): Promise<number> {
+    const lease = await this.assertNamespaceLease();
+    return lease.leaseEpoch;
+  }
+
+  public async getActiveOwnerFence(): Promise<WorkflowOwnerFence> {
+    const lease = await this.assertNamespaceLease();
+    const fence = lease.activeOwnerFence;
+    if (!fence) throw new Error("Workflow namespace lease is not held");
+    return fence;
+  }
+
+  public async getRunEpoch(runId: string): Promise<number> {
+    await this.assertNamespaceLease();
+    const record = await this.readRun(runId);
+    assertSameOwner(record.launch.owner, this.options.owner);
+    return lastCompleteRunEpoch(
+      await readFile(join(this.runDir(runId), "events.ndjson")),
+    );
   }
 
   async release(): Promise<void> {
@@ -153,6 +202,7 @@ export class WorkflowRunStore {
       !lease.belongsTo(
         this.options.owner.ownerId,
         this.options.owner.leaseToken,
+        this.options.owner.ownerGeneration,
       )
     )
       return;
@@ -176,6 +226,7 @@ export class WorkflowRunStore {
     input: Omit<WorkflowRunLaunch, "schemaVersion" | "createdAt">,
   ): Promise<WorkflowRunLaunch> {
     await this.assertNamespaceLease();
+    assertCurrentOwner(input.owner, this.options.owner);
     validateWorkflowRunId(input.runId);
     if (
       this.options.maxRuns !== undefined &&
@@ -228,8 +279,11 @@ export class WorkflowRunStore {
     payload: P,
     runEpoch = 0,
     expectedLastEventOrdinal?: number,
+    leaseEpoch?: number,
   ): Promise<WorkflowAppendReceipt> {
-    await this.assertNamespaceLease();
+    if (!Number.isSafeInteger(runEpoch) || runEpoch < 0) {
+      throw new Error("Invalid workflow run epoch");
+    }
     const dir = this.runDir(runId);
     const event: WorkflowEventEnvelope<T, P> = {
       schemaVersion: 1,
@@ -241,6 +295,17 @@ export class WorkflowRunStore {
     };
     const line = `${JSON.stringify(event)}\n`;
     return this.withLock(runId, async () => {
+      // The lease and owner are revalidated after waiting for the per-run
+      // operation gate, so a release/reacquisition cannot race publication.
+      const lease = await this.assertNamespaceLease();
+      if (
+        leaseEpoch !== undefined &&
+        (!Number.isSafeInteger(leaseEpoch) || leaseEpoch !== lease.leaseEpoch)
+      ) {
+        throw new Error(
+          `Workflow namespace lease epoch ${leaseEpoch} is not current`,
+        );
+      }
       const launch = JSON.parse(
         await readFile(join(dir, "launch.json"), "utf8"),
       ) as WorkflowRunLaunch;
@@ -338,6 +403,7 @@ export class WorkflowRunStore {
     type: T,
     payload: P,
     runEpoch = 0,
+    leaseEpoch?: number,
   ): Promise<WorkflowConditionalAppendResult> {
     try {
       const receipt = await this.append(
@@ -346,6 +412,7 @@ export class WorkflowRunStore {
         payload,
         runEpoch,
         expectedLastEventOrdinal,
+        leaseEpoch,
       );
       return { status: "appended", receipt };
     } catch (error) {
@@ -483,6 +550,19 @@ export class WorkflowRunStore {
   }
 }
 
+function assertCurrentOwner(
+  left: WorkflowOwnerIdentity,
+  right: WorkflowOwnerIdentity,
+): void {
+  assertSameOwner(left, right);
+  if (
+    left.ownerGeneration !== right.ownerGeneration ||
+    left.leaseToken !== right.leaseToken
+  ) {
+    throw new Error("Workflow run belongs to a stale owner generation.");
+  }
+}
+
 class WorkflowConditionalAppendConflict extends Error {
   public constructor(public readonly actualLastEventOrdinal: number) {
     super("Workflow journal revision conflict");
@@ -493,13 +573,13 @@ function assertSameOwner(
   left: WorkflowOwnerIdentity,
   right: WorkflowOwnerIdentity,
 ): void {
+  // Persistent lookup identity is stable across reload/reacquisition. Live
+  // generation and lease-token checks happen against the namespace lease under
+  // the append gate, rather than against the immutable launch snapshot.
   if (
     left.projectKey !== right.projectKey ||
-    left.cwd !== right.cwd ||
     left.piSessionId !== right.piSessionId ||
-    left.ownerId !== right.ownerId ||
-    left.ownerGeneration !== right.ownerGeneration ||
-    left.leaseToken !== right.leaseToken
+    left.ownerId !== right.ownerId
   ) {
     throw new Error("Workflow run belongs to a different owner or session.");
   }
@@ -540,10 +620,16 @@ export function workflowRunStoreRoot(
   rootDir: string,
   owner: WorkflowOwnerIdentity,
 ): string {
+  const projectKey = /^[a-f0-9]{64}$/i.test(owner.projectKey)
+    ? owner.projectKey.toLowerCase()
+    : createHash("sha256").update(owner.projectKey).digest("hex");
+  const sessionKey = createHash("sha256")
+    .update(owner.piSessionId)
+    .digest("hex");
   return join(
     rootDir,
-    safePart(owner.projectKey, "project key"),
-    safePart(owner.piSessionId, "session id"),
+    safePart(projectKey, "project key"),
+    safePart(sessionKey, "session key"),
   );
 }
 

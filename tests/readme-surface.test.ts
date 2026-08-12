@@ -48,6 +48,8 @@ describe("README public surface", () => {
 
     expect(tools).toHaveLength(24);
     expect(commands).toHaveLength(17);
+    expect(new Set(tools).size).toBe(tools.length);
+    expect(new Set(commands).size).toBe(commands.length);
     for (const name of tools) {
       expect(toolInventory, `Missing tool inventory row for ${name}`).toContain(
         `| \`${name}\``,

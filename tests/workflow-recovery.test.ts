@@ -2,16 +2,24 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import {
   DurableWorkflowProjectionRepository,
   enumerateRecoverableWorkflowRuns,
   recoverWorkflowRun,
+  recoverWorkflowRunsAtStartup,
 } from "../src/workflow-recovery";
 import {
   DurableWorkflowController,
+  runDurableWorkflowPlan,
   workflowDeliveryId,
 } from "../src/workflow-durable-plan-runner";
+import type { WorkflowProjection } from "../src/workflow-projection-repository";
 import { projectWorkflowRun } from "../src/workflow-projection-repository";
+import {
+  canonicalizeWorkflowValue,
+  type WorkflowPlan,
+} from "../src/workflow-plan";
 import { WorkflowRunStore } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
 
@@ -24,6 +32,15 @@ const owner: WorkflowOwnerIdentity = {
   ownerGeneration: 1,
   leaseToken: "lease",
 };
+
+function legacyMutationHash(
+  previousMutationHash: string,
+  payload: Record<string, unknown>,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ previousMutationHash, payload }))
+    .digest("hex");
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -298,6 +315,78 @@ describe("workflow recovery projection", () => {
     ).rejects.toThrow("Duplicate");
   });
 
+  it("recovers legacy mutation hashes and chains new canonical mutations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "legacy",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+
+    const appendedPayload = {
+      taskId: "legacy-task",
+      phaseId: "phase",
+      prompt: "legacy work",
+    };
+    const appendedHash = legacyMutationHash("", appendedPayload);
+    await store.append("legacy", "task_appended", {
+      ...appendedPayload,
+      previousMutationHash: "",
+      mutationHash: appendedHash,
+    });
+    const blockedPayload = { taskId: "legacy-task" };
+    const blockedHash = legacyMutationHash(appendedHash, blockedPayload);
+    await store.append("legacy", "task_blocked", {
+      ...blockedPayload,
+      previousMutationHash: appendedHash,
+      mutationHash: blockedHash,
+    });
+
+    const recovered = await recoverWorkflowRun({ store, owner }, "legacy");
+    expect(recovered).toMatchObject({
+      revision: 2,
+      mutationHash: blockedHash,
+      tasks: {
+        "legacy-task": {
+          status: "blocked",
+          phaseId: "phase",
+          prompt: "legacy work",
+        },
+      },
+    });
+
+    const controller = new DurableWorkflowController({ store, owner });
+    const unblocked = await controller.mutateTask("legacy", {
+      type: "unblock",
+      taskId: "legacy-task",
+      expectedRevision: recovered.revision,
+    });
+    expect(unblocked).toMatchObject({
+      revision: 3,
+      mutationHash: expect.any(String),
+      tasks: { "legacy-task": { status: "pending" } },
+    });
+
+    const events = (await store.readRun("legacy")).events;
+    const followUp = events[2];
+    expect(followUp?.type).toBe("task_unblocked");
+    const followUpPayload = followUp?.payload as Record<string, unknown>;
+    const expectedCanonicalHash = createHash("sha256")
+      .update(
+        canonicalizeWorkflowValue({
+          previousMutationHash: blockedHash,
+          payload: blockedPayload,
+        }),
+      )
+      .digest("hex");
+    expect(followUpPayload.previousMutationHash).toBe(blockedHash);
+    expect(followUpPayload.mutationHash).toBe(expectedCanonicalHash);
+    expect(unblocked?.mutationHash).toBe(expectedCanonicalHash);
+  });
+
   it("enforces the legal block and unblock transition sequence", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
     dirs.push(root);
@@ -420,5 +509,359 @@ describe("workflow recovery projection", () => {
         (event) => event.type === "delivery_receipt",
       ),
     ).toHaveLength(1);
+  });
+  it("projects stale running claims to interrupted at startup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "stale",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("stale", "run_created", {});
+    await store.append("stale", "run_started", {});
+    await store.append("stale", "task_started", {
+      taskId: "a",
+      attempt: 1,
+      phaseId: "phase",
+    });
+
+    const replacementOwner = {
+      ...owner,
+      ownerGeneration: owner.ownerGeneration + 1,
+      leaseToken: "reloaded-lease",
+    };
+    const replacementStore = new WorkflowRunStore({
+      rootDir: root,
+      owner: replacementOwner,
+    });
+    const result = await recoverWorkflowRunsAtStartup({
+      store: replacementStore,
+      owner: replacementOwner,
+      reason: "startup",
+    });
+    expect(result.interruptedRunIds).toEqual(["stale"]);
+    expect(result.resumeEligibleRunIds).toEqual([]);
+    await expect(
+      recoverWorkflowRun(
+        { store: replacementStore, owner: replacementOwner },
+        "stale",
+      ),
+    ).resolves.toMatchObject({
+      status: "interrupted",
+      tasks: { a: { status: "running", attempt: 1 } },
+    });
+    expect(
+      (await replacementStore.readRun("stale")).events.filter(
+        (event) => event.type === "run_interrupted",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("hands off a trusted resume without replaying committed tasks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const persistedPlan: WorkflowPlan = {
+      schemaVersion: 1,
+      name: "resume",
+      phases: [
+        {
+          id: "phase",
+          mode: "sequential",
+          tasks: [
+            { id: "committed", prompt: "committed" },
+            { id: "pending", prompt: "pending" },
+          ],
+        },
+      ],
+    };
+    await store.createRun({
+      runId: "resume",
+      planRevision: 1,
+      plan: persistedPlan,
+      resumePolicy: "on-session-start",
+      owner,
+    });
+    await store.append("resume", "run_created", {});
+    await store.append("resume", "run_started", {});
+    await store.append("resume", "task_started", {
+      taskId: "committed",
+      attempt: 1,
+      phaseId: "phase",
+    });
+    await store.append("resume", "task_succeeded", {
+      taskId: "committed",
+      attempt: 1,
+      result: "done",
+    });
+    await store.append("resume", "task_started", {
+      taskId: "pending",
+      attempt: 1,
+      phaseId: "phase",
+    });
+
+    const handoff: WorkflowProjection[] = [];
+    const handoffPlans: WorkflowPlan[] = [];
+    const result = await recoverWorkflowRunsAtStartup({
+      store,
+      owner,
+      reason: "startup",
+      trustedResume: true,
+      onAutoResume: (projection, plan) => {
+        handoff.push(projection);
+        if (plan) handoffPlans.push(plan);
+      },
+    });
+    expect(result.resumeEligibleRunIds).toEqual(["resume"]);
+    expect(result.autoResumedRunIds).toEqual(["resume"]);
+    expect(handoff[0]).toMatchObject({
+      status: "interrupted",
+      tasks: {
+        committed: { status: "succeeded", attempt: 1 },
+        pending: { status: "running", attempt: 1 },
+      },
+    });
+    expect(handoffPlans).toEqual([persistedPlan]);
+  });
+
+  it("auto-resumes only an explicitly permitted policy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const autoPlan: WorkflowPlan = {
+      schemaVersion: 1,
+      name: "auto",
+      phases: [
+        {
+          id: "phase",
+          mode: "parallel",
+          tasks: [{ id: "a", prompt: "a" }],
+        },
+      ],
+    };
+    await store.createRun({
+      runId: "auto",
+      planRevision: 1,
+      plan: autoPlan,
+      resumePolicy: "on-session-start",
+      owner,
+    });
+    await store.append("auto", "run_started", {});
+    await store.append("auto", "task_started", {
+      taskId: "a",
+      attempt: 1,
+    });
+    const handoff: string[] = [];
+    const handoffPlans: WorkflowPlan[] = [];
+    const result = await recoverWorkflowRunsAtStartup({
+      store,
+      owner,
+      reason: "reload",
+      onAutoResume: (projection, plan) => {
+        handoff.push(projection.runId);
+        if (plan) handoffPlans.push(plan);
+      },
+    });
+    expect(result.autoResumedRunIds).toEqual(["auto"]);
+    expect(handoff).toEqual(["auto"]);
+    expect(handoffPlans).toEqual([autoPlan]);
+  });
+  it("auto-resumes a persisted plan once without replaying committed tasks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    const plan: WorkflowPlan = {
+      schemaVersion: 1,
+      name: "auto-once",
+      phases: [
+        {
+          id: "phase",
+          mode: "sequential",
+          tasks: [
+            { id: "committed", prompt: "committed" },
+            { id: "pending", prompt: "pending" },
+          ],
+        },
+      ],
+    };
+    await store.createRun({
+      runId: "auto-once",
+      planRevision: 1,
+      plan,
+      resumePolicy: "on-session-start",
+      owner,
+    });
+    await store.append("auto-once", "run_created", {
+      tasks: [
+        { id: "committed", phaseId: "phase", prompt: "committed" },
+        { id: "pending", phaseId: "phase", prompt: "pending" },
+      ],
+    });
+    await store.append("auto-once", "run_started", {});
+    await store.append("auto-once", "task_started", {
+      taskId: "committed",
+      attempt: 1,
+      phaseId: "phase",
+    });
+    await store.append("auto-once", "task_succeeded", {
+      taskId: "committed",
+      attempt: 1,
+      result: "already done",
+    });
+    await store.append("auto-once", "task_started", {
+      taskId: "pending",
+      attempt: 1,
+      phaseId: "phase",
+    });
+
+    const calls: string[] = [];
+    const result = await recoverWorkflowRunsAtStartup({
+      store,
+      owner,
+      reason: "startup",
+      onAutoResume: async (projection, persistedPlan) => {
+        expect(projection.runId).toBe("auto-once");
+        expect(persistedPlan).toEqual(plan);
+        await runDurableWorkflowPlan({
+          store,
+          owner,
+          runId: projection.runId,
+          plan: persistedPlan!,
+          resume: true,
+          runAgent: async ({ prompt }) => {
+            calls.push(prompt);
+            return {
+              isError: false,
+              output: `done:${prompt}`,
+              usage: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                turns: 1,
+              },
+            };
+          },
+        });
+      },
+    });
+
+    expect(result.autoResumedRunIds).toEqual(["auto-once"]);
+    expect(calls).toEqual(["pending"]);
+    await expect(
+      recoverWorkflowRun({ store, owner }, "auto-once"),
+    ).resolves.toMatchObject({
+      status: "done",
+      tasks: {
+        committed: { status: "succeeded", attempt: 1 },
+        pending: { status: "succeeded", attempt: 2 },
+      },
+    });
+  });
+
+  it("keeps legacy on-session-start runs queryable without auto-resuming", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "legacy",
+      planRevision: 1,
+      resumePolicy: "on-session-start",
+      owner,
+    });
+    await store.append("legacy", "run_started", {});
+    await store.append("legacy", "task_started", {
+      taskId: "a",
+      attempt: 1,
+    });
+
+    let callbackCount = 0;
+    const result = await recoverWorkflowRunsAtStartup({
+      store,
+      owner,
+      reason: "reload",
+      onAutoResume: () => {
+        callbackCount++;
+      },
+    });
+    expect(result.interruptedRunIds).toEqual(["legacy"]);
+    expect(result.resumeEligibleRunIds).toEqual([]);
+    expect(result.autoResumedRunIds).toEqual([]);
+    expect(callbackCount).toBe(0);
+    await expect(
+      recoverWorkflowRun({ store, owner }, "legacy"),
+    ).resolves.toMatchObject({ status: "interrupted" });
+  });
+
+  it("does not auto-resume manual runs even when trusted recovery is requested", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "manual",
+      planRevision: 1,
+      plan: {
+        schemaVersion: 1,
+        name: "manual",
+        phases: [
+          {
+            id: "phase",
+            mode: "sequential",
+            tasks: [{ id: "a", prompt: "a" }],
+          },
+        ],
+      },
+      resumePolicy: "manual",
+      owner,
+    });
+    await store.append("manual", "run_started", {});
+    await store.append("manual", "task_started", {
+      taskId: "a",
+      attempt: 1,
+    });
+
+    let callbackCount = 0;
+    const result = await recoverWorkflowRunsAtStartup({
+      store,
+      owner,
+      reason: "startup",
+      trustedResume: true,
+      onAutoResume: () => {
+        callbackCount++;
+      },
+    });
+    expect(result.resumeEligibleRunIds).toEqual([]);
+    expect(result.autoResumedRunIds).toEqual([]);
+    expect(callbackCount).toBe(0);
+  });
+
+  it("does not claim prior runs on new or fork lifecycle boundaries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-recovery-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "prior",
+      planRevision: 1,
+      resumePolicy: "on-session-start",
+      owner,
+    });
+    await store.append("prior", "run_started", {});
+    await store.append("prior", "task_started", { taskId: "a", attempt: 1 });
+
+    await expect(
+      recoverWorkflowRunsAtStartup({ store, owner, reason: "new" }),
+    ).resolves.toMatchObject({
+      runs: [],
+      interruptedRunIds: [],
+    });
+    expect(
+      (await store.readRun("prior")).events.some(
+        (event) => event.type === "run_interrupted",
+      ),
+    ).toBe(false);
   });
 });

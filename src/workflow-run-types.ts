@@ -1,3 +1,5 @@
+import type { WorkflowPlan } from "./workflow-plan";
+
 export const WORKFLOW_RUN_TYPES_VERSION = 1 as const;
 export const WORKFLOW_RUN_ID_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
 
@@ -40,6 +42,8 @@ export interface WorkflowOperationRequest extends WorkflowOperationIdentity {
   responseOrdinal: number;
 }
 
+export type WorkflowRunPlanSnapshot = WorkflowPlan;
+
 export interface WorkflowRunLaunch {
   schemaVersion: typeof WORKFLOW_RUN_TYPES_VERSION;
   runId: string;
@@ -48,6 +52,11 @@ export interface WorkflowRunLaunch {
   owner: WorkflowOwnerIdentity;
   createdAt: number;
   planDigest?: string;
+  /**
+   * Canonical normalized declarative plan admitted for this run. The
+   * snapshot is optional for compatibility with legacy launch records.
+   */
+  plan?: WorkflowRunPlanSnapshot;
 }
 
 export interface WorkflowAppendReceipt {

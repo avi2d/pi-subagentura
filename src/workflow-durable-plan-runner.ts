@@ -1,8 +1,16 @@
 import type { SubagentResult } from "./helpers";
-import { validateWorkflowPlan, type WorkflowPlan } from "./workflow-plan";
-import type { WorkflowProjection } from "./workflow-projection-repository";
+import {
+  canonicalWorkflowPlanDigest,
+  canonicalizeWorkflowValue,
+  normalizeWorkflowPlan,
+  type WorkflowPlan,
+} from "./workflow-plan";
 import { recoverWorkflowRun } from "./workflow-recovery";
-import { WorkflowRunStore } from "./workflow-run-store";
+import type { WorkflowProjection } from "./workflow-projection-repository";
+import {
+  WorkflowRunStore,
+  type WorkflowConditionalAppendResult,
+} from "./workflow-run-store";
 import type {
   WorkflowApprovalDecision,
   WorkflowApprovalRequest,
@@ -32,6 +40,152 @@ export interface DurableWorkflowPlanOptions {
   onProjection?: (projection: WorkflowProjection) => void;
 }
 
+export interface DurableWorkflowDispatcherSlot {
+  closeAdmission?: () => void;
+  drain?: () => Promise<void>;
+}
+
+export interface DurableSessionShutdownAbortReason {
+  readonly source: "session_shutdown";
+  readonly reason: "session_shutdown";
+}
+
+export interface ActiveDurableWorkflowExecution {
+  readonly runId: string;
+  readonly owner: WorkflowOwnerIdentity;
+  readonly store?: WorkflowRunStore;
+  readonly abortController: AbortController;
+  readonly promise: Promise<WorkflowProjection>;
+  readonly dispatcherSlot?: DurableWorkflowDispatcherSlot;
+}
+
+/**
+ * In-memory liveness is intentionally only an execution overlay. Durable
+ * journal state remains authoritative, while this owner-scoped registry lets
+ * trusted cancellation close admission and drain the active executor.
+ */
+export class DurableActiveExecutionRegistry {
+  private readonly entries = new Map<string, ActiveDurableWorkflowExecution>();
+
+  public get(
+    owner: WorkflowOwnerIdentity,
+    runId: string,
+  ): ActiveDurableWorkflowExecution | undefined {
+    return this.entries.get(activeExecutionKey(owner, runId));
+  }
+
+  public list(
+    owner: WorkflowOwnerIdentity,
+  ): readonly ActiveDurableWorkflowExecution[] {
+    const key = activeOwnerKey(owner);
+    return [...this.entries.values()].filter(
+      (execution) => activeOwnerKey(execution.owner) === key,
+    );
+  }
+
+  public register(
+    execution: ActiveDurableWorkflowExecution,
+  ): ActiveDurableWorkflowExecution | undefined {
+    const key = activeExecutionKey(execution.owner, execution.runId);
+    const current = this.entries.get(key);
+    if (current) return current;
+    this.entries.set(key, execution);
+    return undefined;
+  }
+
+  public unregister(execution: ActiveDurableWorkflowExecution): void {
+    const key = activeExecutionKey(execution.owner, execution.runId);
+    if (this.entries.get(key) === execution) this.entries.delete(key);
+  }
+}
+
+export const activeDurableExecutionRegistry =
+  new DurableActiveExecutionRegistry();
+
+export async function drainActiveDurableExecutions(
+  owner: WorkflowOwnerIdentity,
+  reason: "session_shutdown" = "session_shutdown",
+): Promise<WorkflowProjection[]> {
+  const executions = activeDurableExecutionRegistry.list(owner);
+  const shutdownReason: DurableSessionShutdownAbortReason = {
+    source: "session_shutdown",
+    reason,
+  };
+  const projections = await Promise.all(
+    executions.map(async (execution) => {
+      execution.dispatcherSlot?.closeAdmission?.();
+      if (!execution.abortController.signal.aborted) {
+        execution.abortController.abort(shutdownReason);
+      }
+      try {
+        await execution.dispatcherSlot?.drain?.();
+      } catch {
+        // Shutdown remains best-effort when a provider slot has already gone
+        // away; the durable execution is still awaited below.
+      }
+      try {
+        await execution.promise;
+      } catch {
+        // The durable recovery projection below is authoritative.
+      }
+      if (!execution.store) return undefined;
+      const current = await recoverWorkflowRun(
+        { store: execution.store, owner: execution.owner },
+        execution.runId,
+      );
+      if (current.terminal || current.cancellationRequested) return current;
+      return commitInterruptedRun(
+        execution.store,
+        execution.owner,
+        execution.runId,
+        undefined,
+        reason,
+      );
+    }),
+  );
+  return projections.filter(
+    (projection): projection is WorkflowProjection => projection !== undefined,
+  );
+}
+
+function activeOwnerKey(owner: WorkflowOwnerIdentity): string {
+  return JSON.stringify([
+    owner.projectKey,
+    owner.cwd,
+    owner.piSessionId,
+    owner.ownerId,
+    owner.ownerGeneration,
+    owner.leaseToken,
+  ]);
+}
+
+function isSessionShutdownAbort(reason: unknown): boolean {
+  if (typeof reason !== "object" || reason === null || !("source" in reason))
+    return false;
+  return reason.source === "session_shutdown";
+}
+
+function sessionShutdownPayload(
+  reason: "session_shutdown" = "session_shutdown",
+): { reason: "session_shutdown" } {
+  return { reason };
+}
+
+function activeExecutionKey(
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+): string {
+  return JSON.stringify([
+    owner.projectKey,
+    owner.cwd,
+    owner.piSessionId,
+    owner.ownerId,
+    owner.ownerGeneration,
+    owner.leaseToken,
+    runId,
+  ]);
+}
+
 export interface DurableWorkflowControllerOptions {
   store: WorkflowRunStore;
   owner: WorkflowOwnerIdentity;
@@ -54,7 +208,7 @@ export class DurableWorkflowController {
           (task) => task.status === "failed",
         );
         if (failed) {
-          await this.options.store.append(runId, "run_result", {
+          await this.append(runId, "run_result", {
             result: {
               status: "error",
               error: {
@@ -63,13 +217,11 @@ export class DurableWorkflowController {
               },
             },
           });
-          await this.options.store.append(runId, "run_terminal", {});
+          await this.append(runId, "run_terminal", {});
         }
       }
       const repaired = await recoverWorkflowRun(this.options, runId);
       if (isTerminal(repaired.status) && !repaired.delivery) {
-        // A crash may occur after the terminal event and before the outbox
-        // intent. Repair the limbo window before exposing the projection.
         await appendDeliveryIntent(
           this.options.store,
           this.options.owner,
@@ -95,12 +247,40 @@ export class DurableWorkflowController {
   public async cancel(runId: string): Promise<WorkflowProjection | undefined> {
     const projection = await this.getStatus(runId);
     if (!projection || isTerminal(projection.status)) return projection;
-    await this.options.store.append(runId, "run_result", {
-      result: { status: "cancelled" },
-    });
-    await this.options.store.append(runId, "run_cancelled", {});
-    await appendDeliveryIntent(this.options.store, this.options.owner, runId);
-    return recoverWorkflowRun(this.options, runId);
+
+    // Admission is closed durably before any active provider is signalled.
+    if (!projection.cancellationRequested) {
+      await this.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "run_cancel_requested",
+        {},
+      );
+    }
+
+    const active = activeDurableExecutionRegistry.get(
+      this.options.owner,
+      runId,
+    );
+    if (active) {
+      active.dispatcherSlot?.closeAdmission?.();
+      if (!active.abortController.signal.aborted) {
+        active.abortController.abort(
+          new Error("Workflow cancellation requested"),
+        );
+      }
+      await active.dispatcherSlot?.drain?.();
+      try {
+        await active.promise;
+      } catch {
+        // A provider/runner failure still leaves the durable journal as the
+        // source of truth; cancellation terminalization below is idempotent.
+      }
+    }
+
+    const drained = await this.getStatus(runId);
+    if (!drained || isTerminal(drained.status)) return drained;
+    return commitCancelledRun(this.options.store, this.options.owner, runId);
   }
 
   public async pauseForBudget(
@@ -110,7 +290,7 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection || isTerminal(projection.status)) return projection;
     if (projection.status === "awaiting_budget") return projection;
-    await this.options.store.append(runId, "run_awaiting_budget", {
+    await this.append(runId, "run_awaiting_budget", {
       ...(reason ? { reason } : {}),
     });
     return this.getStatus(runId);
@@ -122,7 +302,7 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection || projection.status !== "awaiting_budget")
       return projection;
-    await this.options.store.append(runId, "run_budget_resumed", {});
+    await this.append(runId, "run_budget_resumed", {});
     return this.getStatus(runId);
   }
 
@@ -153,7 +333,7 @@ export class DurableWorkflowController {
       if (isTerminal(projection.status)) {
         throw new Error("Cannot append work to a terminal workflow");
       }
-      const appendResult = await this.options.store.appendIfCurrent(
+      const appendResult = await this.appendIfCurrent(
         runId,
         projection.lastEventOrdinal,
         "task_appended",
@@ -195,7 +375,7 @@ export class DurableWorkflowController {
         : mutation.type === "unblock"
           ? "task_unblocked"
           : "task_skipped";
-    const appendResult = await this.options.store.appendIfCurrent(
+    const appendResult = await this.appendIfCurrent(
       runId,
       projection.lastEventOrdinal,
       eventType,
@@ -217,9 +397,7 @@ export class DurableWorkflowController {
     if (!projection || projection.delivery?.deliveryId !== deliveryId)
       return projection;
     if (projection.delivery.status !== "delivered") {
-      await this.options.store.append(runId, "delivery_receipt", {
-        deliveryId,
-      });
+      await this.append(runId, "delivery_receipt", { deliveryId });
     }
     return this.getStatus(runId);
   }
@@ -232,9 +410,7 @@ export class DurableWorkflowController {
     if (!projection || projection.delivery?.deliveryId !== deliveryId)
       return projection;
     if (projection.delivery.status === "pending") {
-      await this.options.store.append(runId, "delivery_dispatched", {
-        deliveryId,
-      });
+      await this.append(runId, "delivery_dispatched", { deliveryId });
     }
     return this.getStatus(runId);
   }
@@ -247,7 +423,7 @@ export class DurableWorkflowController {
     const projection = await this.getStatus(runId);
     if (!projection) return undefined;
     if (projection.approval?.status === "pending") return projection;
-    await this.options.store.append(runId, "approval_requested", { request });
+    await this.append(runId, "approval_requested", { request });
     return this.getStatus(runId);
   }
 
@@ -280,15 +456,107 @@ export class DurableWorkflowController {
       return projection;
     }
     if (projection.approval.status !== "pending") return projection;
-    await this.options.store.append(runId, "approval_decided", decision);
+    await this.append(runId, "approval_decided", decision);
     if (decision.status === "rejected") {
-      await this.options.store.append(runId, "run_blocked", {
+      await this.append(runId, "run_blocked", {
         reason: decision.reason ?? "Workflow approval rejected",
       });
     }
     this.options.onApprovalDecision?.(runId, decision.status);
     return this.getStatus(runId);
   }
+
+  private async append(
+    runId: string,
+    type: string,
+    payload: unknown,
+  ): Promise<unknown> {
+    return appendCurrentEvent(this.options.store, runId, type, payload);
+  }
+
+  private async appendIfCurrent(
+    runId: string,
+    expectedLastEventOrdinal: number,
+    type: string,
+    payload: unknown,
+  ): Promise<WorkflowConditionalAppendResult> {
+    return appendCurrentConditionalEvent(
+      this.options.store,
+      runId,
+      expectedLastEventOrdinal,
+      type,
+      payload,
+    );
+  }
+}
+async function currentRunEpoch(
+  store: WorkflowRunStore,
+  runId: string,
+): Promise<number> {
+  const candidate = (
+    store as WorkflowRunStore & {
+      getRunEpoch?: (id: string) => Promise<number>;
+    }
+  ).getRunEpoch;
+  if (candidate) return candidate.call(store, runId);
+  const events = (await store.readRun(runId)).events;
+  return events.reduce(
+    (epoch, event) =>
+      Number.isSafeInteger(event.runEpoch) && event.runEpoch > epoch
+        ? event.runEpoch
+        : epoch,
+    0,
+  );
+}
+
+async function currentLeaseEpoch(store: WorkflowRunStore): Promise<number> {
+  const candidate = (
+    store as WorkflowRunStore & {
+      getLeaseEpoch?: () => Promise<number>;
+    }
+  ).getLeaseEpoch;
+  return candidate ? candidate.call(store) : 0;
+}
+
+async function appendCurrentEvent(
+  store: WorkflowRunStore,
+  runId: string,
+  type: string,
+  payload: unknown,
+  runEpoch?: number,
+): Promise<unknown> {
+  const effectiveRunEpoch =
+    runEpoch === undefined ? await currentRunEpoch(store, runId) : runEpoch;
+  const leaseEpoch = await currentLeaseEpoch(store);
+  return store.append(
+    runId,
+    type,
+    payload,
+    effectiveRunEpoch,
+    undefined,
+    leaseEpoch,
+  );
+}
+
+async function appendCurrentConditionalEvent(
+  store: WorkflowRunStore,
+  runId: string,
+  expectedLastEventOrdinal: number,
+  type: string,
+  payload: unknown,
+  runEpoch?: number,
+): Promise<WorkflowConditionalAppendResult> {
+  const effectiveRunEpoch =
+    runEpoch === undefined ? await currentRunEpoch(store, runId) : runEpoch;
+  const leaseEpoch = await currentLeaseEpoch(store);
+  return store.appendIfCurrent(
+    runId,
+    expectedLastEventOrdinal,
+    type,
+    payload,
+    effectiveRunEpoch,
+    leaseEpoch,
+  );
 }
 
 function withMutationHash(
@@ -297,7 +565,9 @@ function withMutationHash(
 ): Record<string, unknown> {
   const previous = previousMutationHash ?? "";
   const mutationHash = createHash("sha256")
-    .update(JSON.stringify({ previousMutationHash: previous, payload }))
+    .update(
+      canonicalizeWorkflowValue({ previousMutationHash: previous, payload }),
+    )
     .digest("hex");
   return { ...payload, previousMutationHash: previous, mutationHash };
 }
@@ -323,19 +593,93 @@ export function workflowDeliveryMessage(
 export async function runDurableWorkflowPlan(
   options: DurableWorkflowPlanOptions,
 ): Promise<WorkflowProjection> {
+  // Durable admission owns one immutable snapshot. Process isolation is
+  // rejected here, before lookup/create, while non-durable previews retain
+  // their independent validation and runner behavior.
+  const normalizedPlan =
+    options.plan.schemaVersion === 1
+      ? normalizeWorkflowPlan(options.plan, { durable: true })
+      : options.plan;
+  const normalizedOptions = { ...options, plan: normalizedPlan };
+  const existing = activeDurableExecutionRegistry.get(
+    options.owner,
+    options.runId,
+  );
+  if (existing) return existing.promise;
+
+  const abortController = new AbortController();
+  const abortListener = () => {
+    abortController.abort(options.signal?.reason);
+  };
+  if (options.signal) {
+    if (options.signal.aborted) abortListener();
+    else
+      options.signal.addEventListener("abort", abortListener, { once: true });
+  }
+  let resolveExecution!: (projection: WorkflowProjection) => void;
+  let rejectExecution!: (error: unknown) => void;
+  const executionPromise = new Promise<WorkflowProjection>(
+    (resolve, reject) => {
+      resolveExecution = resolve;
+      rejectExecution = reject;
+    },
+  );
+  // Keep the registry promise awaitable for trusted cancellation while
+  // preventing an executor failure from becoming an unhandled rejection when
+  // no controller is observing it.
+  void executionPromise.catch(() => undefined);
+  const execution: ActiveDurableWorkflowExecution = {
+    runId: options.runId,
+    owner: options.owner,
+    store: options.store,
+    abortController,
+    promise: executionPromise,
+    dispatcherSlot: {
+      closeAdmission: () => {
+        // Admission is closed by the caller before the abort signal is
+        // delivered. The signal itself is owned by the caller so shutdown
+        // can preserve its typed reason.
+      },
+    },
+  };
+  const duplicate = activeDurableExecutionRegistry.register(execution);
+  if (duplicate) {
+    if (options.signal)
+      options.signal.removeEventListener("abort", abortListener);
+    return duplicate.promise;
+  }
+  try {
+    const result = await executeDurableWorkflowPlan({
+      ...normalizedOptions,
+      signal: abortController.signal,
+    });
+    resolveExecution(result);
+    return result;
+  } catch (error) {
+    rejectExecution(error);
+    throw error;
+  } finally {
+    if (options.signal)
+      options.signal.removeEventListener("abort", abortListener);
+    activeDurableExecutionRegistry.unregister(execution);
+  }
+}
+
+async function executeDurableWorkflowPlan(
+  options: DurableWorkflowPlanOptions,
+): Promise<WorkflowProjection> {
   const { store, owner, runId, plan } = options;
-  const planDigest = createHash("sha256")
-    .update(JSON.stringify(plan))
-    .digest("hex");
+  const planDigest =
+    plan.schemaVersion === 1 ? canonicalWorkflowPlanDigest(plan) : "";
   const publish = (next: WorkflowProjection): WorkflowProjection => {
     options.onProjection?.(next);
     return next;
   };
   let projection: WorkflowProjection;
+  let runEpoch = 1;
   const controller = new DurableWorkflowController({ store, owner });
-  // Validate before recovery so malformed resume input cannot touch an
-  // authoritative run or dispatch work.
-  validateWorkflowPlan({ ...plan, schemaVersion: 1 });
+  const append = (type: string, payload: unknown) =>
+    appendCurrentEvent(store, runId, type, payload, runEpoch);
   try {
     const recovered = await controller.getStatus(runId);
     if (!recovered) {
@@ -344,28 +688,40 @@ export async function runDurableWorkflowPlan(
       throw missing;
     }
     projection = recovered;
+    runEpoch = Math.max(1, await currentRunEpoch(store, runId));
   } catch (error) {
     if (!isMissingRun(error)) throw error;
     // Do not leave an orphaned run directory for an invalid new plan.
-    validateWorkflowPlan(plan);
+    if (plan.schemaVersion !== 1)
+      throw new Error("Invalid workflow plan header");
     await store.createRun({
       runId,
       planRevision: plan.schemaVersion,
       planDigest,
+      plan,
       resumePolicy: options.resumePolicy ?? "manual",
       owner,
     });
-    await store.append(runId, "run_created", {
+    runEpoch = Math.max(1, await currentRunEpoch(store, runId));
+    await append("run_created", {
       tasks: plan.phases.flatMap((phase) =>
         phase.tasks.map((task) => ({
           id: task.id,
           phaseId: phase.id,
           prompt: task.prompt,
-          ...(task.label ? { label: task.label } : {}),
+          ...(task.label === undefined ? {} : { label: task.label }),
+          ...(task.input === undefined ? {} : { input: task.input }),
         })),
       ),
     });
     projection = (await controller.getStatus(runId)) as WorkflowProjection;
+  }
+  if (projection.status === "running") {
+    // No local registry entry exists at this point, so a running claim belongs
+    // to a crashed/reloaded executor. Fence it before any trusted resume.
+    await append("run_interrupted", { reason: "stale_execution" });
+    projection = (await controller.getStatus(runId)) as WorkflowProjection;
+    runEpoch = Math.max(1, await currentRunEpoch(store, runId));
   }
 
   if (projection.status === "interrupted" && !options.resume) {
@@ -383,12 +739,23 @@ export async function runDurableWorkflowPlan(
   }
   // The stored revision owns mismatch reporting before resume validation.
   if (isTerminal(projection.status)) return publish(projection);
-  if (options.signal?.aborted) {
-    return publish(await commitCancelledRun(store, owner, runId));
+  if (projection.status === "interrupted" && options.resume) {
+    runEpoch = Math.max(1, runEpoch + 1);
+  }
+  if (options.signal?.aborted || projection.cancellationRequested) {
+    return publish(
+      await commitAbortedDurableRun(
+        store,
+        owner,
+        runId,
+        runEpoch,
+        options.signal,
+      ),
+    );
   }
   if (isRunDispatchSuspended(projection)) return publish(projection);
   if (projection.status === "created" || projection.status === "interrupted") {
-    await store.append(runId, "run_started", {});
+    await append("run_started", {});
   }
 
   for (const phase of plan.phases) {
@@ -397,10 +764,17 @@ export async function runDurableWorkflowPlan(
       return current?.status !== "succeeded" && current?.status !== "skipped";
     });
     if (phase.mode === "parallel") {
-      const completed = await runDurableParallelPhase(options, phase.id, tasks);
+      const completed = await runDurableParallelPhase(
+        options,
+        phase.id,
+        tasks,
+        runEpoch,
+      );
       if (!completed) {
-        await appendDeliveryIntent(store, owner, runId);
-        return publish(await recoverWorkflowRun({ store, owner }, runId));
+        const recovered = await recoverWorkflowRun({ store, owner }, runId);
+        if (isTerminal(recovered.status))
+          await appendDeliveryIntent(store, owner, runId, runEpoch);
+        return publish(recovered);
       }
       continue;
     }
@@ -409,17 +783,25 @@ export async function runDurableWorkflowPlan(
       const existing = projection.tasks[task.id];
       if (existing?.status === "succeeded" || existing?.status === "skipped")
         continue;
-      if (isRunDispatchSuspended(projection) || !isTaskDispatchable(existing))
+      if (
+        isRunDispatchSuspended(projection) ||
+        projection.cancellationRequested ||
+        !isTaskDispatchable(existing)
+      )
         return publish(projection);
       if (options.signal?.aborted) {
-        await store.append(runId, "run_result", {
-          result: { status: "cancelled" },
-        });
-        await store.append(runId, "run_cancelled", {});
-        return publish(await commitCancelledRun(store, owner, runId));
+        return publish(
+          await commitAbortedDurableRun(
+            store,
+            owner,
+            runId,
+            runEpoch,
+            options.signal,
+          ),
+        );
       }
       const attempt = (existing?.attempt ?? 0) + 1;
-      await store.append(runId, "task_started", {
+      await append("task_started", {
         taskId: task.id,
         attempt,
         phaseId: phase.id,
@@ -431,19 +813,30 @@ export async function runDurableWorkflowPlan(
           label: task.label ?? task.id,
           signal: options.signal,
         });
-        await store.append(runId, "usage_observed", {
+        if (options.signal?.aborted) {
+          return publish(
+            await commitAbortedDurableRun(
+              store,
+              owner,
+              runId,
+              runEpoch,
+              options.signal,
+            ),
+          );
+        }
+        await append("usage_observed", {
           input: result.usage.input,
           output: result.usage.output,
           taskId: task.id,
           attempt,
         });
         if (result.isError) {
-          await store.append(runId, "task_failed", {
+          await append("task_failed", {
             taskId: task.id,
             attempt,
             error: result.errorMessage ?? "Task failed",
           });
-          await store.append(runId, "run_result", {
+          await append("run_result", {
             result: {
               status: "error",
               error: {
@@ -452,24 +845,33 @@ export async function runDurableWorkflowPlan(
               },
             },
           });
-          await store.append(runId, "run_terminal", {});
-          await appendDeliveryIntent(store, owner, runId);
+          await append("run_terminal", {});
+          await appendDeliveryIntent(store, owner, runId, runEpoch);
           return publish(await recoverWorkflowRun({ store, owner }, runId));
         }
-        await store.append(runId, "task_succeeded", {
+        await append("task_succeeded", {
           taskId: task.id,
           attempt,
           result: result.output,
         });
       } catch (error) {
-        if (options.signal?.aborted) {
-          await store.append(runId, "run_result", {
-            result: { status: "cancelled" },
-          });
-          await store.append(runId, "run_cancelled", {});
-          return publish(await commitCancelledRun(store, owner, runId));
+        if (isSessionShutdownAbort(options.signal?.reason)) {
+          return publish(
+            await commitAbortedDurableRun(
+              store,
+              owner,
+              runId,
+              runEpoch,
+              options.signal,
+            ),
+          );
         }
-        await store.append(runId, "run_interrupted", {});
+        if (options.signal?.aborted || projection.cancellationRequested) {
+          return publish(
+            await commitCancelledRun(store, owner, runId, runEpoch),
+          );
+        }
+        await append("run_interrupted", {});
         throw error;
       }
     }
@@ -478,7 +880,8 @@ export async function runDurableWorkflowPlan(
   // Mutations are authoritative. Re-read after the declared plan so work
   // appended while the coordinator was running cannot be silently ignored.
   projection = await recoverWorkflowRun({ store, owner }, runId);
-  if (isRunDispatchSuspended(projection)) return publish(projection);
+  if (isRunDispatchSuspended(projection) || projection.cancellationRequested)
+    return publish(projection);
   const declaredTaskIds = new Set(
     plan.phases.flatMap((phase) => phase.tasks.map((task) => task.id)),
   );
@@ -506,8 +909,19 @@ export async function runDurableWorkflowPlan(
         task.status === "blocked"
       )
         continue;
+      if (options.signal?.aborted) {
+        return publish(
+          await commitAbortedDurableRun(
+            store,
+            owner,
+            runId,
+            runEpoch,
+            options.signal,
+          ),
+        );
+      }
       const attempt = task.attempt + 1;
-      await store.append(runId, "task_started", {
+      await append("task_started", {
         taskId: task.id,
         attempt,
         phaseId: task.phaseId ?? "appended",
@@ -520,19 +934,38 @@ export async function runDurableWorkflowPlan(
           label: task.label ?? task.id,
           signal: options.signal,
         });
-      } catch (error) {
         if (options.signal?.aborted) {
-          await store.append(runId, "run_result", {
-            result: { status: "cancelled" },
-          });
-          await store.append(runId, "run_cancelled", {});
-          await appendDeliveryIntent(store, owner, runId);
-          return publish(await recoverWorkflowRun({ store, owner }, runId));
+          return publish(
+            await commitAbortedDurableRun(
+              store,
+              owner,
+              runId,
+              runEpoch,
+              options.signal,
+            ),
+          );
         }
-        await store.append(runId, "run_interrupted", {});
+      } catch (error) {
+        if (isSessionShutdownAbort(options.signal?.reason)) {
+          return publish(
+            await commitAbortedDurableRun(
+              store,
+              owner,
+              runId,
+              runEpoch,
+              options.signal,
+            ),
+          );
+        }
+        if (options.signal?.aborted || projection.cancellationRequested) {
+          return publish(
+            await commitCancelledRun(store, owner, runId, runEpoch),
+          );
+        }
+        await append("run_interrupted", {});
         throw error;
       }
-      await store.append(runId, "usage_observed", {
+      await append("usage_observed", {
         input: result.usage.input,
         output: result.usage.output,
         taskId: task.id,
@@ -540,19 +973,19 @@ export async function runDurableWorkflowPlan(
       });
       if (result.isError) {
         const message = result.errorMessage ?? "Task failed";
-        await store.append(runId, "task_failed", {
+        await append("task_failed", {
           taskId: task.id,
           attempt,
           error: message,
         });
-        await store.append(runId, "run_result", {
+        await append("run_result", {
           result: { status: "error", error: { code: "task_failed", message } },
         });
-        await store.append(runId, "run_terminal", {});
-        await appendDeliveryIntent(store, owner, runId);
+        await append("run_terminal", {});
+        await appendDeliveryIntent(store, owner, runId, runEpoch);
         return publish(await recoverWorkflowRun({ store, owner }, runId));
       }
-      await store.append(runId, "task_succeeded", {
+      await append("task_succeeded", {
         taskId: task.id,
         attempt,
         result: result.output,
@@ -561,12 +994,24 @@ export async function runDurableWorkflowPlan(
   }
 
   projection = await recoverWorkflowRun({ store, owner }, runId);
-  if (isRunDispatchSuspended(projection)) return publish(projection);
-  await store.append(runId, "run_result", {
+  if (options.signal?.aborted) {
+    return publish(
+      await commitAbortedDurableRun(
+        store,
+        owner,
+        runId,
+        runEpoch,
+        options.signal,
+      ),
+    );
+  }
+  if (isRunDispatchSuspended(projection) || projection.cancellationRequested)
+    return publish(projection);
+  await append("run_result", {
     result: { status: "done", result: "Workflow completed" },
   });
-  await store.append(runId, "run_terminal", {});
-  await appendDeliveryIntent(store, owner, runId);
+  await append("run_terminal", {});
+  await appendDeliveryIntent(store, owner, runId, runEpoch);
   projection = await recoverWorkflowRun({ store, owner }, runId);
   return publish(projection);
 }
@@ -575,11 +1020,14 @@ async function runDurableParallelPhase(
   options: DurableWorkflowPlanOptions,
   phaseId: string,
   tasks: WorkflowPlan["phases"][number]["tasks"],
+  runEpoch: number,
 ): Promise<boolean> {
   const limit = Math.max(1, Math.min(4, tasks.length));
   let nextIndex = 0;
   let firstError: unknown;
   let interrupted = false;
+  const append = (type: string, payload: unknown) =>
+    appendCurrentEvent(options.store, options.runId, type, payload, runEpoch);
   const worker = async (): Promise<void> => {
     while (firstError === undefined) {
       const task = tasks[nextIndex++];
@@ -591,14 +1039,16 @@ async function runDurableParallelPhase(
       const attempt = (projection.tasks[task.id]?.attempt ?? 0) + 1;
       if (
         isRunDispatchSuspended(projection) ||
+        projection.cancellationRequested ||
         !isTaskDispatchable(projection.tasks[task.id])
       )
         return;
       if (options.signal?.aborted) {
         firstError = options.signal.reason ?? new Error("Workflow cancelled");
+        interrupted = isSessionShutdownAbort(options.signal.reason);
         return;
       }
-      await options.store.append(options.runId, "task_started", {
+      await append("task_started", {
         taskId: task.id,
         attempt,
         phaseId,
@@ -610,7 +1060,12 @@ async function runDurableParallelPhase(
           label: task.label ?? task.id,
           signal: options.signal,
         });
-        await options.store.append(options.runId, "usage_observed", {
+        if (options.signal?.aborted) {
+          firstError = options.signal.reason ?? new Error("Workflow cancelled");
+          interrupted = isSessionShutdownAbort(options.signal.reason);
+          return;
+        }
+        await append("usage_observed", {
           input: result.usage.input,
           output: result.usage.output,
           taskId: task.id,
@@ -618,33 +1073,33 @@ async function runDurableParallelPhase(
         });
         if (result.isError) {
           const message = result.errorMessage ?? "Task failed";
-          await options.store.append(options.runId, "task_failed", {
+          await append("task_failed", {
             taskId: task.id,
             attempt,
             error: message,
           });
-          if (firstError === undefined) {
-            firstError = new Error(message);
-          }
+          if (firstError === undefined) firstError = new Error(message);
           return;
         }
-        await options.store.append(options.runId, "task_succeeded", {
+        await append("task_succeeded", {
           taskId: task.id,
           attempt,
           result: result.output,
         });
       } catch (error) {
-        if (options.signal?.aborted) {
+        if (isSessionShutdownAbort(options.signal?.reason)) {
+          interrupted = true;
           firstError ??= error;
           return;
         }
-        // A thrown runner error means the coordinator/attempt was interrupted.
-        // Logical task failures are represented by result.isError and are the
-        // only failures that should close the run as terminal.
+        if (options.signal?.aborted || projection.cancellationRequested) {
+          firstError ??= error;
+          return;
+        }
         if (firstError === undefined) {
           interrupted = true;
           firstError = error;
-          await options.store.append(options.runId, "run_interrupted", {});
+          await append("run_interrupted", {});
         }
         return;
       }
@@ -652,12 +1107,30 @@ async function runDurableParallelPhase(
   };
   await Promise.all(Array.from({ length: limit }, () => worker()));
   if (firstError !== undefined) {
-    if (interrupted) throw firstError;
+    if (interrupted) {
+      if (isSessionShutdownAbort(options.signal?.reason)) {
+        await commitAbortedDurableRun(
+          options.store,
+          options.owner,
+          options.runId,
+          runEpoch,
+          options.signal,
+        );
+        return false;
+      }
+      throw firstError;
+    }
     if (options.signal?.aborted) {
-      await commitCancelledRun(options.store, options.owner, options.runId);
+      await commitAbortedDurableRun(
+        options.store,
+        options.owner,
+        options.runId,
+        runEpoch,
+        options.signal,
+      );
       return false;
     }
-    await options.store.append(options.runId, "run_result", {
+    await append("run_result", {
       result: {
         status: "error",
         error: {
@@ -669,10 +1142,13 @@ async function runDurableParallelPhase(
         },
       },
     });
-    await options.store.append(options.runId, "run_terminal", {});
-    await appendDeliveryIntent(options.store, options.owner, options.runId);
-    // The coordinator has already committed the terminal result. Returning
-    // the projection keeps the public result aligned with durable state.
+    await append("run_terminal", {});
+    await appendDeliveryIntent(
+      options.store,
+      options.owner,
+      options.runId,
+      runEpoch,
+    );
     return false;
   }
   return true;
@@ -682,36 +1158,170 @@ async function appendDeliveryIntent(
   store: WorkflowRunStore,
   owner: WorkflowOwnerIdentity,
   runId: string,
+  runEpoch?: number,
 ): Promise<void> {
   const projection = await recoverWorkflowRun({ store, owner }, runId);
   if (projection.delivery) return;
-  await store.append(runId, "delivery_intent", {
-    deliveryId: workflowDeliveryId(runId),
-    message: workflowDeliveryMessage(projection),
-  });
+  await appendCurrentEvent(
+    store,
+    runId,
+    "delivery_intent",
+    {
+      deliveryId: workflowDeliveryId(runId),
+      message: workflowDeliveryMessage(projection),
+    },
+    runEpoch,
+  );
 }
+
+async function commitAbortedDurableRun(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  runEpoch: number,
+  signal: AbortSignal | undefined,
+): Promise<WorkflowProjection> {
+  const current = await recoverWorkflowRun({ store, owner }, runId);
+  if (
+    signal?.aborted &&
+    isSessionShutdownAbort(signal.reason) &&
+    !current.cancellationRequested
+  ) {
+    return commitInterruptedRun(
+      store,
+      owner,
+      runId,
+      runEpoch,
+      "session_shutdown",
+    );
+  }
+  return commitCancelledRun(store, owner, runId, runEpoch);
+}
+
+async function commitInterruptedRun(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  runEpoch?: number,
+  reason: "session_shutdown" = "session_shutdown",
+): Promise<WorkflowProjection> {
+  const current = await recoverWorkflowRun({ store, owner }, runId);
+  if (current.terminal || current.cancellationRequested) return current;
+  if (current.status !== "interrupted") {
+    await appendCurrentEvent(
+      store,
+      runId,
+      "run_interrupted",
+      sessionShutdownPayload(reason),
+      runEpoch,
+    );
+  }
+  return recoverWorkflowRun({ store, owner }, runId);
+}
+
+const cancellationCommitPromises = new Map<
+  string,
+  Promise<WorkflowProjection>
+>();
 
 async function commitCancelledRun(
   store: WorkflowRunStore,
   owner: WorkflowOwnerIdentity,
   runId: string,
+  runEpoch?: number,
 ): Promise<WorkflowProjection> {
-  const current = await recoverWorkflowRun({ store, owner }, runId);
-  if (!current.terminal)
-    await store.append(runId, "run_result", {
-      result: { status: "cancelled" },
-    });
-  const afterResult = await recoverWorkflowRun({ store, owner }, runId);
+  const key = activeExecutionKey(owner, runId);
+  const existing = cancellationCommitPromises.get(key);
+  if (existing) return existing;
+  const pending = commitCancelledRunInternal(store, owner, runId, runEpoch);
+  cancellationCommitPromises.set(key, pending);
+  void pending.then(
+    () => {
+      if (cancellationCommitPromises.get(key) === pending)
+        cancellationCommitPromises.delete(key);
+    },
+    () => {
+      if (cancellationCommitPromises.get(key) === pending)
+        cancellationCommitPromises.delete(key);
+    },
+  );
+  return pending;
+}
+
+async function commitCancelledRunInternal(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  runEpoch?: number,
+): Promise<WorkflowProjection> {
+  let current = await recoverWorkflowRun({ store, owner }, runId);
+  if (current.terminal) return current;
+  const effectiveRunEpoch =
+    runEpoch === undefined ? await currentRunEpoch(store, runId) : runEpoch;
+  if (!current.cancellationRequested) {
+    await appendCurrentEvent(
+      store,
+      runId,
+      "run_cancel_requested",
+      {},
+      effectiveRunEpoch,
+    );
+    current = await recoverWorkflowRun({ store, owner }, runId);
+  }
+  if (current.terminal) return current;
+  current = await settleCancelledTasks(store, owner, runId, effectiveRunEpoch);
+  if (current.terminal) return current;
+  await appendCurrentEvent(
+    store,
+    runId,
+    "run_result",
+    { result: { status: "cancelled" } },
+    effectiveRunEpoch,
+  );
   const hasCancellationMarker = (await store.readRun(runId)).events.some(
     (event) => event.type === "run_cancelled",
   );
-  if (!hasCancellationMarker) await store.append(runId, "run_cancelled", {});
-  await appendDeliveryIntent(store, owner, runId);
+  if (!hasCancellationMarker) {
+    await appendCurrentEvent(
+      store,
+      runId,
+      "run_cancelled",
+      {},
+      effectiveRunEpoch,
+    );
+  }
+  await appendDeliveryIntent(store, owner, runId, effectiveRunEpoch);
   return recoverWorkflowRun({ store, owner }, runId);
+}
+
+async function settleCancelledTasks(
+  store: WorkflowRunStore,
+  owner: WorkflowOwnerIdentity,
+  runId: string,
+  runEpoch: number,
+): Promise<WorkflowProjection> {
+  let current = await recoverWorkflowRun({ store, owner }, runId);
+  for (const task of Object.values(current.tasks)) {
+    if (isTerminalTaskStatus(task.status)) continue;
+    await appendCurrentEvent(
+      store,
+      runId,
+      "task_skipped",
+      {
+        taskId: task.id,
+        attempt: task.attempt,
+        reason: "cancelled",
+      },
+      runEpoch,
+    );
+    current = await recoverWorkflowRun({ store, owner }, runId);
+  }
+  return current;
 }
 
 function isRunDispatchSuspended(projection: WorkflowProjection): boolean {
   return (
+    projection.cancellationRequested ||
     projection.status === "blocked" ||
     projection.status === "awaiting_budget" ||
     projection.approval?.status === "pending"
@@ -724,6 +1334,11 @@ function isTaskDispatchable(
   return (
     task === undefined || task.status === "pending" || task.status === "running"
   );
+}
+function isTerminalTaskStatus(
+  status: WorkflowProjection["tasks"][string]["status"],
+): boolean {
+  return status === "succeeded" || status === "failed" || status === "skipped";
 }
 
 function isTerminal(status: WorkflowProjection["status"]): boolean {

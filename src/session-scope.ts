@@ -157,7 +157,7 @@ export function registerSessionScope(
     if (registration.interactiveStates !== undefined) {
       existing.interactiveStates = registration.interactiveStates;
     }
-    if (registration.durableWorkflowOwner !== undefined) {
+    if ("durableWorkflowOwner" in registration) {
       existing.durableWorkflowOwner = registration.durableWorkflowOwner;
     }
     return existing;

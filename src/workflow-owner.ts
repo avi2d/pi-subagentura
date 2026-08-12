@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type { WorkflowOwnerIdentity } from "./workflow-run-types";
 import { WorkflowRunStore } from "./workflow-run-store";
 import {
@@ -14,6 +16,32 @@ export interface WorkflowOwnerIdentityInput {
   ownerId: string;
   ownerGeneration: number;
   leaseToken: string;
+}
+
+/** Resolve a portable project namespace from the canonical real cwd. */
+export function canonicalWorkflowProjectKey(cwd: string): string {
+  if (!cwd || cwd.length > 500) throw new Error("Invalid workflow cwd");
+  let canonical: string;
+  try {
+    canonical = realpathSync.native(cwd);
+  } catch (error) {
+    throw new Error("Workflow cwd cannot be canonicalized", { cause: error });
+  }
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/** Stable session owner IDs survive process restart; a namespace salt is used
+ * only by explicit new/fork lifecycle boundaries. */
+export function workflowSessionOwnerId(
+  sessionId: string,
+  namespaceSalt = "",
+): string {
+  if (!sessionId || sessionId.length > 200) {
+    throw new Error("Invalid workflow session ID");
+  }
+  return `session-${createHash("sha256")
+    .update(`${sessionId}\0${namespaceSalt}`)
+    .digest("hex")}`;
 }
 
 /** Construct the complete durable owner fence from host-provided identity. */
@@ -110,4 +138,15 @@ export function workflowOwnerFromSessionContext(input: {
     ownerGeneration: input.generation,
     leaseToken: input.leaseToken,
   });
+}
+
+/** Create a fresh unpredictable live lease token at each lifecycle boundary. */
+export function workflowLeaseToken(
+  cwd: string,
+  sessionId: string,
+  generation: number,
+): string {
+  return createHash("sha256")
+    .update(`${cwd}\0${sessionId}\0${generation}\0${randomUUID()}`)
+    .digest("hex");
 }

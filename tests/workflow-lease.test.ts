@@ -28,7 +28,7 @@ describe("WorkflowNamespaceLease", () => {
     await second.release();
     await first.assertHeld();
     await first.release();
-    await expect(second.acquire()).resolves.toMatchObject({ epoch: 1 });
+    await expect(second.acquire()).resolves.toMatchObject({ epoch: 2 });
   });
 
   it("takes over a valid stale lease exactly once", async () => {
@@ -55,6 +55,54 @@ describe("WorkflowNamespaceLease", () => {
     now = 111;
     await expect(second.acquire()).resolves.toMatchObject({ epoch: 2 });
     await expect(first.assertHeld()).rejects.toThrow("not held");
+  });
+  it("persists a monotonic epoch across repeated release and reacquisition", async () => {
+    const rootDir = await root();
+    const first = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "one",
+      leaseToken: "first-token",
+    });
+    const second = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "two",
+      leaseToken: "second-token",
+    });
+    await expect(first.acquire()).resolves.toMatchObject({ epoch: 1 });
+    await first.release();
+    await expect(second.acquire()).resolves.toMatchObject({ epoch: 2 });
+    await second.release();
+    await expect(first.acquire()).resolves.toMatchObject({ epoch: 3 });
+  });
+
+  it("fails closed when a stale PID is live with the recorded start identity", async () => {
+    const rootDir = await root();
+    const processStartTime = Math.floor(Date.now() - process.uptime() * 1000);
+    let now = 100;
+    const first = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "one",
+      leaseToken: "first-token",
+      staleAfterMs: 10,
+      now: () => now,
+      processId: process.pid,
+      processStartTime,
+    });
+    const second = new WorkflowNamespaceLease({
+      rootDir,
+      namespace: "project",
+      ownerId: "two",
+      leaseToken: "second-token",
+      staleAfterMs: 10,
+      now: () => now,
+      processStartTimeForPid: () => processStartTime,
+    });
+    await first.acquire();
+    now = 111;
+    await expect(second.acquire()).rejects.toThrow("held by a live process");
   });
 
   it("fails closed on malformed lease evidence", async () => {

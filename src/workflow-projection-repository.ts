@@ -7,6 +7,8 @@ import type {
   WorkflowApprovalRequest,
   WorkflowApprovalDecision,
 } from "./workflow-run-types";
+import type { DurableValue } from "./workflow-durable-value";
+import { canonicalizeWorkflowValue } from "./workflow-plan";
 import { createHash } from "node:crypto";
 
 export interface WorkflowProjectionTask {
@@ -17,6 +19,7 @@ export interface WorkflowProjectionTask {
   phaseId?: string;
   prompt?: string;
   label?: string;
+  input?: DurableValue;
   result?: unknown;
   error?: string;
 }
@@ -40,6 +43,7 @@ export interface WorkflowProjection {
     decision?: WorkflowApprovalDecision;
   };
   runBlock?: { reason: string; source: "approval" | "runtime" };
+  cancellationRequested?: boolean;
   mutationHash?: string;
 }
 
@@ -69,8 +73,14 @@ export function projectWorkflowRun(
   const appliedEventIds = new Set<string>();
   const usageKeys = new Set<string>();
   let mutationHash = "";
+  let currentRunEpoch = 0;
 
   for (const [ordinal, event] of events.entries()) {
+    const eventEpoch = Number.isSafeInteger(event.runEpoch)
+      ? event.runEpoch
+      : 0;
+    if (eventEpoch < currentRunEpoch) continue;
+    if (eventEpoch > currentRunEpoch) currentRunEpoch = eventEpoch;
     if (appliedEventIds.has(event.eventId)) continue;
     appliedEventIds.add(event.eventId);
     projection.lastEventOrdinal = ordinal;
@@ -82,13 +92,30 @@ export function projectWorkflowRun(
         mutationHash: candidate,
         ...data
       } = payload;
-      const expected = createHash("sha256")
-        .update(JSON.stringify({ previousMutationHash, payload: data }))
-        .digest("hex");
       const hasHashEvidence =
         previousMutationHash !== undefined || candidate !== undefined;
       if (hasHashEvidence) {
-        if (previousMutationHash !== mutationHash || candidate !== expected)
+        const previous = previousMutationHash ?? "";
+        const expectedCanonical = createHash("sha256")
+          .update(
+            canonicalizeWorkflowValue({
+              previousMutationHash: previous,
+              payload: data,
+            }),
+          )
+          .digest("hex");
+        const expectedLegacy = createHash("sha256")
+          .update(
+            JSON.stringify({
+              previousMutationHash: previous,
+              payload: data,
+            }),
+          )
+          .digest("hex");
+        if (
+          previous !== mutationHash ||
+          (candidate !== expectedCanonical && candidate !== expectedLegacy)
+        )
           continue;
         mutationHash = candidate;
         projection.mutationHash = candidate;
@@ -144,6 +171,7 @@ function applyEvent(
             phaseId: String(task.phaseId),
             prompt: String(task.prompt),
             ...(task.label === undefined ? {} : { label: String(task.label) }),
+            ...(task.input === undefined ? {} : { input: task.input }),
           };
         }
       }
@@ -167,6 +195,11 @@ function applyEvent(
       if (!projection.approval) return;
       projection.approval.status = payload.status;
       projection.approval.decision = payload as WorkflowApprovalDecision;
+      break;
+    case "run_cancel_requested":
+    case "run_cancellation_requested":
+    case "run_admission_closed":
+      projection.cancellationRequested = true;
       break;
     case "task_started": {
       const id = String(payload.taskId);
@@ -259,6 +292,7 @@ function applyEvent(
         ...(payload.label === undefined
           ? {}
           : { label: String(payload.label) }),
+        ...(payload.input === undefined ? {} : { input: payload.input }),
       };
       break;
     }
@@ -329,14 +363,14 @@ function finite(value: unknown): number {
     ? value
     : 0;
 }
-
 function definitionFields(
   previous: WorkflowProjectionTask | undefined,
-): Pick<WorkflowProjectionTask, "phaseId" | "prompt" | "label"> {
+): Pick<WorkflowProjectionTask, "phaseId" | "prompt" | "label" | "input"> {
   return {
     ...(previous?.phaseId === undefined ? {} : { phaseId: previous.phaseId }),
     ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
     ...(previous?.label === undefined ? {} : { label: previous.label }),
+    ...(previous?.input === undefined ? {} : { input: previous.input }),
   };
 }
 

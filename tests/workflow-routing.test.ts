@@ -27,6 +27,15 @@ describe("workflow eager routing", () => {
     expect(
       decideWorkflowRouting({
         mode: "preferred",
+        text: "Investigate the service; refactor the service",
+      }),
+    ).toMatchObject({
+      kind: "durable_plan",
+      reason: "eligible_complex_request",
+    });
+    expect(
+      decideWorkflowRouting({
+        mode: "always",
         text: "Investigate and refactor the service",
       }),
     ).toMatchObject({
@@ -36,6 +45,41 @@ describe("workflow eager routing", () => {
     expect(
       decideWorkflowRouting({ mode: "always", text: "small task" }),
     ).toEqual({ kind: "direct", reason: "not_complex" });
+  });
+
+  it("does not treat multiple verbs in one focused fix as independent slices", () => {
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "Investigate and refactor the same bug",
+      }),
+    ).toEqual({
+      kind: "direct",
+      reason: "preferred_requires_multiple_slices",
+    });
+  });
+
+  it("honors explicit planner slices and phased continuation", () => {
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "Continue the workflow",
+        phasedContinuation: true,
+      }),
+    ).toMatchObject({
+      kind: "durable_plan",
+      reason: "eligible_complex_request",
+    });
+    expect(
+      decideWorkflowRouting({
+        mode: "preferred",
+        text: "Refactor the service",
+        independentSlices: 2,
+      }),
+    ).toMatchObject({
+      kind: "durable_plan",
+      reason: "eligible_complex_request",
+    });
   });
 
   it("suppresses routing for simple and management contexts", () => {

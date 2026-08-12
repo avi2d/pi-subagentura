@@ -6,6 +6,7 @@ import {
   WorkflowRunCorruptionError,
   WorkflowRunStorageError,
   WorkflowRunStore,
+  workflowRunPath,
 } from "../src/workflow-run-store";
 import type { WorkflowOwnerIdentity } from "../src/workflow-run-types";
 
@@ -46,14 +47,7 @@ describe("WorkflowRunStore", () => {
       owner,
     });
     await appendFile(
-      join(
-        root,
-        owner.projectKey,
-        owner.piSessionId,
-        "runs",
-        "corrupt",
-        "events.ndjson",
-      ),
+      join(workflowRunPath(root, owner, "corrupt"), "events.ndjson"),
       "{not-json}\n",
     );
 
@@ -153,7 +147,7 @@ describe("WorkflowRunStore", () => {
     });
     await store.append("run", "task_done", { ok: true });
     await appendFile(
-      join(root, "project", "session", "runs", "run", "events.ndjson"),
+      join(workflowRunPath(root, owner, "run"), "events.ndjson"),
       '{"torn":',
     );
 
@@ -179,7 +173,7 @@ describe("WorkflowRunStore", () => {
     });
     await store.append("a-run", "task_done", { ok: true });
     await appendFile(
-      join(root, "project", "session", "runs", "a-run", "events.ndjson"),
+      join(workflowRunPath(root, owner, "a-run"), "events.ndjson"),
       "torn",
     );
 
@@ -202,7 +196,7 @@ describe("WorkflowRunStore", () => {
     });
     const first = await store.append("run", "task_done", { ok: true });
     await appendFile(
-      join(root, "project", "session", "runs", "run", "events.ndjson"),
+      join(workflowRunPath(root, owner, "run"), "events.ndjson"),
       '{"torn":',
     );
 
@@ -254,6 +248,44 @@ describe("WorkflowRunStore", () => {
       "different owner",
     );
     expect((await store.readRun("run")).events).toHaveLength(0);
+  });
+  it("rejects a callback fenced by a released namespace epoch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const store = new WorkflowRunStore({ rootDir: root, owner });
+    await store.createRun({
+      runId: "run",
+      planRevision: 1,
+      resumePolicy: "manual",
+      owner,
+    });
+    const oldLeaseEpoch = await store.getLeaseEpoch();
+    await store.append("run", "first", {}, 0, undefined, oldLeaseEpoch);
+    await store.release();
+
+    const replacement = new WorkflowRunStore({ rootDir: root, owner });
+    const newLeaseEpoch = await replacement.getLeaseEpoch();
+    expect(newLeaseEpoch).toBeGreaterThan(oldLeaseEpoch);
+    await expect(
+      store.append("run", "stale-callback", {}, 0, undefined, oldLeaseEpoch),
+    ).rejects.toThrow("epoch");
+    await expect(
+      replacement.append(
+        "run",
+        "current-callback",
+        {},
+        0,
+        undefined,
+        newLeaseEpoch,
+      ),
+    ).resolves.toBeDefined();
+  });
+  it("uses hashed owner lookup segments instead of raw session IDs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-store-"));
+    dirs.push(root);
+    const path = workflowRunPath(root, owner, "run");
+    expect(path).not.toContain(`/${owner.piSessionId}/`);
+    expect(path).toContain("runs/run");
   });
 
   it("rejects invalid durable run IDs before creating storage", async () => {

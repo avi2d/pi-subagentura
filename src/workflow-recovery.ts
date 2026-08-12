@@ -4,11 +4,38 @@ import {
   type WorkflowProjection,
   type WorkflowProjectionRepository,
 } from "./workflow-projection-repository";
-import type { WorkflowOwnerIdentity } from "./workflow-run-types";
+import type {
+  WorkflowOwnerIdentity,
+  WorkflowRunPlanSnapshot,
+} from "./workflow-run-types";
+
+export type WorkflowRecoveryLifecycle =
+  "startup" | "reload" | "resume" | "new" | "fork";
 
 export interface WorkflowRecoveryOptions {
   store: WorkflowRunStore;
   owner: WorkflowOwnerIdentity;
+}
+
+export interface WorkflowStartupRecoveryOptions extends WorkflowRecoveryOptions {
+  reason?: WorkflowRecoveryLifecycle;
+  /**
+   * Retained for compatibility with callers that used to explicitly request
+   * trusted recovery. Auto-resume remains restricted to persisted
+   * `on-session-start` launch snapshots.
+   */
+  trustedResume?: boolean;
+  onAutoResume?: (
+    projection: WorkflowProjection,
+    plan?: WorkflowRunPlanSnapshot,
+  ) => Promise<void> | void;
+}
+
+export interface WorkflowStartupRecoveryResult {
+  readonly runs: readonly WorkflowProjection[];
+  readonly interruptedRunIds: readonly string[];
+  readonly resumeEligibleRunIds: readonly string[];
+  readonly autoResumedRunIds: readonly string[];
 }
 
 export class DurableWorkflowProjectionRepository implements WorkflowProjectionRepository {
@@ -58,6 +85,91 @@ export async function enumerateRecoverableWorkflowRuns(
   return projections;
 }
 
+/**
+ * Reconcile current-owner durable claims before session delivery/rehydration.
+ * `new` and `fork` are explicit namespace boundaries and never enumerate or
+ * mutate runs from the prior lifecycle.
+ */
+export async function recoverWorkflowRunsAtStartup(
+  options: WorkflowStartupRecoveryOptions,
+): Promise<WorkflowStartupRecoveryResult> {
+  const reason = options.reason ?? "startup";
+  if (reason === "new" || reason === "fork") {
+    return {
+      runs: [],
+      interruptedRunIds: [],
+      resumeEligibleRunIds: [],
+      autoResumedRunIds: [],
+    };
+  }
+
+  const leaseFence = await options.store.getActiveOwnerFence();
+  const runs: WorkflowProjection[] = [];
+  const interruptedRunIds: string[] = [];
+  const resumeEligibleRunIds: string[] = [];
+  const autoResumedRunIds: string[] = [];
+
+  for (const runId of await options.store.listRunIds()) {
+    let record: WorkflowRunRecord;
+    try {
+      record = await options.store.readRun(runId);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (!sameOwner(record.launch.owner, options.owner)) continue;
+
+    let projection = projectWorkflowRun(record.launch, record.events);
+    if (projection.status === "running" && !projection.terminal) {
+      const currentRunEpoch = record.events.reduce(
+        (epoch, event) =>
+          Number.isSafeInteger(event.runEpoch)
+            ? Math.max(epoch, event.runEpoch)
+            : epoch,
+        0,
+      );
+      const result = await options.store.appendIfCurrent(
+        runId,
+        projection.lastEventOrdinal,
+        "run_interrupted",
+        {
+          reason: "session_start",
+          lifecycle: reason,
+        },
+        currentRunEpoch,
+        leaseFence.leaseEpoch,
+      );
+      if (result.status === "appended") {
+        interruptedRunIds.push(runId);
+      }
+      projection = await recoverWorkflowRun(options, runId);
+    }
+
+    const persistedPlan = record.launch.plan;
+    const permitsAutoResume =
+      projection.status === "interrupted" &&
+      record.launch.resumePolicy === "on-session-start" &&
+      persistedPlan !== undefined;
+    if (permitsAutoResume) {
+      resumeEligibleRunIds.push(runId);
+      if (options.onAutoResume) {
+        await options.onAutoResume(projection, persistedPlan);
+        autoResumedRunIds.push(runId);
+      }
+    }
+    runs.push(projection);
+  }
+
+  return {
+    runs,
+    interruptedRunIds,
+    resumeEligibleRunIds,
+    autoResumedRunIds,
+  };
+}
+
+export const startupRecoverWorkflowRuns = recoverWorkflowRunsAtStartup;
+
 function assertOwner(
   record: WorkflowRunRecord,
   owner: WorkflowOwnerIdentity,
@@ -73,10 +185,7 @@ function sameOwner(
 ): boolean {
   return (
     left.projectKey === right.projectKey &&
-    left.cwd === right.cwd &&
     left.piSessionId === right.piSessionId &&
-    left.ownerId === right.ownerId &&
-    left.ownerGeneration === right.ownerGeneration &&
-    left.leaseToken === right.leaseToken
+    left.ownerId === right.ownerId
   );
 }
