@@ -28,6 +28,7 @@ import {
   type ParsedSpawnTreeContext,
 } from "./spawn-tree-context";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
+import { loadOrchestratorRoutingMetadata } from "./orchestrator-routing";
 import {
   cancelInteractiveSubagentByState,
   removeInteractiveSubagentState,
@@ -268,6 +269,18 @@ export function registerSessionHandlers(
       event.reason === "reload" ||
       event.reason === "resume";
     if (shouldRehydrate) {
+      if (process.env.PI_SUBAGENTURA_CHILD !== "1") {
+        try {
+          // Tools reload on demand; startup only validates persistence so the
+          // routing overlay never becomes a second runtime registry or cache.
+          loadOrchestratorRoutingMetadata(ctx.cwd);
+        } catch (error) {
+          console.error(
+            "[subagentura] orchestrator routing metadata recovery failed",
+            error,
+          );
+        }
+      }
       try {
         rehydrateInteractiveSubagents(
           ctx.cwd,
