@@ -39,6 +39,7 @@ import {
   formatCompletionDeliveryBehavior,
 } from "../notifications";
 import { InteractiveParams } from "../schemas";
+import { registerToolWithRuntimeValidation } from "../runtime-validation";
 import { updateRunningSubagentFooter } from "../artifact-poller";
 import {
   getStartedSessionScopes,
@@ -179,7 +180,7 @@ export function registerInteractiveSubagentTools(
     ? { id: registrationScope.id }
     : undefined;
   // ── Tool 6: spawn an attachable mux-backed Pi session ──────────────
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "subagent_interactive",
     label: "Interactive Subagent",
     description: [
@@ -340,7 +341,7 @@ export function registerInteractiveSubagentTools(
   });
 
   // ── Tool 7: inspect attachable tmux-backed sessions ────────────────
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "get_interactive_subagent_status",
     label: "Get Interactive Subagent Status",
     description:
@@ -402,7 +403,7 @@ export function registerInteractiveSubagentTools(
   });
 
   // ── Tool 8: cancel an attachable tmux-backed session ───────────────
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
     description:
@@ -484,7 +485,7 @@ export function registerInteractiveSubagentTools(
   // blank prompt) and at most MAX_FOLLOWUP_BYTES UTF-8 bytes (symmetric with
   // MAX_PERSONA_BYTES in interactive-tmux.ts — 64 KiB is well above any realistic
   // follow-up prompt; larger values are rejected up-front with a structured error).
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "send_interactive_subagent_message",
     label: "Send Interactive Subagent Message",
     description: [
@@ -660,7 +661,7 @@ export function registerInteractiveSubagentTools(
   // sub-agent did. The main agent calls this when it wants to know more than the pointer.
   // The artifact (events.ndjson + output.md + output-N.md snapshots) is the source of truth for what
   // the sub-agent did. The main agent calls this when it wants to know more than the pointer.
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "read_subagent_artifact",
     label: "Read Subagent Artifact",
     description: [
@@ -829,7 +830,7 @@ export function registerInteractiveSubagentTools(
   });
 
   // ── Tool: list known interactive sub-agent artifacts ─────────────
-  pi.registerTool({
+  registerToolWithRuntimeValidation(pi, {
     name: "list_subagent_artifacts",
     label: "List Subagent Artifacts",
     description: [

@@ -48,6 +48,15 @@ import {
 import { registerInteractiveSubagentTools } from "../src/tools/interactive";
 
 const savedTmux = process.env.TMUX;
+const savedValidationFlag = process.env.PI_SUBAGENTURA_WITH_VALIDATION;
+
+function setValidationFlag(value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env.PI_SUBAGENTURA_WITH_VALIDATION;
+  } else {
+    process.env.PI_SUBAGENTURA_WITH_VALIDATION = value;
+  }
+}
 
 /** Minimal ctx for the tool's execute signature. */
 function mockCtx() {
@@ -152,6 +161,50 @@ describe("subagent_interactive tool lifecycle", () => {
     vi.clearAllMocks();
     if (savedTmux === undefined) delete process.env.TMUX;
     else process.env.TMUX = savedTmux;
+    setValidationFlag(savedValidationFlag);
+  });
+
+  it("rejects invalid spawn params before launching a pane", async () => {
+    setValidationFlag("on");
+    const toolDef = getInteractiveToolDef(api);
+
+    const result = await toolDef.execute(
+      "call-invalid",
+      { task: 42 },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: {
+        status: "error",
+        code: "invalid_params",
+        tool: "subagent_interactive",
+      },
+    });
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+  });
+
+  it("validates a representative inline schema before field access", async () => {
+    setValidationFlag("true");
+    const sendTool = api.registerTool.mock.calls.find(
+      ([tool]: any[]) => tool.name === "send_interactive_subagent_message",
+    )?.[0];
+
+    const result = await sendTool.execute("call-invalid-inline", {
+      id: "aaaaaaaaaaaaaaaa",
+    });
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: {
+        status: "error",
+        code: "invalid_params",
+        tool: "send_interactive_subagent_message",
+      },
+    });
   });
 
   it("shows focus instead of nested attach guidance inside tmux", async () => {
