@@ -31,6 +31,7 @@ export interface SessionScope {
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
   lineageMode?: "root" | "child";
+  isParentIdle?: () => boolean;
   parentStreaming: boolean;
   inProcessJobs: Map<string, JobState>;
   pendingInProcessDeliveries: PendingJobDelivery[];
@@ -47,6 +48,7 @@ export interface SessionScopeRegistration {
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
   lineageMode?: "root" | "child";
+  isParentIdle?: () => boolean;
   parentStreaming?: boolean;
   inProcessJobs?: Map<string, JobState>;
   pendingInProcessDeliveries?: PendingJobDelivery[];
@@ -160,6 +162,8 @@ export function registerSessionScope(
     }
     if (registration.lineageMode !== undefined) {
       existing.lineageMode = registration.lineageMode;
+    if (registration.isParentIdle !== undefined) {
+      existing.isParentIdle = registration.isParentIdle;
     }
     if (registration.inProcessJobs !== undefined) {
       existing.inProcessJobs = registration.inProcessJobs;
@@ -185,6 +189,7 @@ export function registerSessionScope(
         sessionManager: registration.sessionManager,
         spawnTreeContext: registration.spawnTreeContext,
         lineageMode: registration.lineageMode ?? "root",
+        isParentIdle: registration.isParentIdle,
         parentStreaming: registration.parentStreaming ?? false,
         inProcessJobs: registration.inProcessJobs ?? new Map(),
         pendingInProcessDeliveries:
@@ -320,6 +325,18 @@ export function getActiveSessionScopeId(): number | undefined {
 export function resolveStreamingFlag(owner?: SessionOwnerToken): boolean {
   if (owner) return resolveLiveSessionScope(owner)?.parentStreaming ?? false;
   return Boolean(getGlobalState().__piSubagenturaParentStreaming);
+}
+
+export function resolveActualStreamingFlag(owner?: SessionOwnerToken): boolean {
+  const scope = owner ? resolveLiveSessionScope(owner) : undefined;
+  if (scope?.isParentIdle) {
+    try {
+      return !scope.isParentIdle();
+    } catch {
+      // A stale context falls back to the event-maintained compatibility flag.
+    }
+  }
+  return resolveStreamingFlag(owner);
 }
 
 export interface InteractiveSessionOwnerState {

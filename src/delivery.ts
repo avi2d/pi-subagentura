@@ -26,11 +26,13 @@ import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
 import {
   interactiveStateBelongsToOwner,
   ownerlessEntitiesVisible,
+  resolveActualStreamingFlag,
   resolveLiveSessionScope,
   resolveStreamingFlag,
   type SessionOwnerToken,
 } from "./session-scope";
 import { inProcessJobOwner, inProcessJobsForOwner } from "./helpers";
+import { sendCompletionTurn } from "./completion-turn";
 
 export const MAX_DELIVERY_RECORDS = 32;
 export const MAX_DELIVERY_QUEUE_BYTES = 256 * 1024;
@@ -403,10 +405,13 @@ export function flushDeliveries(
     bytes += separatorBytes + itemBytes;
   }
   const triggersTurn = selected.some(({ intent }) => intent.triggerTurn);
-  if (resolveStreamingFlag(owner) && !triggersTurn) return;
+  const parentStreaming = resolveStreamingFlag(owner);
+  const actualParentStreaming = resolveActualStreamingFlag(owner);
+  if (parentStreaming && !triggersTurn) return;
   const deliveryIds = selected.map(({ intent }) => intent.deliveryId);
   try {
-    pi.sendMessage(
+    sendCompletionTurn(
+      pi,
       {
         customType: "subagent-notify",
         content: selected.map(({ content }) => content).join("\n\n---\n\n"),
@@ -429,6 +434,7 @@ export function flushDeliveries(
       {
         deliverAs: "followUp",
         triggerTurn: triggersTurn,
+        parentStreaming: actualParentStreaming,
       },
     );
   } catch {

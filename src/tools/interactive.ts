@@ -37,7 +37,9 @@ import { debugLog } from "../helpers";
 import {
   completionTriggersTurn,
   formatCompletionDeliveryBehavior,
+  sanitizeOutput,
 } from "../notifications";
+import { isOrchestratorV2Enabled } from "../completion-turn";
 import {
   MAX_ORCHESTRATOR_ROUTING_ALIASES,
   MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
@@ -46,7 +48,7 @@ import {
   upsertOrchestratorRoutingEntry,
   type OrchestratorRoutingEntry,
 } from "../orchestrator-routing";
-import { InteractiveParams } from "../schemas";
+import { InteractiveParams, MAX_INTERACTIVE_CONTEXT_BYTES } from "../schemas";
 import { registerToolWithDefaultGuidance } from "../tool-guidance";
 import { updateRunningSubagentFooter } from "../artifact-poller";
 import {
@@ -61,6 +63,7 @@ function isValidSubagentId(id: string): boolean {
   return isValidOrchestratorChildId(id);
 }
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
+const MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
 const FOLLOWUP_COMPLETION_REMINDER =
   ' [MANDATORY COMPLETION PROTOCOL FOR EVERY FOLLOW-UP TURN: Before sending your final assistant response, write the result to output.md; make "$ARTIFACT_DIR/cli.mjs" done 0 your final tool call and wait for success. If it fails, do not send the final response; fix the cause and retry until completion is recorded. Do not rely on the lifecycle hook. After completion is recorded, remain in the Pi REPL and wait for follow-up; do not intentionally exit or close the pane unless explicitly asked.]';
@@ -68,6 +71,34 @@ const FOLLOWUP_COMPLETION_REMINDER =
 function formatFollowupPreview(message: string): string {
   if (message.length <= MAX_FOLLOWUP_PREVIEW_CHARS) return message;
   return `${message.slice(0, MAX_FOLLOWUP_PREVIEW_CHARS)}… [truncated; ${message.length} chars total]`;
+}
+
+function formatArtifactProviderOutput(output: string | null): string {
+  if (output === null) return "";
+  const sanitized = sanitizeOutput(output);
+  const originalBytes = Buffer.byteLength(sanitized, "utf8");
+  let bounded = sanitized;
+  if (originalBytes > MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES) {
+    const marker = `\n[Output truncated from ${originalBytes} bytes.]`;
+    bounded = Buffer.from(sanitized, "utf8")
+      .subarray(
+        0,
+        Math.max(
+          0,
+          MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES -
+            Buffer.byteLength(marker, "utf8"),
+        ),
+      )
+      .toString("utf8");
+    while (
+      Buffer.byteLength(`${bounded}${marker}`, "utf8") >
+      MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES
+    ) {
+      bounded = bounded.slice(0, -1);
+    }
+    bounded += marker;
+  }
+  return `\n<untrusted-subagent-output>\n${bounded || "(empty output)"}\n</untrusted-subagent-output>`;
 }
 
 type InitialRoutingMetadataResult =
@@ -136,6 +167,20 @@ function validateInitialRoutingMetadata(
     }
     if (seen.has(alias)) return `duplicate alias: ${alias}`;
     seen.add(alias);
+  }
+  return undefined;
+}
+
+function validateRoutingMetadataMode(
+  topLevelOrchestratorV2: boolean,
+  description: string | undefined,
+  aliases: string[] | undefined,
+): string | undefined {
+  if (topLevelOrchestratorV2 && description === undefined) {
+    return "routingDescription is required for a top-level Orchestratorv2 child";
+  }
+  if (!topLevelOrchestratorV2 && (description !== undefined || aliases)) {
+    return "routingDescription and routingAliases are reserved for a top-level Orchestratorv2 session";
   }
   return undefined;
 }
@@ -305,17 +350,25 @@ export function registerInteractiveSubagentTools(
         params.routingDescription,
         params.routingAliases,
       );
-      if (routingMetadataError) {
+      const topLevelOrchestratorV2 =
+        process.env.PI_SUBAGENTURA_CHILD !== "1" && isOrchestratorV2Enabled(pi);
+      const routingModeError = validateRoutingMetadataMode(
+        topLevelOrchestratorV2,
+        params.routingDescription,
+        params.routingAliases,
+      );
+      if (routingMetadataError || routingModeError) {
+        const error = routingMetadataError ?? routingModeError!;
         return {
           content: [
             {
               type: "text",
-              text: `Invalid initial routing metadata: ${routingMetadataError}`,
+              text: `Invalid initial routing metadata: ${error}`,
             },
           ],
           details: {
             status: "invalid_routing_metadata",
-            error: routingMetadataError,
+            error,
           },
           isError: true,
         };
@@ -329,6 +382,25 @@ export function registerInteractiveSubagentTools(
         includeContext?: boolean;
         context?: string;
       };
+      if (
+        contextParams.context !== undefined &&
+        Buffer.byteLength(contextParams.context, "utf8") >
+          MAX_INTERACTIVE_CONTEXT_BYTES
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Explicit context exceeds ${MAX_INTERACTIVE_CONTEXT_BYTES} bytes.`,
+            },
+          ],
+          details: {
+            status: "invalid_context",
+            maxBytes: MAX_INTERACTIVE_CONTEXT_BYTES,
+          },
+          isError: true,
+        };
+      }
       debugLog("info", "tool_call", {
         toolName: "subagent_interactive",
         toolCallId: _toolCallId,
@@ -899,7 +971,9 @@ export function registerInteractiveSubagentTools(
       // doesn't see a misleading "not written yet" after the sub-agent has
       // already exited (the common case: model finished without writing).
       let outputText: string;
-      if (output === null) {
+      if (!wantsOutput) {
+        outputText = "(not requested)";
+      } else if (output === null) {
         if (params.turnId !== undefined) {
           outputText = `(no immutable snapshot for turnId ${params.turnId})`;
         } else if (params.turn !== undefined) {
@@ -944,7 +1018,8 @@ export function registerInteractiveSubagentTools(
                 : "") +
               turnsLine +
               historyLine +
-              `Output: ${outputText}`,
+              `Output: ${outputText}` +
+              (wantsOutput ? formatArtifactProviderOutput(output) : ""),
           },
         ],
         details: {

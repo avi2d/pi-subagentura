@@ -10,6 +10,11 @@ import {
   resetRuntimeSpawnTreeContextForTests,
   writeLineageBootstrap,
 } from "../src/spawn-tree-context";
+import {
+  clearCompletionTurnWake,
+  ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
+  sendCompletionTurn,
+} from "../src/completion-turn";
 
 const BASE_INTERACTIVE_TOOL_NAMES = [
   "cancel_interactive_subagent",
@@ -236,6 +241,41 @@ describe("extension registration", () => {
       resetRuntimeSpawnTreeContextForTests();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("does not acknowledge a completion wake during preflight", async () => {
+    const api = mockApi({
+      appendEntry: vi.fn(),
+      getFlag: vi.fn((name: string) => name === "orchestratorv2"),
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+    });
+    registerExtension(api as any);
+    sendCompletionTurn(
+      api as any,
+      {
+        customType: "subagent-notify",
+        content: "completed",
+        display: true,
+      },
+      {
+        deliverAs: "followUp",
+        triggerTurn: true,
+        parentStreaming: false,
+      },
+    );
+
+    const beforeAgentStart = api.on.mock.calls.find(
+      ([event]: any[]) => event === "before_agent_start",
+    )?.[1];
+    await beforeAgentStart({ systemPrompt: "base prompt" }, {});
+
+    expect((api as any).appendEntry).toHaveBeenCalledOnce();
+    expect((api as any).appendEntry).toHaveBeenCalledWith(
+      ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
+      expect.objectContaining({ state: "requested" }),
+    );
+    clearCompletionTurnWake(api as any);
   });
 
   it("registers a minimal interactive runtime in child mode", () => {

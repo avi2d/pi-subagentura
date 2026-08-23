@@ -47,6 +47,11 @@ import {
   type SessionScope,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
+import {
+  acknowledgeCompletionTurnWake,
+  clearCompletionTurnWake,
+  recoverCompletionTurnWakes,
+} from "./completion-turn";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -226,11 +231,13 @@ export function registerSessionHandlers(
 
   pi.on("agent_start", () => {
     if (scope.lifecycle !== "started") return;
+    acknowledgeCompletionTurnWake(pi);
     scope.parentStreaming = true;
     setLegacyActiveSessionRefs(scope);
   });
   pi.on("agent_settled", () => {
     if (scope.lifecycle !== "started") return;
+    acknowledgeCompletionTurnWake(pi);
     scope.parentStreaming = false;
     const owner = sessionOwner(scope);
     setLegacyActiveSessionRefs(scope);
@@ -260,6 +267,8 @@ export function registerSessionHandlers(
     ) {
       scope.spawnTreeContext = createRootSpawnTreeContext(sessionId);
     }
+    scope.isParentIdle =
+      typeof ctx.isIdle === "function" ? ctx.isIdle.bind(ctx) : undefined;
     scope.parentStreaming = false;
     registerSessionScope(scope);
     setLegacyActiveSessionRefs(scope);
@@ -275,10 +284,7 @@ export function registerSessionHandlers(
           // routing overlay never becomes a second runtime registry or cache.
           loadOrchestratorRoutingMetadata(ctx.cwd);
         } catch (error) {
-          console.error(
-            "[subagentura] orchestrator routing metadata recovery failed",
-            error,
-          );
+          logSessionError("orchestrator_routing_recovery_failed", error);
         }
       }
       try {
@@ -290,6 +296,11 @@ export function registerSessionHandlers(
         );
       } catch {
         /* best effort — rehydrate is a recovery path */
+      }
+      try {
+        recoverCompletionTurnWakes(pi, ctx.sessionManager?.getBranch?.() ?? []);
+      } catch (error) {
+        logSessionError("orchestratorv2_wake_recovery_failed", error);
       }
     }
     ensureInteractivePoller(globalState);
@@ -309,6 +320,8 @@ export function registerSessionHandlers(
       cleanupScopeGeneration(scope, owner, event, "session_shutdown", ctx);
       clearFreshChildLineage(scope, event?.reason);
       scope.parentStreaming = false;
+      scope.isParentIdle = undefined;
+      clearCompletionTurnWake(pi);
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
       removeSessionScope(scope.id);
