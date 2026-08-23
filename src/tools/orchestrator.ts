@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerToolWithDefaultGuidance } from "../tool-guidance";
 import { Type } from "typebox";
 import {
   MAX_ORCHESTRATOR_ROUTING_ALIASES,
@@ -6,6 +7,7 @@ import {
   MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
   listOrchestratorRoutingEntries,
   loadOrchestratorAgentRegistryView,
+  removeOrchestratorRoutingEntry,
   upsertOrchestratorRoutingEntry,
   type OrchestratorRoutingEntry,
 } from "../orchestrator-routing";
@@ -51,6 +53,17 @@ const UpdateOrchestratorAgentDescriptionParams = Type.Object({
   }),
 });
 
+const RemoveOrchestratorAgentDescriptionParams = Type.Object({
+  childId: Type.String({
+    pattern: CHILD_ID_PATTERN,
+    description: "Interactive child ID whose routing metadata is removed",
+  }),
+  confirmed: Type.Literal(true, {
+    description:
+      "Must be true after the user has confirmed permanent metadata removal",
+  }),
+});
+
 export function registerOrchestratorTools(
   pi: ExtensionAPI,
   registrationScope?: SessionScope,
@@ -59,7 +72,7 @@ export function registerOrchestratorTools(
     ? { id: registrationScope.id }
     : undefined;
 
-  pi.registerTool({
+  registerToolWithDefaultGuidance(pi, {
     name: "list_orchestrator_agents",
     label: "List Orchestrator Agents",
     description:
@@ -88,7 +101,7 @@ export function registerOrchestratorTools(
     },
   });
 
-  pi.registerTool({
+  registerToolWithDefaultGuidance(pi, {
     name: "update_orchestrator_agent_description",
     label: "Update Orchestrator Agent Description",
     description:
@@ -141,6 +154,47 @@ export function registerOrchestratorTools(
             },
           ],
           details: { status: "updated", entry },
+        };
+      } catch (error) {
+        return routingErrorResult(error);
+      }
+    },
+  });
+
+  registerToolWithDefaultGuidance(pi, {
+    name: "remove_orchestrator_agent_description",
+    label: "Remove Orchestrator Agent Description",
+    description:
+      "Remove one confirmed routing metadata entry so stale records can be retired and capacity recovered. This does not cancel or delete an interactive child.",
+    parameters: RemoveOrchestratorAgentDescriptionParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const scope = resolveToolSessionScope(toolToken);
+      if (!scope) return sessionUnavailableResult();
+      try {
+        const entry = removeOrchestratorRoutingEntry(ctx.cwd, params.childId);
+        if (!entry) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No routing metadata exists for interactive child ${params.childId}.`,
+              },
+            ],
+            details: {
+              status: "not_found",
+              childId: params.childId,
+            },
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Removed confirmed routing metadata for interactive child ${params.childId}.`,
+            },
+          ],
+          details: { status: "removed", entry },
         };
       } catch (error) {
         return routingErrorResult(error);
