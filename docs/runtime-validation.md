@@ -1,7 +1,13 @@
 # Runtime tool-parameter validation
 
-pi-subagentura can add a strict, sanitized validation layer around all 21 public
-agent tools. It is disabled by default.
+pi-subagentura can add a strict, sanitized validation layer around the 21 public
+agent tools present on the master baseline for this change. It is an opt-in
+development and debugging aid, and it is disabled by default.
+
+This scope is intentionally independent of PR #90. The two Orchestratorv2 tools
+from that PR are not present on this baseline and are explicitly deferred to a
+separate validation task. This document does not claim automatic coverage for
+future public tools.
 
 Enable it for a Pi process with:
 
@@ -22,7 +28,8 @@ prepared arguments before Pi performs that conversion, so an invalid model tool
 call cannot reach the extension callback through coercion.
 
 The `execute` wrapper repeats the same check for direct or programmatic callers
-that bypass Pi's agent loop. A direct invalid call returns structured details:
+that bypass Pi's agent loop. A direct invalid call returns `isError: true` with
+structured `details`:
 
 ```json
 {
@@ -33,12 +40,20 @@ that bypass Pi's agent loop. A direct invalid call returns structured details:
 }
 ```
 
-For a normal model-originated call, Pi converts a thrown pre-execution
-validation failure into an error tool result. Its text contains the same
-sanitized paths and messages, but Pi owns the outer result shape.
+For a normal model-originated call, `prepareArguments` throws before Pi reaches
+the extension's `execute` wrapper. Pi converts that failure into an error tool
+result with `isError: true`, bounded sanitized text, and `details: {}`. Pi's
+current API does not preserve the structured `invalid_params` details when
+`prepareArguments` throws.
+
+That distinction is intentional. Raw pre-coercion rejection is preserved for
+model calls, while direct callers retain the structured extension result. This
+feature is not a host-level error-envelope extension, and it does not modify Pi
+agent-core.
 
 Disabling this feature does **not** disable Pi's built-in validation. It
-preserves Pi's normal schema-validation and primitive-coercion behavior.
+preserves Pi's normal schema-validation and primitive-coercion behavior. It also
+does not add validation errors, artifact events, or tool-registration changes.
 
 ## Strictness rules
 
@@ -52,6 +67,15 @@ When enabled:
   an additional-property schema;
 - nested `Type.Unknown()` values remain unrestricted, including workflow `args`
   and declarative-plan task `input` values.
+- `subagent_interactive` rejects a persona larger than 64 KiB before artifact,
+  pane, or model-launch work. This is a byte limit, so it remains a semantic
+  preflight rather than a TypeBox `maxLength` constraint.
+
+In child sessions, Pi emits `tool_execution_start` before `prepareArguments`.
+While debug validation is enabled, pi-subagentura briefly defers the activity
+start and discards both activity events when the matching sanitized validation
+rejection arrives. With validation disabled, activity starts are persisted
+immediately as before.
 
 The top-level closed-object rule is intentionally opt-in. Public schemas remain
 permissive when the environment flag is disabled, preserving existing callers.

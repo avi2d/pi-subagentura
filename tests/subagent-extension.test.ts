@@ -76,7 +76,7 @@ describe("extension registration", () => {
     }
   });
 
-  it("registers the expected tools without throwing", () => {
+  it("registers the 21-tool master baseline without PR #90 Orchestratorv2 tools", () => {
     const api = mockApi();
     expect(() => registerExtension(api as any)).not.toThrow();
     expect(api.registerMessageRenderer).toHaveBeenCalledOnce();
@@ -101,7 +101,7 @@ describe("extension registration", () => {
     );
   });
 
-  it("validates every registered tool before execution", async () => {
+  it("validates exactly the 21-tool master baseline; PR #90 Orchestratorv2 is deferred", async () => {
     const api = mockApi();
     process.env.PI_SUBAGENTURA_WITH_VALIDATION = "on";
     registerExtension(api as any);
