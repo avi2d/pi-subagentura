@@ -16,6 +16,7 @@ const MAX_VALIDATION_ERRORS = 8;
 const MAX_ERROR_PATH_CHARS = 160;
 const MAX_VALIDATION_CONTAINER_ENTRIES = 4096;
 const MAX_VALIDATION_DEPTH = 64;
+const MAX_VALIDATION_RESULT_TEXT_CHARS = 4096;
 
 interface ValidationError {
   keyword: string;
@@ -318,6 +319,39 @@ export function invalidRuntimeParamsError(
   errors: InvalidParameterError[],
 ): Error {
   return new Error(invalidParamsText(tool, errors));
+}
+
+export function isRuntimeValidationRejectionResult(
+  tool: unknown,
+  result: unknown,
+): boolean {
+  if (typeof tool !== "string" || !isRecord(result)) return false;
+  const content = result.content;
+  const details = result.details;
+  if (!Array.isArray(content) || content.length !== 1 || !isRecord(details)) {
+    return false;
+  }
+  try {
+    if (Object.keys(details).length !== 0) return false;
+  } catch {
+    return false;
+  }
+  const first = content[0];
+  if (
+    !isRecord(first) ||
+    first.type !== "text" ||
+    typeof first.text !== "string"
+  ) {
+    return false;
+  }
+  if (first.text.length > MAX_VALIDATION_RESULT_TEXT_CHARS) return false;
+  const lines = first.text.split("\n");
+  return (
+    lines.length >= 2 &&
+    lines.length <= MAX_VALIDATION_ERRORS + 1 &&
+    lines[0] === `Invalid parameters for ${tool}.` &&
+    lines.slice(1).every((line) => line.startsWith("- /") && line.length <= 256)
+  );
 }
 
 function isInvalidParameterError(
