@@ -164,6 +164,7 @@ describe("Pi validation boundary", () => {
     });
     const text = JSON.stringify(result);
     expect(result.isError).toBe(true);
+    expect(result.details).toEqual({});
     expect(text).toContain("Expected string");
     expect(text).toContain("Unexpected parameter");
     expect(text).not.toContain(secretValue);
@@ -171,14 +172,17 @@ describe("Pi validation boundary", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it("preserves Pi coercion when the opt-in flag is off", async () => {
-    setValidationFlag("off");
-    const { execute, tool } = createTool();
-    const result = await runThroughPi(tool, { task: 42 });
-    expect(result.isError).toBe(false);
-    expect(execute).toHaveBeenCalledOnce();
-    expect(execute.mock.calls[0][1]).toEqual({ task: "42" });
-  });
+  it.each([undefined, "false"])(
+    "preserves Pi coercion when the opt-in flag is %s",
+    async (value) => {
+      setValidationFlag(value);
+      const { execute, tool } = createTool();
+      const result = await runThroughPi(tool, { task: 42 });
+      expect(result.isError).toBe(false);
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0][1]).toEqual({ task: "42" });
+    },
+  );
 });
 
 describe("runtime parameter validation errors", () => {

@@ -302,7 +302,7 @@ function invalidParamsText(
   ].join("\n");
 }
 
-function invalidParamsResult(
+export function invalidRuntimeParamsResult(
   tool: string,
   errors: InvalidParameterError[],
 ): AgentToolResult<InvalidParamsDetails> & { isError: true } {
@@ -311,6 +311,13 @@ function invalidParamsResult(
     details: { status: "error", code: "invalid_params", tool, errors },
     isError: true,
   };
+}
+
+export function invalidRuntimeParamsError(
+  tool: string,
+  errors: InvalidParameterError[],
+): Error {
+  return new Error(invalidParamsText(tool, errors));
 }
 
 function isInvalidParameterError(
@@ -366,7 +373,7 @@ export function withRuntimeParameterValidation<
         prepared,
       );
       if (!validation.ok) {
-        throw new Error(invalidParamsText(definition.name, validation.errors));
+        throw invalidRuntimeParamsError(definition.name, validation.errors);
       }
       return validation.value as never;
     },
@@ -378,7 +385,7 @@ export function withRuntimeParameterValidation<
           params,
         );
         if (!validation.ok) {
-          return invalidParamsResult(definition.name, validation.errors);
+          return invalidRuntimeParamsResult(definition.name, validation.errors);
         }
         executionParams = validation.value as never;
       }
