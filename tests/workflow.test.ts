@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   MAX_ITEMS_PER_CALL,
+  WORKFLOW_WALL_TIMEOUT_MS,
   MAX_WORKFLOW_AGENT_RECORDS,
   SCHEMA_RETRIES,
   MAX_WORKFLOW_JOBS,
@@ -158,6 +159,12 @@ function previewPlan(name = "preview-plan") {
     ],
   };
 }
+
+describe("workflow time limits", () => {
+  it("defaults the worker wall timeout to 100 hours", () => {
+    expect(WORKFLOW_WALL_TIMEOUT_MS).toBe(100 * 60 * 60_000);
+  });
+});
 
 describe("parseWorkflow", () => {
   it("extracts a pure-literal meta and the body", () => {
