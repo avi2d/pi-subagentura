@@ -207,7 +207,7 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
-  it("defaults to notify + automatic triggering when both params are omitted", async () => {
+  it("defaults to coordinated independent reference delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
 
@@ -221,23 +221,63 @@ describe("subagent_interactive tool lifecycle", () => {
 
     expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
     const callArgs = mockLaunchInteractiveSubagent.mock.calls[0][0];
-    expect(callArgs.notifyOnComplete).toBe("notify");
-    expect(callArgs.triggerTurnOnComplete).toBe(true);
+    expect(callArgs.notifyOnComplete).toBeUndefined();
+    expect(callArgs.triggerTurnOnComplete).toBeUndefined();
+    expect(callArgs.completionPolicy).toBe("each");
     expect(callArgs.spawnTreeContext).toMatchObject({
       role: "root",
       rootId: "test-session-id",
     });
+    expect(result.content[0].text).toContain("notify the user immediately");
     expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
+      "immutable result references when safely idle",
     );
   });
 
-  it("defaults explicit notify mode to automatic triggering", async () => {
+  it("forwards an explicit related completion group", async () => {
     const toolDef = getInteractiveToolDef(api);
+    const result = await toolDef.execute(
+      "call-group",
+      {
+        task: "review shard",
+        completionPolicy: "group",
+        completionGroupId: "review",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
 
+    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        completionPolicy: "group",
+        completionGroupId: "review",
+      }),
+    );
+    expect(result.content[0].text).toContain("group review");
+  });
+
+  it("rejects conflicting coordinated and legacy delivery options", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const result = await toolDef.execute(
+      "call-conflict",
+      {
+        task: "review shard",
+        completionPolicy: "each",
+        notifyOnComplete: "notify",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("cannot be combined");
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+  });
+
+  it("maps explicit legacy notify mode to coordinated each delivery", async () => {
+    const toolDef = getInteractiveToolDef(api);
     const result = await toolDef.execute(
       "call-2",
       { task: "research X", notifyOnComplete: "notify" },
@@ -246,24 +286,16 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].notifyOnComplete,
-    ).toBe("notify");
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(true);
-    expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.notifyOnComplete).toBeUndefined();
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("notify the user immediately");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
-  it("explains explicit inject mode with automatic turn triggering disabled", async () => {
+  it("maps explicit legacy inject controls to coordinated each delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-3",
       {
@@ -276,24 +308,18 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].notifyOnComplete,
-    ).toBe("inject");
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(false);
-    expect(result.content[0].text).toContain(
-      "Completion output will be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "No new parent turn will start automatically",
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.notifyOnComplete).toBeUndefined();
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
+    expect(result.content[0].text).not.toContain(
+      "Completion output will be injected",
     );
   });
 
-  it("forwards triggerTurnOnComplete when explicitly passed", async () => {
+  it("accepts legacy triggerTurnOnComplete through coordinated delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-trigger-turn",
       {
@@ -306,16 +332,10 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(true);
-    expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
   it("updates the running footer immediately after launch", async () => {
@@ -456,9 +476,8 @@ describe("subagent_interactive tool lifecycle", () => {
       undefined,
     );
   });
-  it("preserves explicit false triggering for notify mode", async () => {
+  it("maps legacy false triggering to coordinated timing", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-notify-no-trigger",
       {
@@ -471,12 +490,10 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(false);
-    expect(result.content[0].text).toContain(
-      "No new parent turn will start automatically",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
   it("notifies the user without scheduling another LLM completion when cancelled", async () => {
@@ -516,20 +533,25 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
-  it("exposes notifyOnComplete in the schema with the new default documented", () => {
+  it("documents coordinated defaults and compatibility mappings in the schema", () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
-    const params = toolDef.parameters;
-    // TypeBox runtime shape: properties.notifyOnComplete exists
-    const properties = (params as any).properties;
-    expect(properties).toBeDefined();
-    expect(properties.notifyOnComplete).toBeDefined();
-    expect(properties.triggerTurnOnComplete).toBeDefined();
-    // Description must document 'notify' as the default and 'inject' as a valid
-    // alternative.
-    const desc = properties.notifyOnComplete.description ?? "";
-    expect(desc).toMatch(/notify.*default|default.*notify/i);
-    expect(desc).toContain('"inject"');
+    const properties = (toolDef.parameters as any).properties;
+
+    expect(properties.completionPolicy.description).toMatch(
+      /defaults to "each"/i,
+    );
+    expect(properties.completionPolicy.description).toContain('"group"');
+    expect(properties.completionGroupId.description).toMatch(/required/i);
+    expect(properties.notifyOnComplete.description).toMatch(
+      /deprecated compatibility/i,
+    );
+    expect(properties.notifyOnComplete.description).toMatch(
+      /coordinated each/i,
+    );
+    expect(properties.triggerTurnOnComplete.description).toMatch(
+      /deprecated compatibility/i,
+    );
   });
 
   it("isolates peer status, cancel, send, list, and read tools", async () => {

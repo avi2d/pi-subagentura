@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Explicit `completionPolicy: "each" | "group"` coordination for asynchronous sub-agents and background workflows, with bounded `completionGroupId` barriers, human-input priority, manual-result consumption, and compact reference manifests.
+- Exactly-once TUI completion entries for `done`, `error`, and `cancelled` outcomes; these entries are excluded from parent LLM context.
+
+### Changed
+
+- Asynchronous completion now defaults to coordinated `each` delivery: ready independent results coalesce while the parent is busy, then attach to the next natural human turn or trigger one safe continuation without injecting full child output.
+- Completion groups seal when the spawning parent turn settles and release one aggregate manifest only after every registered member is terminal; workflow-owned children remain suppressed in favor of the workflow aggregate.
+- Interactive coordinated policy, group membership, intents, and receipts rehydrate only into the matching parent session. In-process jobs and background workflows remain session scoped.
+
+### Deprecated
+
+- `notifyOnComplete` and `triggerTurnOnComplete` remain accepted as compatibility inputs that map to coordinated `each` delivery. They cannot be combined with `completionPolicy` or `completionGroupId`; full-output legacy injection is no longer selectable by new API calls.
+
 ## [3.3.1] - 2026-08-25
 
 ### Fixed
@@ -52,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - In-process sub-agent calls now run asynchronously by default; pass `async: false` for a single blocking call.
 - `get_subagent_result` returns live state by default and supports explicit bounded waiting with `wait` and `timeoutMs`.
-- Interactive pointer completions trigger a parent turn by default; set `triggerTurnOnComplete: false` to persist without waking the parent.
+- In 3.2.0, interactive pointer completions began triggering a parent turn by default; `triggerTurnOnComplete: false` persisted without waking the parent. This historical default is superseded by the coordinated behavior in Unreleased.
 
 ### Fixed
 
@@ -105,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- **Async sub-agents default to inject.** `subagent_with_context` and `subagent_isolated` with `async: true` now default to `notifyOnComplete: "inject"`, delivering the job result into the parent conversation when complete. Pass `notifyOnComplete: "notify"` to persist a pointer-only completion without injecting the full output.
+- **3.0.0 changed async sub-agents to inject by default.** At that release, `subagent_with_context` and `subagent_isolated` with `async: true` defaulted to `notifyOnComplete: "inject"`; `"notify"` persisted a pointer-only completion. This historical default is superseded by the coordinated behavior in Unreleased.
 
 ### Added
 

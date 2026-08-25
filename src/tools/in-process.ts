@@ -47,6 +47,14 @@ import {
 import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
+  assertCompletionGroupOpen,
+  consumeCompletionSource,
+  publishCompletion,
+  registerCompletionMember,
+  resolveCompletionPolicy,
+  type ResolvedCompletionPolicy,
+} from "../completion-coordinator";
+import {
   completionTriggersTurn,
   deliverNotification,
   formatCompletionDeliveryBehavior,
@@ -236,17 +244,97 @@ function createAsyncJobErrorResult(error: unknown): SubagentResult {
   };
 }
 
+function completionPolicyErrorResult(
+  error: unknown,
+): AgentToolResult<InProcessSubagentDetails> {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{ type: "text", text: `Sub-agent not started: ${message}` }],
+    details: { status: "error", usage: ZERO_USAGE },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
+}
+
+function resolveAsyncCompletionPolicy(
+  params: Record<string, unknown>,
+  runAsync: boolean,
+): ResolvedCompletionPolicy {
+  if (!runAsync) return { legacy: false };
+  return resolveCompletionPolicy(params);
+}
+
+function formatResolvedCompletionBehavior(
+  completion: ResolvedCompletionPolicy,
+  jobState: JobState,
+): string {
+  if (completion.legacy) {
+    return formatCompletionDeliveryBehavior(
+      jobState.notifyOnComplete ?? "inject",
+      completionTriggersTurn(
+        jobState.notifyOnComplete ?? "inject",
+        jobState.triggerTurnOnComplete,
+      ),
+      "planned",
+    );
+  }
+  return completion.policy === "group"
+    ? `Completion will notify the user immediately and resume the parent once group ${completion.groupId} is sealed at parent settlement and all registered members finish.`
+    : "Completion will notify the user immediately and resume the parent with a compact result reference when safely idle.";
+}
+
+function publishInProcessCompletion(
+  jobState: JobState,
+  result: SubagentResult,
+  owner?: SessionOwnerToken,
+): void {
+  if (!jobState.completionPolicy || jobState.completionOwner === "workflow") {
+    return;
+  }
+  publishCompletion(
+    {
+      schemaVersion: 1,
+      completionId: `job:${jobState.id}`,
+      source: "in-process",
+      sourceId: jobState.id,
+      label: `Job ${jobState.id}`,
+      status: result.cancelled
+        ? "cancelled"
+        : result.isError
+          ? "error"
+          : "done",
+      policy: jobState.completionPolicy,
+      ...(jobState.completionGroupId
+        ? { groupId: jobState.completionGroupId }
+        : {}),
+      references: result.cancelled
+        ? [{ label: "status", value: "cancelled; no result retained" }]
+        : [
+            {
+              label: "result",
+              value: `call get_subagent_result with jobId ${JSON.stringify(jobState.id)}`,
+            },
+          ],
+      completedAt: Date.now(),
+    },
+    owner,
+  );
+}
+
 function settleAsyncJob(
   jobId: string,
   jobState: JobState,
   result: SubagentResult,
   ctx: RunningFooterContext | undefined,
 ): void {
-  if (jobState.status === "cancelled") return;
   const owner = inProcessJobOwner(jobState);
+  if (jobState.status === "cancelled") {
+    if (result.cancelled) publishInProcessCompletion(jobState, result, owner);
+    return;
+  }
   if (result.cancelled) {
     jobState.status = "cancelled";
     jobState.result = result;
+    publishInProcessCompletion(jobState, result, owner);
     scheduleJobCleanup(jobId, true, undefined, owner);
     if (ctx) updateRunningFooter(ctx, owner);
     return;
@@ -255,9 +343,11 @@ function settleAsyncJob(
   jobState.result = result;
   scheduleJobCleanup(jobId, false, jobState.maxAge, owner);
 
+  publishInProcessCompletion(jobState, result, owner);
   // A workflow aggregate consumes its children's results itself; the child must
   // never independently notify or inject into the parent session.
   const shouldDeliver =
+    !jobState.completionPolicy &&
     jobState.completionOwner !== "workflow" &&
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered &&
@@ -266,6 +356,7 @@ function settleAsyncJob(
   if (shouldDeliver) {
     deliverNotification(jobState, result);
   } else if (
+    !jobState.completionPolicy &&
     jobState.completionOwner !== "workflow" &&
     jobState.notifyOnComplete &&
     !jobState.notificationDelivered
@@ -375,16 +466,16 @@ function registerSubagentWithContextTool(
       "",
       "Examples:",
       '  - task: "Review this PR for security issues", persona: "You are a senior security auditor"',
-      '  - task: "Continue debugging while we plan next steps", async: true, notifyOnComplete: "notify"',
-      '  - task: "Summarize the key decisions made in this conversation", model: "anthropic/claude-sonnet-4-5"',
+      '  - task: "Review one module", completionPolicy: "each"',
+      '  - task: "Review one shard", completionPolicy: "group", completionGroupId: "review"',
       "",
       "Runs async (background) BY DEFAULT so the parent turn stays responsive — pass async: false only for a single short sub-agent whose result you need inline.",
-      "When fanning out multiple sub-agents (e.g. one per PR/file), leave async at its default so they run concurrently without blocking the parent.",
-      'The main agent continues immediately; async jobs inject their result by default when complete. Pass notifyOnComplete: "notify" to persist a pointer-only completion in parent context without injecting the full output.',
+      "Async completionPolicy defaults to each: the user gets one TUI-only notice, and safely-idle ready results are coalesced into one compact parent manifest.",
+      "Use completionPolicy=group with a shared completionGroupId for related jobs; the parent resumes once its settled-turn group is sealed and every member is terminal.",
+      "Human input takes priority, and successful get_subagent_result collection consumes the pending automatic delivery.",
+      "Deprecated notifyOnComplete and triggerTurnOnComplete inputs map to coordinated each delivery and cannot be combined with completionPolicy or completionGroupId.",
       "Nested orchestration depth is capped (SUBAGENTURA_MAX_ORCHESTRATION_DEPTH, default 3); over-deep spawns are refused and the sub-agent should do the work itself.",
-      "Use get_subagent_status to poll progress and get_subagent_result to collect output.",
-      "Both modes show the user a completion notification.",
-      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
+      "Use get_subagent_status for live inspection and get_subagent_result only when explicit collection is needed.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -393,6 +484,13 @@ function registerSubagentWithContextTool(
       if (!execution) return unavailableSessionResult();
       const { owner } = execution;
       const runAsync = params.async ?? true;
+      let completion: ResolvedCompletionPolicy;
+      try {
+        completion = resolveAsyncCompletionPolicy(params, runAsync);
+        assertCompletionGroupOpen(completion.policy, completion.groupId, owner);
+      } catch (error) {
+        return completionPolicyErrorResult(error);
+      }
       debugLog("info", "tool_call", {
         toolName: "subagent_with_context",
         toolCallId: _toolCallId,
@@ -401,8 +499,15 @@ function registerSubagentWithContextTool(
         persona: params.persona ?? null,
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
-        notifyOnComplete: params.notifyOnComplete ?? null,
-        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
+        notifyOnComplete: completion.legacy
+          ? (params.notifyOnComplete ?? "inject")
+          : null,
+        triggerTurnOnComplete: completion.legacy
+          ? (params.triggerTurnOnComplete ?? null)
+          : null,
+        completionPolicy:
+          completion.policy ?? (completion.legacy ? "legacy" : null),
+        completionGroupId: completion.groupId ?? null,
         maxAge: params.maxAge ?? null,
       });
 
@@ -476,13 +581,14 @@ function registerSubagentWithContextTool(
           abort,
           parentJobId: spawn.parentJobId,
           depth: spawn.childDepth,
-          notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : "inject",
+          notifyOnComplete: completion.legacy
+            ? params.notifyOnComplete === "notify"
+              ? "notify"
+              : "inject"
+            : undefined,
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          completionPolicy: completion.policy,
+          completionGroupId: completion.groupId,
           deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
@@ -491,6 +597,15 @@ function registerSubagentWithContextTool(
         if (!registerInProcessJob(jobState, owner)) {
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
+        }
+        if (completion.policy) {
+          registerCompletionMember(
+            "in-process",
+            jobId,
+            completion.policy,
+            completion.groupId,
+            owner,
+          );
         }
         updateRunningFooter(ctx, owner);
 
@@ -503,14 +618,7 @@ function registerSubagentWithContextTool(
               type: "text",
               text:
                 `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.\n\n` +
-                formatCompletionDeliveryBehavior(
-                  jobState.notifyOnComplete ?? "inject",
-                  completionTriggersTurn(
-                    jobState.notifyOnComplete ?? "inject",
-                    jobState.triggerTurnOnComplete,
-                  ),
-                  "planned",
-                ) +
+                formatResolvedCompletionBehavior(completion, jobState) +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -609,15 +717,16 @@ function registerSubagentIsolatedTool(
       "",
       "Examples:",
       '  - task: "Propose a README outline for this repo", persona: "You are a technical writer"',
-      '  - task: "Give me a second opinion on this approach", model: "anthropic/claude-sonnet-4-5"',
-      '  - task: "Analyze this code without context contamination", async: true, notifyOnComplete: "inject"',
+      '  - task: "Review one module", completionPolicy: "each"',
+      '  - task: "Review one shard", completionPolicy: "group", completionGroupId: "review"',
       "",
       "Runs async (background) BY DEFAULT so the parent turn stays responsive — pass async: false only for a single short sub-agent whose result you need inline.",
-      "When fanning out multiple sub-agents (e.g. one per PR/file), leave async at its default so they run concurrently without blocking the parent.",
-      "The main agent continues immediately. Use get_subagent_status to poll progress and get_subagent_result to collect output.",
+      "Async completionPolicy defaults to each: the user gets one TUI-only notice, and safely-idle ready results are coalesced into one compact parent manifest.",
+      "Use completionPolicy=group with a shared completionGroupId for related jobs; the parent resumes once its settled-turn group is sealed and every member is terminal.",
+      "Human input takes priority, and successful get_subagent_result collection consumes the pending automatic delivery.",
+      "Deprecated notifyOnComplete and triggerTurnOnComplete inputs map to coordinated each delivery and cannot be combined with completionPolicy or completionGroupId.",
       "Nested orchestration depth is capped (SUBAGENTURA_MAX_ORCHESTRATION_DEPTH, default 3); over-deep spawns are refused and the sub-agent should do the work itself.",
-      "Both modes show the user a completion notification.",
-      "notifyOnComplete controls the LLM payload; triggerTurnOnComplete independently controls whether a new parent turn starts.",
+      "Use get_subagent_status for live inspection and get_subagent_result only when explicit collection is needed.",
     ].join("\n"),
     parameters: BaseParams,
 
@@ -626,6 +735,13 @@ function registerSubagentIsolatedTool(
       if (!execution) return unavailableSessionResult();
       const { owner } = execution;
       const runAsync = params.async ?? true;
+      let completion: ResolvedCompletionPolicy;
+      try {
+        completion = resolveAsyncCompletionPolicy(params, runAsync);
+        assertCompletionGroupOpen(completion.policy, completion.groupId, owner);
+      } catch (error) {
+        return completionPolicyErrorResult(error);
+      }
       debugLog("info", "tool_call", {
         toolName: "subagent_isolated",
         toolCallId: _toolCallId,
@@ -634,8 +750,15 @@ function registerSubagentIsolatedTool(
         persona: params.persona ?? null,
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
-        notifyOnComplete: params.notifyOnComplete ?? null,
-        triggerTurnOnComplete: params.triggerTurnOnComplete ?? false,
+        notifyOnComplete: completion.legacy
+          ? (params.notifyOnComplete ?? "inject")
+          : null,
+        triggerTurnOnComplete: completion.legacy
+          ? (params.triggerTurnOnComplete ?? null)
+          : null,
+        completionPolicy:
+          completion.policy ?? (completion.legacy ? "legacy" : null),
+        completionGroupId: completion.groupId ?? null,
         maxAge: params.maxAge ?? null,
       });
 
@@ -690,13 +813,14 @@ function registerSubagentIsolatedTool(
           abort,
           parentJobId: spawn.parentJobId,
           depth: spawn.childDepth,
-          notifyOnComplete:
-            params.notifyOnComplete === "inject"
-              ? "inject"
-              : params.notifyOnComplete === "notify"
-                ? "notify"
-                : "inject",
+          notifyOnComplete: completion.legacy
+            ? params.notifyOnComplete === "notify"
+              ? "notify"
+              : "inject"
+            : undefined,
           triggerTurnOnComplete: params.triggerTurnOnComplete,
+          completionPolicy: completion.policy,
+          completionGroupId: completion.groupId,
           deliveryOwner,
           notificationDelivered: false,
           maxAge: params.maxAge,
@@ -705,6 +829,15 @@ function registerSubagentIsolatedTool(
         if (!registerInProcessJob(jobState, owner)) {
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
+        }
+        if (completion.policy) {
+          registerCompletionMember(
+            "in-process",
+            jobId,
+            completion.policy,
+            completion.groupId,
+            owner,
+          );
         }
         updateRunningFooter(ctx, owner);
 
@@ -717,14 +850,7 @@ function registerSubagentIsolatedTool(
               type: "text",
               text:
                 `Job ${jobId} started. The main agent continues — use get_subagent_status to check progress and get_subagent_result to collect output when ready.\n\n` +
-                formatCompletionDeliveryBehavior(
-                  jobState.notifyOnComplete ?? "inject",
-                  completionTriggersTurn(
-                    jobState.notifyOnComplete ?? "inject",
-                    jobState.triggerTurnOnComplete,
-                  ),
-                  "planned",
-                ) +
+                formatResolvedCompletionBehavior(completion, jobState) +
                 (modelWarning ? `\n\n${modelWarning}` : ""),
             },
           ],
@@ -892,7 +1018,7 @@ function registerGetSubagentResultTool(
       "Retrieve an async subagent job's current or final result and usage summary.",
       "A running job returns immediately with live status unless waiting is explicit. Pass wait: true to wait up to timeoutMs.",
       "ONLY call this tool when the user explicitly asks you to wait for or collect a specific async result.",
-      "Do not call it immediately after spawning async sub-agents; completion injection handles normal background fan-out.",
+      "Do not call it immediately after spawning async sub-agents; coordinated completion notices and compact manifests handle normal background fan-out. Successful terminal collection consumes the matching pending automatic delivery.",
     ].join("\n"),
     parameters: ResultParams,
 
@@ -920,6 +1046,7 @@ function registerGetSubagentResultTool(
       }
 
       if (job.status === "cancelled") {
+        consumeCompletionSource(pi, "in-process", job.id, execution.owner);
         return {
           content: [
             {
@@ -1043,6 +1170,7 @@ function registerGetSubagentResultTool(
       const result = waitResult.value!;
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
+      consumeCompletionSource(pi, "in-process", job.id, execution.owner);
 
       if ((job.status as JobStatus) === "cancelled") {
         return {
@@ -1178,6 +1306,16 @@ function registerCancelSubagentTool(
         /* Session may already be disposed; abort is best-effort */
       }
       job.status = "cancelled";
+      publishInProcessCompletion(
+        job,
+        job.result ?? {
+          output: "",
+          usage: ZERO_USAGE,
+          isError: false,
+          cancelled: true,
+        },
+        execution.owner,
+      );
       scheduleJobCleanup(params.jobId, true, undefined, execution.owner);
       updateRunningFooter(ctx, execution.owner);
 

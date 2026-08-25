@@ -423,12 +423,12 @@ async function runRequest(
     : undefined;
   const followupMarker =
     !toolResultId && !explicitMarker
-      ? [...states.entries()].find(
-          ([key, value]) =>
-            key.includes("WORKFLOW_ASYNC") &&
-            !key.includes("CHILD_") &&
-            value.stage === "complete",
-        )?.[0]
+      ? [...states.entries()]
+          .reverse()
+          .find(
+            ([key, value]) =>
+              !key.includes("CHILD_") && value.stage === "complete",
+          )?.[0]
       : undefined;
   const marker = continuationMarker ?? explicitMarker ?? followupMarker;
   const previous = marker ? states.get(marker) : undefined;
@@ -462,7 +462,7 @@ async function runRequest(
 
   const isChild = marker.includes("CHILD_");
   let state: State = previous ?? { stage: "initial", requestSeq: 0 };
-  if (state.stage === "complete" && !marker.includes("WORKFLOW_ASYNC")) {
+  if (state.stage === "complete" && marker !== followupMarker) {
     throw new Error(`duplicate request for completed marker ${marker}`);
   }
   if (
@@ -581,9 +581,50 @@ async function runRequest(
     return;
   }
 
+  if (
+    marker.includes("INTERACTIVE") &&
+    !marker.includes("CHILD_") &&
+    state.stage === "complete"
+  ) {
+    const final = message([
+      {
+        type: "text",
+        text: `Interactive completion reference received for ${marker}.`,
+      },
+    ]);
+    states.set(marker, { stage: "complete", requestSeq });
+    emit(stream, textEvents(final), final);
+    diagnostic({
+      marker,
+      requestSeq,
+      afterStage: "complete",
+      route: "trigger-followup",
+      eventType: "done",
+    });
+    return;
+  }
+
   if (marker.includes("WORKFLOW_ASYNC") && state.stage === "complete") {
     const final = message([
       { type: "text", text: `Workflow follow-up settled for ${marker}.` },
+    ]);
+    states.set(marker, { stage: "complete", requestSeq });
+    emit(stream, textEvents(final), final);
+    diagnostic({
+      marker,
+      requestSeq,
+      afterStage: "complete",
+      route: "trigger-followup",
+      eventType: "done",
+    });
+    return;
+  }
+  if (state.stage === "complete" && marker === followupMarker) {
+    const final = message([
+      {
+        type: "text",
+        text: `Async completion reference received for ${marker}.`,
+      },
     ]);
     states.set(marker, { stage: "complete", requestSeq });
     emit(stream, textEvents(final), final);

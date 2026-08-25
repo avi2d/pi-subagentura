@@ -13,16 +13,25 @@ import {
   artifactPath,
   INTERACTIVE_ARTIFACT_OWNER_FILE,
   isArtifactOutputSettled,
+  isCompletionEvent,
   loadInteractiveStates,
   lastEvent,
   listOutputHistory,
   listOutputTurns,
   readEvents,
+  readEventBatch,
   readOutput,
   readOutputForTurnId,
   readOutputForTurn,
+  updateInteractiveState,
   type SubagentArtifact,
 } from "../artifact";
+import {
+  assertCompletionGroupOpen,
+  consumeCompletionSource,
+  registerCompletionMember,
+  resolveCompletionPolicy,
+} from "../completion-coordinator";
 import {
   cancelInteractiveSubagent,
   formatInteractiveState,
@@ -122,6 +131,41 @@ function getArtifactForState(
   return artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
 }
 
+interface SelectedCompletion {
+  turnId: string;
+  protocolV2: boolean;
+}
+
+function completionForRead(
+  art: SubagentArtifact,
+  selector: { turn?: number; turnId?: string },
+): SelectedCompletion | undefined {
+  const completions: ReturnType<typeof readEventBatch>["records"] = [];
+  let cursor = 0;
+  for (;;) {
+    const batch = readEventBatch(art, cursor);
+    completions.push(
+      ...batch.records.filter(({ event }) => isCompletionEvent(event)),
+    );
+    if (batch.endOffset <= cursor) break;
+    cursor = batch.endOffset;
+  }
+  const selected = selector.turnId
+    ? completions.find(
+        ({ event }) =>
+          event.type === "completion" && event.turnId === selector.turnId,
+      )
+    : selector.turn !== undefined
+      ? completions.filter(({ event }) => event.type === "done")[
+          selector.turn - 1
+        ]
+      : completions.at(-1);
+  if (!selected) return undefined;
+  return selected.event.type === "completion"
+    ? { turnId: selected.event.turnId, protocolV2: true }
+    : { turnId: `legacy-${selected.startOffset}`, protocolV2: false };
+}
+
 function resolveInteractiveToolStates(token: SessionToolToken | undefined):
   | {
       scope?: SessionScope;
@@ -188,10 +232,10 @@ export function registerInteractiveSubagentTools(
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
       "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
-      "Both completion modes show the user a notification.",
-      'Defaults: notifyOnComplete="notify" and triggerTurnOnComplete=true.',
-      "The default stores only an artifact pointer (output is not injected) and automatically starts the next parent turn after pointer delivery.",
-      "Explicit triggerTurnOnComplete=false disables the automatic turn for either mode.",
+      "Completion coordination defaults to each: every terminal turn creates one TUI-only notice, while safely-idle results are coalesced into a compact immutable-reference manifest that resumes the parent.",
+      "Use completionPolicy=group with a shared completionGroupId for related agents; the parent resumes once the spawning turn settles and every registered member is terminal.",
+      "Human input takes priority, and successful read_subagent_artifact collection consumes the matching pending delivery.",
+      "Deprecated notifyOnComplete and triggerTurnOnComplete inputs map to coordinated each delivery and cannot be combined with completionPolicy or completionGroupId.",
     ].join("\n"),
     parameters: InteractiveParams,
 
@@ -224,6 +268,24 @@ export function registerInteractiveSubagentTools(
           isError: true,
         };
       }
+      let completion: ReturnType<typeof resolveCompletionPolicy>;
+      try {
+        completion = resolveCompletionPolicy(params);
+        assertCompletionGroupOpen(
+          completion.policy,
+          completion.groupId,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            { type: "text", text: `Sub-agent not started: ${message}` },
+          ],
+          details: { status: "error", error: message },
+          isError: true,
+        };
+      }
       const completionMode = params.notifyOnComplete ?? "notify";
       const triggerTurn = completionTriggersTurn(
         completionMode,
@@ -236,8 +298,10 @@ export function registerInteractiveSubagentTools(
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
         includeContext: params.includeContext ?? false,
-        notifyOnComplete: completionMode,
-        triggerTurnOnComplete: triggerTurn,
+        notifyOnComplete: completion.legacy ? completionMode : null,
+        triggerTurnOnComplete: completion.legacy ? triggerTurn : null,
+        completionPolicy: completion.policy ?? "legacy",
+        completionGroupId: completion.groupId ?? null,
       });
 
       let contextText: string | null = null;
@@ -264,8 +328,10 @@ export function registerInteractiveSubagentTools(
           cwd: targetCwd,
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
-          notifyOnComplete: completionMode,
-          triggerTurnOnComplete: triggerTurn,
+          notifyOnComplete: completion.legacy ? completionMode : undefined,
+          triggerTurnOnComplete: completion.legacy ? triggerTurn : undefined,
+          completionPolicy: completion.policy,
+          completionGroupId: completion.groupId,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
@@ -273,6 +339,15 @@ export function registerInteractiveSubagentTools(
           sessionScope: registration.scope,
           spawnTreeContext: registration.scope?.spawnTreeContext,
         });
+        if (completion.policy) {
+          registerCompletionMember(
+            "interactive",
+            state.id,
+            completion.policy,
+            completion.groupId,
+            registration.scope ? sessionOwner(registration.scope) : undefined,
+          );
+        }
         updateRunningSubagentFooter(
           ctx.ui,
           registration.scope ? sessionOwner(registration.scope) : undefined,
@@ -293,7 +368,17 @@ export function registerInteractiveSubagentTools(
               type: "text",
               text:
                 `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
-                `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
+                `${
+                  completion.legacy
+                    ? formatCompletionDeliveryBehavior(
+                        completionMode,
+                        triggerTurn,
+                        "planned",
+                      )
+                    : completion.policy === "group"
+                      ? `Completion will notify the user immediately and resume the parent once group ${completion.groupId} is sealed at parent settlement and all registered members finish.`
+                      : "Completion will notify the user immediately and resume the parent with immutable result references when safely idle."
+                }\n\n` +
                 locationLines.join("\n"),
             },
           ],
@@ -618,18 +703,9 @@ export function registerInteractiveSubagentTools(
       // sendCommandToPane uses send-keys + Enter; it throws synchronously if the
       // pane is gone (e.g. the child exited between the status check and now).
       // Wrap so the parent gets a structured error instead of an exception trace.
+      const startsNewTurn = state.status === "idle";
       try {
         sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
-        // Reaching the send proves both workflow release conditions held at the guard above.
-        // Release ownership only after sendCommandToPane succeeds so a failed send remains owned.
-        if (
-          state.completionOwner === "workflow" &&
-          state.workflowResultConsumed &&
-          state.status === "idle"
-        ) {
-          state.completionOwner = "standalone";
-          state.workflowId = undefined;
-        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -648,6 +724,39 @@ export function registerInteractiveSubagentTools(
           isError: true,
         };
       }
+      // Reaching the send proves both workflow release conditions held at the guard above.
+      if (
+        state.completionOwner === "workflow" &&
+        state.workflowResultConsumed &&
+        state.status === "idle"
+      ) {
+        state.completionOwner = "standalone";
+        state.workflowId = undefined;
+      }
+      let persistenceWarning: string | undefined;
+      if (startsNewTurn) {
+        state.completionPolicy = "each";
+        state.completionGroupId = undefined;
+        state.notifyOnComplete = undefined;
+        state.triggerTurnOnComplete = undefined;
+        if (state.parentSessionId) {
+          try {
+            updateInteractiveState(state.cwd, state.id, (entry) => {
+              entry.completionPolicy = "each";
+              delete entry.completionGroupId;
+              delete entry.notifyOnComplete;
+              delete entry.triggerTurnOnComplete;
+            });
+          } catch (error) {
+            persistenceWarning =
+              "The message was sent, but the new completion policy could not be persisted; reload may require manual recovery.";
+            debugLog("warn", "interactive_followup_policy_persist_failed", {
+              id: state.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
       const messagePreview = formatFollowupPreview(params.message);
       const messageTruncated =
         params.message.length > MAX_FOLLOWUP_PREVIEW_CHARS;
@@ -657,11 +766,13 @@ export function registerInteractiveSubagentTools(
             type: "text",
             text:
               `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.` +
-              `\n\nMessage sent:\n${messagePreview}`,
+              `\n\nMessage sent:\n${messagePreview}` +
+              (persistenceWarning ? `\n\nWarning: ${persistenceWarning}` : ""),
           },
         ],
         details: {
           id: params.id,
+          ...(persistenceWarning ? { persistenceWarning } : {}),
           paneId: state.paneId,
           messageLength: params.message.length,
           messagePreview,
@@ -673,18 +784,18 @@ export function registerInteractiveSubagentTools(
   });
 
   // ── Tool: read an interactive sub-agent's artifact ───────────────
-  // The artifact (events.ndjson + output.md) is the source of truth for what the
-  // sub-agent did. The main agent calls this when it wants to know more than the pointer.
-  // The artifact (events.ndjson + output.md + output-N.md snapshots) is the source of truth for what
-  // the sub-agent did. The main agent calls this when it wants to know more than the pointer.
+  // Events and immutable terminal snapshots are authoritative. output.md remains
+  // mutable staging for legacy or still-running artifacts only.
   registerToolWithDefaultGuidance(pi, {
     name: "read_subagent_artifact",
     label: "Read Subagent Artifact",
     description: [
-      "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
-      "if present, the sub-agent's output.md (the latest turn's content) or a specific turn's snapshot.",
+      "Read an interactive sub-agent's artifact on disk. Returns lifecycle events and, by default,",
+      "the latest terminal immutable protocol-v2 snapshot. Mutable output.md is used only when",
+      "no protocol-v2 terminal snapshot applies, including legacy or still-running artifacts.",
       "Use `since` (unix ms) to fetch only events newer than your last read. Use `turnId` for a",
       "protocol-v2 Pi turn, or legacy numeric `turn` for an output-N.md snapshot.",
+      "Returning a terminal output consumes its matching pending coordinated delivery so it is not sent again automatically; events-only reads do not consume it.",
     ].join("\n"),
     parameters: Type.Object({
       id: Type.String({
@@ -771,12 +882,17 @@ export function registerInteractiveSubagentTools(
         params.includeOutput !== false ||
         params.turn !== undefined ||
         params.turnId !== undefined;
+      const selectedCompletion = wantsOutput
+        ? completionForRead(art, params)
+        : undefined;
       const output = wantsOutput
         ? params.turnId !== undefined
           ? readOutputForTurnId(art, params.turnId)
           : params.turn !== undefined
             ? readOutputForTurn(art, params.turn)
-            : readOutput(art)
+            : selectedCompletion?.protocolV2
+              ? readOutputForTurnId(art, selectedCompletion.turnId)
+              : readOutput(art)
         : null;
       const lastEventValue =
         events.length > 0 ? events[events.length - 1] : null;
@@ -814,6 +930,15 @@ export function registerInteractiveSubagentTools(
               .map(({ turnId, eventId }) => `${turnId} → ${eventId}`)
               .join(", ")}\n`
           : "";
+      if (wantsOutput && output !== null && selectedCompletion) {
+        consumeCompletionSource(
+          pi,
+          "interactive",
+          params.id,
+          registration?.scope ? sessionOwner(registration.scope) : undefined,
+          selectedCompletion.turnId,
+        );
+      }
       return {
         content: [
           {

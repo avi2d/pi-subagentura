@@ -37,6 +37,18 @@ import {
 } from "../src/workflow";
 import { withOrchestrationContext } from "../src/orchestration-context";
 import {
+  clearSessionScopes,
+  registerSessionScope,
+  sessionOwner,
+} from "../src/session-scope";
+import {
+  clearCompletionCoordinator,
+  publishCompletion,
+  registerCompletionCoordinator,
+  registerCompletionMember,
+  sealCompletionGroups,
+} from "../src/completion-coordinator";
+import {
   usageFromAssistantMessages,
   type SubagentResult,
   type Usage,
@@ -2703,6 +2715,113 @@ describe("registerWorkflowTool", () => {
     });
     expect(repeated.content[0].text).toContain("already cancelled");
     workflowJobRegistry.delete(job.id);
+  });
+
+  it("publishes cancellation before a workflow promise settles", async () => {
+    clearSessionScopes();
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const entries: any[] = [];
+    const pi = {
+      registerTool: vi.fn((definition: any) => tools.push(definition)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      on: vi.fn(),
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entries.push({ type: "custom", customType, data });
+      }),
+      sendMessage: vi.fn(),
+    };
+    const scope = registerSessionScope({
+      id: 991,
+      generation: 1,
+      lifecycle: "started",
+      pi: pi as never,
+      sessionManager: {
+        getSessionId: () => "workflow-parent",
+        getEntries: () => entries,
+      },
+      parentStreaming: false,
+      inProcessJobs: new Map(),
+      pendingInProcessDeliveries: [],
+      interactiveStates: new Map(),
+    });
+    const workflowOwner = sessionOwner(scope);
+    registerCompletionCoordinator(pi as never, scope);
+    registerWorkflowTool(pi as never, scope);
+    let releaseAgent!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const completionNotification = vi.fn((settledJob: any) => {
+      publishCompletion(
+        {
+          schemaVersion: 1,
+          completionId: `workflow:${settledJob.id}`,
+          source: "workflow",
+          sourceId: settledJob.id,
+          label: `Workflow ${settledJob.id}`,
+          status: settledJob.status === "cancelled" ? "cancelled" : "done",
+          policy: settledJob.completionPolicy,
+          groupId: settledJob.completionGroupId,
+          references: [
+            { label: "result", value: `get_workflow_result ${settledJob.id}` },
+          ],
+          completedAt: 1,
+        },
+        workflowOwner,
+      );
+      return true;
+    });
+    const job = startWorkflowJob(
+      "cancel-before-settle",
+      `export const meta = { name: "cancel-before-settle", description: "d" };\nreturn await agent("wait");`,
+      {
+        runAgent: () =>
+          new Promise<SubagentResult>((resolve) => {
+            releaseAgent = () => resolve(ok("late result"));
+            markStarted();
+          }),
+      },
+      undefined,
+      completionNotification,
+      workflowOwner,
+    );
+    await started;
+    job.completionPolicy = "group";
+    job.completionGroupId = "cancel-group";
+    registerCompletionMember(
+      "workflow",
+      job.id,
+      "group",
+      job.completionGroupId,
+      workflowOwner,
+    );
+    sealCompletionGroups(workflowOwner);
+
+    try {
+      const cancel = tools.find((tool) => tool.name === "cancel_workflow")!;
+      await cancel.execute("", { workflowId: job.id });
+
+      expect(
+        entries.filter(
+          (entry) => entry.customType === "subagentura-completion",
+        ),
+      ).toHaveLength(1);
+      releaseAgent();
+      await job.promise.catch(() => undefined);
+      expect(completionNotification).toHaveBeenCalledOnce();
+      expect(
+        entries.filter(
+          (entry) => entry.customType === "subagentura-completion",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      workflowJobRegistry.delete(job.id);
+      clearCompletionCoordinator(workflowOwner);
+      clearSessionScopes();
+    }
   });
 
   it("save_workflow tool validates the script before persisting", async () => {

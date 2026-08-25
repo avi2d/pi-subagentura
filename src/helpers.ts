@@ -41,6 +41,7 @@ import {
 } from "./cancellation-snapshots";
 import { withOrchestrationContext } from "./orchestration-context";
 import type { InteractiveSubagentState } from "./interactive-tmux";
+import type { CompletionPolicy } from "./completion-coordinator";
 import {
   findSessionScope,
   ownerlessEntitiesVisible,
@@ -325,12 +326,16 @@ export interface JobState {
   modelLabel?: string;
   /** Effective level after Pi's model-capability clamping. */
   thinkingLevel?: ThinkingLevel;
-  /** Notification mode requested by spawner's notifyOnComplete param */
+  /** Deprecated legacy pointer/output delivery mode. */
   notifyOnComplete?: NotifyOnComplete;
   /** Delivery owner captured at async spawn time. */
   deliveryOwner?: JobDeliveryOwner;
-  /** Whether completion notifications should trigger a parent LLM turn. */
+  /** Deprecated legacy parent-turn trigger override. */
   triggerTurnOnComplete?: boolean;
+  /** Coordinated default: independent readiness or an explicit group barrier. */
+  completionPolicy?: CompletionPolicy;
+  /** Required for coordinated grouped completion. */
+  completionGroupId?: string;
   /** At-most-once delivery guard */
   notificationDelivered?: boolean;
   /** Set true by get_subagent_result to suppress redundant notification */

@@ -64,6 +64,8 @@ describe("rehydrateInteractiveSubagents", () => {
       artifactDir: state.artifactDir,
       sessionFile: state.sessionFile,
       triggerTurnOnComplete: true,
+      completionPolicy: "group",
+      completionGroupId: "review",
     });
 
     const result = mod.rehydrateInteractiveSubagents(cwd);
@@ -75,6 +77,8 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated?.mux).toBe("tmux");
     expect(rehydrated?.parentSessionId).toBe("pi");
     expect(rehydrated?.triggerTurnOnComplete).toBe(true);
+    expect(rehydrated?.completionPolicy).toBe("group");
+    expect(rehydrated?.completionGroupId).toBe("review");
   });
 
   it("preserves an explicit false trigger override across rehydrate", async () => {
@@ -282,6 +286,7 @@ describe("rehydrateInteractiveSubagents", () => {
     mod.rehydrateInteractiveSubagents(cwd, undefined, [
       {
         type: "custom_message",
+        customType: "subagent-notify",
         details: { deliveryIds: ["already-sent"] },
       },
     ]);

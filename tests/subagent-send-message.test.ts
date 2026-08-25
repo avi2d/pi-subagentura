@@ -229,6 +229,50 @@ describe("send_interactive_subagent_message", () => {
     expect(result.details.status).toBe("sent");
     expect(state.completionOwner).toBe("standalone");
     expect(state.workflowId).toBeUndefined();
+    expect(state.completionPolicy).toBe("each");
+    expect(state.completionGroupId).toBeUndefined();
+  });
+
+  it("starts a new independent completion policy after a grouped follow-up", async () => {
+    const state = registerState(api.sessionScope, {
+      status: "idle",
+      completionPolicy: "group",
+      completionGroupId: "finished-group",
+    });
+    mockSendCommandToPane.mockReturnValue(undefined);
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+
+    const result = await toolDef.execute("call-new-turn", {
+      id: state.id,
+      message: "start another turn",
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(state.completionPolicy).toBe("each");
+    expect(state.completionGroupId).toBeUndefined();
+  });
+
+  it("reports a persistence warning without misreporting a successful send", async () => {
+    const state = registerState(api.sessionScope, {
+      status: "idle",
+      cwd: "/dev/null",
+      parentSessionId: "parent",
+      completionPolicy: "group",
+      completionGroupId: "finished-group",
+    });
+    mockSendCommandToPane.mockReturnValue(undefined);
+    const toolDef = getToolDef(api, "send_interactive_subagent_message");
+
+    const result = await toolDef.execute("call-persist-warning", {
+      id: state.id,
+      message: "start another turn",
+    });
+
+    expect(mockSendCommandToPane).toHaveBeenCalledOnce();
+    expect(result.isError).toBeFalsy();
+    expect(result.details.status).toBe("sent");
+    expect(result.details.persistenceWarning).toMatch(/could not be persisted/);
+    expect(result.content[0].text).toContain("Warning:");
   });
 
   it("rejects an idle workflow-owned sub-agent before its result is consumed", async () => {

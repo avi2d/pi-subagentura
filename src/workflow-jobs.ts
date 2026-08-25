@@ -19,6 +19,7 @@ import {
   MAX_WORKFLOW_AGENT_RECORDS,
   zeroWorkflowUsage,
 } from "./workflow-core";
+import type { CompletionPolicy } from "./completion-coordinator";
 
 // ── Background workflow-job registry ─────────────────────────────────
 
@@ -74,6 +75,8 @@ export interface WorkflowJobState {
   notificationAttempt?: number;
   /** Parent session lifecycle that owns this workflow job. */
   parentSessionOwner?: SessionOwnerToken;
+  completionPolicy?: CompletionPolicy;
+  completionGroupId?: string;
 }
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
@@ -303,7 +306,7 @@ export function startWorkflowJob(
       state.snapshot.liveUsage = undefined;
       liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
-      invokeCompletionHook(state);
+      invokeWorkflowCompletionHook(state);
       return r;
     })
     .catch((err) => {
@@ -317,7 +320,7 @@ export function startWorkflowJob(
       state.snapshot.liveUsage = undefined;
       liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
-      invokeCompletionHook(state);
+      invokeWorkflowCompletionHook(state);
       throw err;
     })
     .finally(() => {
@@ -335,7 +338,7 @@ export function startWorkflowJob(
   return state;
 }
 
-function invokeCompletionHook(job: WorkflowJobState): void {
+export function invokeWorkflowCompletionHook(job: WorkflowJobState): void {
   const callback = job.completionNotification;
   if (
     !callback ||
@@ -397,7 +400,7 @@ export function retryPendingWorkflowNotifications(
 ): void {
   for (const job of workflowJobsForOwner(owner)) {
     if (job.status === "running") continue;
-    invokeCompletionHook(job);
+    invokeWorkflowCompletionHook(job);
   }
 }
 

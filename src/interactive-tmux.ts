@@ -57,6 +57,7 @@ import {
   removeInteractiveState,
 } from "./artifact";
 import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
+import type { CompletionPolicy } from "./completion-coordinator";
 import {
   type CapturePaneOptions,
   type CapturePaneResult,
@@ -256,18 +257,14 @@ export interface InteractiveSubagentState {
   autoDoneForTurnAt?: number;
   /** @deprecated Legacy session metadata retained for API compatibility. */
   lastStopText?: string;
-  /**
-   * Notification delivery mode requested by spawner's notifyOnComplete param.
-   * "notify" emits status and artifact pointers. "inject" also includes bounded,
-   * untrusted output in one attributed custom message.
-   */
+  /** Deprecated legacy pointer/output delivery mode. */
   notifyOnComplete?: "notify" | "inject";
-  /**
-   * When true, the attributed custom completion message triggers a parent turn.
-   * The public subagent_interactive tool defaults this to true for both modes;
-   * legacy states may retain an explicit false value.
-   */
+  /** Deprecated legacy parent-turn trigger override. */
   triggerTurnOnComplete?: boolean;
+  /** Coordinated default: independent readiness or an explicit group barrier. */
+  completionPolicy?: CompletionPolicy;
+  /** Required for coordinated grouped completion. */
+  completionGroupId?: string;
   /** @deprecated Legacy v1 inject cursor retained for API compatibility. */
   lastInjectedEventTs?: number;
   /** @deprecated Legacy v1 snapshot cursor retained for API compatibility. */
@@ -493,14 +490,14 @@ export function launchInteractiveSubagent(params: {
   contextText?: string | null;
   /** Spawn in a detached named window (invisible) instead of a visible split. */
   background?: boolean;
-  /**
-   * Notification delivery mode requested by the spawner. The public
-   * `subagent_interactive` tool passes `"notify"` by default; explicit callers
-   * choose `"inject"` when full output delivery is required.
-   */
+  /** Deprecated legacy pointer/output delivery mode. */
   notifyOnComplete?: "notify" | "inject";
-  /** Whether notify-mode completion messages should trigger a parent LLM turn. */
+  /** Deprecated legacy parent-turn trigger override. */
   triggerTurnOnComplete?: boolean;
+  /** Coordinated default: independent readiness or an explicit group barrier. */
+  completionPolicy?: CompletionPolicy;
+  /** Required for coordinated grouped completion. */
+  completionGroupId?: string;
   /** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
   muxPreference?: "auto" | "tmux" | "zellij";
   /**
@@ -665,8 +662,12 @@ export function launchInteractiveSubagent(params: {
         muxSession,
         artifactDir: paths.artifactDir,
         sessionFile: paths.sessionFile,
-        notifyOnComplete: params.notifyOnComplete ?? "inject",
+        notifyOnComplete: params.completionPolicy
+          ? undefined
+          : (params.notifyOnComplete ?? "inject"),
         triggerTurnOnComplete: params.triggerTurnOnComplete,
+        completionPolicy: params.completionPolicy,
+        completionGroupId: params.completionGroupId,
         parentSessionId: params.parentSessionId,
         eventByteCursor: 0,
         sessionByteCursor: 0,
@@ -803,8 +804,12 @@ export function launchInteractiveSubagent(params: {
     selectPaneCommand: attach.focusCommand,
     launchScriptFile: paths.launchScriptFile,
     artifactDir: paths.artifactDir,
-    notifyOnComplete: params.notifyOnComplete ?? "inject",
+    notifyOnComplete: params.completionPolicy
+      ? undefined
+      : (params.notifyOnComplete ?? "inject"),
     triggerTurnOnComplete: params.triggerTurnOnComplete,
+    completionPolicy: params.completionPolicy,
+    completionGroupId: params.completionGroupId,
     parentSessionId: params.parentSessionId,
     supervisorOwner: params.supervisorOwner,
     workflowId: params.workflowId,
@@ -1067,6 +1072,7 @@ function appendCancellation(
     });
   }
   if (!completion) return;
+  if (state.completionPolicy) return;
   if (!acknowledgeDelivery) return;
   const mode = state.notifyOnComplete ?? "inject";
   const deliveryId = deliveryIdFor({

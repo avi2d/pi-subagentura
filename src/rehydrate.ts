@@ -19,6 +19,7 @@ import {
   type InteractiveSubagentPersistedStateV2,
 } from "./artifact";
 import { reconcileDeliveryReceipts } from "./delivery";
+import { registerCompletionMember } from "./completion-coordinator";
 import {
   buildAttachCommandsForState,
   deriveInteractiveSubagentStatusFromLifecycle,
@@ -117,6 +118,8 @@ export function rehydrateInteractiveSubagents(
       artifactDir: entry.artifactDir,
       notifyOnComplete: entry.notifyOnComplete,
       triggerTurnOnComplete: entry.triggerTurnOnComplete,
+      completionPolicy: entry.completionPolicy,
+      completionGroupId: entry.completionGroupId,
       parentSessionId: entry.parentSessionId ?? "pi",
       eventByteCursor: entry.eventByteCursor,
       lastDeliveredSessionByte: sessionResumeCursor,
@@ -151,6 +154,15 @@ export function rehydrateInteractiveSubagents(
     );
     if (next === "exited" || next === "cancelled") terminal++;
     else if (next === "running" || next === "idle") alive++;
+    if (rehydrated.completionPolicy) {
+      registerCompletionMember(
+        "interactive",
+        rehydrated.id,
+        rehydrated.completionPolicy,
+        rehydrated.completionGroupId,
+        scope ? sessionOwner(scope) : undefined,
+      );
+    }
     registerInteractiveSubagentState(rehydrated, scope);
   }
 

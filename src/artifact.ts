@@ -1365,6 +1365,8 @@ export interface InteractiveSubagentPersistedStateV1 {
 
   notifyOnComplete?: "notify" | "inject";
   triggerTurnOnComplete?: boolean;
+  completionPolicy?: "each" | "group";
+  completionGroupId?: string;
 
   /** Parent pi session id; only rehydrated when the current session matches. */
   parentSessionId?: string;
@@ -1382,6 +1384,8 @@ export interface PersistedDeliveryIntent {
   output?: OutputSnapshot;
   message?: string;
   state: "queued" | "dispatchAttempted";
+  completionPolicy?: "each" | "group";
+  completionGroupId?: string;
 }
 
 export const MAX_DELIVERY_RECEIPTS = 256;
@@ -1519,6 +1523,19 @@ function migrateStatePayload(
         basename(entry.artifactDir),
       );
       const cutoverOffset = legacy ? eventLogEndOffset(art) : 0;
+      const completionGroupId =
+        typeof entry.completionGroupId === "string" &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entry.completionGroupId)
+          ? entry.completionGroupId
+          : undefined;
+      const completionPolicy =
+        entry.completionPolicy === "each"
+          ? "each"
+          : entry.completionPolicy === "group"
+            ? completionGroupId
+              ? "group"
+              : "each"
+            : undefined;
       const cursor = (candidate: unknown, fallback: number): number =>
         typeof candidate === "number" &&
         Number.isSafeInteger(candidate) &&
@@ -1547,6 +1564,21 @@ function migrateStatePayload(
               ) {
                 return [];
               }
+              const intentGroupId =
+                typeof rawIntent.completionGroupId === "string" &&
+                /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(
+                  rawIntent.completionGroupId,
+                )
+                  ? rawIntent.completionGroupId
+                  : undefined;
+              const intentPolicy =
+                rawIntent.completionPolicy === "each"
+                  ? "each"
+                  : rawIntent.completionPolicy === "group"
+                    ? intentGroupId
+                      ? "group"
+                      : "each"
+                    : undefined;
               const output =
                 rawIntent.output &&
                 typeof rawIntent.output === "object" &&
@@ -1580,6 +1612,10 @@ function migrateStatePayload(
                   ...(output ? { output } : {}),
                   ...(typeof rawIntent.message === "string"
                     ? { message: rawIntent.message.slice(0, 500) }
+                    : {}),
+                  ...(intentPolicy ? { completionPolicy: intentPolicy } : {}),
+                  ...(intentPolicy === "group"
+                    ? { completionGroupId: intentGroupId }
                     : {}),
                   state: rawIntent.state,
                 },
@@ -1671,6 +1707,8 @@ function migrateStatePayload(
         ...(typeof entry.triggerTurnOnComplete === "boolean"
           ? { triggerTurnOnComplete: entry.triggerTurnOnComplete }
           : {}),
+        ...(completionPolicy ? { completionPolicy } : {}),
+        ...(completionPolicy === "group" ? { completionGroupId } : {}),
         ...(typeof entry.parentSessionId === "string"
           ? { parentSessionId: entry.parentSessionId }
           : {}),

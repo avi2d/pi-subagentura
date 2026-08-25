@@ -54,6 +54,7 @@
     "src/artifact-poller.ts",
     "src/child-protocol.ts",
     "src/delivery.ts",
+    "src/completion-coordinator.ts",
     "src/helpers.ts",
     "src/orchestration-context.ts",
     "src/pi-sdk-compat.ts",

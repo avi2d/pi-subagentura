@@ -19,6 +19,7 @@ const {
   mockBuildLiveUpdate,
   mockScheduleJobCleanup,
   mockDeliverNotification,
+  mockPublishCompletion,
 } = vi.hoisted(() => ({
   mockStartSubagentJob: vi.fn(),
   mockDebugLog: vi.fn(),
@@ -26,6 +27,7 @@ const {
   mockBuildLiveUpdate: vi.fn(),
   mockScheduleJobCleanup: vi.fn(),
   mockDeliverNotification: vi.fn(),
+  mockPublishCompletion: vi.fn(),
 }));
 
 // We need a separate hoisted mock for `convertToLlm` / `serializeConversation`
@@ -54,6 +56,15 @@ vi.mock("../src/notifications", async (importOriginal) => {
   return {
     ...actual,
     deliverNotification: mockDeliverNotification,
+  };
+});
+
+vi.mock("../src/completion-coordinator", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/completion-coordinator")>();
+  return {
+    ...actual,
+    publishCompletion: mockPublishCompletion,
   };
 });
 
@@ -1055,6 +1066,7 @@ describe("cancel_subagent tool", () => {
         id: jobId,
         status: "running",
         session: { abort: abortFn } as any,
+        completionPolicy: "each",
       }),
     );
 
@@ -1080,6 +1092,18 @@ describe("cancel_subagent tool", () => {
     );
     // Footer was updated
     expect(ctx.ui.setStatus).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "cancelled",
+        references: [
+          {
+            label: "status",
+            value: "cancelled; no result retained",
+          },
+        ],
+      }),
+      undefined,
+    );
   });
 
   it("handles abort rejection gracefully", async () => {
@@ -1794,10 +1818,13 @@ describe("subagent_with_context async path", () => {
     );
 
     expect(jobRegistry.has("default-job")).toBe(true);
-    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("inject");
+    expect(jobRegistry.get("default-job")).toMatchObject({
+      completionPolicy: "each",
+      notifyOnComplete: undefined,
+    });
   });
 
-  it("uses notify mode when notifyOnComplete is 'notify'", async () => {
+  it("maps legacy notifyOnComplete to coordinated each mode", async () => {
     mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
     mockSerializeConversation.mockReturnValue("Hi");
 
@@ -1820,7 +1847,8 @@ describe("subagent_with_context async path", () => {
       ctx,
     );
 
-    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("notify");
+    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBeUndefined();
+    expect(jobRegistry.get("default-job")!.completionPolicy).toBe("each");
   });
 
   it("includes modelWarning in async response when present", async () => {
@@ -1854,7 +1882,7 @@ describe("subagent_with_context async path", () => {
     expect(result.content[0].text).toContain("Model not found");
   });
 
-  it("delivers notification when async job completes successfully", async () => {
+  it("publishes a coordinated completion when an async job succeeds", async () => {
     let resolveJob!: (v: SubagentResult) => void;
     const deferred = new Promise<SubagentResult>((r) => {
       resolveJob = r;
@@ -1893,7 +1921,16 @@ describe("subagent_with_context async path", () => {
 
     const job = jobRegistry.get("default-job")!;
     expect(job.status).toBe("done");
-    expect(mockDeliverNotification).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "in-process",
+        sourceId: "default-job",
+        status: "done",
+        policy: "each",
+      }),
+      undefined,
+    );
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
   });
 
   it("does not deliver notification when job is cancelled before completion", async () => {
@@ -1937,9 +1974,10 @@ describe("subagent_with_context async path", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     expect(mockDeliverNotification).not.toHaveBeenCalled();
+    expect(mockPublishCompletion).not.toHaveBeenCalled();
   });
 
-  it("delivers notification on job promise rejection", async () => {
+  it("publishes a coordinated completion on job promise rejection", async () => {
     let rejectJob!: (err: Error) => void;
     const deferred = new Promise<SubagentResult>((_, reject) => {
       rejectJob = reject;
@@ -1977,7 +2015,16 @@ describe("subagent_with_context async path", () => {
     rejectJob(new Error("LLM crash"));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(mockDeliverNotification).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "in-process",
+        sourceId: "default-job",
+        status: "error",
+        policy: "each",
+      }),
+      undefined,
+    );
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
   });
 });
 
@@ -2037,7 +2084,11 @@ describe("async rejection settlement", () => {
       undefined,
       undefined,
     );
-    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceId: "default-job", status: "error" }),
+      undefined,
+    );
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
       undefined,
@@ -2104,7 +2155,11 @@ describe("async rejection settlement", () => {
       undefined,
       undefined,
     );
-    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceId: "default-job", status: "error" }),
+      undefined,
+    );
 
     const result = await getToolDef(api, "get_subagent_result").execute(
       "result-call",

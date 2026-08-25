@@ -38,6 +38,12 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { appendDeterministicTurn } from "./helpers/deterministic-artifacts";
 import { registerInProcessJob } from "../src/helpers";
 
+import {
+  flushCompletionManifests,
+  publishCompletion,
+  registerCompletionMember,
+  settleCompletionParentTurn,
+} from "../src/completion-coordinator";
 const repoRoot = new URL("..", import.meta.url).pathname;
 const harnesses: PiSessionHarness[] = [];
 const artifactRoots: string[] = [];
@@ -76,6 +82,14 @@ function resolveHarnessScope(
 
 function flushHarnessDeliveries(scope: SessionScope): void {
   flushDeliveries(scope.pi, scope.ui, sessionOwner(scope));
+}
+
+async function setupCoordinatorHarness() {
+  const existingScopeIds = new Set(getSessionScopes().map(({ id }) => id));
+  const harness = await createPiSessionHarness(repoRoot);
+  harnesses.push(harness);
+  const scope = resolveHarnessScope(harness, existingScopeIds);
+  return { harness, scope };
 }
 
 async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
@@ -129,6 +143,169 @@ async function setup(mode: "notify" | "inject", triggerTurn: boolean) {
   });
   return { harness, notify, sendMessage, state, scope };
 }
+
+describe("coordinated completion delivery", () => {
+  it("keeps the durable user notice out of provider context and sends one compact manifest", async () => {
+    const { harness, scope } = await setupCoordinatorHarness();
+    const owner = sessionOwner(scope);
+    scope.parentStreaming = true;
+    publishCompletion(
+      {
+        schemaVersion: 1,
+        completionId: "interactive:agent-a:turn-a",
+        source: "interactive",
+        sourceId: "agent-a",
+        turnId: "turn-a",
+        label: "Agent a",
+        status: "done",
+        policy: "each",
+        references: [
+          {
+            label: "output",
+            value: "/tmp/artifacts/a/outputs/event-a.md",
+          },
+          {
+            label: "activity",
+            value: "/tmp/artifacts/a/events.ndjson",
+          },
+        ],
+        completedAt: 1,
+      },
+      owner,
+    );
+
+    const completionEntries = harness.sessionManager
+      .getEntries()
+      .filter(
+        (entry: any) =>
+          entry.type === "custom" &&
+          entry.customType === "subagentura-completion",
+      );
+    expect(completionEntries).toHaveLength(1);
+    expect(harness.contexts).toHaveLength(0);
+
+    scope.parentStreaming = false;
+    flushCompletionManifests(owner);
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    const providerContext = JSON.stringify(harness.contexts[0]);
+    expect(providerContext).toContain("Completed background work");
+    expect(providerContext).toContain("outputs/event-a.md");
+    expect(providerContext).toContain("events.ndjson");
+    expect(providerContext).not.toContain("subagentura-completion");
+    expect(providerContext).not.toContain("untrusted-subagent-output");
+    harness.completeNext();
+    await harness.session.waitForIdle();
+  });
+
+  it("attaches a ready manifest to human input instead of queuing another turn", async () => {
+    const { harness, scope } = await setupCoordinatorHarness();
+    const owner = sessionOwner(scope);
+    scope.parentStreaming = true;
+    publishCompletion(
+      {
+        schemaVersion: 1,
+        completionId: "job:human-priority",
+        source: "in-process",
+        sourceId: "human-priority",
+        label: "Job human-priority",
+        status: "done",
+        policy: "each",
+        references: [
+          {
+            label: "result",
+            value: 'call get_subagent_result with jobId "human-priority"',
+          },
+        ],
+        completedAt: 2,
+      },
+      owner,
+    );
+    scope.parentStreaming = false;
+
+    const prompt = harness.session.prompt("What changed?");
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    const providerContext = JSON.stringify(harness.contexts[0]);
+    expect(providerContext).toContain("What changed?");
+    expect(providerContext).toContain("Job human-priority");
+    expect(
+      harness.sessionManager
+        .getEntries()
+        .filter(
+          (entry: any) =>
+            entry.type === "custom_message" &&
+            entry.customType === "subagent-manifest",
+        ),
+    ).toHaveLength(1);
+    harness.completeNext();
+    await prompt;
+  });
+
+  it("resumes once after every sealed related member is terminal", async () => {
+    const { harness, scope } = await setupCoordinatorHarness();
+    const owner = sessionOwner(scope);
+    scope.parentStreaming = true;
+    for (const id of ["group-a", "group-b"]) {
+      registerCompletionMember("in-process", id, "group", "review", owner);
+      publishCompletion(
+        {
+          schemaVersion: 1,
+          completionId: `job:${id}`,
+          source: "in-process",
+          sourceId: id,
+          label: `Job ${id}`,
+          status: id === "group-a" ? "done" : "error",
+          policy: "group",
+          groupId: "review",
+          references: [{ label: "result", value: `retrieve ${id}` }],
+          completedAt: id === "group-a" ? 1 : 2,
+        },
+        owner,
+      );
+    }
+
+    expect(harness.contexts).toHaveLength(0);
+    scope.parentStreaming = false;
+    settleCompletionParentTurn(owner);
+
+    await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
+    const manifests = harness.sessionManager
+      .getEntries()
+      .filter(
+        (entry: any) =>
+          entry.type === "custom_message" &&
+          entry.customType === "subagent-manifest",
+      );
+    expect(manifests).toHaveLength(1);
+    expect((manifests[0] as any).details.completionIds).toEqual([
+      "job:group-a",
+      "job:group-b",
+    ]);
+    harness.completeNext();
+    await harness.session.waitForIdle();
+  });
+
+  it("does not advertise mutable output for a v2 completion without a snapshot", async () => {
+    const { harness, state, scope } = await setup("notify", false);
+    scope.parentStreaming = true;
+    const intent = state.pendingDeliveries![0];
+    intent.eventId = "cancel-v2-event";
+    intent.status = "cancelled";
+    intent.completionPolicy = "each";
+
+    flushHarnessDeliveries(scope);
+
+    const notice = harness.sessionManager
+      .getEntries()
+      .find(
+        (entry: any) =>
+          entry.type === "custom" &&
+          entry.customType === "subagentura-completion",
+      ) as any;
+    expect(notice.data.references).toEqual([
+      { label: "activity", value: join(state.artifactDir, "events.ndjson") },
+    ]);
+  });
+});
 
 describe("Pi session delivery integration", () => {
   it("idle notify persists a pointer without calling the provider", async () => {

@@ -26,26 +26,27 @@ The pre-commit hook (`simple-git-hooks` → `lint-staged` → `prettier --write`
 
 ## Source layout (the 30-second tour)
 
-| File                           | Purpose                                                                                                                                                                                                           |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/subagent.ts`              | **Entrypoint/barrel.** ~100 LOC. Default export registers all tool groups and session handlers; re-exports internals for test access.                                                                             |
-| `src/tools/in-process.ts`      | `subagent_with_context`, `subagent_isolated`, async job management tools (`get_subagent_status`, `get_subagent_result`, `cancel_subagent`, `prune_subagent_jobs`), and `list_available_models`.                   |
-| `src/tools/interactive.ts`     | Interactive sub-agent tools (`subagent_interactive`, `get_interactive_subagent_status`, `cancel_interactive_subagent`, `send_interactive_subagent_message`, `list_subagent_artifacts`, `read_subagent_artifact`). |
-| `src/session-handlers.ts`      | `session_start`/`session_shutdown` handlers; poller interval setup/teardown on extension load/reload/shutdown.                                                                                                    |
-| `src/artifact-poller.ts`       | Per-tick byte-ordered artifact walk, legacy session-JSONL tail-reading, durable delivery enqueue, and UI activity updates.                                                                                        |
-| `src/rehydrate.ts`             | Reconstruct persisted cursors, queues, and delivery receipts on session start/reload/resume.                                                                                                                      |
-| `src/helpers.ts`               | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `formatUsage`, job registry and cleanup.                                                                                              |
-| `src/artifact.ts`              | Versioned artifact protocol, immutable `outputs/<eventId>.md`, byte readers, mixed-v1 compatibility, and state-v2 helpers.                                                                                        |
-| `src/child-protocol.ts`        | Child-only Pi lifecycle hooks selected by `PI_SUBAGENTURA_CHILD=1`.                                                                                                                                               |
-| `src/delivery.ts`              | Bounded durable trigger-aware delivery queue and deterministic delivery IDs.                                                                                                                                      |
-| `src/interactive-tmux.ts`      | `InteractiveSubagentState` and registry, launch-script builder, mux backend dispatch (is-alive, send-keys, kill-pane).                                                                                            |
-| `src/multiplexer*.ts`          | Pluggable multiplexer interface + tmux and zellij backends. Registry auto-detects available backend at runtime.                                                                                                   |
-| `src/subagent-artifact-cli.ts` | Tiny `cli.mjs` wrapper called by the child: `cli.mjs done N` / `cli.mjs error "msg"`.                                                                                                                             |
-| `src/notifications.ts`         | Unified in-process completion delivery and output sanitization.                                                                                                                                                   |
-| `src/rendering.ts`             | TUI rendering helpers: `renderSubagentCall`, `renderSubagentResult`, `renderInteractiveStateSummary`.                                                                                                             |
-| `src/schemas.ts`               | TypeBox schemas for tool parameter validation (`BaseParams`, `InteractiveParams`, etc.).                                                                                                                          |
-| `src/workflow*.ts`             | Workflow tool/core/worker/job/UI modules. Worker execution is isolated from the parent thread but the VM is not a security boundary.                                                                              |
-| `src/test-utils.ts`            | `importFresh` helper used by tests to reset module-level state (interactive sub-agent registry, mux mock, etc.).                                                                                                  |
+| File                            | Purpose                                                                                                                                                                                                           |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/subagent.ts`               | **Entrypoint/barrel.** ~100 LOC. Default export registers all tool groups and session handlers; re-exports internals for test access.                                                                             |
+| `src/tools/in-process.ts`       | `subagent_with_context`, `subagent_isolated`, async job management tools (`get_subagent_status`, `get_subagent_result`, `cancel_subagent`, `prune_subagent_jobs`), and `list_available_models`.                   |
+| `src/tools/interactive.ts`      | Interactive sub-agent tools (`subagent_interactive`, `get_interactive_subagent_status`, `cancel_interactive_subagent`, `send_interactive_subagent_message`, `list_subagent_artifacts`, `read_subagent_artifact`). |
+| `src/session-handlers.ts`       | `session_start`/`session_shutdown` handlers; poller interval setup/teardown on extension load/reload/shutdown.                                                                                                    |
+| `src/artifact-poller.ts`        | Per-tick byte-ordered artifact walk, legacy session-JSONL tail-reading, durable delivery enqueue, and UI activity updates.                                                                                        |
+| `src/rehydrate.ts`              | Reconstruct persisted cursors, queues, and delivery receipts on session start/reload/resume.                                                                                                                      |
+| `src/helpers.ts`                | `startSubagentJob` primitive (in-process sub-agent runner), `resolveModel`, `formatUsage`, job registry and cleanup.                                                                                              |
+| `src/artifact.ts`               | Versioned artifact protocol, immutable `outputs/<eventId>.md`, byte readers, mixed-v1 compatibility, and state-v2 helpers.                                                                                        |
+| `src/child-protocol.ts`         | Child-only Pi lifecycle hooks selected by `PI_SUBAGENTURA_CHILD=1`.                                                                                                                                               |
+| `src/delivery.ts`               | Bounded durable trigger-aware delivery queue and deterministic delivery IDs.                                                                                                                                      |
+| `src/completion-coordinator.ts` | TUI-only completion entries, each/group barriers, manual consumption, human-priority manifest attachment, and triggered parent continuation.                                                                      |
+| `src/interactive-tmux.ts`       | `InteractiveSubagentState` and registry, launch-script builder, mux backend dispatch (is-alive, send-keys, kill-pane).                                                                                            |
+| `src/multiplexer*.ts`           | Pluggable multiplexer interface + tmux and zellij backends. Registry auto-detects available backend at runtime.                                                                                                   |
+| `src/subagent-artifact-cli.ts`  | Tiny `cli.mjs` wrapper called by the child: `cli.mjs done N` / `cli.mjs error "msg"`.                                                                                                                             |
+| `src/notifications.ts`          | Upgrade-only legacy in-process delivery broker and output sanitization.                                                                                                                                           |
+| `src/rendering.ts`              | TUI rendering helpers: `renderSubagentCall`, `renderSubagentResult`, `renderInteractiveStateSummary`.                                                                                                             |
+| `src/schemas.ts`                | TypeBox schemas for tool parameter validation (`BaseParams`, `InteractiveParams`, etc.).                                                                                                                          |
+| `src/workflow*.ts`              | Workflow tool/core/worker/job/UI modules. Worker execution is isolated from the parent thread but the VM is not a security boundary.                                                                              |
+| `src/test-utils.ts`             | `importFresh` helper used by tests to reset module-level state (interactive sub-agent registry, mux mock, etc.).                                                                                                  |
 
 ## Code conventions
 
@@ -94,6 +95,34 @@ The runtime validation in the workflow tool (`validateSchema`, `extractJson`) is
 
 `runInNewContext` is not an escape-proof jail. The workflow VM uses null-prototype sandboxes, guarded `Date`/`Math`, and disabled string/wasm code generation to block known accidental escapes (including constructor-chain `Function` calls), but workflow scripts are still trusted agent-authored code. Do not expose workflow execution to arbitrary user-supplied JavaScript without adding real process-level isolation and a security review.
 
+### Coordinated completion is two-channel
+
+The coordinated async default is `completionPolicy="each"`; grouped work must
+use `completionPolicy="group"` and a bounded explicit `completionGroupId`.
+Registration happens at spawn. Every parent `agent_settled` seals its registered
+groups, and a group becomes ready only after all members are terminal. `error`
+and `cancelled` are terminal; late members are rejected.
+
+Each terminal record appends one deterministic `subagentura-completion` entry.
+It is rendered in the TUI with `appendEntry`/`registerEntryRenderer` and must
+never enter model context. The only automatic model payload is one bounded,
+hidden `subagent-manifest` with immutable artifact references or explicit result
+tool IDs. Independent ready work coalesces while the parent is busy. Human input
+wins: `before_agent_start` attaches the manifest to the natural turn instead of
+queuing a competing follow-up.
+
+Successful terminal reads through `get_subagent_result`,
+`get_workflow_result`, or output-bearing `read_subagent_artifact` must append a
+consumption receipt before returning. Workflow-owned child agents never publish
+directly; only their workflow aggregate does. Preserve that suppression on both
+process and in-process runner paths.
+
+`notifyOnComplete` and `triggerTurnOnComplete` remain accepted only as deprecated
+compatibility inputs. Both map to coordinated `each` delivery; they must never
+restore full-output injection or independent trigger timing. Reject either field
+when `completionPolicy` or `completionGroupId` is also present. The legacy broker
+exists only to drain persisted pre-coordinator state and support internal tests.
+
 ### Background workflows are parent-session scoped
 
 Background workflow jobs and in-process async sub-agent jobs do **not** survive
@@ -113,10 +142,13 @@ and notification delivery to the new parent context.
 ### Rehydrate state file (`<cwd>/.pi/subagentura-state.json`)
 
 The interactive sub-agent registry is persisted to a per-(cwd) state file on
-`launchInteractiveSubagent`. The file stores the minimum fields needed to rehydrate
-(`paneId`, `mux`, `artifactDir`, `sessionFile`, `notifyOnComplete`). On `session_start` the
-rehydrate function reads schema v2 and reconstructs artifact/session byte
-cursors, active turn, pending delivery intents, and delivery receipts.
+`launchInteractiveSubagent`. The file stores the minimum fields needed to
+rehydrate pane/artifact identity plus completion policy/group metadata. On
+`session_start`, the schema-v2 reader reconstructs artifact/session byte cursors,
+the active turn, pending delivery intents, and delivery receipts. Coordinated
+completion and consumption entries remain parent-session records; rehydrate
+reconciles them, registers restored interactive group members, and seals recovered
+groups before polling.
 
 **Crash-safe ordering at both write sites:**
 
@@ -160,10 +192,12 @@ reconstruct cancellation authority from inherited env.
 This isolates accidental subprocess inheritance; it is not an OS security boundary
 against malicious same-UID code, which can already address the user's mux directly.
 
-**Delivery receipts:** Rehydrate reconciles deterministic `deliveryId` values
-against parent custom session entries. The synchronous Pi API proves dispatch,
-not durable commit, so delivery is at-least-once and a crash-window duplicate
-remains possible.
+**Delivery receipts:** Rehydrate reconciles deterministic interactive
+`deliveryId` values plus coordinated completion, manifest, and consumption
+entries in the matching parent session. The synchronous Pi API proves dispatch,
+not durable commit, so automatic manifest delivery is at-least-once and a
+crash-window duplicate remains possible. In-process jobs and background workflows
+remain process/session scoped and are retired rather than rehydrated.
 
 **Edge cases:**
 
@@ -211,13 +245,14 @@ src/
   artifact-poller.ts               # byte-ordered event fold, durable enqueue, activity UI
   child-protocol.ts                # child-only Pi lifecycle hooks and completion writer
   delivery.ts                      # bounded delivery broker and receipt reconciliation
+  completion-coordinator.ts         # TUI notices, barriers, manifests, consumption
   rehydrate.ts                     # restore persisted cursors, queues, and receipts
   helpers.ts                       # startSubagentJob, resolveModel, job registry
   artifact.ts                      # v2 events, immutable outputs, state migration
   interactive-tmux.ts              # InteractiveSubagentState, registry, mux dispatch
   multiplexer{,-tmux,-zellij}.ts   # mux backend abstraction (tmux + zellij)
   subagent-artifact-cli.ts         # cli.mjs wrapper
-  notifications.ts                 # in-process completion delivery and compatibility exports
+  notifications.ts                 # upgrade-only legacy completion broker
   rendering.ts                     # TUI render helpers
   schemas.ts                       # TypeBox tool-param schemas
   workflow.ts                      # workflow tool
@@ -234,5 +269,5 @@ docs/                              # Managed by the separate pi-docs package; do
 ## When in doubt
 
 - The existing tests in the same directory are the best documentation of intended behavior.
-- `tests/artifact-delivery.integration.test.ts`, `tests/pi-session-delivery.integration.test.ts`, `tests/subagent-notify.test.ts`, and the rehydrate tests together define the protocol-v2 delivery contract.
+- `tests/completion-coordinator.test.ts`, `tests/artifact-delivery.integration.test.ts`, `tests/pi-session-delivery.integration.test.ts`, `tests/subagent-notify.test.ts`, and the rehydrate tests together define coordinated completion and protocol-v2 delivery.
 - The release flow is in `CONTRIBUTING.md`. The dev loop (typecheck + test + format) is above. If a step seems to be missing from this file, it probably is — add it.

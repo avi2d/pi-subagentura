@@ -148,7 +148,8 @@ describe("real Pi terminal E2E", () => {
       // the scripted model is selected and both extensions loaded.
       const screen = harness.renderedScreen();
       expect(screen).toContain("mock • medium");
-      expect(screen).toContain("mock-provider.ts");
+      expect(screen).toContain("mock-");
+      expect(screen).toContain("provider.ts");
       expect(screen).toContain("subagent.ts");
       expect(harness.panes()).toEqual(
         expect.arrayContaining([
@@ -203,7 +204,7 @@ describe("real Pi terminal E2E", () => {
   );
 
   it(
-    "inspects and retrieves an async isolated child without a triggering turn",
+    "inspects and retrieves an async isolated child with coordinated completion",
     async () => {
       const scenario = getScenario("async-isolated");
       await startScenario("async-isolated");
@@ -224,9 +225,6 @@ describe("real Pi terminal E2E", () => {
         (screen) => /get_subagent_status [a-f0-9]{16}/.test(screen),
         "status tool call rendered",
       );
-      const parentCallsBeforeRelease = harness
-        .providerEvents()
-        .filter((event) => event.marker === scenario.marker).length;
 
       harness.release(scenario.gate!);
       await harness.waitForProvider(
@@ -234,14 +232,13 @@ describe("real Pi terminal E2E", () => {
         "async completion",
       );
       await harness.waitForScreen(
-        (screen) => /✅ Job [a-f0-9]{16} done/.test(screen),
-        "async completion notification",
+        (screen) => /✓ "Job [a-f0-9]{16}" done/.test(screen),
+        "async completion TUI notice",
       );
-      expect(
-        harness
-          .providerEvents()
-          .filter((event) => event.marker === scenario.marker),
-      ).toHaveLength(parentCallsBeforeRelease);
+      await harness.waitForScreen(
+        (screen) => screen.includes("Async completion reference received"),
+        "async completion parent manifest",
+      );
 
       await sendMarker("[E2E:ASYNC_RESULT]");
       await harness.waitForScreen(
@@ -294,14 +291,14 @@ describe("real Pi terminal E2E", () => {
         (events) =>
           events.filter(
             (event) =>
-              event.marker === scenario.marker &&
+              event.marker === "[E2E:WORKFLOW_STATUS]" &&
               event.route === "trigger-followup",
           ).length === 1,
         "background workflow trigger follow-up",
         20_000,
       );
       await harness.waitForScreen(
-        (screen) => screen.includes("Workflow follow-up settled"),
+        (screen) => screen.includes("Async completion reference received"),
         "background workflow settled screen",
       );
       await sendMarker("[E2E:WORKFLOW_RESULT]");
@@ -400,7 +397,8 @@ describe("real Pi terminal E2E", () => {
         "interactive child idle pane",
       );
       await harness.waitForScreen(
-        (screen) => screen.includes("Completion output was not injected"),
+        (screen) =>
+          screen.includes("Interactive completion reference received"),
         "interactive parent notification",
         20_000,
       );

@@ -42,7 +42,7 @@ export const BaseParams = Type.Object({
   async: Type.Optional(
     Type.Boolean({
       description:
-        "Run subagent in background. DEFAULT: true — fan-out and long-running work must not block the parent turn. Returns a jobId immediately instead of blocking; the main agent continues and the result is injected when complete (poll with get_subagent_status or collect with get_subagent_result for manual follow-up). Pass async: false ONLY for a single short sub-agent whose answer you need inline before continuing. Async keeps the parent responsive but does NOT by itself prevent nested fan-out — depth is capped separately.",
+        "Run subagent in background. DEFAULT: true — fan-out and long-running work must not block the parent turn. Returns a jobId immediately; coordinated completion publishes a TUI-only notice and later resumes the parent with a compact retrieval reference. Pass async: false ONLY for a single short sub-agent whose answer you need inline before continuing. Async keeps the parent responsive but does NOT by itself prevent nested fan-out — depth is capped separately.",
     }),
   ),
   notifyOnComplete: Type.Optional(
@@ -50,23 +50,37 @@ export const BaseParams = Type.Object({
       [
         Type.Literal("notify", {
           description:
-            "Show a user notification and persist a pointer-only completion message without injecting output into the parent LLM. Does not trigger a turn by default.",
+            "Deprecated compatibility value. Maps to coordinated each delivery with a TUI-only notice and compact references.",
         }),
         Type.Literal("inject", {
           description:
-            "Show a user notification and inject one attributed, bounded completion message with output into the parent LLM. Triggers a turn by default.",
+            "Deprecated compatibility value. Maps to coordinated each delivery and never injects full output.",
         }),
       ],
       {
         description:
-          'Controls the payload saved for parent LLM context, independently of triggerTurnOnComplete. Both modes show the same user-facing notification. The spawn result explains the selected behavior. Defaults to "inject" when async is true.',
+          "Deprecated compatibility payload mode. Either value maps to coordinated each delivery and cannot be combined with completionPolicy or completionGroupId.",
       },
     ),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Notify defaults false; inject defaults true. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
+        "Deprecated compatibility input. Coordinated policy/barrier and human-priority timing are authoritative; cannot be combined with completionPolicy or completionGroupId.",
+    }),
+  ),
+  completionPolicy: Type.Optional(
+    Type.Union([Type.Literal("each"), Type.Literal("group")], {
+      description:
+        'Completion coordination policy. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; deprecated legacy fields also map to "each".',
+    }),
+  ),
+  completionGroupId: Type.Optional(
+    Type.String({
+      maxLength: 128,
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      description:
+        'Required with completionPolicy="group". Explicit identifier shared by related jobs.',
     }),
   ),
   maxAge: Type.Optional(
@@ -156,13 +170,27 @@ export const InteractiveParams = Type.Object({
   notifyOnComplete: Type.Optional(
     Type.Union([Type.Literal("notify"), Type.Literal("inject")], {
       description:
-        'Controls the payload saved for parent LLM context. Defaults to "notify" (pointer-only, no injected output); "inject" sends full output. Both modes show a user-facing notification.',
+        "Deprecated compatibility mode. Either value maps to coordinated each delivery with TUI-only notice and compact references; cannot be combined with completionPolicy or completionGroupId.",
     }),
   ),
   triggerTurnOnComplete: Type.Optional(
     Type.Boolean({
       description:
-        "Independently controls whether delivery starts a new parent LLM turn. Defaults true for both notify and inject; false disables triggering for either mode. Triggering delivery uses Pi's native follow-up queue while the parent is busy; non-triggering delivery waits until idle.",
+        "Deprecated compatibility input. Coordinated policy/barrier and human-priority timing are authoritative; cannot be combined with completionPolicy or completionGroupId.",
+    }),
+  ),
+  completionPolicy: Type.Optional(
+    Type.Union([Type.Literal("each"), Type.Literal("group")], {
+      description:
+        'Completion coordination policy. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; deprecated legacy fields also map to "each".',
+    }),
+  ),
+  completionGroupId: Type.Optional(
+    Type.String({
+      maxLength: 128,
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      description:
+        'Required with completionPolicy="group". Explicit identifier shared by related agents.',
     }),
   ),
   mux: Type.Optional(
