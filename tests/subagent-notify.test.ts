@@ -562,6 +562,33 @@ describe("notifyOnComplete", () => {
       expect(api.notify).not.toHaveBeenCalled();
     });
 
+    it("retries a transient durable completion notice failure", async () => {
+      const jobId = "notify-transient-append-failure";
+      const control = createJobControl();
+      let completionAttempts = 0;
+      api.appendEntry.mockImplementation((customType: string) => {
+        if (customType !== "subagentura-completion") return;
+        completionAttempts += 1;
+        if (completionAttempts === 1) throw new Error("disk unavailable");
+      });
+      mockStartSubagentJob.mockImplementationOnce(() =>
+        mockJobResult(jobId, control.jobPromise),
+      );
+      await isolatedToolDef.execute(
+        "call-transient-append-failure",
+        { async: true, task: "test" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      control.resolve(SUCCESS_RESULT);
+
+      await vi.waitFor(() => expect(completionAttempts).toBe(2));
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(sentMessageAt(api, 0).content).toContain(jobId);
+    });
+
     it("keeps usage out of the compact legacy manifest", async () => {
       const jobId = "notify-usage";
       const control = createJobControl();

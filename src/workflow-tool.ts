@@ -66,6 +66,7 @@ import { registerToolWithDefaultGuidance } from "./tool-guidance";
 import {
   assertCompletionGroupOpen,
   consumeCompletionSource,
+  MAX_COMPLETION_LABEL_LENGTH,
   publishCompletion,
   registerCompletionMember,
   resolveCompletionPolicy,
@@ -379,6 +380,22 @@ export function registerWorkflowTool(
     }
   }
 
+  function workflowCompletionLabel(job: WorkflowJobState): string {
+    const prefix = "Workflow ";
+    const suffix = ` (${job.id})`;
+    const nameLimit = Math.max(
+      0,
+      MAX_COMPLETION_LABEL_LENGTH - prefix.length - suffix.length,
+    );
+    const displayName =
+      job.name.length <= nameLimit
+        ? job.name
+        : nameLimit <= 1
+          ? job.name.slice(0, nameLimit)
+          : `${job.name.slice(0, nameLimit - 1)}…`;
+    return `${prefix}${displayName}${suffix}`;
+  }
+
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
     if (job.completionPolicy) {
       publishCompletion(
@@ -387,7 +404,7 @@ export function registerWorkflowTool(
           completionId: `workflow:${job.id}`,
           source: "workflow",
           sourceId: job.id,
-          label: `Workflow ${job.name} (${job.id})`,
+          label: workflowCompletionLabel(job),
           status:
             job.status === "cancelled"
               ? "cancelled"

@@ -131,6 +131,61 @@ describe("completion coordinator", () => {
     });
   });
 
+  it("does not duplicate a notice when append throws after writing", async () => {
+    vi.useRealTimers();
+    const setupResult = setup();
+    scope = setupResult.scope;
+    let throwAfterWrite = true;
+    setupResult.pi.appendEntry.mockImplementation(
+      (customType: string, data: unknown) => {
+        setupResult.entries.push({ type: "custom", customType, data });
+        if (customType === "subagentura-completion" && throwAfterWrite) {
+          throwAfterWrite = false;
+          throw new Error("late append failure");
+        }
+      },
+    );
+
+    expect(() =>
+      publishCompletion(record("append-then-throw"), sessionOwner(scope)),
+    ).not.toThrow();
+    await vi.waitFor(() => expect(manifests(setupResult.pi)).toHaveLength(1));
+
+    expect(userCompletions(setupResult.entries)).toHaveLength(1);
+  });
+
+  it("does not spin while durable notice storage remains unavailable", async () => {
+    vi.useRealTimers();
+    const setupResult = setup();
+    scope = setupResult.scope;
+    setupResult.pi.appendEntry.mockImplementation(() => {
+      throw new Error("disk unavailable");
+    });
+
+    publishCompletion(record("persistent-failure"), sessionOwner(scope));
+    await vi.waitFor(() =>
+      expect(setupResult.pi.appendEntry).toHaveBeenCalledTimes(2),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(setupResult.pi.appendEntry).toHaveBeenCalledTimes(2);
+    expect(manifests(setupResult.pi)).toHaveLength(0);
+  });
+
+  it("preserves protocol-valid interactive turn IDs in retrieval selectors", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const turnId = "t".repeat(256);
+
+    publishCompletion(record("long-turn", { turnId }), sessionOwner(scope));
+    flushCompletionManifests(sessionOwner(scope));
+
+    expect(userCompletions(setupResult.entries)[0].data.turnId).toBe(turnId);
+    expect(manifests(setupResult.pi)[0][0].content).toContain(
+      JSON.stringify(turnId),
+    );
+  });
+
   it("coalesces independent completions that become ready while busy", () => {
     const setupResult = setup();
     scope = setupResult.scope;

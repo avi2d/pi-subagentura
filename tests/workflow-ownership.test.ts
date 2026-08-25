@@ -245,15 +245,26 @@ describe("workflow parent session ownership", () => {
     const tools: any[] = [];
     const sendA = vi.fn();
     const sendB = vi.fn();
+    const entriesA: any[] = [];
     const piA = {
       registerTool: vi.fn((tool) => tools.push(tool)),
       registerFlag: vi.fn(),
       registerCommand: vi.fn(),
       on: vi.fn(),
       sendMessage: sendA,
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entriesA.push({ type: "custom", customType, data });
+      }),
     } as any;
     const piB = { sendMessage: sendB } as any;
-    const contextA = { ...context(50, 1), pi: piA };
+    const contextA = {
+      ...context(50, 1),
+      pi: piA,
+      sessionManager: {
+        getSessionId: () => "parent-a",
+        getEntries: () => entriesA,
+      },
+    };
     const contextB = { ...context(60, 1), pi: piB };
     registerSessionScope(contextA);
     registerSessionScope(contextB);

@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { MAX_TURN_ID_LENGTH } from "./artifact";
 import {
   getActiveSessionOwner,
   resolveLiveSessionScope,
@@ -19,7 +20,7 @@ const MAX_GROUP_MEMBERS = 32;
 const MAX_COMPLETION_ID_LENGTH = 128;
 const MAX_SOURCE_ID_LENGTH = 128;
 const MAX_GROUP_ID_LENGTH = 128;
-const MAX_LABEL_LENGTH = 160;
+export const MAX_COMPLETION_LABEL_LENGTH = 160;
 const MAX_REFERENCE_LENGTH = 4096;
 const MAX_REFERENCES = 8;
 const MAX_MANIFEST_BYTES = 32 * 1024;
@@ -110,6 +111,7 @@ interface CompletionCoordinatorState {
   owner: SessionOwnerToken;
   pi: ExtensionAPI;
   records: Map<string, CompletionRecord>;
+  pendingNotices: Map<string, CompletionRecord>;
   consumed: Set<string>;
   dispatchAttempted: Set<string>;
   sourceConsumptions: CompletionConsumption[];
@@ -238,9 +240,11 @@ function normalizeRecord(value: unknown): CompletionRecord {
     source: raw.source,
     sourceId: boundedString(raw.sourceId, "sourceId", MAX_SOURCE_ID_LENGTH),
     ...(typeof raw.turnId === "string" && raw.turnId.length > 0
-      ? { turnId: raw.turnId.slice(0, MAX_COMPLETION_ID_LENGTH) }
+      ? {
+          turnId: boundedString(raw.turnId, "turnId", MAX_TURN_ID_LENGTH),
+        }
       : {}),
-    label: boundedString(raw.label, "label", MAX_LABEL_LENGTH),
+    label: boundedString(raw.label, "label", MAX_COMPLETION_LABEL_LENGTH),
     status: raw.status,
     policy: raw.policy,
     ...(groupId ? { groupId } : {}),
@@ -364,6 +368,7 @@ function reconcileState(state: CompletionCoordinatorState): void {
       continue;
     }
     state.records.set(record.completionId, record);
+    state.pendingNotices.delete(record.completionId);
     if (record.policy === "group") {
       const group = state.groups.get(record.groupId!) ?? {
         groupId: record.groupId!,
@@ -402,6 +407,7 @@ function getState(
     owner: resolvedOwner,
     pi: scope.pi,
     records: new Map(),
+    pendingNotices: new Map(),
     consumed: new Set(),
     dispatchAttempted: new Set(),
     sourceConsumptions: [],
@@ -543,6 +549,24 @@ function appendConsumption(
       state.dispatchAttempted.delete(record.completionId);
     }
   }
+}
+
+function persistPendingNotices(state: CompletionCoordinatorState): boolean {
+  const appendEntry = state.pi.appendEntry;
+  if (typeof appendEntry !== "function") return false;
+  for (const [completionId, record] of state.pendingNotices) {
+    try {
+      appendEntry.call(state.pi, COMPLETION_ENTRY_TYPE, record);
+      state.pendingNotices.delete(completionId);
+    } catch (error) {
+      debugLog("warn", "completion_notice_persist_failed", {
+        completionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+  return true;
 }
 
 function scheduleFlush(state: CompletionCoordinatorState): void {
@@ -699,8 +723,9 @@ export function publishCompletion(
     }
   }
   if (!state.records.has(record.completionId)) {
-    state.pi.appendEntry?.(COMPLETION_ENTRY_TYPE, record);
     state.records.set(record.completionId, record);
+    state.pendingNotices.set(record.completionId, record);
+    persistPendingNotices(state);
   }
   if (
     state.sourceConsumptions.some((consumption) =>
@@ -724,7 +749,7 @@ export function consumeCompletionSource(
   if (!state || state.pi !== pi) return;
   reconcileState(state);
   const normalizedSourceId = sourceId.slice(0, MAX_SOURCE_ID_LENGTH);
-  const normalizedTurnId = turnId?.slice(0, MAX_COMPLETION_ID_LENGTH);
+  const normalizedTurnId = turnId?.slice(0, MAX_TURN_ID_LENGTH);
   if (
     state.sourceConsumptions.some(
       (consumption) =>
@@ -804,6 +829,8 @@ export function prepareCompletionManifest(
 ): ReturnType<typeof manifestMessage> | undefined {
   const state = getState(owner);
   if (!state) return undefined;
+  reconcileState(state);
+  if (!persistPendingNotices(state)) return undefined;
   const ready = selectManifestRecords(readyRecords(state));
   if (ready.length === 0) return undefined;
   state.turnStarting = true;

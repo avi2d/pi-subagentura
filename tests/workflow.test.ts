@@ -2824,6 +2824,68 @@ describe("registerWorkflowTool", () => {
     }
   });
 
+  it("publishes completion for an accepted long workflow name", async () => {
+    clearSessionScopes();
+    const tools: Array<{ name: string; execute: Function }> = [];
+    const entries: any[] = [];
+    const pi = {
+      registerTool: vi.fn((definition: any) => tools.push(definition)),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      on: vi.fn(),
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entries.push({ type: "custom", customType, data });
+      }),
+      sendMessage: vi.fn(),
+    };
+    const scope = registerSessionScope({
+      id: 992,
+      generation: 1,
+      lifecycle: "started",
+      pi: pi as never,
+      sessionManager: {
+        getSessionId: () => "workflow-parent",
+        getEntries: () => entries,
+      },
+      parentStreaming: false,
+      inProcessJobs: new Map(),
+      pendingInProcessDeliveries: [],
+      interactiveStates: new Map(),
+    });
+    const workflowOwner = sessionOwner(scope);
+    registerCompletionCoordinator(pi as never, scope);
+    registerWorkflowTool(pi as never, scope);
+    const name = "w".repeat(150);
+    const workflow = tools.find((tool) => tool.name === "workflow")!;
+
+    try {
+      const started = await workflow.execute(
+        "call-long-name",
+        {
+          script: `export const meta = { name: ${JSON.stringify(name)}, description: "d" };\nreturn "done";`,
+          async: true,
+        },
+        undefined,
+        undefined,
+        { cwd: process.cwd(), model: undefined, modelRegistry: undefined },
+      );
+      const job = workflowJobRegistry.get(started.details.workflowId)!;
+      await job.promise;
+
+      const completionEntries = entries.filter(
+        (entry) => entry.customType === "subagentura-completion",
+      );
+      expect(completionEntries).toHaveLength(1);
+      expect(completionEntries[0].data.sourceId).toBe(job.id);
+      expect(completionEntries[0].data.label.length).toBeLessThanOrEqual(160);
+      workflowJobRegistry.delete(job.id);
+    } finally {
+      clearCompletionCoordinator(workflowOwner);
+      clearSessionScopes();
+    }
+  });
+
   it("save_workflow tool validates the script before persisting", async () => {
     const tools: Array<{ name: string; execute: Function }> = [];
     const pi = {
