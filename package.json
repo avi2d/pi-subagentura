@@ -49,6 +49,7 @@
     "src/notifications.ts",
     "src/rendering.ts",
     "src/schemas.ts",
+    "src/tool-guidance.ts",
     "src/artifact.ts",
     "src/artifact-poller.ts",
     "src/child-protocol.ts",

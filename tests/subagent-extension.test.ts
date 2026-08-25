@@ -94,6 +94,18 @@ describe("extension registration", () => {
     );
   });
 
+  it("adds default-preservation guidance to every tool", () => {
+    const api = mockApi();
+
+    registerExtension(api as any);
+
+    for (const [tool] of api.registerTool.mock.calls) {
+      expect(tool.description).toContain(
+        "Treat documented defaults as reasonable defaults. Override them only when the user explicitly asks.",
+      );
+    }
+  });
+
   it("registers the --orchestrator flag", () => {
     const api = mockApi();
 
