@@ -77,12 +77,6 @@ available, the runtime falls back to in-process execution. Intermediate agent
 results stay in workflow variables outside the parent model context, and only
 the workflow's final result returns to the parent.
 
-The `workflow` tool also accepts bounded declarative `plan` objects with
-ordered sequential phases and stable task IDs. Declarative plans run
-in-process and non-durably in this preview, use the same async-by-default
-status, result, cancellation, and tree surfaces as script workflows, and reject
-process isolation or durability before starting work.
-
 Workflow scripts are trusted agent-authored JavaScript. The VM improves
 determinism but is not a security boundary, so never run untrusted JavaScript.
 Background workflow jobs are scoped to the current parent session and are
@@ -125,29 +119,29 @@ These commands are intended for people at the Pi prompt.
 
 The extension registers 21 public tools for parent agents.
 
-| Tool                                | Purpose                                                              |
-| ----------------------------------- | -------------------------------------------------------------------- |
-| `workflow`                          | Run a trusted script, saved workflow, or sequential declarative plan |
-| `save_workflow`                     | Validate and save a reusable workflow                                |
-| `list_workflows`                    | List saved workflows                                                 |
-| `delete_workflow`                   | Delete a saved workflow                                              |
-| `get_workflow_status`               | Inspect a background workflow                                        |
-| `get_workflow_result`               | Wait for and return a workflow result                                |
-| `cancel_workflow`                   | Cancel a background workflow                                         |
-| `subagent_with_context`             | Delegate with the parent conversation                                |
-| `subagent_isolated`                 | Delegate with a fresh context                                        |
-| `get_subagent_status`               | Inspect an async in-process job                                      |
-| `get_subagent_result`               | Retrieve current or final async job output                           |
-| `cancel_subagent`                   | Cancel an async job                                                  |
-| `prune_subagent_jobs`               | Remove completed and failed jobs                                     |
-| `list_available_models`             | List configured model identifiers                                    |
-| `subagent_interactive`              | Launch an attachable Pi session in tmux/Zellij                       |
-| `get_interactive_subagent_status`   | Inspect attachable child sessions                                    |
-| `cancel_interactive_subagent`       | Kill an attachable child pane                                        |
-| `send_interactive_subagent_message` | Send a follow-up while preserving child context                      |
-| `list_subagent_artifacts`           | List durable interactive-agent artifacts                             |
-| `read_subagent_artifact`            | Read lifecycle events and output snapshots                           |
-| `cleanup_subagent_artifacts`        | Remove expired artifact directories and stale registry entries       |
+| Tool                                | Purpose                                                        |
+| ----------------------------------- | -------------------------------------------------------------- |
+| `workflow`                          | Run a trusted workflow script or saved workflow                |
+| `save_workflow`                     | Validate and save a reusable workflow                          |
+| `list_workflows`                    | List saved workflows                                           |
+| `delete_workflow`                   | Delete a saved workflow                                        |
+| `get_workflow_status`               | Inspect a background workflow                                  |
+| `get_workflow_result`               | Wait for and return a workflow result                          |
+| `cancel_workflow`                   | Cancel a background workflow                                   |
+| `subagent_with_context`             | Delegate with the parent conversation                          |
+| `subagent_isolated`                 | Delegate with a fresh context                                  |
+| `get_subagent_status`               | Inspect an async in-process job                                |
+| `get_subagent_result`               | Retrieve current or final async job output                     |
+| `cancel_subagent`                   | Cancel an async job                                            |
+| `prune_subagent_jobs`               | Remove completed and failed jobs                               |
+| `list_available_models`             | List configured model identifiers                              |
+| `subagent_interactive`              | Launch an attachable Pi session in tmux/Zellij                 |
+| `get_interactive_subagent_status`   | Inspect attachable child sessions                              |
+| `cancel_interactive_subagent`       | Kill an attachable child pane                                  |
+| `send_interactive_subagent_message` | Send a follow-up while preserving child context                |
+| `list_subagent_artifacts`           | List durable interactive-agent artifacts                       |
+| `read_subagent_artifact`            | Read lifecycle events and output snapshots                     |
+| `cleanup_subagent_artifacts`        | Remove expired artifact directories and stale registry entries |
 
 ## How it compares with other Pi sub-agent extensions
 

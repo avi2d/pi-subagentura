@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Non-durable declarative workflow plans with ordered sequential phases, stable task IDs, in-process execution, and the existing async status, result, cancellation, and tree surfaces.
-
 ## [3.3.0] - 2026-08-05
 
 ### Added

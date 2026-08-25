@@ -5,30 +5,8 @@ import {
   workflowJobRegistry,
   type WorkflowJobState,
 } from "../src/workflow";
-import type { WorkflowPlanState } from "../src/workflow-plan-state";
 
-type WorkflowSnapshotWithPlanState = WorkflowJobState["snapshot"] & {
-  planState?: WorkflowPlanState;
-};
-
-type WorkflowJobOverrides = Omit<Partial<WorkflowJobState>, "snapshot"> & {
-  snapshot?: Partial<WorkflowSnapshotWithPlanState>;
-};
-
-function makeJob(overrides: WorkflowJobOverrides = {}): WorkflowJobState {
-  const { snapshot: snapshotOverrides, ...jobOverrides } = overrides;
-  const snapshot = {
-    agentsSpawned: 2,
-    errorCount: 0,
-    tokensSpent: 42,
-    phases: ["Scan"],
-    currentPhase: "Scan",
-    lastMessage: "→ started scout",
-    runningCount: 1,
-    agentRecords: [],
-    agentRecordsOmitted: 0,
-    ...snapshotOverrides,
-  };
+function makeJob(overrides: Partial<WorkflowJobState> = {}): WorkflowJobState {
   return {
     id: "wf_test",
     name: "demo-flow",
@@ -36,8 +14,18 @@ function makeJob(overrides: WorkflowJobOverrides = {}): WorkflowJobState {
     startedAt: 123,
     promise: Promise.resolve({}) as any,
     abort: new AbortController(),
-    ...jobOverrides,
-    snapshot,
+    snapshot: {
+      agentsSpawned: 2,
+      errorCount: 0,
+      tokensSpent: 42,
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      lastMessage: "→ started scout",
+      runningCount: 1,
+      agentRecords: [],
+      agentRecordsOmitted: 0,
+    },
+    ...overrides,
   };
 }
 
@@ -66,71 +54,6 @@ describe("WorkflowTreeComponent", () => {
     const expanded = component.render(100).join("\n");
     expect(expanded).toContain("◆ phase: Scan");
     expect(expanded).toContain("→ started scout");
-  });
-
-  it("renders declarative plan phases and every task state in order", () => {
-    const planState: WorkflowPlanState = {
-      plan: {
-        schemaVersion: 1,
-        name: "preview",
-        phases: [
-          {
-            id: "prepare",
-            mode: "sequential",
-            tasks: [
-              { id: "draft", label: "draft", prompt: "Draft the work" },
-              { id: "check", label: "check", prompt: "Check the draft" },
-            ],
-          },
-          {
-            id: "execute",
-            mode: "sequential",
-            tasks: [
-              { id: "apply", label: "apply", prompt: "Apply the work" },
-              { id: "verify", label: "verify", prompt: "Verify the work" },
-            ],
-          },
-        ],
-      },
-      status: "error",
-      currentPhase: "execute",
-      tasks: {
-        draft: "succeeded",
-        check: "pending",
-        apply: "running",
-        verify: "failed",
-      },
-      revision: 4,
-    };
-    workflowJobRegistry.set(
-      "wf_test",
-      makeJob({
-        status: "error",
-        snapshot: {
-          ...makeJob().snapshot,
-          currentPhase: undefined,
-          planState,
-        },
-      }),
-    );
-
-    const component = new WorkflowTreeComponent({ done: vi.fn() });
-    component.handleInput("\r");
-    const expanded = component.render(160).join("\n");
-
-    expect(expanded).toContain("phase: execute");
-    expect(expanded).toContain("◆ phase: prepare");
-    expect(expanded).toContain("◆ phase: execute (current)");
-    expect(expanded).toContain("✓ succeeded draft (draft)");
-    expect(expanded).toContain("· pending check (check)");
-    expect(expanded).toContain("→ running apply (apply)");
-    expect(expanded).toContain("✗ failed verify (verify)");
-    expect(expanded.indexOf("◆ phase: prepare")).toBeLessThan(
-      expanded.indexOf("◆ phase: execute"),
-    );
-    expect(expanded.indexOf("pending check")).toBeLessThan(
-      expanded.indexOf("running apply"),
-    );
   });
 
   it("renders latest agent rows with omission count", () => {
