@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerToolWithDefaultGuidance } from "../tool-guidance";
 import { Type } from "typebox";
 import {
   MAX_ORCHESTRATOR_ROUTING_ALIASES,
@@ -88,7 +89,7 @@ export function registerOrchestratorTools(
     ? { id: registrationScope.id }
     : undefined;
 
-  pi.registerTool({
+  registerToolWithDefaultGuidance(pi, {
     name: "list_orchestrator_agents",
     label: "List Orchestrator Agents",
     description:
@@ -118,7 +119,7 @@ export function registerOrchestratorTools(
     },
   });
 
-  pi.registerTool({
+  registerToolWithDefaultGuidance(pi, {
     name: "update_orchestrator_agent_description",
     label: "Update Orchestrator Agent Description",
     description:

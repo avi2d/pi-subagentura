@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { debugLog } from "./helpers";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type CompletionMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
@@ -55,10 +56,10 @@ export function acknowledgeCompletionTurnWake(pi: ExtensionAPI): void {
     clearCompletionTurnWake(pi);
   } catch (error) {
     if (wakeStates.get(pi) === state) state.inFlight = false;
-    console.error(
-      "[subagentura] Orchestratorv2 completion wake acknowledgement failed",
-      error,
-    );
+    debugLog("error", "orchestratorv2_wake_ack_failed", {
+      error:
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+    });
   }
 }
 

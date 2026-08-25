@@ -1,4 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const { mockDebugLog } = vi.hoisted(() => ({ mockDebugLog: vi.fn() }));
+
+vi.mock("../src/helpers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/helpers")>();
+  return { ...actual, debugLog: mockDebugLog };
+});
 import {
   acknowledgeCompletionTurnWake,
   clearCompletionTurnWake,
@@ -29,6 +36,7 @@ function completion(content: string) {
 describe("Orchestratorv2 completion turns", () => {
   afterEach(() => {
     vi.useRealTimers();
+    mockDebugLog.mockClear();
   });
 
   it("coalesces concurrent completions without retrying an outstanding preflight", () => {
@@ -73,10 +81,6 @@ describe("Orchestratorv2 completion turns", () => {
 
   it("retains the wake until its durable acknowledgement succeeds", () => {
     const pi = mockPi();
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => {});
-
     sendCompletionTurn(pi as never, completion("one"), {
       deliverAs: "followUp",
       triggerTurn: true,
@@ -89,7 +93,12 @@ describe("Orchestratorv2 completion turns", () => {
     acknowledgeCompletionTurnWake(pi as never);
     acknowledgeCompletionTurnWake(pi as never);
 
-    expect(consoleError).toHaveBeenCalledOnce();
+    expect(mockDebugLog).toHaveBeenCalledOnce();
+    expect(mockDebugLog).toHaveBeenCalledWith(
+      "error",
+      "orchestratorv2_wake_ack_failed",
+      expect.objectContaining({ error: expect.any(String) }),
+    );
     expect(pi.appendEntry).toHaveBeenCalledTimes(3);
     expect(pi.appendEntry).toHaveBeenLastCalledWith(
       ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
@@ -101,7 +110,7 @@ describe("Orchestratorv2 completion turns", () => {
 
   it("allows a later completion to re-wake after repeated acknowledgement failures", () => {
     const pi = mockPi();
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    mockDebugLog.mockClear();
 
     sendCompletionTurn(pi as never, completion("one"), {
       deliverAs: "followUp",

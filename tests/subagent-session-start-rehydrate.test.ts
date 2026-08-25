@@ -14,6 +14,13 @@ import { upsertOrchestratorRoutingEntry } from "../src/orchestrator-routing";
 import { importFresh } from "./test-utils";
 import { makeTmp } from "./subagent-rehydrate-helpers";
 
+const { mockDebugLog } = vi.hoisted(() => ({ mockDebugLog: vi.fn() }));
+
+vi.mock("../src/helpers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/helpers")>();
+  return { ...actual, debugLog: mockDebugLog };
+});
+
 const ROUTED_CHILD = "0123456789abcdef";
 const LEGACY_ROUTED_CHILD = "abc12345";
 
@@ -29,6 +36,7 @@ describe("session_start rehydrate integration", () => {
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
+    mockDebugLog.mockClear();
     vi.restoreAllMocks();
     vi.doUnmock("node:child_process");
     vi.doUnmock("../src/interactive-tmux");
@@ -208,17 +216,16 @@ describe("session_start rehydrate integration", () => {
       sessionFile: "/tmp/sess.jsonl",
     });
     writeFileSync(join(cwd, ".pi", "subagentura-routing.json"), "{");
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const { startHandler } = await setupExtension();
     await startHandler!({ type: "session_start", reason: "reload" }, { cwd });
 
     expect(interactiveSubagentRegistry.has("runtime-survives")).toBe(true);
-    expect(error).toHaveBeenCalledWith(
-      "[subagentura] orchestrator routing metadata recovery failed",
-      expect.any(Error),
+    expect(mockDebugLog).toHaveBeenCalledWith(
+      "error",
+      "orchestrator_routing_recovery_failed",
+      expect.objectContaining({ error: expect.any(String) }),
     );
-    error.mockRestore();
   });
 
   it("session_start does NOT rehydrate on startup when session ID doesn't match", async () => {
