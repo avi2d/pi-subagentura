@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-08-25
+
+### Fixed
+
+- Interactive sub-agents now survive parent reload, resume, and quit continuity without becoming orphaned, while new and fork sessions still clean up prior ownership and descendant spawn-tree authority remains explicit and bounded ([#97](https://github.com/lmn451/pi-subagentura/pull/97)).
+- High-concurrency sub-agent workloads reduce parent input lag by coalescing artifact, delivery, multiplexer, and workflow-worker hot paths ([#96](https://github.com/lmn451/pi-subagentura/pull/96)).
+- The default workflow wall-clock timeout is 100 hours instead of 30 minutes, preventing long-running workflows from terminating unexpectedly.
+- Session lifecycle failures use the opt-in debug logger instead of writing through the host console, avoiding Pi TUI corruption.
+
+### Known limitations
+
+- Descendant lineage bootstrap credentials expire 60 seconds after creation; delayed child startup leaves the pane usable but recursive interactive spawning unavailable for that session until the child is respawned or started fresh.
+
 ## [3.3.0] - 2026-08-05
 
 ### Added
@@ -109,7 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workflow `runningCount` decremented on agent failure; timeout propagates abort to in-flight work.
 - Shared workflow script parsing (`workflow-script.mjs`) used by main thread and worker thread.
 
-[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/lmn451/pi-subagentura/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/lmn451/pi-subagentura/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/lmn451/pi-subagentura/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/lmn451/pi-subagentura/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/lmn451/pi-subagentura/compare/v3.0.3...v3.1.0
