@@ -233,7 +233,7 @@ Parameters:
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
 - `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; shared by related jobs
+- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
 - `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
 - `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
@@ -260,7 +260,7 @@ Parameters:
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
 - `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; shared by related jobs
+- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
 - `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
 - `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
@@ -358,14 +358,18 @@ Parameters:
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
 - `completionPolicy` — `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; shared by related agents
+- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related agents (max 32 members per group, 512 groups per parent session)
 - `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
 - `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
 
 Deprecated compatibility fields cannot be combined with `completionPolicy` or
 `completionGroupId`. The spawn result describes the selected coordinated behavior.
 
-The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts — sub-agents that finish while you're away are picked up on the next poll.
+The sub-agent's artifact contains `events.ndjson` lifecycle records, mutable
+`output.md` staging, and immutable protocol-v2 `outputs/<eventId>.md` terminal
+snapshots. Terminal retrieval uses the immutable snapshot by `turnId`; mutable
+output is legacy/staging fallback only. The pane is for live monitoring, and the
+artifact survives parent restarts.
 
 The interactive sub-agent **registry state** survives parent reloads and restarts. When spawned,
 a per-(cwd) state file is written to `<cwd>/.pi/subagentura-state.json`.
@@ -506,15 +510,19 @@ Coordinated delivery is the default for asynchronous in-process jobs,
 interactive agents, and background workflows. It separates the human channel
 from the parent-model channel:
 
-1. Every `done`, `error`, or `cancelled` completion appends one deterministic
+1. Every parent-visible standalone `done`, `error`, or `cancelled` completion,
+   plus every background workflow aggregate completion, appends one deterministic
    `subagentura-completion` entry rendered in the TUI. This entry is excluded
-   from LLM context, and event replay does not append it again.
+   from LLM context, and event replay does not append it again. Workflow-owned
+   child turns remain visible through workflow progress but do not publish directly.
 2. The parent model receives one bounded, hidden `subagent-manifest` containing
    statuses and references—not child output. Interactive records point to the
    immutable `outputs/<eventId>.md` snapshot when available plus
    `events.ndjson`; legacy artifacts may fall back to mutable `output.md`.
    In-process and workflow records point to `get_subagent_result` and
    `get_workflow_result`.
+   Coordinated workflow completion labels are capped at 160 characters without
+   changing the workflow ID, retained workflow name, or retrieval identity.
 3. The manifest attaches to a pending human-initiated turn when possible.
    Otherwise Pi receives one triggered follow-up after the parent is safely
    idle. Human prompts and steering always take priority.
@@ -529,12 +537,17 @@ from the parent-model channel:
   and cancellations satisfy the barrier. Per-member TUI notices still appear
   immediately, and an entirely consumed group does not trigger an empty turn.
 
+A group supports at most 32 distinct `source:sourceId` members, with at most
+512 groups per parent session. `completionGroupId` is 1–128 characters and must
+match `[A-Za-z0-9][A-Za-z0-9._:-]*`. A source can satisfy a group only once;
+later turns from the same source/group are delivered independently as `each`.
+
 Successful terminal retrieval through `get_subagent_result`,
 `get_workflow_result`, or `read_subagent_artifact` with output consumes the
 matching pending record before returning it. Automatic and manual delivery share
 the same receipts, so normal runtime paths do not deliver the result twice.
 Workflow-owned process or in-process children never publish directly; only the
-workflow's aggregate completion participates.
+background workflow aggregate completion participates in coordinated delivery.
 
 The deprecated `notifyOnComplete` and `triggerTurnOnComplete` fields remain
 accepted for compatibility. Either legacy value maps deterministically to
@@ -548,9 +561,15 @@ Interactive coordinated policy, group membership, intents, and receipts survive
 same-session startup/reload/resume through `.pi/subagentura-state.json` and
 parent session entries. In-process jobs and background workflows remain
 parent-session scoped and are retired on session replacement. `new` and `fork`
-do not import prior completion work. Deterministic identities prevent routine
-duplicates, but Pi's synchronous send proves dispatch rather than durable
-commit, so a crash in that window can still replay a manifest.
+do not import prior completion work.
+
+Parent delivery fails closed behind durable notice storage. If `appendEntry`
+fails, the notice remains pending and the manifest is withheld; later coordinator
+activity retries without a tight loop. If the entry was written before an
+exception, session-entry reconciliation prevents a duplicate. Deterministic
+identities prevent routine replay, but Pi's synchronous `sendMessage` proves
+dispatch rather than durable commit, so a crash in that separate window can still
+replay a manifest.
 
 #### `get_interactive_subagent_status`
 
@@ -579,14 +598,21 @@ Parameters:
 Sends a follow-up prompt to a running or idle interactive sub-agent by id. The
 message is delivered into the child's existing REPL via the sub-agent's mux
 backend (tmux send-keys or zellij write-chars + write 13), so the child's model
-context is preserved — this is a true follow-up turn, not a fresh spawn. A
-message submitted while the child streams is processed through Pi's
-one-at-a-time steering queue; its persisted user entry receives a distinct
-artifact turn and immutable completion snapshot. The child calls `cli.mjs done
-0` again when finished, producing a new coordinated completion record. An idle
-follow-up starts a new independent `"each"` policy; steering during the active
-turn retains that turn's existing policy.
-Refuses to send if the sub-agent is not in the registry, is neither `running` nor `idle`, or if the mux itself rejects the send call (e.g. the pane was killed between the status check and send). All three failure modes return a structured `isError: true` result.
+context is preserved — this is a true follow-up turn, not a fresh spawn.
+
+Every persisted user entry produces a distinct artifact turn and immutable
+completion snapshot. An idle follow-up resets future delivery to independent
+`each`. A source can satisfy a completion group only once, so later turns from
+that source/group are also delivered independently as `each`, even when steering
+retained the active turn's persisted group metadata.
+
+Workflow-owned children reject follow-ups until the workflow has consumed the
+current result and the pane is idle. The first successful follow-up then promotes
+the pane to standalone. The child calls `cli.mjs done 0` again when finished.
+
+The tool refuses to send if the sub-agent is not registered, is neither `running`
+nor `idle`, remains workflow-owned, or the mux rejects the send call. Each failure
+returns a structured `isError: true` result.
 
 Parameters:
 
@@ -621,7 +647,7 @@ Parameters:
 - `since` — optional unix-ms timestamp; only return events with `ts >= since`
 - `includeOutput` — include the output (default `true`); historical selectors imply output
 - `turn` — optional turn number; read `output-N.md` for that specific turn instead of the latest `output.md`
-- `turnId` — optional protocol-v2 Pi turn id; read its immutable `outputs/<eventId>.md` snapshot
+- `turnId` — optional protocol-v2 Pi turn id, up to 256 characters; read its immutable `outputs/<eventId>.md` snapshot
 
 ### `list_available_models`
 

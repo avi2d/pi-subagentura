@@ -16,6 +16,7 @@ import {
   isCompletionEvent,
   loadInteractiveStates,
   lastEvent,
+  MAX_TURN_ID_LENGTH,
   listOutputHistory,
   listOutputTurns,
   readEvents,
@@ -508,7 +509,7 @@ export function registerInteractiveSubagentTools(
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
     description:
-      "Kill an interactive sub-agent pane. The tool result acknowledges parent-initiated cancellation, so artifacts are retained without injecting a duplicate cancellation completion into LLM context.",
+      "Kill an interactive sub-agent pane and retain its cancelled artifact. Coordinated delivery still emits one TUI-only terminal notice and may later add a compact cancellation selector; the tool result does not inject a duplicate full-output cancellation message.",
     parameters: Type.Object({
       jobId: Type.String({
         description:
@@ -549,7 +550,7 @@ export function registerInteractiveSubagentTools(
           ? ` Snapshot error: ${state.cancellationSnapshot.error}`
           : "";
       userNotification =
-        `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
+        `Interactive sub-agent ${params.jobId} cancelled; coordinated delivery will use one TUI notice and, when eligible, one compact cancellation selector. ` +
         `Artifacts retained at ${state.artifactDir}.${snapshotText}`;
       try {
         ctx.ui.notify(userNotification, "warning");
@@ -562,7 +563,7 @@ export function registerInteractiveSubagentTools(
             type: "text",
             text:
               `Interactive sub-agent ${params.jobId} cancelled. ` +
-              `No separate cancellation completion will be injected into the parent LLM. ` +
+              `Coordinated delivery will use one TUI notice and, when eligible, one compact cancellation selector. ` +
               `Artifacts retained at ${state.artifactDir}.` +
               (state.cancellationSnapshot?.path
                 ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}.`
@@ -594,8 +595,10 @@ export function registerInteractiveSubagentTools(
       "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
       "is a true follow-up turn, not a fresh spawn. A workflow-owned child can accept a follow-up",
       "only after its completed turn is idle and its workflow runner has consumed the result. It is",
-      "promoted to standalone only after that follow-up is sent successfully. The child will run the",
-      "new turn and (per its system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
+      "promoted to standalone only after that follow-up is sent successfully. An idle follow-up resets",
+      "future completion delivery to independent each; a source can satisfy a group only once, so later",
+      "turns from that source/group are also independent. The child will run the new turn and (per its",
+      "system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
       "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
     ].join("\n"),
     parameters: Type.Object({
@@ -821,8 +824,9 @@ export function registerInteractiveSubagentTools(
       ),
       turnId: Type.Optional(
         Type.String({
+          maxLength: MAX_TURN_ID_LENGTH,
           description:
-            "Read a protocol-v2 immutable output by its Pi-derived turnId.",
+            "Read a protocol-v2 immutable output by its Pi-derived turnId (max 256 characters).",
         }),
       ),
     }),

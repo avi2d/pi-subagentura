@@ -21,6 +21,8 @@ Use subagents to widen investigation, reduce context pressure, or get independen
 
 - Use the default `completionPolicy: "each"` for independent background work. Use `completionPolicy: "group"` with one explicit shared `completionGroupId` when related jobs must be synthesized only after every member is done, errored, or cancelled.
 - Spawn every member of a completion group in the same parent turn. Group membership seals when that turn settles; late members are rejected.
+- Groups are explicit and bounded: at most 32 `source:sourceId` members, 512 groups per parent session, and safe 1–128 character IDs. One source satisfies a group once; later turns are independent `each` completions.
+- Workflow-owned child turns report through workflow progress only; wait for the workflow aggregate. An idle follow-up to an interactive reviewer starts a distinct independent completion.
 - Do not poll by default. The user receives a TUI-only completion entry, while the parent receives one compact reference manifest when safely idle. Ready independent results coalesce, and a sealed group produces one all-terminal manifest.
 - Human input has priority. A ready manifest attaches to the user's natural turn instead of starting a competing continuation; results collected successfully with `get_subagent_result`, `get_workflow_result`, or `read_subagent_artifact` are consumed and omitted from later automatic delivery.
 - Prefer `completionPolicy`. Deprecated `notifyOnComplete` / `triggerTurnOnComplete` inputs only map to coordinated `each`; they cannot request full-output injection or be combined with `completionPolicy` / `completionGroupId`.

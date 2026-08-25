@@ -500,7 +500,7 @@ export function registerWorkflowTool(
       "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
       "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
       "Background completionPolicy defaults to each: the user gets one TUI-only notice and the parent resumes with a compact get_workflow_result reference.",
-      "Use completionPolicy=group with a shared completionGroupId when related background workflows must reach one all-terminal barrier before the parent resumes.",
+      "Use completionPolicy=group with a shared safe 1–128 character completionGroupId when related background workflows must reach one all-terminal barrier before the parent resumes (max 32 members per group, 512 groups per parent session).",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
@@ -558,7 +558,7 @@ export function registerWorkflowTool(
           maxLength: 128,
           pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
           description:
-            'Required with completionPolicy="group". Explicit identifier shared by related background work.',
+            'Required with completionPolicy="group". Safe 1–128 character identifier shared by related background work; at most 32 members per group and 512 groups per parent session.',
         }),
       ),
     }),

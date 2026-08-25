@@ -80,7 +80,7 @@ export const BaseParams = Type.Object({
       maxLength: 128,
       pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
       description:
-        'Required with completionPolicy="group". Explicit identifier shared by related jobs.',
+        'Required with completionPolicy="group". Explicit identifier shared by related jobs. Safe 1–128 character IDs only; at most 32 members per group and 512 groups per parent session.',
     }),
   ),
   maxAge: Type.Optional(
@@ -190,7 +190,7 @@ export const InteractiveParams = Type.Object({
       maxLength: 128,
       pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
       description:
-        'Required with completionPolicy="group". Explicit identifier shared by related agents.',
+        'Required with completionPolicy="group". Explicit identifier shared by related agents. Safe 1–128 character IDs only; at most 32 members per group and 512 groups per parent session.',
     }),
   ),
   mux: Type.Optional(

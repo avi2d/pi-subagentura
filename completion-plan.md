@@ -1,286 +1,203 @@
-# Completion Delivery Coordination Plan
+# Completion Delivery Coordination
 
 ## Status
 
-Implementation plan for `feat/completion-delivery-groups`, originally branched
-from `origin/master` at `0acb79e` and synchronized through `fc08047` (`v3.3.1`).
+Implemented on `feat/completion-delivery-groups` at `53f33cf` and hardened at
+`b41579a`. This document records the shipped design and its verification contract.
 
-## Problem
+## Historical problem
 
-A completed sub-agent currently uses the same Pi custom-message channel for
-both user notification and parent-LLM delivery. Each custom message participates
-in model context, and triggered follow-ups may be queued while the parent is
-busy. A result that the parent already collected manually can therefore arrive
-again later as an automatic completion message. Parallel related work can also
-produce one parent turn per member instead of one aggregate continuation.
+Completion notifications previously reused Pi custom messages for both the user
+and the parent model. Those messages entered later model context, could queue a
+turn while the parent was busy, and could redeliver output that the parent had
+already collected. Related fan-out could also create one continuation per member.
 
-## Goals
+The implementation separates those channels and coordinates parent readiness.
 
-1. Notify the user exactly once for every terminal sub-agent turn.
-2. Keep user-only notices out of parent LLM context.
-3. Support two explicit parent-delivery policies:
-   - `each`: independent results become eligible independently;
-   - `group`: related results wait at a sealed all-terminal barrier.
-4. Trigger automatic parent continuation without requiring the user to ask for
-   status.
-5. Give human input priority over automatic continuation.
-6. Deliver each result to the parent model at most once through normal runtime
-   paths, including manual result collection.
-7. Preserve durable delivery IDs, rehydrate behavior, bounded payloads, and
-   workflow-owned child suppression.
+## Goals and scope
 
-## Non-goals
+- Notify the user once for every parent-visible standalone terminal turn and every
+  background workflow aggregate terminal result.
+- Keep user notices out of parent LLM context.
+- Deliver compact references instead of full child output by default.
+- Support independent `each` readiness and explicit sealed `group` barriers.
+- Give human prompts, steering, and queued follow-ups priority.
+- Consume manually retrieved terminal results before automatic delivery.
+- Preserve bounded state, explicit ownership, immutable artifact identity, and
+  workflow-owned child suppression.
 
-- Inferring task relatedness from task text.
-- Injecting full child output automatically by default.
-- Treating mutable `output.md` as an authoritative historical snapshot.
-- Parsing arbitrary shell commands to infer that a result was consumed.
-- Eliminating the documented crash window where Pi proves synchronous dispatch
-  but not durable session commit.
+Workflow-owned child turns remain visible through workflow progress but do not
+publish direct completion notices or manifests. Only the background workflow
+aggregate joins the parent coordinator.
 
 ## Terminology
 
-- **Completion**: one terminal child turn with outcome `done`, `error`, or
-  `cancelled`.
-- **User notice**: durable TUI-only completion entry. It never participates in
-  LLM context.
-- **Delivery intent**: durable parent-model work item identified by deterministic
-  `deliveryId`.
-- **Consumed**: the parent retrieved the completion manually, so automatic model
-  delivery must omit it.
-- **Dispatched**: the compact manifest was submitted to Pi for model delivery.
-- **Receipted**: the parent session contains the corresponding deterministic ID.
-- **Completion group**: explicit related-work barrier with durable membership.
-- **Sealed**: no more members may join a group.
-- **Terminal group**: a sealed group whose every member is done, errored, or
-  cancelled.
+- **Completion record**: a normalized parent-visible `done`, `error`, or
+  `cancelled` result with a deterministic `completionId`.
+- **User notice**: a durable `subagentura-completion` custom entry rendered only
+  in the TUI. The entry itself is the notice reconciliation receipt.
+- **Manifest**: a bounded hidden `subagent-manifest` containing statuses and
+  retrieval references, never full child output by default.
+- **Consumed**: terminal output was retrieved manually, so later automatic
+  delivery omits the matching completion.
+- **Completion group**: an explicit barrier keyed by `completionGroupId`.
+- **Sealed**: the spawning parent turn settled, so no new group members may join.
 
-## Required behavior
+## Two-channel contract
 
 ### User channel
 
-For every terminal completion:
+For each parent-visible terminal record, the coordinator:
 
-1. Append one durable custom entry with `pi.appendEntry()`.
-2. Render it with `pi.registerEntryRenderer()`.
-3. Include bounded status, agent/turn identity, and retrieval reference.
-4. Record a deterministic user-notice receipt so polling, reload, and retries do
-   not append the same notice again.
-5. Keep running state visible in the existing footer/supervisor.
+1. normalizes and bounds the record;
+2. appends one `subagentura-completion` entry with `pi.appendEntry()`;
+3. renders it with `pi.registerEntryRenderer()`;
+4. reconciles deterministic IDs against parent session entries; and
+5. excludes the entry from provider context.
 
-`pi.sendMessage()` must not be used for user-only notices because Pi documents
-that custom messages participate in LLM context even when `triggerTurn` is
-false.
+`pi.sendMessage()` is never used for a user-only notice because custom messages
+participate in later model context even when they do not trigger a turn.
 
-### Parent policy: `each`
+Parent delivery fails closed behind notice persistence. A failed notice append
+remains pending and blocks manifest preparation. One scheduled retry occurs when
+safe, and later coordinator activity may retry again; persistent failure never
+creates a tight loop. If an append writes and then throws, reconciliation sees the
+existing entry and prevents a duplicate.
 
-1. A terminal independent result becomes ready immediately.
-2. Never inject it into an active parent turn mid-stream.
-3. When the parent is safely idle, trigger one follow-up containing a compact
-   manifest of all independent results ready at that dispatch instant.
-4. Coalescing is allowed and preferred; readiness is independent, but multiple
-   ready completions must not create a burst of redundant turns.
-5. A single sub-agent naturally triggers after its own completion.
+### Parent-model channel
 
-### Parent policy: `group`
+A ready manifest contains JSON records inside `<completion-manifest>`:
 
-1. Related work declares `completionPolicy: "group"` and an explicit bounded
-   `completionGroupId`; relatedness is never inferred.
-2. Register each delivery ID as a durable group member.
-3. Seal the group when its spawning parent turn settles, or when a workflow's
-   scheduler closes its member set.
-4. Notify the user for each terminal member immediately.
-5. Do not trigger the parent model until the group is sealed and every member is
-   terminal.
-6. At the barrier, trigger one parent turn with one aggregate manifest.
-7. `error` and `cancelled` are terminal and cannot hold the barrier open.
-8. If every result was manually consumed, do not trigger an empty turn.
+```text
+<completion-manifest>
+{"completionId":"...","source":"interactive","sourceId":"...","turnId":"...","status":"done","retrieve":"read_subagent_artifact(id: \"...\", turnId: \"...\")","references":[{"label":"output","value":".../outputs/<eventId>.md"}]}
+</completion-manifest>
+```
 
-Distinct related groups created in one parent turn must remain separate.
+Structured message details contain `completionIds` and any represented `groups`.
+Interactive references prefer immutable `outputs/<eventId>.md` plus
+`events.ndjson`; legacy artifacts may fall back to staging `output.md`.
+In-process and workflow records point to `get_subagent_result` and
+`get_workflow_result`.
+
+Manifests are capped at 32 KiB and 128 records. A grouped unit is selected
+atomically and is never split to fit. If references exceed the budget, the
+manifest retains bounded retrieval calls and omits the expanded reference array.
+Physical publication order is authoritative.
+
+## Readiness policies
+
+### `each`
+
+Independent records become ready immediately. Records that finish while the
+parent is busy coalesce at the next safe dispatch instead of creating a burst of
+turns.
+
+### `group`
+
+Related top-level work declares `completionPolicy: "group"` and one shared,
+explicit `completionGroupId`. Relatedness is never inferred from prompt text.
+
+- Every member is registered at spawn.
+- The spawning parent turn's settlement seals the group.
+- Late members are rejected.
+- `done`, `error`, and `cancelled` all satisfy terminality.
+- Parent delivery waits until every registered member is terminal.
+- Per-member TUI notices remain immediate.
+- An entirely consumed group creates no empty continuation.
+
+Membership uses bounded `source:sourceId` keys, not delivery IDs. A group supports
+at most 32 members, a parent session supports at most 512 groups, and IDs are
+1–128 characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`. One source satisfies a
+group once; later turns from the same source/group are independent `each` records
+with distinct completion IDs.
+
+Workflow schedulers do not seal parent completion groups for internal children.
+Internal children are suppressed, and only the background workflow aggregate participates.
 
 ## Human-input priority
 
-Human activity must take precedence over automatic completion delivery.
-
-1. If a human prompt, steering message, or follow-up is already pending, do not
-   queue another automatic parent turn.
-2. If ready completions exist before a human-initiated turn starts, attach one
-   coalesced manifest to that natural turn instead of triggering a second turn.
-3. If completions become ready during the human turn, wait for settlement and
-   then dispatch only what remains unconsumed.
-4. Session replacement or cancellation must retire or migrate intents according
-   to the existing lifecycle policy; no intent may cross into the wrong parent
-   session.
-5. Commands that replace/cancel the session must not receive a completion
-   manifest from the abandoned session.
-
-Implementation should use Pi's input/turn lifecycle, `ctx.hasPendingMessages()`,
-`ctx.isIdle()`, and the session scope rather than timing guesses.
+- Never inject a manifest into a streaming parent turn.
+- Human input marks a priority fence before `agent_start`.
+- `before_agent_start` attaches a ready manifest to the natural human turn.
+- A separate turn-start fence closes the `before_agent_start` to `agent_start`
+  race.
+- Completions that arrive during a human turn wait for settlement.
+- Without pending human work, safe parent idleness triggers one follow-up.
+- Session replacement retires session-scoped work before it can reach a new owner.
 
 ## Manual consumption
 
-The following successful terminal-result paths must atomically consume matching
-pending delivery IDs before returning result content:
+Successful terminal output retrieval through these tools appends a matching
+consumption entry before returning:
 
-- `read_subagent_artifact` for a selected or latest terminal turn;
+- `read_subagent_artifact` when it successfully returns a selected or latest terminal output (requesting output without a terminal snapshot does not consume);
 - `get_subagent_result`;
 - `get_workflow_result`.
 
-A successful built-in `read` of an owned immutable output snapshot may also be
-recognized after tool completion and consumed when it can be mapped safely.
-Generic shell reads cannot be recognized reliably and remain outside this
-contract.
+Events-only artifact reads do not consume output. Interactive consumption matches
+the immutable terminal turn, not mutable follow-up staging bytes. Protocol-v2
+turn IDs remain intact up to the artifact protocol limit of 256 characters.
 
-Consumption and automatic dispatch must share one coordinator/claim path so
-only one wins. Automatic triggered delivery must wait for parent settlement;
-this removes the normal race where Pi has already queued an irreversible
-follow-up before manual collection finishes.
+## Interactive follow-ups and cancellation
 
-## Manifest format
+Every persisted child user entry produces a distinct artifact turn and immutable
+snapshot. An idle follow-up resets future policy to independent `each`. A source
+can satisfy a group only once, so repeated completions cannot reopen a sealed
+group.
 
-The model receives references, not full output by default.
+Workflow-owned children reject follow-up until the workflow has consumed the
+current result and the pane is idle. The first successful follow-up promotes the
+pane to standalone.
 
-Interactive completion:
+Interactive cancellation writes the cancelled artifact first. Coordinated state
+then produces one TUI-only terminal notice and may later include one compact
+cancellation selector; upgrade-recovered pre-coordinator intents alone retain
+legacy synthetic-receipt suppression.
 
-```text
-- agent <id>, turn <turnId>, <status>
-  output: <artifactDir>/outputs/<eventId>.md
-  activity: <artifactDir>/events.ndjson
-```
+## API and compatibility
 
-Use the immutable protocol-v2 snapshot. Fall back to `output.md` only for legacy
-artifacts without an immutable snapshot.
-
-In-process completion:
-
-```text
-- job <jobId>, <status>: call get_subagent_result({ jobId: "<jobId>" })
-```
-
-Workflow completion:
-
-```text
-- workflow <workflowId>, <status>: call get_workflow_result({ workflowId: "<workflowId>" })
-```
-
-Every manifest is bounded, sanitized, attributed, and carries its delivery IDs
-in structured details for receipt reconciliation.
-
-## State model
-
-A coordinator owned by `SessionScope` should serialize transitions:
-
-```text
-queued -> ready -> claimed(manual | automatic) -> dispatched -> receipted
-                  \-> consumed
-```
-
-Group state minimally contains:
-
-```text
-completionGroupId
-owner/session generation
-member delivery IDs
-sealed flag
-dispatched/receipted aggregate ID
-```
-
-Interactive group and delivery state required across reload must be persisted in
-the existing per-cwd state file using crash-safe ordering. In-process jobs and
-background workflows remain parent-session scoped under their existing rules.
-Physical event byte order remains authoritative.
-
-## API direction and compatibility
-
-Expose an explicit policy on spawnable background work:
+Spawnable asynchronous work accepts:
 
 ```text
 completionPolicy: "each" | "group"  // default: "each"
 completionGroupId?: string           // required for "group"
 ```
 
-The implementation must define how group sealing occurs and document it. Prefer
-parent-turn settlement for directly spawned agents and workflow scheduler
-completion for workflow-owned groups.
+Deprecated `notifyOnComplete` and `triggerTurnOnComplete` inputs remain accepted.
+Either legacy value maps deterministically to coordinated `each`, cannot request
+full-output injection, and cannot be combined with new completion fields.
 
-Keep legacy `notifyOnComplete` and `triggerTurnOnComplete` inputs accepted during
-a deprecation period. Map explicit legacy values deterministically and document
-that:
+Coordinated workflow completion labels are capped at 160 characters without
+changing workflow IDs, retained workflow names, or retrieval identity.
 
-- the user notice is always TUI-only;
-- model payloads are compact references;
-- trigger timing is coordinated by policy/barrier and human priority.
+## Lifecycle and durability
 
-Reject conflicting old/new options rather than silently choosing one.
+Interactive completion policy, group identity, event cursors, pending intents,
+and legacy receipts rehydrate only into the matching parent session. In-process
+jobs and background workflows remain parent-session scoped and do not survive
+session replacement. `new` and `fork` do not import prior completion work.
 
-## Workflow ownership
+A successful Pi `sendMessage()` proves synchronous dispatch, not durable session
+commit. Deterministic completion IDs prevent ordinary replay, but a crash in that
+separate commit window can still replay a manifest. This at-least-once boundary is
+not described as exactly once.
 
-Workflow-owned interactive children continue to suppress direct child delivery.
-Only the workflow completion participates in the parent completion coordinator.
-A workflow's internal fan-out uses its scheduler's known terminal barrier and
-must not trigger the parent once per internal child.
+## Verification contract
 
-## Tests to add first
+Permanent regressions cover:
 
-### Core coordinator
+- independent coalescing and sealed all-terminal groups;
+- errors, cancellation, late-member rejection, and one-shot group membership;
+- human-input and turn-start races;
+- manual consumption and immutable retrieval selection;
+- bounded queues, manifests, group units, and crash/rehydrate replay;
+- transient notice retry, append-then-throw reconciliation, and no retry spin;
+- workflow-owned suppression and cancellation deduplication;
+- accepted long workflow names and 256-character turn IDs;
+- tmux, Zellij, Pi-session provider context, and terminal E2E behavior.
 
-- independent single completion becomes ready;
-- independent completions coalesce while parent is busy;
-- explicit groups remain blocked before sealing;
-- sealed groups wait for every member;
-- errors and cancellations satisfy terminality;
-- duplicate event folds do not duplicate notices or delivery;
-- all-consumed groups produce no automatic turn.
-
-### Parent lifecycle and human priority
-
-- no automatic send while `parentStreaming`;
-- queued human input wins over ready completion;
-- ready manifest is attached once to the next human turn;
-- completion during a human turn dispatches only after settlement;
-- session replacement cannot leak old intents;
-- repeated child turns use distinct delivery IDs.
-
-### Manual consumption
-
-- artifact read wins before automatic dispatch;
-- in-process result collection wins before automatic dispatch;
-- workflow result collection wins before automatic dispatch;
-- automatic dispatch wins only once when no manual collector does;
-- reload reconciles receipts without replaying consumed output.
-
-### Context cleanliness
-
-Using the Pi session harness:
-
-- each user notice creates a custom entry, not a custom message;
-- notices never appear in the next provider request;
-- one intended compact manifest appears in the provider request;
-- full child output is absent unless explicitly retrieved;
-- several related completions produce one provider turn and one manifest.
-
-### Integrations
-
-- tmux and zellij completion paths;
-- terminal E2E with a human prompt arriving before group completion;
-- terminal E2E with related reviewers producing one aggregate continuation.
-
-## Documentation
-
-Update at least:
-
-- `README.md` tool parameters and completion-delivery behavior;
-- `architecture.md` durable broker, group barrier, and human-priority flow;
-- `AGENTS.md` invariants and testing guidance;
-- `CHANGELOG.md` behavior/API change;
-- tool schemas/descriptions and default-guidance text;
-- workflow documentation where background completion behavior is described.
-
-Documentation must clearly separate user notification from parent-LLM delivery
-and state that `triggerTurn: false` alone does not keep a `sendMessage()` custom
-message out of model context.
-
-## Verification gates
+Required release checks:
 
 ```bash
 npm run typecheck
@@ -291,20 +208,16 @@ npm run test:tmux
 npm run test:zellij
 ```
 
-Also run the focused Pi-session delivery tests and terminal E2E scenarios. No
-runtime `console.*` calls are permitted; diagnostics use `debugLog`.
+Also run the terminal E2E suite. Runtime diagnostics use `debugLog`; published
+runtime code must not call host `console.*` methods.
 
-## Acceptance criteria
+## External documentation sync handoff
 
-- The user sees one completion notice per terminal sub-agent turn without asking
-  for status.
-- Independent work resumes the main agent without per-completion bursts.
-- Related work resumes the main agent once, after the sealed all-terminal
-  barrier.
-- Human input is never displaced by completion automation.
-- Manually consumed results do not arrive again automatically.
-- Default notices do not participate in LLM context.
-- Parent manifests contain immutable references and retrieval IDs, not repeated
-  full output.
-- Reload, cancellation, errors, repeated child turns, and mux backends retain
-  deterministic delivery behavior.
+The repository-managed root docs and published example guide carry the current
+contract. The externally managed `pi-docs` source must mirror these changes into
+`docs/workflows.md`: add the background completion API/ownership semantics and
+replace mutable `output.md` polling with terminal-event selection followed by the
+matching immutable `outputs/<eventId>.md` snapshot. Its frontmatter should add
+`completion`, `completionPolicy`, and `completionGroupId`. The Phase 2
+`docs/workflow.md` design should either gain the current coordinator flow or be
+marked historical. Do not edit generated `docs/` copies in this repository.

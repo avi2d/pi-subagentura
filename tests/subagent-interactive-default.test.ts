@@ -521,11 +521,11 @@ describe("subagent_interactive tool lifecycle", () => {
       expect.objectContaining({ id: "abc12345" }),
     );
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("no separate cancellation completion"),
+      expect.stringContaining("one compact cancellation selector"),
       "warning",
     );
     expect(result.content[0].text).toContain(
-      "No separate cancellation completion will be injected",
+      "one compact cancellation selector",
     );
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "subagentura-running",
@@ -552,6 +552,12 @@ describe("subagent_interactive tool lifecycle", () => {
     expect(properties.triggerTurnOnComplete.description).toMatch(
       /deprecated compatibility/i,
     );
+    expect(properties.completionGroupId.maxLength).toBe(128);
+    expect(properties.completionGroupId.description).toContain("32 members");
+    const readToolDef = api.registerTool.mock.calls.find(
+      ([tool]: any[]) => tool.name === "read_subagent_artifact",
+    )?.[0];
+    expect(readToolDef.parameters.properties.turnId.maxLength).toBe(256);
   });
 
   it("isolates peer status, cancel, send, list, and read tools", async () => {

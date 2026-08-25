@@ -40,6 +40,20 @@ workflow({
 });
 ```
 
+## Background completion
+
+Background workflows default to `completionPolicy: "each"`. The workflow
+aggregate emits one TUI-only terminal notice and, when the parent is safely ready,
+one compact `get_workflow_result` selector. Internal workflow-owned agents report
+through workflow progress and never publish direct completion notices or manifests.
+
+Use `completionPolicy: "group"` with a shared `completionGroupId` only for related
+top-level background work spawned in one parent turn. Groups seal when that parent
+turn settles and release after every registered aggregate is terminal. Human input
+takes priority, successful terminal retrieval consumes pending automatic delivery,
+and cancellation publishes the aggregate terminal status. Jobs and results remain
+scoped to the current parent session.
+
 ## Authoring guidance
 
 Write raw JavaScript without fences. Include a top-level pure-literal

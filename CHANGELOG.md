@@ -10,13 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Explicit `completionPolicy: "each" | "group"` coordination for asynchronous sub-agents and background workflows, with bounded `completionGroupId` barriers, human-input priority, manual-result consumption, and compact reference manifests.
-- Exactly-once TUI completion entries for `done`, `error`, and `cancelled` outcomes; these entries are excluded from parent LLM context.
+- Exactly-once TUI completion entries for parent-visible standalone and background workflow aggregate `done`, `error`, and `cancelled` outcomes; workflow-owned child turns remain suppressed and entries are excluded from parent LLM context.
 
 ### Changed
 
 - Asynchronous completion now defaults to coordinated `each` delivery: ready independent results coalesce while the parent is busy, then attach to the next natural human turn or trigger one safe continuation without injecting full child output.
-- Completion groups seal when the spawning parent turn settles and release one aggregate manifest only after every registered member is terminal; workflow-owned children remain suppressed in favor of the workflow aggregate.
+- Completion groups seal when the spawning parent turn settles and release one aggregate manifest only after every registered member is terminal; workflow-owned children remain suppressed in favor of the background workflow aggregate.
 - Interactive coordinated policy, group membership, intents, and receipts rehydrate only into the matching parent session. In-process jobs and background workflows remain session scoped.
+
+### Fixed
+
+- Durable TUI completion notice writes retry without duplicating append-then-throw entries or spinning during persistent storage failure; parent manifests wait for notice persistence.
+- Accepted long workflow names are truncated only in bounded completion labels, preserving workflow IDs and completion delivery.
+- Protocol-v2 Pi turn IDs up to 256 characters remain intact in notices, immutable retrieval selectors, and consumption receipts.
 
 ### Deprecated
 

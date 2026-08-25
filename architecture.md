@@ -643,20 +643,22 @@ File truncation resets parsing and cursors.
 
 An interactive completion first becomes a deterministic persisted delivery intent before the artifact cursor advances. `delivery.ts` drains coordinated intents into `completion-coordinator.ts` in bounded chunks; only upgrade-recovered pre-coordinator intents continue through the legacy FIFO.
 
-For every coordinated terminal record, the coordinator appends one deterministic `subagentura-completion` custom entry. Its renderer is TUI-only: Pi excludes it from provider context. Reconciliation against parent entries makes repeated artifact folds, polling, and ordinary reload idempotent.
+For every parent-visible standalone terminal record and every background workflow aggregate, the coordinator appends one deterministic `subagentura-completion` custom entry. Workflow-owned child turns are suppressed before publication. The renderer is TUI-only: Pi excludes it from provider context. Reconciliation against parent entries makes repeated artifact folds, polling, and ordinary reload idempotent.
 
 Policy determines readiness:
 
 - `each` records are ready independently and coalesce at the next dispatch instant;
 - `group` records register bounded explicit membership at spawn, seal when the spawning parent turn settles, and become ready only when every member is `done`, `error`, or `cancelled`.
 
+Groups use `source:sourceId` member keys, support at most 32 members and 512 groups per parent session, and accept 1–128 character IDs matching `[A-Za-z0-9][A-Za-z0-9._:-]*`. A source satisfies a group once; repeated turns from that source/group are independent `each` records.
+
 The coordinator never injects into a streaming turn. Human input and steering set a priority fence; `before_agent_start` attaches one hidden bounded `subagent-manifest` to that natural turn. Without human input, safe idleness triggers one Pi follow-up. The manifest contains completion IDs, statuses, and references only. Interactive references prefer immutable `outputs/<eventId>.md`; in-process and workflow references name their result tools.
 
-Successful terminal retrieval through `read_subagent_artifact`, `get_subagent_result`, or `get_workflow_result` appends a consumption entry before returning. The coordinator omits consumed records, and an all-consumed group creates no empty turn. Workflow-owned children are suppressed before this path, so only the workflow aggregate publishes.
+Successful terminal retrieval through `read_subagent_artifact`, `get_subagent_result`, or `get_workflow_result` appends a consumption entry before returning. The coordinator omits consumed records, and an all-consumed group creates no empty turn. Workflow-owned children are suppressed before this path, so only the background workflow aggregate publishes.
 
 Deprecated public legacy fields map to coordinated `each` and cannot select this channel. Upgrade-recovered pre-coordinator intents may still send `subagent-notify` with prior inject/pointer semantics; those messages remain part of later LLM context.
 
-Interactive queue and receipt identity remain bounded and persisted. A successful `sendMessage` proves synchronous dispatch, not durable parent-session commit. Deterministic IDs prevent routine replay, but a crash in that window can still duplicate a manifest or legacy message.
+Interactive queue and receipt identity remain bounded and persisted. Parent delivery is fail-closed behind durable notice storage: failed notice appends remain pending, block manifest preparation, and retry on later coordinator activity without a tight loop. Reconciliation handles append-then-throw without duplication. A successful `sendMessage` proves synchronous dispatch, not durable parent-session commit; a crash in that separate window can still duplicate a manifest or legacy message.
 
 ### 8.5 Rehydration
 
@@ -918,15 +920,15 @@ Background jobs retain live samples by agent ID and aggregate only still-running
 
 ## 12. Cancellation semantics
 
-| Scope               | Trigger                                        | Ordering and propagation                                                                                               | Terminal evidence                                                   |
-| ------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Sync in-process     | Parent tool signal                             | Abort listener calls session abort; nested recorded descendants cascade                                                | Returned cancelled `SubagentResult`                                 |
-| Async in-process    | `cancel_subagent`, cross-mode cancel, shutdown | Snapshot, abort target controller, recursively abort `parentJobId` descendants, prevent late settlement overwrite      | Cancelled registry state until scheduled removal                    |
-| Interactive single  | Interactive cancel tool                        | Snapshot, `.cancelled`, parent completion, synthetic receipt, registry mark, pane kill                                 | Artifact completion plus later `process_exited`                     |
-| Interactive subtree | Supervisor/lineage action                      | Validate bounded manifests; sort deepest first; skip stale/non-actionable/terminal; continue after failures            | Per-node categorized result and artifact/process state              |
-| Workflow            | `cancel_workflow`, cross-mode cancel, shutdown | Abort job and engine, normalize immediately, cancel active runner, post worker abort, terminate thread                 | Cancelled workflow state and runner receipts                        |
-| Result wait only    | Abort status/result waiting tool               | Stop waiting; do not cancel underlying in-process/workflow job                                                         | `wait_cancelled`/timeout response                                   |
-| Session shutdown    | Pi lifecycle                                   | Fence generation first; clear identity before asynchronous teardown; preserve interactive panes for reload/resume/quit | No late owner delivery; durable state retained or deleted by reason |
+| Scope               | Trigger                                        | Ordering and propagation                                                                                                                                | Terminal evidence                                                   |
+| ------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Sync in-process     | Parent tool signal                             | Abort listener calls session abort; nested recorded descendants cascade                                                                                 | Returned cancelled `SubagentResult`                                 |
+| Async in-process    | `cancel_subagent`, cross-mode cancel, shutdown | Snapshot, abort target controller, recursively abort `parentJobId` descendants, prevent late settlement overwrite                                       | Cancelled registry state until scheduled removal                    |
+| Interactive single  | Interactive cancel tool                        | Snapshot, `.cancelled`, parent completion, coordinated completion (synthetic receipt only for upgrade-recovered legacy state), registry mark, pane kill | Artifact completion plus later `process_exited`                     |
+| Interactive subtree | Supervisor/lineage action                      | Validate bounded manifests; sort deepest first; skip stale/non-actionable/terminal; continue after failures                                             | Per-node categorized result and artifact/process state              |
+| Workflow            | `cancel_workflow`, cross-mode cancel, shutdown | Abort job and engine, normalize immediately, cancel active runner, post worker abort, terminate thread                                                  | Cancelled workflow state and runner receipts                        |
+| Result wait only    | Abort status/result waiting tool               | Stop waiting; do not cancel underlying in-process/workflow job                                                                                          | `wait_cancelled`/timeout response                                   |
+| Session shutdown    | Pi lifecycle                                   | Fence generation first; clear identity before asynchronous teardown; preserve interactive panes for reload/resume/quit                                  | No late owner delivery; durable state retained or deleted by reason |
 
 Cancellation snapshots are optional under `SUBAGENT_CANCEL_SNAPSHOT=full`.
 They are bounded, atomic, keyed for deduplication, and failure-tolerant.
@@ -1092,7 +1094,7 @@ The restrictive exports map matters: shipping all source files in `package.json#
 - [ ] Live usage is cumulative per agent and aggregates every still-running agent that has reported a live sample.
 - [ ] Cancellation/error usage reaches the terminal background snapshot before completion delivery.
 - [ ] Final per-agent model attribution prefers the runner result and falls back to the request.
-- [ ] Workflow-owned children never publish directly; the workflow aggregate carries the result-tool reference.
+- [ ] Workflow-owned children never publish directly; the background workflow aggregate carries the result-tool reference.
 - [ ] Workflow state is never claimed to survive process restart.
 - [ ] Nested saved workflow execution reuses the same Worker and shared budgets.
 

@@ -103,19 +103,28 @@ Registration happens at spawn. Every parent `agent_settled` seals its registered
 groups, and a group becomes ready only after all members are terminal. `error`
 and `cancelled` are terminal; late members are rejected.
 
-Each terminal record appends one deterministic `subagentura-completion` entry.
-It is rendered in the TUI with `appendEntry`/`registerEntryRenderer` and must
-never enter model context. The only automatic model payload is one bounded,
-hidden `subagent-manifest` with immutable artifact references or explicit result
-tool IDs. Independent ready work coalesces while the parent is busy. Human input
-wins: `before_agent_start` attaches the manifest to the natural turn instead of
-queuing a competing follow-up.
+Each parent-visible standalone terminal record and each background workflow
+aggregate appends
+one deterministic `subagentura-completion` entry. Workflow-owned child turns are
+suppressed. The entry is rendered in the TUI with
+`appendEntry`/`registerEntryRenderer` and must never enter model context. The only
+automatic model payload is one bounded, hidden `subagent-manifest` with immutable
+artifact references or explicit result tool IDs. Independent ready work coalesces
+while the parent is busy. Human input wins: `before_agent_start` attaches the
+manifest to the natural turn instead of queuing a competing follow-up.
 
 Successful terminal reads through `get_subagent_result`,
 `get_workflow_result`, or output-bearing `read_subagent_artifact` must append a
 consumption receipt before returning. Workflow-owned child agents never publish
-directly; only their workflow aggregate does. Preserve that suppression on both
+directly; only their background workflow aggregate does. Preserve that suppression
+on both
 process and in-process runner paths.
+
+Durable notice persistence gates parent manifests. Retain failed notice appends for
+a later bounded retry, reconcile append-then-throw against session entries, and
+never spin while storage remains unavailable. Keep groups bounded to 32
+`source:sourceId` members, 512 groups per parent session, and safe 1–128 character
+IDs. A source satisfies a group once; later turns are independent `each` records.
 
 `notifyOnComplete` and `triggerTurnOnComplete` remain accepted only as deprecated
 compatibility inputs. Both map to coordinated `each` delivery; they must never
