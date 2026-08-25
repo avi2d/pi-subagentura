@@ -54,6 +54,7 @@ The pre-commit hook (`simple-git-hooks` → `lint-staged` → `prettier --write`
 - **Comments only for non-obvious logic** — protocol invariants, the "why" of a guard, the "what this is NOT" of a deliberate limitation. No restating the code.
 - **Declare all variables BEFORE conditional blocks that may return early.** `const`/`let` are hoisted into the TDZ; `if (cond) { return ... }` references before declaration throw at runtime. TypeScript's `no-use-before-define` (strict mode) catches this.
 - **Errors must be explicit.** No silent `catch {}`. If you must swallow, comment why. `try { ... } catch { /* reason */ }` is the pattern.
+- **Runtime logging uses `debugLog`.** Do not call the host `console.*` methods from published runtime source; route diagnostics through `debugLog` from `src/helpers.ts` so logging stays opt-in and cannot corrupt the Pi TUI. The workflow sandbox's injected `console` API is allowed only when its methods route through the workflow logger.
 - **Never hardcode secrets, API keys, or tokens.** This package is published publicly; anything sensitive goes through the Pi SDK's auth path.
 
 ## Project-specific gotchas
