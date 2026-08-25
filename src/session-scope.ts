@@ -162,6 +162,7 @@ export function registerSessionScope(
     }
     if (registration.lineageMode !== undefined) {
       existing.lineageMode = registration.lineageMode;
+    }
     if (registration.isParentIdle !== undefined) {
       existing.isParentIdle = registration.isParentIdle;
     }

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A separate prompt-directed `--orchestratorv2` thin-router mode with bounded project-local responsibility metadata, runtime-authoritative interactive-agent routing, and legacy interactive-session compatibility.
+
 ## [3.3.1] - 2026-08-25
 
 ### Fixed
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known limitations
 
 - Descendant lineage bootstrap credentials expire 60 seconds after creation; delayed child startup leaves the pane usable but recursive interactive spawning unavailable for that session until the child is respawned or started fresh.
+
 ## [3.3.0] - 2026-08-05
 
 ### Added

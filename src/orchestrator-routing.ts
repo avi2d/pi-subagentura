@@ -11,6 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { Type, type Static } from "typebox";
+import { Value } from "typebox/value";
 import { withInteractiveStateLock } from "./artifact";
 import {
   getInteractivePaneLivenessAsync,
@@ -35,6 +37,43 @@ export const MAX_ORCHESTRATOR_TASK_PREVIEW_BYTES = 512;
 const CHILD_ID = /^[a-f0-9]{8}(?:[a-f0-9]{8})?$/;
 const PROJECT_ID = /^[a-f0-9]{64}$/;
 const MAX_UPDATED_AT_BYTES = 64;
+
+// Single parse boundary for untrusted routing records. Structure comes from
+// the schema; byte bounds stay here because they are not expressible in the
+// schema keywords Pi's TypeBox build projects.
+const RoutingRecordSchema = Type.Object({
+  childId: Type.String({ pattern: CHILD_ID.source }),
+  description: Type.String(),
+  aliases: Type.Optional(Type.Array(Type.String())),
+  provenance: Type.Union([
+    Type.Literal("user"),
+    Type.Literal("orchestratorv2"),
+  ]),
+  updatedAt: Type.String(),
+});
+
+type RoutingRecord = Static<typeof RoutingRecordSchema>;
+
+interface TypeBoxParseError {
+  instancePath?: string;
+  message?: string;
+}
+
+const RECORD_FIELD_PARSE_ERRORS: Record<string, string> = {
+  "/childId": "childId must be 8 or 16 lowercase hexadecimal characters",
+  "/provenance": 'provenance must be "user" or "orchestratorv2"',
+};
+
+function firstParseError(errors: readonly unknown[]): string | undefined {
+  const error = errors[0] as TypeBoxParseError | undefined;
+  if (!error) return undefined;
+  const fieldMessage = error.instancePath
+    ? RECORD_FIELD_PARSE_ERRORS[error.instancePath]
+    : undefined;
+  return (
+    fieldMessage ?? `${error.instancePath ?? ""} ${error.message ?? ""}`.trim()
+  );
+}
 
 export function isValidOrchestratorChildId(value: unknown): value is string {
   return typeof value === "string" && CHILD_ID.test(value);
@@ -761,68 +800,6 @@ function validateOverlay(
   };
 }
 
-function validateEntry(value: unknown): OrchestratorRoutingEntry {
-  if (!isRecord(value)) throw new Error("routing record must be an object");
-  rejectUnknownKeys(value, RECORD_KEYS, "routing record");
-  const childId = expectChildId(value.childId);
-  const description = expectBoundedText(
-    value.description,
-    "description",
-    MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
-  );
-  const aliases = validateAliases(value.aliases);
-  const provenance = validateProvenance(value.provenance);
-  const updatedAt = validateUpdatedAt(value.updatedAt);
-  return {
-    childId,
-    description,
-    ...(aliases === undefined ? {} : { aliases }),
-    provenance,
-    updatedAt,
-  };
-}
-
-function validateAliases(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error("aliases must be an array");
-  if (value.length > MAX_ORCHESTRATOR_ROUTING_ALIASES) {
-    throw new Error(
-      `aliases exceeds ${MAX_ORCHESTRATOR_ROUTING_ALIASES} entries`,
-    );
-  }
-  const seen = new Set<string>();
-  return value.map((alias) => {
-    const validated = expectBoundedText(
-      alias,
-      "alias",
-      MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
-    );
-    if (seen.has(validated)) {
-      throw new Error(`duplicate alias: ${validated}`);
-    }
-    seen.add(validated);
-    return validated;
-  });
-}
-
-function validateProvenance(value: unknown): OrchestratorRoutingProvenance {
-  if (value !== "user" && value !== "orchestratorv2") {
-    throw new Error('provenance must be "user" or "orchestratorv2"');
-  }
-  return value;
-}
-
-function validateUpdatedAt(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    Buffer.byteLength(value, "utf8") > MAX_UPDATED_AT_BYTES ||
-    Number.isNaN(Date.parse(value))
-  ) {
-    throw new Error("updatedAt must be a bounded ISO date string");
-  }
-  return value;
-}
-
 function validateProjectId(value: unknown, expected: string): string {
   if (typeof value !== "string" || !PROJECT_ID.test(value)) {
     throw new Error("projectId must be a sha256 hex digest");
@@ -833,23 +810,64 @@ function validateProjectId(value: unknown, expected: string): string {
   return value;
 }
 
-function expectChildId(value: unknown): string {
-  if (!isValidOrchestratorChildId(value)) {
-    throw new Error("childId must be 8 or 16 lowercase hexadecimal characters");
+function validateEntry(value: unknown): OrchestratorRoutingEntry {
+  // Parse untrusted input once into a typed record; refinements below only
+  // enforce byte bounds the JSON Schema keywords cannot express.
+  if (!isRecord(value)) throw new Error("routing record must be an object");
+  rejectUnknownKeys(value, RECORD_KEYS, "routing record");
+  if (!Value.Check(RoutingRecordSchema, value)) {
+    throw new Error(
+      firstParseError(Value.Errors(RoutingRecordSchema, value)) ??
+        "routing record is malformed",
+    );
   }
-  return value;
+  const parsed = value as RoutingRecord;
+  const description = boundedText(
+    parsed.description,
+    "description",
+    MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
+  );
+  let aliases: string[] | undefined;
+  if (parsed.aliases !== undefined) {
+    if (parsed.aliases.length > MAX_ORCHESTRATOR_ROUTING_ALIASES) {
+      throw new Error(
+        `aliases exceeds ${MAX_ORCHESTRATOR_ROUTING_ALIASES} entries`,
+      );
+    }
+    const seen = new Set<string>();
+    aliases = parsed.aliases.map((alias) => {
+      const validated = boundedText(
+        alias,
+        "alias",
+        MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
+      );
+      if (seen.has(validated)) {
+        throw new Error(`duplicate alias: ${validated}`);
+      }
+      seen.add(validated);
+      return validated;
+    });
+  }
+  if (
+    Buffer.byteLength(parsed.updatedAt, "utf8") > MAX_UPDATED_AT_BYTES ||
+    Number.isNaN(Date.parse(parsed.updatedAt))
+  ) {
+    throw new Error("updatedAt must be a bounded ISO date string");
+  }
+  return {
+    childId: parsed.childId,
+    description,
+    ...(aliases === undefined ? {} : { aliases }),
+    provenance: parsed.provenance,
+    updatedAt: parsed.updatedAt,
+  };
 }
 
-function expectBoundedText(
-  value: unknown,
-  label: string,
-  maxBytes: number,
-): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
+function boundedText(value: string, label: string, maxBytes: number): string {
+  if (value.trim().length === 0) {
     throw new Error(`${label} must be a non-empty string`);
   }
-  const bytes = Buffer.byteLength(value, "utf8");
-  if (bytes > maxBytes) {
+  if (Buffer.byteLength(value, "utf8") > maxBytes) {
     throw new Error(`${label} exceeds ${maxBytes} bytes`);
   }
   return value;

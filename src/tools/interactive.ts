@@ -246,9 +246,9 @@ function getArtifactForState(
 
 function resolveInteractiveToolStates(token: SessionToolToken | undefined):
   | {
-    scope?: SessionScope;
-    states: Map<string, InteractiveSubagentState>;
-  }
+      scope?: SessionScope;
+      states: Map<string, InteractiveSubagentState>;
+    }
   | undefined {
   const scope = resolveToolSessionScope(token);
   if (scope) return { scope, states: scope.interactiveStates };
@@ -510,7 +510,7 @@ export function registerInteractiveSubagentTools(
       const preview = task.length > 60 ? `${task.slice(0, 57)}…` : task;
       return new Text(
         theme.fg("toolTitle", theme.bold("subagent_interactive ")) +
-        theme.fg("accent", String(args.name ?? preview)),
+          theme.fg("accent", String(args.name ?? preview)),
         0,
         0,
       );
@@ -535,8 +535,8 @@ export function registerInteractiveSubagentTools(
       }
       return new Text(
         theme.fg("accent", "⚡ ") +
-        theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
-        theme.fg("dim", ` — pane ${paneId}${thinking}`),
+          theme.fg("toolTitle", `Interactive sub-agent ${id}`) +
+          theme.fg("dim", ` — pane ${paneId}${thinking}`),
         0,
         0,
       );
@@ -570,8 +570,8 @@ export function registerInteractiveSubagentTools(
       }
       const states = params.jobId
         ? [visibleStates?.get(params.jobId)].filter(
-          (s): s is InteractiveSubagentState => Boolean(s),
-        )
+            (s): s is InteractiveSubagentState => Boolean(s),
+          )
         : visibleStates
           ? [...visibleStates.values()]
           : [];
@@ -623,10 +623,10 @@ export function registerInteractiveSubagentTools(
       const ownedState = registration?.states.get(params.jobId);
       const state = ownedState
         ? cancelInteractiveSubagent(
-          params.jobId,
-          "cancel_interactive_subagent",
-          ownedState,
-        )
+            params.jobId,
+            "cancel_interactive_subagent",
+            ownedState,
+          )
         : undefined;
       let userNotification: string;
       if (!state) {
@@ -1000,8 +1000,8 @@ export function registerInteractiveSubagentTools(
       const historyLine =
         outputHistory.length > 0
           ? `Protocol-v2 outputs: ${outputHistory
-            .map(({ turnId, eventId }) => `${turnId} → ${eventId}`)
-            .join(", ")}\n`
+              .map(({ turnId, eventId }) => `${turnId} → ${eventId}`)
+              .join(", ")}\n`
           : "";
       return {
         content: [
