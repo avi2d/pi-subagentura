@@ -207,6 +207,7 @@ export function registerWorkflowTool(
             thinkingLevel,
             supervisorOwner,
             sessionScope: childScope,
+            spawnTreeContext: childScope?.spawnTreeContext,
             workflowId: ownedWorkflowId,
             completionOwner: "workflow",
           });

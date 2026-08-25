@@ -40,7 +40,6 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLI_SOURCE } from "./subagent-artifact-cli";
 import {
@@ -53,6 +52,8 @@ import {
   type SubagentEvent,
   type PersistedDeliveryIntent,
   type PersistedLifecycleFold,
+  type ParentCancellationLifecycleReason,
+  type ParentCancellationOrigin,
   removeInteractiveState,
 } from "./artifact";
 import { acknowledgeDeliveryWithoutDispatch, deliveryIdFor } from "./delivery";
@@ -83,6 +84,14 @@ import {
   resolveLineageStorePathsSync,
   writeLineageManifestAtomicSync,
 } from "./interactive-lineage";
+import {
+  createDescendantSpawnTreeContext,
+  defaultSpawnTreeSessionRoot,
+  LINEAGE_BOOTSTRAP_ENV,
+  retireLineageBootstraps,
+  writeLineageBootstrap,
+  type ParsedSpawnTreeContext,
+} from "./spawn-tree-context";
 
 // Re-export the tmux-specific `readPaneExitCode` for the test suite. The
 // launch script's EXIT trap still writes the @pi-exit-code pane option
@@ -137,7 +146,7 @@ When your task is done, follow this checklist in order. The parent is a parent a
   4. Only after the lifecycle command succeeds, produce your final assistant text in the chat summarising what you did and where to find the work. Make no more tool calls during this turn.
   5. Stay in the REPL. Do not call \`/exit\` or press Ctrl-D. The REPL stays open after step 3 so the user (or the parent) can follow up; the wrapper's EXIT trap will only fire if you actually exit. If you exit, the wrapper will treat it as a crash and the parent will not see your final answer.
 
-Do not call 'cancelled' yourself — the parent agent writes that event only when it explicitly aborts you via the cancel_interactive_subagent tool.
+Do not call 'cancelled' yourself — only parent lifecycle or cancellation actions record that event.
 
 For reference: ${cliPath} is the lifecycle CLI. Each invocation appends one NDJSON line to events.ndjson. The parent reads that file every few seconds. The atomic write pattern (write to .tmp, then rename onto output.md) is fine if you want crash-safety.
 
@@ -331,9 +340,7 @@ export function tmuxSetupHint(): string {
 }
 
 function defaultSessionRoot(): string {
-  return process.env.PI_CODING_AGENT_SESSION_DIR
-    ? resolve(process.env.PI_CODING_AGENT_SESSION_DIR)
-    : join(homedir(), ".pi", "agent", "sessions");
+  return defaultSpawnTreeSessionRoot();
 }
 
 function sessionDirFor(cwd: string): string {
@@ -374,7 +381,9 @@ export function buildInteractivePrompt(params: {
     "MANDATORY COMPLETION PROTOCOL: before sending your final assistant response, " +
     "write your result to output.md (path from the system prompt), run the command below, " +
     "and wait for it to succeed. Repeat this for every turn:\n" +
-    '  "$ARTIFACT_DIR/cli.mjs" done 0';
+    '  "$ARTIFACT_DIR/cli.mjs" done 0\n' +
+    "After completion is recorded, remain in the Pi REPL and wait for follow-up. " +
+    "Do not intentionally exit or close the pane unless explicitly asked.";
 
   if (!params.contextText) return params.task + footer;
   return (
@@ -504,6 +513,8 @@ export function launchInteractiveSubagent(params: {
   supervisorOwner?: SessionOwnerToken;
   /** Current runtime scope that authoritatively owns the spawned state. */
   sessionScope?: SessionScope;
+  /** Explicit lineage authority; ambient lineage environment is never consulted. */
+  spawnTreeContext?: ParsedSpawnTreeContext;
   /** Workflow owner for grouping and cancellation. */
   workflowId?: string;
   /** Workflow-managed completions are consumed by the workflow runner. */
@@ -526,37 +537,21 @@ export function launchInteractiveSubagent(params: {
     params.parentSessionId ?? sessionIdForOwner(params.supervisorOwner);
   const background = params.background !== false; // default true (hidden)
   const paths = createInteractiveSubagentPaths({ id, name: params.name, cwd });
-  const parentAgentId = process.env.PI_SUBAGENTURA_AGENT_ID;
-  const rootId = process.env.PI_SUBAGENTURA_ROOT_ID ?? params.parentSessionId;
+  // Parse-don't-validate: callers must hand us an already-parsed context.
+  const spawnTreeContext = params.spawnTreeContext;
+  const parentAgentId = spawnTreeContext?.currentAgentId;
+  const rootId = spawnTreeContext?.rootId;
   const sessionRoot =
-    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT ?? defaultSessionRoot();
-  const currentDepth = Number.parseInt(
-    process.env.PI_SUBAGENTURA_DEPTH ?? "0",
-    10,
-  );
-  const maxDepth = Number.parseInt(
-    process.env.PI_SUBAGENTURA_MAX_DEPTH ?? String(DEFAULT_MAX_DEPTH),
-    10,
-  );
-  const effectiveCurrentDepth = Number.isFinite(currentDepth)
-    ? currentDepth
-    : 0;
-  const effectiveMaxDepth =
-    Number.isFinite(maxDepth) && maxDepth >= 0 ? maxDepth : DEFAULT_MAX_DEPTH;
+    spawnTreeContext?.sessionRoot ?? defaultSpawnTreeSessionRoot();
+  const effectiveCurrentDepth = spawnTreeContext?.depth ?? 0;
+  const effectiveMaxDepth = spawnTreeContext?.maxDepth ?? DEFAULT_MAX_DEPTH;
   const nextDepth = effectiveCurrentDepth + 1;
   if (rootId && nextDepth > effectiveMaxDepth) {
     throw new Error(
       `interactive sub-agent depth ${nextDepth} exceeds max ${effectiveMaxDepth}`,
     );
   }
-  const configuredMaxNodes = Number.parseInt(
-    process.env.PI_SUBAGENTURA_MAX_NODES ?? String(DEFAULT_MAX_NODES),
-    10,
-  );
-  const maxNodes =
-    Number.isFinite(configuredMaxNodes) && configuredMaxNodes > 0
-      ? configuredMaxNodes
-      : DEFAULT_MAX_NODES;
+  const maxNodes = spawnTreeContext?.maxNodes ?? DEFAULT_MAX_NODES;
   // The cap applies whenever a lineage root exists, even when this spawn will
   // not persist a manifest of its own — recursion inside a tree still has to be
   // bounded by that tree's budget.
@@ -656,6 +651,7 @@ export function launchInteractiveSubagent(params: {
   });
   let persistedState = false;
   let lineageManifestPath: string | undefined;
+  let lineageBootstrapPath: string | undefined;
   // Persist as soon as the pane is addressable. A crash after this point is
   // recoverable on reload. If persistence itself fails, abort and kill the
   // pane; otherwise the child would be invisible to rehydrate after a restart.
@@ -687,7 +683,7 @@ export function launchInteractiveSubagent(params: {
       throw err;
     }
   }
-  if (rootId && params.parentSessionId) {
+  if (rootId && artifactOwnerSessionId) {
     try {
       lineageManifestPath = writeLineageManifestAtomicSync(
         lineageStore!.nodesDir,
@@ -697,7 +693,7 @@ export function launchInteractiveSubagent(params: {
           ...(parentAgentId ? { parentAgentId } : {}),
           rootId,
           rootHash: hashLineageRoot(rootId),
-          ownerSessionId: params.parentSessionId,
+          ownerSessionId: artifactOwnerSessionId,
           name: params.name,
           taskPreview: params.task.replace(/\s+/g, " ").slice(0, 4096),
           startedAt: new Date().toISOString(),
@@ -734,13 +730,20 @@ export function launchInteractiveSubagent(params: {
       cwd,
       thinkingLevel: params.thinkingLevel,
     });
+    if (spawnTreeContext) {
+      lineageBootstrapPath = writeLineageBootstrap(
+        paths.artifactDir,
+        createDescendantSpawnTreeContext(
+          spawnTreeContext,
+          id,
+          paths.artifactDir,
+        ),
+      );
+    }
     writeLaunchScript(paths.launchScriptFile, command, paths.artifactDir, {
-      ...(rootId ? { PI_SUBAGENTURA_ROOT_ID: rootId } : {}),
-      ...(rootId ? { PI_SUBAGENTURA_LINEAGE_SESSION_ROOT: sessionRoot } : {}),
-      PI_SUBAGENTURA_AGENT_ID: id,
-      PI_SUBAGENTURA_DEPTH: String(nextDepth),
-      PI_SUBAGENTURA_MAX_DEPTH: String(effectiveMaxDepth),
-      PI_SUBAGENTURA_MAX_NODES: String(maxNodes),
+      ...(lineageBootstrapPath
+        ? { [LINEAGE_BOOTSTRAP_ENV]: lineageBootstrapPath }
+        : {}),
     });
     const escape = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     mux.sendKeys(
@@ -765,6 +768,13 @@ export function launchInteractiveSubagent(params: {
         rmSync(lineageManifestPath, { force: true });
       } catch {
         /* best effort */
+      }
+    }
+    if (lineageBootstrapPath) {
+      try {
+        rmSync(lineageBootstrapPath, { force: true });
+      } catch {
+        /* best effort — the pane kill below is the important cleanup */
       }
     }
     mux.killPane(paneId, muxSession);
@@ -970,11 +980,18 @@ export function sendCommandToTmuxPane(paneId: string, command: string): void {
   mux.sendEnter(paneId);
 }
 
+interface ParentCancellationContext {
+  origin: ParentCancellationOrigin;
+  lifecycleReason?: ParentCancellationLifecycleReason;
+}
+
 export function cancelInteractiveSubagent(
   id: string,
   source: CancellationSnapshotSource = "cancel_interactive_subagent",
   ownedState?: InteractiveSubagentState,
 ): InteractiveSubagentState | undefined {
+  const snapshotSource =
+    source === "supervisor" ? "cancel_interactive_subagent" : source;
   const state =
     ownedState?.id === id ? ownedState : interactiveSubagentRegistry.get(id);
   if (!state) return undefined;
@@ -987,7 +1004,8 @@ export function cancelInteractiveSubagent(
     sessionFile: state.sessionFile,
     artifactDir: state.artifactDir,
     startedAt: state.startedAt,
-    source,
+    source: snapshotSource,
+    cancellationOrigin: source,
   });
   state.cancellationSnapshot = snapshot;
 
@@ -999,7 +1017,8 @@ export function cancelInteractiveSubagent(
   } catch {
     /* best effort — dir may not exist yet if the launch script is still warming up */
   }
-  appendCancellation(state);
+  retireLineageBootstraps(state.artifactDir);
+  appendCancellation(state, { origin: source });
 
   // 2. Update the registry. The poller still processes the durable cancellation.
   state.status = "cancelled";
@@ -1014,6 +1033,7 @@ export function cancelInteractiveSubagent(
 
 function appendCancellation(
   state: InteractiveSubagentState,
+  context: ParentCancellationContext,
   acknowledgeDelivery = true,
 ): void {
   let turnId = "process";
@@ -1033,6 +1053,8 @@ function appendCancellation(
     turnId,
     outcome: "cancelled",
     source: "parent",
+    cancellationOrigin: context.origin,
+    cancellationLifecycleReason: context.lifecycleReason,
   });
   if (!completion) {
     turnId = `process-cancel-${newEventId()}`;
@@ -1040,6 +1062,8 @@ function appendCancellation(
       turnId,
       outcome: "cancelled",
       source: "parent",
+      cancellationOrigin: context.origin,
+      cancellationLifecycleReason: context.lifecycleReason,
     });
   }
   if (!completion) return;
@@ -1074,13 +1098,15 @@ export function cancelInteractiveDescendantByState(
     artifactDir: state.artifactDir,
     startedAt: state.startedAt,
     source: "cancel_interactive_subagent",
+    cancellationOrigin: "supervisor_descendant",
   });
   try {
     writeFileSync(join(state.artifactDir, ".cancelled"), "", { mode: 0o600 });
   } catch {
     /* best effort; the owner will reconcile the durable pane state */
   }
-  appendCancellation(state, false);
+  retireLineageBootstraps(state.artifactDir);
+  appendCancellation(state, { origin: "supervisor_descendant" }, false);
   state.status = "cancelled";
   const mux = getMuxForState(state);
   if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {
@@ -1114,6 +1140,7 @@ export function cancelInteractiveDescendantByState(
  */
 export function cancelInteractiveSubagentByState(
   state: InteractiveSubagentState,
+  context: ParentCancellationContext = { origin: "session_shutdown" },
 ): void {
   const snapshot = snapshotInteractiveContext({
     kind: "interactive",
@@ -1124,6 +1151,8 @@ export function cancelInteractiveSubagentByState(
     artifactDir: state.artifactDir,
     startedAt: state.startedAt,
     source: "session_shutdown",
+    cancellationOrigin: context.origin,
+    cancellationLifecycleReason: context.lifecycleReason,
   });
   state.cancellationSnapshot = snapshot;
 
@@ -1133,9 +1162,10 @@ export function cancelInteractiveSubagentByState(
   } catch {
     /* best-effort */
   }
-  appendCancellation(state);
+  retireLineageBootstraps(state.artifactDir);
+  appendCancellation(state, context);
 
-  // Explicit cancellation is destructive by request: unless absence is
+  // A destructive lifecycle transition owns teardown: unless absence is
   // confirmed, attempt the kill even when the listing probe is unavailable.
   const mux = getMuxForState(state);
   if (mux.getPaneLiveness(state.paneId, state.muxSession) !== "dead") {

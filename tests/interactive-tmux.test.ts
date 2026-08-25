@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   deriveInteractiveSubagentStatus,
   deriveInteractiveSubagentStatusFromEvents,
@@ -17,12 +25,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importFresh } from "./test-utils";
 import { hashLineageRoot } from "../src/interactive-lineage";
+import {
+  createRootSpawnTreeContext,
+  parseSpawnTreeContext,
+  type SpawnTreeContext,
+  type ParsedSpawnTreeContext,
+} from "../src/spawn-tree-context";
 
 import { loadInteractiveStates } from "../src/artifact";
 /** Standard tmux pane id returned by mocks when "new-window"/"split-window" is called. */
 const MOCK_PANE_ID = "%42";
 /** Tab-separated session/window/pane — matches real tmux #{...} format. */
 const MOCK_LOCATION = "sess\t1\t0\n";
+const inheritedLineageEnv = {
+  rootId: process.env.PI_SUBAGENTURA_ROOT_ID,
+  sessionRoot: process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT,
+};
 
 function installMockExec(scenario: (file: string, args: string[]) => string) {
   vi.resetModules();
@@ -45,6 +63,21 @@ function lineageNodesDir(sessionRoot: string, rootId: string): string {
     hashLineageRoot(rootId),
     "nodes",
   );
+}
+
+function syntheticSpawnTreeContext(
+  sessionRoot: string,
+  overrides: Partial<SpawnTreeContext> = {},
+): ParsedSpawnTreeContext {
+  const context: SpawnTreeContext = {
+    ...createRootSpawnTreeContext("root-session", sessionRoot),
+    ...overrides,
+  };
+  if (context.role === "descendant" && context.currentAgentId) {
+    context.artifactDir ??= join(sessionRoot, context.currentAgentId);
+  }
+  // Re-parse so the helper honors the parse-don't-validate brand contract.
+  return parseSpawnTreeContext(context);
 }
 
 /** Write a schema-valid node manifest so the prune sweep can read it. */
@@ -85,6 +118,13 @@ describe("interactive-tmux", () => {
   beforeEach(() => {
     const g = globalThis as any;
     g.__piSubagenturaInteractiveRegistry?.clear?.();
+    // Tests may run inside a live child; never let fixtures mutate its lineage.
+    delete process.env.PI_SUBAGENTURA_AGENT_ID;
+    delete process.env.PI_SUBAGENTURA_ROOT_ID;
+    delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+    delete process.env.PI_SUBAGENTURA_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_DEPTH;
+    delete process.env.PI_SUBAGENTURA_MAX_NODES;
   });
 
   afterEach(() => {
@@ -92,11 +132,26 @@ describe("interactive-tmux", () => {
     delete process.env.PI_SUBAGENTURA_AGENT_ID;
     delete process.env.PI_SUBAGENTURA_ROOT_ID;
     delete process.env.PI_SUBAGENTURA_DEPTH;
+    delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
     delete process.env.PI_SUBAGENTURA_MAX_DEPTH;
     delete process.env.PI_SUBAGENTURA_MAX_NODES;
     vi.doUnmock("node:child_process");
     vi.doUnmock("node:fs");
     vi.doUnmock("../src/artifact");
+  });
+
+  afterAll(() => {
+    if (inheritedLineageEnv.rootId === undefined) {
+      delete process.env.PI_SUBAGENTURA_ROOT_ID;
+    } else {
+      process.env.PI_SUBAGENTURA_ROOT_ID = inheritedLineageEnv.rootId;
+    }
+    if (inheritedLineageEnv.sessionRoot === undefined) {
+      delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+    } else {
+      process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT =
+        inheritedLineageEnv.sessionRoot;
+    }
   });
 
   it("is unavailable when tmux binary is not on PATH", async () => {
@@ -208,6 +263,12 @@ describe("interactive-tmux", () => {
       cwd: tmp,
       parentSessionId: "owner-session",
       parentCwd: tmp,
+      spawnTreeContext: syntheticSpawnTreeContext(tmp, {
+        role: "descendant",
+        currentAgentId: "parent-agent",
+        depth: 1,
+        maxDepth: 4,
+      }),
     });
 
     const manifestPath = join(
@@ -227,10 +288,20 @@ describe("interactive-tmux", () => {
       cwd: tmp,
     });
     const launchScript = readFileSync(state.launchScriptFile, "utf8");
-    expect(launchScript).toContain(
-      `export PI_SUBAGENTURA_AGENT_ID='${state.id}'`,
+    expect(launchScript).toContain("PI_SUBAGENTURA_LINEAGE_BOOTSTRAP=");
+    expect(launchScript).not.toContain("PI_SUBAGENTURA_AGENT_ID=");
+    expect(launchScript).not.toContain("PI_SUBAGENTURA_DEPTH=");
+    const bootstrapName = readdirSync(state.artifactDir).find((name) =>
+      name.startsWith(".lineage-bootstrap-"),
     );
-    expect(launchScript).toContain("export PI_SUBAGENTURA_DEPTH='2'");
+    const bootstrap = JSON.parse(
+      readFileSync(join(state.artifactDir, bootstrapName!), "utf8"),
+    );
+    expect(bootstrap.context).toMatchObject({
+      parentAgentId: "parent-agent",
+      currentAgentId: state.id,
+      depth: 2,
+    });
   });
 
   it("rejects recursive spawns beyond the configured depth before creating a pane", async () => {
@@ -255,6 +326,12 @@ describe("interactive-tmux", () => {
         task: "fail",
         cwd: tmp,
         parentSessionId: "owner-session",
+        spawnTreeContext: syntheticSpawnTreeContext(tmp, {
+          role: "descendant",
+          currentAgentId: "current-agent",
+          depth: 2,
+          maxDepth: 2,
+        }),
       }),
     ).toThrow(/depth 3 exceeds max 2/);
     expect(calls.some((args) => args[0] === "new-window")).toBe(false);
@@ -290,6 +367,7 @@ describe("interactive-tmux", () => {
         task: "fail",
         cwd: tmp,
         parentSessionId: "owner-session",
+        spawnTreeContext: syntheticSpawnTreeContext(tmp, { maxNodes: 1 }),
       }),
     ).toThrow(/reached max nodes 1/);
     expect(calls.some((args) => args[0] === "new-window")).toBe(false);
@@ -323,6 +401,7 @@ describe("interactive-tmux", () => {
       cwd: tmp,
       parentSessionId: "owner-session",
       parentCwd: tmp,
+      spawnTreeContext: syntheticSpawnTreeContext(tmp, { maxNodes: 4 }),
     });
 
     expect(state.id).toBeTruthy();
@@ -359,6 +438,7 @@ describe("interactive-tmux", () => {
       cwd: tmp,
       parentSessionId: "owner-session",
       parentCwd: tmp,
+      spawnTreeContext: syntheticSpawnTreeContext(tmp, { maxNodes: 2 }),
     });
 
     expect(state.id).toBeTruthy();
@@ -398,6 +478,7 @@ describe("interactive-tmux", () => {
         task: "must remain bounded",
         cwd: tmp,
         parentSessionId: "owner-session",
+        spawnTreeContext: syntheticSpawnTreeContext(tmp, { maxNodes: 1 }),
       }),
     ).toThrow(/reached max nodes 1/);
     expect(calls.some((args) => args[0] === "new-window")).toBe(false);
@@ -434,6 +515,7 @@ describe("interactive-tmux", () => {
         task: "fail",
         cwd: tmp,
         parentSessionId: "owner-session",
+        spawnTreeContext: syntheticSpawnTreeContext(tmp, { maxNodes: 4 }),
       }),
     ).toThrow(/reached max nodes 4/);
     expect(calls.some((args) => args[0] === "new-window")).toBe(false);
@@ -990,6 +1072,8 @@ describe("interactive-tmux", () => {
     expect(prompt).toMatch(/before sending your final assistant response/i);
     expect(prompt).toContain('"$ARTIFACT_DIR/cli.mjs" done 0');
     expect(prompt).toMatch(/every turn/i);
+    expect(prompt).toMatch(/remain in the Pi REPL and wait for follow-up/i);
+    expect(prompt).toMatch(/do not intentionally exit or close the pane/i);
   });
 
   describe("system prompt is always written", () => {

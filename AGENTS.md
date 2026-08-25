@@ -137,6 +137,29 @@ deleted on `session_shutdown(reason="new")` to give the next session a clean sla
 On `session_shutdown(reason="quit")` the panes and state file are preserved so the
 subagents survive a restart.
 
+Standalone interactive panes are preserved for continuity transitions (`startup`,
+`reload`, `resume`, and `quit`) and unknown lifecycle reasons. Automatic lifecycle
+cleanup destroys them only for intentional fresh-session transitions (`new` and
+`fork`); workflow-owned panes retain their generation-scoped cleanup. Parent
+cancellation completion events keep `source="parent"` for compatibility and add
+closed-enum `cancellationOrigin` and `cancellationLifecycleReason` diagnostics.
+
+Lineage authority is explicit process state, never ambient `PI_SUBAGENTURA_*`
+metadata. The active `SessionScope` carries a typed lineage context. Child launchers
+write that context to a mode-0600 one-use bootstrap and export only its path. The child
+atomically claims and unlinks the bootstrap before registration; credentials expire
+after 60 seconds, cancellation/fresh transitions retire unclaimed files, and reloads
+reuse the
+process-local copy. Without an explicit context, the supervisor may show and act on
+direct registry entries but must not project persisted lineage. Vitest setup strips
+lineage/bootstrap variables globally, and lineage tests opt into temporary contexts.
+Legacy lineage identity/depth environment variables are intentionally ignored. A
+mixed-version child without a bootstrap degrades to direct-registry-only lineage and
+cannot recursively spawn interactive children until it is respawned; it must never
+reconstruct cancellation authority from inherited env.
+This isolates accidental subprocess inheritance; it is not an OS security boundary
+against malicious same-UID code, which can already address the user's mux directly.
+
 **Delivery receipts:** Rehydrate reconciles deterministic `deliveryId` values
 against parent custom session entries. The synchronous Pi API proves dispatch,
 not durable commit, so delivery is at-least-once and a crash-window duplicate

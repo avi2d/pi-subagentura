@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,6 +29,7 @@ import {
   resolveLineageStorePaths,
   writeLineageManifestAtomic,
 } from "../src/interactive-lineage";
+import { createRootSpawnTreeContext } from "../src/spawn-tree-context";
 import {
   captureInteractiveSubagent,
   focusInteractiveSubagent,
@@ -51,6 +60,10 @@ import {
 
 const tempDirs: string[] = [];
 const savedTmux = process.env.TMUX;
+const inheritedLineageEnv = {
+  rootId: process.env.PI_SUBAGENTURA_ROOT_ID,
+  sessionRoot: process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT,
+};
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "interactive-supervisor-"));
@@ -148,19 +161,18 @@ const savedLineageEnv: Record<string, string | undefined> = {};
  */
 async function lineageHarness(rootId: string) {
   const sessionRoot = tempDir();
-  savedLineageEnv.PI_SUBAGENTURA_ROOT_ID = process.env.PI_SUBAGENTURA_ROOT_ID;
-  savedLineageEnv.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT =
-    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
-  process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
-  process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
   const paths = await resolveLineageStorePaths(sessionRoot, rootId);
   let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
-  registerInteractiveSupervisor({
-    registerCommand: (_name: string, command: { handler: any }) => {
-      commandHandler = command.handler;
-    },
-    registerShortcut: vi.fn(),
-  } as never);
+  registerInteractiveSupervisor(
+    {
+      registerCommand: (_name: string, command: { handler: any }) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never,
+    undefined,
+    createRootSpawnTreeContext(rootId, sessionRoot),
+  );
 
   return {
     sessionRoot,
@@ -230,6 +242,12 @@ async function lineageHarness(rootId: string) {
   };
 }
 
+// A child reviewer inherits live lineage paths; isolate tests from real panes.
+beforeEach(() => {
+  delete process.env.PI_SUBAGENTURA_ROOT_ID;
+  delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+});
+
 afterEach(() => {
   interactiveSubagentRegistry.clear();
   jobRegistry.clear();
@@ -247,6 +265,20 @@ afterEach(() => {
   }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+afterAll(() => {
+  if (inheritedLineageEnv.rootId === undefined) {
+    delete process.env.PI_SUBAGENTURA_ROOT_ID;
+  } else {
+    process.env.PI_SUBAGENTURA_ROOT_ID = inheritedLineageEnv.rootId;
+  }
+  if (inheritedLineageEnv.sessionRoot === undefined) {
+    delete process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT;
+  } else {
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT =
+      inheritedLineageEnv.sessionRoot;
   }
 });
 
@@ -1338,15 +1370,19 @@ describe("interactive supervisor", () => {
     } as never);
     process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
     process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
-    registerInteractiveSupervisor({
-      registerCommand: (
-        _name: string,
-        command: { handler: typeof commandHandler },
-      ) => {
-        commandHandler = command.handler;
-      },
-      registerShortcut: vi.fn(),
-    } as never);
+    registerInteractiveSupervisor(
+      {
+        registerCommand: (
+          _name: string,
+          command: { handler: typeof commandHandler },
+        ) => {
+          commandHandler = command.handler;
+        },
+        registerShortcut: vi.fn(),
+      } as never,
+      undefined,
+      createRootSpawnTreeContext(rootId, sessionRoot),
+    );
     const custom = vi.fn(async (factory: Function) => {
       const component = factory(
         { requestRender: vi.fn() },
@@ -1620,6 +1656,67 @@ describe("interactive supervisor", () => {
     expect(interactiveSubagentRegistry.has(root.id)).toBe(true);
   });
 
+  it("does not authorize lineage projection from ambient environment alone", async () => {
+    const rootId = "ambient-root";
+    const sessionRoot = tempDir();
+    process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
+    process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = sessionRoot;
+    const paths = await resolveLineageStorePaths(sessionRoot, rootId);
+    await writeLineageManifestAtomic(paths.nodesDir, {
+      schemaVersion: LINEAGE_SCHEMA_VERSION,
+      agentId: "external-live-agent",
+      rootId,
+      rootHash: hashLineageRoot(rootId),
+      ownerSessionId: rootId,
+      name: "external-live-agent",
+      taskPreview: "must remain isolated",
+      startedAt: new Date().toISOString(),
+      cwd: sessionRoot,
+      pane: { backend: "tmux", paneId: "%external" },
+    });
+    const killPane = vi.fn();
+    __setTmuxMultiplexer({
+      getPaneLivenessAsync: async () => "alive",
+      getPaneLiveness: () => "alive",
+      killPane,
+      buildAttachCommands: () => ({
+        attachCommand: "tmux attach -t external",
+        focusCommand: "tmux select-pane -t %external",
+      }),
+    } as never);
+    let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
+    registerInteractiveSupervisor({
+      registerCommand: (_name: string, command: { handler: any }) => {
+        commandHandler = command.handler;
+      },
+      registerShortcut: vi.fn(),
+    } as never);
+    let rendered = "";
+    await commandHandler?.("", {
+      sessionManager: { getSessionId: () => rootId },
+      ui: {
+        custom: async (factory: Function) => {
+          const component = factory(
+            { requestRender: vi.fn() },
+            undefined,
+            undefined,
+            vi.fn(),
+          ) as InteractiveSupervisorComponent;
+          rendered = component.render(200).join("\n");
+          component.handleInput("x");
+          return { kind: "close" };
+        },
+        confirm: vi.fn(),
+        notify: vi.fn(),
+        setStatus: vi.fn(),
+      },
+    });
+
+    expect(rendered).not.toContain("external-live-agent");
+    expect(killPane).not.toHaveBeenCalled();
+    expect(readdirSync(paths.nodesDir)).toContain("external-live-agent.json");
+  });
+
   it("probes terminal registry nodes and prunes only confirmed-dead panes", async () => {
     const harness = await lineageHarness("terminal-probe-root");
     await harness.writeNode("alive", { paneId: "%alive" });
@@ -1777,12 +1874,16 @@ describe("interactive supervisor", () => {
     process.env.PI_SUBAGENTURA_LINEAGE_SESSION_ROOT = file;
     let commandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
     let rendered = "";
-    registerInteractiveSupervisor({
-      registerCommand: (_name: string, command: { handler: any }) => {
-        commandHandler = command.handler;
-      },
-      registerShortcut: vi.fn(),
-    } as never);
+    registerInteractiveSupervisor(
+      {
+        registerCommand: (_name: string, command: { handler: any }) => {
+          commandHandler = command.handler;
+        },
+        registerShortcut: vi.fn(),
+      } as never,
+      undefined,
+      createRootSpawnTreeContext("failing-root", file),
+    );
     try {
       await commandHandler?.("", {
         ui: {

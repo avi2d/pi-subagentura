@@ -24,6 +24,10 @@ import {
   resolveLineageStorePaths,
 } from "../src/interactive-lineage";
 import {
+  createDescendantSpawnTreeContext,
+  createRootSpawnTreeContext,
+} from "../src/spawn-tree-context";
+import {
   __resetMuxInstances,
   MUX_CAPABILITIES,
   safeSegment,
@@ -500,9 +504,10 @@ test("launches and projects a recursive child hierarchy across cwd values", asyn
   const childCwd = mkdtempSync(join(tempRoot, "child-workspace-"));
   const grandchildCwd = mkdtempSync(join(tempRoot, "grandchild-workspace-"));
   const rootId = "tmux-recursive-root";
-  process.env.PI_SUBAGENTURA_ROOT_ID = rootId;
-  delete process.env.PI_SUBAGENTURA_AGENT_ID;
-  delete process.env.PI_SUBAGENTURA_DEPTH;
+  const rootContext = createRootSpawnTreeContext(
+    rootId,
+    process.env.PI_CODING_AGENT_SESSION_DIR!,
+  );
 
   const child = launchInteractiveSubagent({
     name: "Recursive child",
@@ -511,9 +516,13 @@ test("launches and projects a recursive child hierarchy across cwd values", asyn
     parentSessionId: "root-owner",
     muxPreference: "tmux",
     background: true,
+    spawnTreeContext: rootContext,
   });
-  process.env.PI_SUBAGENTURA_AGENT_ID = child.id;
-  process.env.PI_SUBAGENTURA_DEPTH = "1";
+  const childContext = createDescendantSpawnTreeContext(
+    rootContext,
+    child.id,
+    child.artifactDir,
+  );
   const grandchild = launchInteractiveSubagent({
     name: "Recursive grandchild",
     task: "nested fake work",
@@ -521,6 +530,7 @@ test("launches and projects a recursive child hierarchy across cwd values", asyn
     parentSessionId: "child-owner",
     muxPreference: "tmux",
     background: true,
+    spawnTreeContext: childContext,
   });
 
   const paths = await resolveLineageStorePaths(
