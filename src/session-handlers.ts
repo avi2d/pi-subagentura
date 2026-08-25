@@ -23,7 +23,7 @@ import {
   clearInProcessDeliveries,
   flushInProcessDeliveries,
 } from "./notifications";
-import { removeInProcessJob } from "./helpers";
+import { debugLog, removeInProcessJob } from "./helpers";
 import { snapshotInProcessSession } from "./cancellation-snapshots";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
 import {
@@ -58,6 +58,12 @@ function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
 }
 
+function logSessionError(event: string, error: unknown): void {
+  const message =
+    error instanceof Error ? (error.stack ?? error.message) : String(error);
+  debugLog("error", event, { error: message });
+}
+
 function isInMemoryWorkflowPane(state: InteractiveSubagentState): boolean {
   return (
     state.completionOwner === "workflow" ||
@@ -70,8 +76,8 @@ function ensureInteractivePoller(globalState: any): void {
   const handle = setInterval(() => {
     for (const scope of getStartedSessionScopes()) {
       const owner = sessionOwner(scope);
-      void pollArtifactChanges(scope.pi, owner).catch((err) => {
-        console.error("[subagentura] artifact poll failed", err);
+      void pollArtifactChanges(scope.pi, owner).catch((error) => {
+        logSessionError("artifact_poll_failed", error);
       });
     }
   }, 5000);
@@ -165,12 +171,12 @@ async function revokeAndReleaseDurableWorkflowAuthoritySafely(
   try {
     await store.revoke();
   } catch (error) {
-    console.error("[subagentura] durable workflow store revoke failed", error);
+    logSessionError("durable_workflow_store_revoke_failed", error);
   }
   try {
     await store.release();
   } catch (error) {
-    console.error("[subagentura] durable workflow lease release failed", error);
+    logSessionError("durable_workflow_lease_release_failed", error);
   }
   if (scope.durableWorkflowStore === store) {
     scope.durableWorkflowStore = undefined;
@@ -302,10 +308,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
         ctx.sessionManager?.getSessionId?.(),
       );
     } catch (error) {
-      console.error(
-        "[subagentura] durable workflow ownership is unavailable",
-        error,
-      );
+      logSessionError("durable_workflow_ownership_unavailable", error);
     }
 
     if (scope.lifecycle === "started") {
@@ -366,10 +369,7 @@ export function registerSessionHandlers(pi: ExtensionAPI): SessionScope {
       try {
         await recoverDurableWorkflowProjections(scope);
       } catch (error) {
-        console.error(
-          "[subagentura] durable workflow namespace recovery failed",
-          error,
-        );
+        logSessionError("durable_workflow_namespace_recovery_failed", error);
       }
     }
   });
