@@ -343,7 +343,7 @@ describe("WorkflowTreeComponent", () => {
     expect(done).toHaveBeenCalledTimes(2);
   });
 
-  it("returns a cancellation action without mutating the selected workflow", () => {
+  it("cancels the selected running workflow with c", () => {
     const job = makeJob({
       snapshot: {
         ...makeJob().snapshot,
@@ -358,11 +358,11 @@ describe("WorkflowTreeComponent", () => {
 
     component.handleInput("c");
 
-    expect(abortSpy).not.toHaveBeenCalled();
-    expect(job.status).toBe("running");
-    expect(job.snapshot.runningCount).toBe(1);
-    expect(job.snapshot.agentRecords?.[0]?.status).toBe("running");
-    expect(notify).toHaveBeenCalledWith("Cancelling workflow wf_test.");
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(job.status).toBe("cancelled");
+    expect(job.snapshot.runningCount).toBe(0);
+    expect(job.snapshot.agentRecords?.[0]?.status).toBe("cancelled");
+    expect(notify).toHaveBeenCalledWith("Cancelled workflow wf_test.");
     expect(done).toHaveBeenCalledWith({
       kind: "cancel",
       workflowId: "wf_test",

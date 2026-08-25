@@ -13,11 +13,7 @@ import {
   type InteractiveSubagentState,
 } from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
-import {
-  durableWorkflowLiveJobRegistry,
-  registerDurableWorkflowLiveJob,
-  workflowJobRegistry,
-} from "../src/workflow-jobs";
+import { workflowJobRegistry } from "../src/workflow-jobs";
 import { appendEvent, artifactPath } from "../src/artifact";
 import { __setTmuxMultiplexer } from "../src/multiplexer";
 import { updateRunningSubagentFooter } from "../src/artifact-poller";
@@ -145,7 +141,6 @@ describe("session handler lifecycle callbacks", () => {
     jobRegistry.clear();
     workflowJobRegistry.clear();
     interactiveSubagentRegistry.clear();
-    durableWorkflowLiveJobRegistry.clear();
     clearSessionScopes();
     const globalState = globalThis as any;
     globalState.__piSubagenturaInteractivePollerHandle = undefined;
@@ -161,7 +156,6 @@ describe("session handler lifecycle callbacks", () => {
     vi.useRealTimers();
     jobRegistry.clear();
     workflowJobRegistry.clear();
-    durableWorkflowLiveJobRegistry.clear();
     interactiveSubagentRegistry.clear();
     clearSessionScopes();
     __setTmuxMultiplexer(undefined);
@@ -195,137 +189,72 @@ describe("session handler lifecycle callbacks", () => {
     expect((globalThis as any).__piSubagenturaPiRef).toBeUndefined();
   });
 
-  it("drains delayed durable abort completion before revoking and releasing replacement authority", async () => {
-    const registration = registerHandlers();
-    const ctx = startSession(registration, root, "session-delayed-durable");
-    const { sessionScope: scope, handlers } = registration;
-    let revoked = false;
-    const revoke = vi.fn(async () => {
-      revoked = true;
-    });
-    const release = vi.fn(async () => {
-      expect(revoked).toBe(true);
-    });
-    scope.durableWorkflowStore = {
-      revoke,
-      release,
-    } as unknown as NonNullable<SessionScope["durableWorkflowStore"]>;
-    scope.durableWorkflowController = {} as unknown as NonNullable<
-      SessionScope["durableWorkflowController"]
-    >;
-
-    let finishAbort!: () => void;
-    const abortFinished = new Promise<void>((resolve) => {
-      finishAbort = resolve;
-    });
-    let callbackCompleted = false;
-    const completion = abortFinished.then(() => {
-      callbackCompleted = true;
-    });
-    const abort = new AbortController();
-    registerDurableWorkflowLiveJob({
-      id: "durable-delayed-shutdown",
-      name: "durable delayed shutdown",
-      startedAt: Date.now(),
-      runEpoch: 1,
-      promise: completion,
-      abort,
-      parentSessionOwner: sessionOwner(scope),
-    });
-
-    const shutdown = handlers.get("session_shutdown")![0](
-      { reason: "reload" },
-      ctx,
-    ) as Promise<void>;
-    expect(abort.signal.aborted).toBe(true);
-    expect(durableWorkflowLiveJobRegistry.has("durable-delayed-shutdown")).toBe(
-      false,
-    );
-    await Promise.resolve();
-    expect(revoke).not.toHaveBeenCalled();
-    expect(release).not.toHaveBeenCalled();
-
-    finishAbort();
-    await shutdown;
-    expect(callbackCompleted).toBe(true);
-    expect(revoke).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledOnce();
-    expect(revoke.mock.invocationCallOrder[0]).toBeLessThan(
-      release.mock.invocationCallOrder[0],
-    );
-    expect(scope.durableWorkflowStore).toBeUndefined();
-    expect(scope.durableWorkflowController).toBeUndefined();
-  });
-
   it.each([
     ["A-first", "a"],
     ["B-first", "b"],
-  ])(
-    "%s shutdown preserves the peer scope and its state",
-    async (_label, first) => {
-      const a = registerHandlers();
-      const b = registerHandlers();
-      const aCtx = startSession(a, root, "session-a");
-      const bCtx = startSession(b, root, "session-b");
-      const aJob = ownedJob(a.sessionScope, "job-a");
-      const bJob = ownedJob(b.sessionScope, "job-b");
-      const aWorkflow = ownedWorkflow(a.sessionScope, "workflow-a");
-      const bWorkflow = ownedWorkflow(b.sessionScope, "workflow-b");
-      const aState = ownedInteractive(
-        a.sessionScope,
-        root,
-        "state-a",
-        "session-a",
-      );
-      const bState = ownedInteractive(
-        b.sessionScope,
-        root,
-        "state-b",
-        "session-b",
-      );
+  ])("%s shutdown preserves the peer scope and its state", (_label, first) => {
+    const a = registerHandlers();
+    const b = registerHandlers();
+    const aCtx = startSession(a, root, "session-a");
+    const bCtx = startSession(b, root, "session-b");
+    const aJob = ownedJob(a.sessionScope, "job-a");
+    const bJob = ownedJob(b.sessionScope, "job-b");
+    const aWorkflow = ownedWorkflow(a.sessionScope, "workflow-a");
+    const bWorkflow = ownedWorkflow(b.sessionScope, "workflow-b");
+    const aState = ownedInteractive(
+      a.sessionScope,
+      root,
+      "state-a",
+      "session-a",
+    );
+    const bState = ownedInteractive(
+      b.sessionScope,
+      root,
+      "state-b",
+      "session-b",
+    );
 
-      const shutting = first === "a" ? a : b;
-      const surviving = first === "a" ? b : a;
-      const shuttingCtx = first === "a" ? aCtx : bCtx;
-      const survivingCtx = first === "a" ? bCtx : aCtx;
-      const survivingJob = first === "a" ? bJob : aJob;
-      const survivingWorkflow = first === "a" ? bWorkflow : aWorkflow;
-      const survivingState = first === "a" ? bState : aState;
-      const removedJob = first === "a" ? aJob : bJob;
+    const shutting = first === "a" ? a : b;
+    const surviving = first === "a" ? b : a;
+    const shuttingCtx = first === "a" ? aCtx : bCtx;
+    const survivingCtx = first === "a" ? bCtx : aCtx;
+    const survivingJob = first === "a" ? bJob : aJob;
+    const survivingWorkflow = first === "a" ? bWorkflow : aWorkflow;
+    const survivingState = first === "a" ? bState : aState;
+    const removedJob = first === "a" ? aJob : bJob;
 
-      await shutting.handlers.get("session_shutdown")![0](
-        { reason: "new" },
-        shuttingCtx,
-      );
+    shutting.handlers.get("session_shutdown")![0](
+      { reason: "new" },
+      shuttingCtx,
+    );
 
-      expect(shutting.sessionScope.lifecycle).toBe("shutdown");
-      expect(surviving.sessionScope.lifecycle).toBe("started");
-      expect(getSessionScopes()).toEqual([surviving.sessionScope]);
-      expect(removedJob.abort).toHaveBeenCalledOnce();
-      expect(survivingJob.abort).not.toHaveBeenCalled();
-      expect(jobRegistry.get(survivingJob.job.id)).toBe(survivingJob.job);
-      expect(workflowJobRegistry.get(survivingWorkflow.workflow.id)).toBe(
-        survivingWorkflow.workflow,
-      );
-      expect(survivingWorkflow.abort.signal.aborted).toBe(false);
-      expect(interactiveSubagentRegistry.get(survivingState.id)).toBe(
-        survivingState,
-      );
-      expect(
-        (globalThis as any).__piSubagenturaInteractivePollerHandle,
-      ).toBeDefined();
+    expect(shutting.sessionScope.lifecycle).toBe("shutdown");
+    expect(surviving.sessionScope.lifecycle).toBe("started");
+    expect(getSessionScopes()).toEqual([surviving.sessionScope]);
+    expect(removedJob.abort).toHaveBeenCalledOnce();
+    expect(survivingJob.abort).not.toHaveBeenCalled();
+    expect(jobRegistry.get(survivingJob.job.id)).toBe(survivingJob.job);
+    expect(workflowJobRegistry.get(survivingWorkflow.workflow.id)).toBe(
+      survivingWorkflow.workflow,
+    );
+    expect(survivingWorkflow.abort.signal.aborted).toBe(false);
+    expect(interactiveSubagentRegistry.get(survivingState.id)).toBe(
+      survivingState,
+    );
+    expect(
+      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+    ).toBeDefined();
 
-      await surviving.handlers.get("session_shutdown")![0](
-        { reason: "quit" },
-        survivingCtx,
-      );
-      expect(
-        (globalThis as any).__piSubagenturaInteractivePollerHandle,
-      ).toBeUndefined();
-    },
-  );
+    surviving.handlers.get("session_shutdown")![0](
+      { reason: "quit" },
+      survivingCtx,
+    );
+    expect(
+      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+    ).toBeUndefined();
+  });
 
-  it("a second session_start cleans only that scope's prior generation", async () => {
+  it("a second session_start cleans only that scope's prior generation", () => {
     const a = registerHandlers();
     const b = registerHandlers();
     startSession(a, root, "session-a");
@@ -346,7 +275,7 @@ describe("session handler lifecycle callbacks", () => {
     const sharedPoller = (globalThis as any)
       .__piSubagenturaInteractivePollerHandle;
 
-    await b.handlers.get("session_start")![0]({ reason: "new" }, bCtx);
+    b.handlers.get("session_start")![0]({ reason: "new" }, bCtx);
 
     expect(sessionOwner(a.sessionScope)).toEqual(aOwner);
     expect((globalThis as any).__piSubagenturaInteractivePollerHandle).toBe(

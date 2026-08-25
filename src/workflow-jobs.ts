@@ -85,15 +85,6 @@ export interface WorkflowJobState {
   /** Parent session lifecycle that owns this workflow job. */
   parentSessionOwner?: SessionOwnerToken;
 }
-export interface DurableWorkflowLiveJob {
-  id: string;
-  name: string;
-  startedAt: number;
-  runEpoch: number;
-  promise: Promise<unknown>;
-  abort: AbortController;
-  parentSessionOwner?: SessionOwnerToken;
-}
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
   // eslint-disable-next-line no-var
@@ -106,32 +97,8 @@ export const workflowJobRegistry = g.__piSubagenturaWorkflowJobs as Map<
   string,
   WorkflowJobState
 >;
-declare global {
-  // eslint-disable-next-line no-var
-  var __piSubagenturaDurableWorkflowLiveJobs:
-    Map<string, DurableWorkflowLiveJob> | undefined;
-}
-if (!g.__piSubagenturaDurableWorkflowLiveJobs) {
-  g.__piSubagenturaDurableWorkflowLiveJobs = new Map();
-}
-export const durableWorkflowLiveJobRegistry =
-  g.__piSubagenturaDurableWorkflowLiveJobs as Map<
-    string,
-    DurableWorkflowLiveJob
-  >;
 
 export const MAX_WORKFLOW_JOBS = 100;
-export function createDurableWorkflowRunId(): string {
-  for (;;) {
-    const runId = `wf_${randomBytes(16).toString("hex")}`;
-    if (
-      !workflowJobRegistry.has(runId) &&
-      !durableWorkflowLiveJobRegistry.has(runId)
-    ) {
-      return runId;
-    }
-  }
-}
 
 /** Maximum notification delivery attempts before giving up. */
 export const MAX_WORKFLOW_NOTIFICATION_ATTEMPTS = 5;
@@ -167,36 +134,6 @@ export function getWorkflowJobForOwner(
   if (!job || !workflowJobBelongsToOwner(job, owner)) return undefined;
   return job;
 }
-export function getDurableWorkflowLiveJobForOwner(
-  workflowId: string,
-  owner: SessionOwnerToken | undefined,
-): DurableWorkflowLiveJob | undefined {
-  const job = durableWorkflowLiveJobRegistry.get(workflowId);
-  if (!job) return undefined;
-  if (!owner) return job.parentSessionOwner ? undefined : job;
-  return job.parentSessionOwner?.id === owner.id &&
-    job.parentSessionOwner.generation === owner.generation
-    ? job
-    : undefined;
-}
-
-export function registerDurableWorkflowLiveJob(
-  job: DurableWorkflowLiveJob,
-): void {
-  if (
-    workflowJobRegistry.has(job.id) ||
-    durableWorkflowLiveJobRegistry.has(job.id)
-  ) {
-    throw new Error(`Workflow id is already live: ${job.id}`);
-  }
-  durableWorkflowLiveJobRegistry.set(job.id, job);
-  const forget = () => {
-    if (durableWorkflowLiveJobRegistry.get(job.id) === job) {
-      durableWorkflowLiveJobRegistry.delete(job.id);
-    }
-  };
-  void job.promise.then(forget, forget);
-}
 
 export function workflowJobsForActiveSession(): WorkflowJobState[] {
   return workflowJobsForOwner(getActiveSessionOwner());
@@ -212,7 +149,7 @@ export function workflowJobsForOwner(
 
 export function cleanupWorkflowJobsForOwner(
   owner: SessionOwnerToken | undefined,
-): Promise<void> {
+): void {
   for (const [id, job] of workflowJobRegistry) {
     if (!workflowJobBelongsToOwner(job, owner)) continue;
     job.suppressCompletionNotification = true;
@@ -223,21 +160,6 @@ export function cleanupWorkflowJobsForOwner(
     if (job.status === "cancelled") normalizeCancelledWorkflowState(job);
     workflowJobRegistry.delete(id);
   }
-
-  const durableCompletions: Promise<unknown>[] = [];
-  for (const [id, job] of durableWorkflowLiveJobRegistry) {
-    const belongs = owner
-      ? job.parentSessionOwner?.id === owner.id &&
-        job.parentSessionOwner.generation === owner.generation
-      : !job.parentSessionOwner;
-    if (!belongs) continue;
-    durableCompletions.push(job.promise);
-    job.abort.abort(
-      new Error("Durable workflow interrupted by parent session shutdown"),
-    );
-    durableWorkflowLiveJobRegistry.delete(id);
-  }
-  return Promise.allSettled(durableCompletions).then(() => undefined);
 }
 
 async function runTrackedWorkflowAgent(
