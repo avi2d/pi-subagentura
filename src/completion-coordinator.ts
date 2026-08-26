@@ -146,6 +146,7 @@ interface CompletionOverflowState {
   retirementBlocked: boolean;
   retirementBlockedAt?: number;
   pendingRecords: Map<string, CompletionRecord>;
+  retirementMetadataDirty: boolean;
   appendFailures: number;
   noticeGeneration: number;
   noticeDeliveredGeneration: number;
@@ -586,6 +587,7 @@ function loadOverflowState(owner: SessionOwnerToken): CompletionOverflowState {
     retirementBlocked: index.retirementBlocked,
     retirementBlockedAt: index.retirementBlockedAt,
     pendingRecords: new Map(),
+    retirementMetadataDirty: false,
     appendFailures: index.failed ? 1 : 0,
     noticeGeneration: 0,
     noticeDeliveredGeneration: 0,
@@ -794,6 +796,9 @@ function appendOverflowRecord(
     !nextRetirementBlocked && record.sequence !== undefined
       ? Math.max(previousRetiredThrough ?? 0, record.sequence)
       : previousRetiredThrough;
+  const retirementStateChanged =
+    state.overflow.retirementBlocked !== nextRetirementBlocked ||
+    state.overflow.retirementBlockedAt !== nextRetirementBlockedAt;
   try {
     const result = appendLedgerLine(
       state.overflow.path,
@@ -801,28 +806,16 @@ function appendOverflowRecord(
       { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
     );
     state.overflow.rotated ||= result.dropped > 0;
-    const meta = appendLedgerLine(
-      state.overflow.path,
-      JSON.stringify({
-        kind: "overflow-meta",
-        rotated: state.overflow.rotated,
-        ...(nextRetiredThrough !== undefined
-          ? { retiredThrough: nextRetiredThrough }
-          : {}),
-        retirementBlocked: nextRetirementBlocked,
-        ...(nextRetirementBlockedAt !== undefined
-          ? { retirementBlockedAt: nextRetirementBlockedAt }
-          : {}),
-      }),
-      { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
-    );
-    state.overflow.rotated ||= meta.dropped > 0;
-    if (meta.dropped > 0 && state.overflow.rotated) {
-      appendLedgerLine(
+    if (
+      result.dropped > 0 ||
+      state.overflow.retirementMetadataDirty ||
+      retirementStateChanged
+    ) {
+      const meta = appendLedgerLine(
         state.overflow.path,
         JSON.stringify({
           kind: "overflow-meta",
-          rotated: true,
+          rotated: state.overflow.rotated,
           ...(nextRetiredThrough !== undefined
             ? { retiredThrough: nextRetiredThrough }
             : {}),
@@ -833,6 +826,25 @@ function appendOverflowRecord(
         }),
         { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
       );
+      state.overflow.rotated ||= meta.dropped > 0;
+      if (meta.dropped > 0 && state.overflow.rotated) {
+        appendLedgerLine(
+          state.overflow.path,
+          JSON.stringify({
+            kind: "overflow-meta",
+            rotated: true,
+            ...(nextRetiredThrough !== undefined
+              ? { retiredThrough: nextRetiredThrough }
+              : {}),
+            retirementBlocked: nextRetirementBlocked,
+            ...(nextRetirementBlockedAt !== undefined
+              ? { retirementBlockedAt: nextRetirementBlockedAt }
+              : {}),
+          }),
+          { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
+        );
+      }
+      state.overflow.retirementMetadataDirty = false;
     }
     state.overflow.retiredThrough = nextRetiredThrough;
     state.overflow.retirementBlocked = nextRetirementBlocked;
@@ -858,6 +870,7 @@ function appendOverflowRecord(
       );
     state.overflow.appendFailures++;
     state.overflow.retirementBlocked = true;
+    state.overflow.retirementMetadataDirty = true;
     if (record.sequence !== undefined) {
       state.overflow.retirementBlockedAt = Math.min(
         state.overflow.retirementBlockedAt ?? record.sequence,
