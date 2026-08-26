@@ -172,6 +172,7 @@ interface CompletionCoordinatorState {
   consumptionLedgerPath: string;
   fallbackReceiptOffset: number;
   fallbackReceiptDropping: boolean;
+  fallbackReceiptScanPending: boolean;
   fallbackExpectations: Map<string, CompletionExpectation>;
   deferredConsumedIds: Set<string>;
   groupReservations: Map<string, number>;
@@ -659,15 +660,23 @@ function reconcileFallbackConsumptions(
   state: CompletionCoordinatorState,
 ): void {
   const records = [...state.records.values()];
-  for (const record of records) {
-    if (state.deferredConsumedIds.has(record.completionId)) {
-      state.consumed.add(record.completionId);
-      state.dispatchAttempted.delete(record.completionId);
-    }
+  for (const completionId of state.deferredConsumedIds) {
+    if (!state.records.has(completionId)) continue;
+    state.consumed.add(completionId);
+    state.dispatchAttempted.delete(completionId);
+    state.deferredConsumedIds.delete(completionId);
+    state.fallbackExpectations.delete(completionId);
+  }
+  if (
+    !state.fallbackReceiptScanPending &&
+    state.fallbackExpectations.size === 0
+  ) {
+    return;
   }
   const known = new Set(
     state.sourceConsumptions.map((consumption) => JSON.stringify(consumption)),
   );
+  const matchedExpectationIds = new Set<string>();
   try {
     const result = scanLedgerLines(
       state.consumptionLedgerPath,
@@ -696,6 +705,7 @@ function reconcileFallbackConsumptions(
         for (const expectation of state.fallbackExpectations.values()) {
           if (expectationMatchesConsumption(expectation, consumption)) {
             state.deferredConsumedIds.add(expectation.completionId);
+            matchedExpectationIds.add(expectation.completionId);
           }
         }
       },
@@ -711,10 +721,18 @@ function reconcileFallbackConsumptions(
       if (state.deferredConsumedIds.delete(record.completionId)) {
         state.consumed.add(record.completionId);
         state.dispatchAttempted.delete(record.completionId);
+        state.fallbackExpectations.delete(record.completionId);
       }
-      state.fallbackExpectations.delete(record.completionId);
     }
+    for (const completionId of matchedExpectationIds) {
+      if (!state.deferredConsumedIds.has(completionId)) {
+        state.fallbackExpectations.delete(completionId);
+      }
+    }
+    state.fallbackReceiptScanPending =
+      result.dropping || state.fallbackExpectations.size > 0;
   } catch (error) {
+    state.fallbackReceiptScanPending = state.fallbackExpectations.size > 0;
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       debugLog("warn", "completion_consumption_ledger_scan_failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -1012,17 +1030,34 @@ function reconcileState(state: CompletionCoordinatorState): void {
     -MAX_COMPLETION_RECORDS,
   );
   reconcileFallbackConsumptions(state);
-  for (const record of state.records.values()) {
+  const markConsumed = (record: CompletionRecord): void => {
+    state.consumed.add(record.completionId);
+    state.dispatchAttempted.delete(record.completionId);
+    state.fallbackExpectations.delete(record.completionId);
+  };
+  for (const record of completionEntries.values()) {
     if (
-      manifestIds.has(record.completionId) ||
-      (!state.fallbackExpectations.has(record.completionId) &&
-        state.sourceConsumptions.some((consumption) =>
-          matchesConsumption(record, consumption),
-        ))
+      !state.fallbackExpectations.has(record.completionId) &&
+      state.sourceConsumptions.some((consumption) =>
+        matchesConsumption(record, consumption),
+      )
     ) {
-      state.consumed.add(record.completionId);
-      state.dispatchAttempted.delete(record.completionId);
-      state.fallbackExpectations.delete(record.completionId);
+      markConsumed(record);
+    }
+  }
+  for (const completionId of manifestIds) {
+    const record = state.records.get(completionId);
+    if (record) markConsumed(record);
+  }
+  if (consumptions.length === 0) return;
+  for (const record of state.records.values()) {
+    if (state.fallbackExpectations.has(record.completionId)) continue;
+    if (
+      consumptions.some((consumption) =>
+        matchesConsumption(record, consumption),
+      )
+    ) {
+      markConsumed(record);
     }
   }
 }
@@ -1057,6 +1092,7 @@ function getState(
     consumptionLedgerPath: completionConsumptionPath(resolvedOwner),
     fallbackReceiptOffset: 0,
     fallbackReceiptDropping: false,
+    fallbackReceiptScanPending: true,
     fallbackExpectations: new Map(),
     deferredConsumedIds: new Set(),
     groupReservations: new Map(),
@@ -1524,6 +1560,7 @@ export function registerCompletionExpectations(
   if (expectations.length === 0) return;
   const state = getState(owner, { reconcile: false });
   if (!state) return;
+  state.fallbackReceiptScanPending = true;
   for (const expectation of expectations) {
     if (
       expectation.source !== "interactive" &&
