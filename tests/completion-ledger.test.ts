@@ -55,4 +55,16 @@ describe("completion ledger", () => {
       }),
     ).toThrow();
   });
+  it("fails closed on a symlinked parent directory", () => {
+    root = mkdtempSync(join(tmpdir(), "completion-ledger-parent-symlink-"));
+    const linked = join(root, "linked");
+    const path = join(linked, ".pi", "ledger.ndjson");
+    symlinkSync(root, linked);
+    expect(() =>
+      appendLedgerLine(path, JSON.stringify({ id: 1 }), {
+        maxRecords: 2,
+        maxBytes: 100,
+      }),
+    ).toThrow();
+  });
 });

@@ -1371,6 +1371,7 @@ export interface InteractiveSubagentPersistedStateV1 {
   triggerTurnOnComplete?: boolean;
   completionPolicy?: "each" | "group";
   completionTombstone?: "failed";
+  completionTombstoneAt?: number;
   completionGroupId?: string;
 
   /** Parent pi session id; only rehydrated when the current session matches. */
@@ -1716,6 +1717,11 @@ function migrateStatePayload(
         ...(completionPolicy === "group" ? { completionGroupId } : {}),
         ...(entry.completionTombstone === "failed"
           ? { completionTombstone: "failed" as const }
+          : {}),
+        ...(typeof entry.completionTombstoneAt === "number" &&
+        Number.isFinite(entry.completionTombstoneAt) &&
+        entry.completionTombstoneAt >= 0
+          ? { completionTombstoneAt: entry.completionTombstoneAt }
           : {}),
         ...(typeof entry.parentSessionId === "string"
           ? { parentSessionId: entry.parentSessionId }

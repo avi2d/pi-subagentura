@@ -82,6 +82,7 @@ function formatFollowupPreview(message: string): string {
 function persistInteractiveRollbackTombstone(
   state: InteractiveSubagentState,
 ): void {
+  const tombstoneAt = Date.now();
   if (!state.parentSessionId) return;
   try {
     updateInteractiveState(state.cwd, state.id, (entry) => {
@@ -90,6 +91,7 @@ function persistInteractiveRollbackTombstone(
       delete entry.notifyOnComplete;
       delete entry.triggerTurnOnComplete;
       entry.completionTombstone = "failed";
+      entry.completionTombstoneAt = tombstoneAt;
     });
   } catch (error) {
     debugLog("warn", "interactive_spawn_tombstone_failed", {

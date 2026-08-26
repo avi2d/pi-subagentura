@@ -30,6 +30,8 @@ import {
 } from "./interactive-tmux";
 import { sessionOwner, type SessionScope } from "./session-scope";
 
+export const FAILED_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
+
 export function rehydrateInteractiveSubagents(
   cwd: string,
   currentSessionId?: string,
@@ -46,10 +48,20 @@ export function rehydrateInteractiveSubagents(
   let alive = 0;
   let terminal = 0;
 
+  const now = Date.now();
   for (const entry of Object.values(
     payload.states,
   ) as Array<InteractiveSubagentPersistedStateV2>) {
-    if (entry.completionTombstone === "failed") continue;
+    const tombstoneAt = entry.completionTombstoneAt;
+    const tombstoneExpired =
+      tombstoneAt === undefined ||
+      (typeof tombstoneAt === "number" &&
+        Number.isFinite(tombstoneAt) &&
+        tombstoneAt <= now &&
+        now - tombstoneAt >= FAILED_TOMBSTONE_TTL_MS);
+    if (entry.completionTombstone === "failed" && !tombstoneExpired) {
+      continue;
+    }
     if (currentSessionId && entry.parentSessionId !== currentSessionId) {
       continue;
     }

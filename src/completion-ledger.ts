@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   closeSync,
   constants,
   fchmodSync,
@@ -8,12 +9,28 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { randomUUID, createHash } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, parse, resolve, sep } from "node:path";
+// macOS exposes these two stable system aliases; every other parent symlink fails closed.
+
+function darwinRootAlias(
+  root: string,
+  current: string,
+  next: string,
+  part: string,
+): string | undefined {
+  if (process.platform !== "darwin" || current !== root) return undefined;
+  if (part !== "tmp" && part !== "var") {
+    return undefined;
+  }
+  const canonical = `/private/${part}`;
+  return realpathSync(next) === canonical ? canonical : undefined;
+}
 
 export interface LedgerReadResult {
   lines: string[];
@@ -23,6 +40,39 @@ export interface LedgerReadResult {
 export interface LedgerAppendResult {
   ok: boolean;
   dropped: number;
+}
+
+function ensureLedgerParent(path: string): void {
+  const parent = dirname(resolve(path));
+  const root = parse(parent).root;
+  const relative = parent.slice(root.length);
+  let current = root;
+  for (const part of relative.split(sep).filter(Boolean)) {
+    const next = join(current, part);
+    try {
+      const stat = lstatSync(next);
+      if (stat.isSymbolicLink()) {
+        const alias = darwinRootAlias(root, current, next, part);
+        if (alias) {
+          current = alias;
+          continue;
+        }
+        throw new Error(`Ledger parent is not a directory: ${next}`);
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`Ledger parent is not a directory: ${next}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      mkdirSync(next, { mode: 0o700 });
+      const stat = lstatSync(next);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error(`Ledger parent is not a directory: ${next}`);
+      }
+    }
+    if (part === ".pi") chmodSync(next, 0o700);
+    current = next;
+  }
 }
 
 function noFollow(): number {
@@ -36,7 +86,7 @@ function assertRegularLedger(path: string): void {
 }
 
 function openLedger(path: string, flags: number, mode?: number): number {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  ensureLedgerParent(path);
   try {
     assertRegularLedger(path);
   } catch (error) {
@@ -109,7 +159,7 @@ export function readLedgerLines(
 }
 
 function writeLedger(path: string, lines: string[]): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  ensureLedgerParent(path);
   try {
     assertRegularLedger(path);
   } catch (error) {

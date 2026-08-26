@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -686,6 +687,34 @@ describe("completion coordinator", () => {
     );
   });
 
+  it("clears consumed reservations before sealing a concurrent group", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    const first = reserveCompletionGroup("group", "reserved", owner);
+    const second = reserveCompletionGroup("group", "reserved", owner);
+    registerCompletionMember(
+      "interactive",
+      "reserved-a",
+      "group",
+      "reserved",
+      owner,
+      first,
+    );
+    registerCompletionMember(
+      "interactive",
+      "reserved-b",
+      "group",
+      "reserved",
+      owner,
+      second,
+    );
+    sealCompletionGroups(owner);
+    expect(() => assertCompletionGroupOpen("group", "reserved", owner)).toThrow(
+      /sealed/,
+    );
+  });
+
   it("preflights the maximum number of completion groups", () => {
     const setupResult = setup();
     scope = setupResult.scope;
@@ -726,6 +755,30 @@ describe("completion coordinator", () => {
     expect(
       setupResult.entries.filter((entry) => entry.type === "custom_message"),
     ).toHaveLength(1);
+  });
+
+  it("stops manifest retry timers after bounded exhaustion", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    let permanent = true;
+    setupResult.pi.sendMessage.mockImplementation((message: any) => {
+      if (permanent) throw new Error("permanent dispatch failure");
+      setupResult.entries.push({ type: "custom_message", ...message });
+    });
+    scope.parentStreaming = true;
+    publishCompletion(record("permanent-retry"), sessionOwner(scope));
+    scope.parentStreaming = false;
+    flushCompletionManifests(sessionOwner(scope));
+    vi.runAllTimers();
+    expect(setupResult.pi.sendMessage).toHaveBeenCalledTimes(9);
+    expect(vi.getTimerCount()).toBe(0);
+    permanent = false;
+    flushCompletionManifests(sessionOwner(scope));
+    expect(setupResult.pi.sendMessage).toHaveBeenCalledTimes(10);
+    expect(
+      setupResult.pi.sendMessage.mock.calls[9]?.[0].details.completionIds,
+    ).toContain("completion-permanent-retry");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("keeps successful consumption durable when the receipt append fails", () => {
@@ -812,13 +865,99 @@ describe("completion coordinator", () => {
     symlinkSync(join(scope.cwd, "missing-target"), ledger);
     scope.parentStreaming = true;
     try {
-      for (let index = 0; index <= MAX_COMPLETION_RECORDS; index++) {
+      for (let index = 0; index <= MAX_COMPLETION_RECORDS + 8; index++) {
         publishCompletion(record(`failure-${index}`), sessionOwner(scope));
       }
       scope.parentStreaming = false;
       const message = prepareCompletionManifest(sessionOwner(scope));
       expect(message?.content).toContain("ledger_append_failed");
       expect(message?.content).toContain("completion-failure-0");
+      expect(message?.content).toContain("retainedRecords");
+      expect(message?.details.overflowFailedRetained).toBe(8);
+      expect(message?.details.overflowFailedOmitted).toBeGreaterThan(0);
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a failed spill across later success and coordinator reload", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-mixed-overflow-"));
+    mkdirSync(join(scope.cwd, ".pi"), { recursive: true });
+    const ledgerPath = sessionLedgerPath(
+      scope.cwd,
+      "parent-session",
+      "subagentura-completion-overflow",
+    );
+    symlinkSync(join(scope.cwd, "missing-target"), ledgerPath);
+    scope.parentStreaming = true;
+    try {
+      for (let index = 0; index <= MAX_COMPLETION_RECORDS; index++) {
+        publishCompletion(record(`mixed-failure-${index}`), owner);
+      }
+      unlinkSync(ledgerPath);
+      publishCompletion(record("mixed-success"), owner);
+      scope.parentStreaming = false;
+      clearCompletionCoordinator(owner);
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      const message = prepareCompletionManifest(owner);
+      expect(message?.details.overflowRetirementBlocked).toBe(false);
+      expect(readFileSync(ledgerPath, "utf8")).toContain(
+        "completion-mixed-failure-0",
+      );
+      const recoveredLedger = readFileSync(ledgerPath, "utf8");
+      clearCompletionCoordinator(owner);
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      prepareCompletionManifest(owner);
+      expect(readFileSync(ledgerPath, "utf8")).toBe(recoveredLedger);
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a durable retirement floor after overflow-ledger rotation", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-floor-"));
+    scope.parentStreaming = true;
+    try {
+      registerCompletionMember(
+        "interactive",
+        "floor-source",
+        "group",
+        "floor",
+        owner,
+      );
+      publishCompletion(
+        record("floor-source", {
+          completionId: "floor-first",
+          policy: "group",
+          groupId: "floor",
+        }),
+        owner,
+      );
+      for (let index = 0; index < MAX_COMPLETION_RECORDS + 520; index++) {
+        publishCompletion(record(`floor-filler-${index}`), owner);
+      }
+      scope.parentStreaming = false;
+      const ledgerPath = sessionLedgerPath(
+        scope.cwd,
+        "parent-session",
+        "subagentura-completion-overflow",
+      );
+      const ledgerBeforeRestart = readFileSync(ledgerPath, "utf8");
+      clearCompletionCoordinator(owner);
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      flushCompletionManifests(owner);
+      settleCompletionParentTurn(owner);
+      const manifestContent = manifests(setupResult.pi)
+        .map(([message]) => message.content)
+        .join("\n");
+      expect(manifestContent).not.toContain('"completionId":"floor-first"');
+      expect(readFileSync(ledgerPath, "utf8")).toBe(ledgerBeforeRestart);
     } finally {
       rmSync(scope.cwd, { recursive: true, force: true });
     }

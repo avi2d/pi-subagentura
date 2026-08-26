@@ -155,6 +155,23 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated?.startedAt).toBe(0); // falls back to 0
   });
 
+  it("recovers a legacy tombstone without a timestamp as expired", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "legacy-tombstoned-spawn";
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%099",
+      mux: "tmux",
+      artifactDir: join(cwd, id),
+      sessionFile: "/tmp/legacy-tombstoned.jsonl",
+      parentSessionId: "reload-parent",
+      completionTombstone: "failed",
+    });
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent");
+    expect(interactiveSubagentRegistry.has(id)).toBe(true);
+  });
+
   it("does not rehydrate a failed completion-registration tombstone", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");
@@ -169,9 +186,28 @@ describe("rehydrateInteractiveSubagents", () => {
       completionPolicy: "group",
       completionGroupId: "failed-group",
       completionTombstone: "failed",
+      completionTombstoneAt: Date.now(),
     });
     mod.rehydrateInteractiveSubagents(cwd, "reload-parent");
     expect(interactiveSubagentRegistry.has(id)).toBe(false);
+  });
+
+  it("allows an expired failed tombstone to be recovered", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "expired-tombstone";
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%101",
+      mux: "tmux",
+      artifactDir: join(cwd, id),
+      sessionFile: "/tmp/expired-tombstone.jsonl",
+      parentSessionId: "reload-parent",
+      completionTombstone: "failed",
+      completionTombstoneAt: Date.now() - 6 * 60 * 1000,
+    });
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent");
+    expect(interactiveSubagentRegistry.has(id)).toBe(true);
   });
 
   it("rehydrates same-session artifacts into the current scope generation", async () => {

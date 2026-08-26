@@ -265,6 +265,7 @@ export interface InteractiveSubagentState {
   completionPolicy?: CompletionPolicy;
   /** Durable tombstone for a spawn that failed completion registration. */
   completionTombstone?: "failed";
+  completionTombstoneAt?: number;
   /** Required for coordinated grouped completion. */
   completionGroupId?: string;
   /** @deprecated Legacy v1 inject cursor retained for API compatibility. */

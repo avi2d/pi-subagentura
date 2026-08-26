@@ -26,6 +26,10 @@ const MAX_COMPLETION_GROUPS = 512;
 const MAX_LEDGER_RECORDS = 512;
 const MAX_LEDGER_BYTES = 256 * 1024;
 const MAX_FALLBACK_RECEIPT_LINE_BYTES = 1024 * 1024;
+const MAX_MANIFEST_RETRY_ATTEMPTS = 8;
+const MAX_COMPLETION_SEQUENCE = Number.MAX_SAFE_INTEGER - 1;
+const MAX_FAILED_OVERFLOW_RECORDS = 8;
+const MAX_PENDING_OVERFLOW_RECORDS = MAX_COMPLETION_RECORDS;
 const MAX_GROUP_MEMBERS = 32;
 const MAX_COMPLETION_ID_LENGTH = 128;
 const MAX_SOURCE_ID_LENGTH = 128;
@@ -58,6 +62,8 @@ export interface CompletionRecord {
   groupId?: string;
   references: CompletionReference[];
   completedAt: number;
+  /** Monotonic publication sequence used to retire spilled session entries. */
+  sequence?: number;
   ownerSessionId?: string;
 }
 
@@ -130,10 +136,16 @@ interface CompletionOverflowState {
   ids: Set<string>;
   count: number;
   rotated: boolean;
+  retiredThrough?: number;
+  retirementBlocked: boolean;
+  retirementBlockedAt?: number;
+  pendingRecords: Map<string, CompletionRecord>;
   appendFailures: number;
   noticeAttempted: boolean;
   noticeDelivered: boolean;
   failedIds: string[];
+  failedRecords: CompletionRecord[];
+  failedRecordsOmitted: number;
 }
 
 interface CompletionCoordinatorState {
@@ -149,6 +161,7 @@ interface CompletionCoordinatorState {
   turnStarting: boolean;
   groups: Map<string, CompletionGroupState>;
   sessionEntryCount: number;
+  nextCompletionSequence: number;
   consumptionLedgerPath: string;
   fallbackReceiptsScanned: boolean;
   groupReservations: Map<string, number>;
@@ -156,6 +169,7 @@ interface CompletionCoordinatorState {
   groupsSealed: boolean;
   overflow: CompletionOverflowState;
   manifestRetryAttempt: number;
+  manifestRetryExhausted: boolean;
   manifestRetryTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -268,6 +282,13 @@ function normalizeRecord(value: unknown): CompletionRecord {
     raw.completedAt >= 0
       ? raw.completedAt
       : Date.now();
+  const sequence =
+    typeof raw.sequence === "number" &&
+    Number.isSafeInteger(raw.sequence) &&
+    raw.sequence >= 0 &&
+    raw.sequence <= MAX_COMPLETION_SEQUENCE
+      ? raw.sequence
+      : undefined;
   return {
     schemaVersion: COMPLETION_RECORD_SCHEMA_VERSION,
     completionId: boundedString(
@@ -288,6 +309,7 @@ function normalizeRecord(value: unknown): CompletionRecord {
     ...(groupId ? { groupId } : {}),
     references,
     completedAt,
+    ...(sequence !== undefined ? { sequence } : {}),
     ...(typeof raw.ownerSessionId === "string" && raw.ownerSessionId.length > 0
       ? { ownerSessionId: raw.ownerSessionId.slice(0, MAX_SOURCE_ID_LENGTH) }
       : {}),
@@ -410,28 +432,71 @@ function parseLedgerCompletion(line: string): CompletionRecord | undefined {
   }
 }
 
-function ledgerMarksOverflow(line: string): boolean {
+function overflowLedgerMeta(line: string):
+  | {
+      rotated: boolean;
+      retiredThrough?: number;
+      retirementBlocked: boolean;
+      retirementBlockedAt?: number;
+    }
+  | undefined {
   try {
     const value = JSON.parse(line) as Record<string, unknown>;
-    return value.kind === "overflow-meta" && value.rotated === true;
+    if (value.kind !== "overflow-meta") return undefined;
+    return {
+      rotated: value.rotated === true,
+      retirementBlocked: value.retirementBlocked === true,
+      ...(typeof value.retirementBlockedAt === "number" &&
+      Number.isSafeInteger(value.retirementBlockedAt) &&
+      value.retirementBlockedAt >= 0 &&
+      value.retirementBlockedAt <= MAX_COMPLETION_SEQUENCE
+        ? { retirementBlockedAt: value.retirementBlockedAt }
+        : {}),
+      ...(typeof value.retiredThrough === "number" &&
+      Number.isSafeInteger(value.retiredThrough) &&
+      value.retiredThrough >= 0 &&
+      value.retiredThrough <= MAX_COMPLETION_SEQUENCE
+        ? { retiredThrough: value.retiredThrough }
+        : {}),
+    };
   } catch {
-    return false;
+    return undefined;
   }
 }
 
 function overflowIndexFromLedger(
   owner: SessionOwnerToken,
   path: string,
-): { ids: Set<string>; count: number; rotated: boolean; failed: boolean } {
+): {
+  ids: Set<string>;
+  count: number;
+  rotated: boolean;
+  retiredThrough?: number;
+  retirementBlocked: boolean;
+  retirementBlockedAt?: number;
+  failed: boolean;
+} {
   const ids = new Set<string>();
   let count = 0;
   let rotated = false;
+  let retiredThrough: number | undefined;
+  let retirementBlocked = false;
+  let retirementBlockedAt: number | undefined;
   let failed = false;
   try {
     const loaded = readLedgerLines(path, MAX_LEDGER_BYTES);
     rotated = loaded.truncated;
     for (const line of loaded.lines) {
-      if (ledgerMarksOverflow(line)) rotated = true;
+      const meta = overflowLedgerMeta(line);
+      if (meta) {
+        rotated ||= meta.rotated;
+        if (meta.retiredThrough !== undefined) {
+          retiredThrough = Math.max(retiredThrough ?? 0, meta.retiredThrough);
+        }
+        retirementBlocked = meta.retirementBlocked;
+        retirementBlockedAt = meta.retirementBlockedAt;
+        continue;
+      }
       const record = parseLedgerCompletion(line);
       if (
         !record ||
@@ -459,6 +524,9 @@ function overflowIndexFromLedger(
     ids,
     count: Math.min(count, MAX_LEDGER_RECORDS),
     rotated,
+    ...(retiredThrough !== undefined ? { retiredThrough } : {}),
+    retirementBlocked,
+    ...(retirementBlockedAt !== undefined ? { retirementBlockedAt } : {}),
     failed,
   };
 }
@@ -471,10 +539,16 @@ function loadOverflowState(owner: SessionOwnerToken): CompletionOverflowState {
     ids: index.ids,
     count: index.count,
     rotated: index.rotated,
+    retiredThrough: index.retiredThrough,
+    retirementBlocked: index.retirementBlocked,
+    retirementBlockedAt: index.retirementBlockedAt,
+    pendingRecords: new Map(),
     appendFailures: index.failed ? 1 : 0,
     noticeAttempted: false,
     noticeDelivered: false,
     failedIds: [],
+    failedRecords: [],
+    failedRecordsOmitted: 0,
   };
 }
 
@@ -564,6 +638,16 @@ function refreshOverflowIndex(state: CompletionCoordinatorState): void {
   state.overflow.ids = index.ids;
   state.overflow.count = index.count;
   state.overflow.rotated ||= index.rotated;
+  if (!index.failed) {
+    state.overflow.retirementBlocked = index.retirementBlocked;
+    state.overflow.retirementBlockedAt = index.retirementBlockedAt;
+  }
+  if (index.retiredThrough !== undefined) {
+    state.overflow.retiredThrough = Math.max(
+      state.overflow.retiredThrough ?? 0,
+      index.retiredThrough,
+    );
+  }
   if (index.failed) state.overflow.appendFailures++;
 }
 
@@ -571,6 +655,22 @@ function appendOverflowRecord(
   state: CompletionCoordinatorState,
   record: CompletionRecord,
 ): boolean {
+  const previousRetiredThrough = state.overflow.retiredThrough;
+  const wasPending = state.overflow.pendingRecords.has(record.completionId);
+  const resolvesBlocked =
+    state.overflow.retirementBlocked &&
+    (state.overflow.retirementBlockedAt === undefined
+      ? wasPending || state.overflow.pendingRecords.size === 0
+      : record.sequence === state.overflow.retirementBlockedAt);
+  const nextRetirementBlocked =
+    state.overflow.retirementBlocked && !resolvesBlocked;
+  const nextRetirementBlockedAt = nextRetirementBlocked
+    ? state.overflow.retirementBlockedAt
+    : undefined;
+  const nextRetiredThrough =
+    !nextRetirementBlocked && record.sequence !== undefined
+      ? Math.max(previousRetiredThrough ?? 0, record.sequence)
+      : previousRetiredThrough;
   try {
     const result = appendLedgerLine(
       state.overflow.path,
@@ -583,6 +683,13 @@ function appendOverflowRecord(
       JSON.stringify({
         kind: "overflow-meta",
         rotated: state.overflow.rotated,
+        ...(nextRetiredThrough !== undefined
+          ? { retiredThrough: nextRetiredThrough }
+          : {}),
+        retirementBlocked: nextRetirementBlocked,
+        ...(nextRetirementBlockedAt !== undefined
+          ? { retirementBlockedAt: nextRetirementBlockedAt }
+          : {}),
       }),
       { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
     );
@@ -590,16 +697,61 @@ function appendOverflowRecord(
     if (meta.dropped > 0 && state.overflow.rotated) {
       appendLedgerLine(
         state.overflow.path,
-        JSON.stringify({ kind: "overflow-meta", rotated: true }),
+        JSON.stringify({
+          kind: "overflow-meta",
+          rotated: true,
+          ...(nextRetiredThrough !== undefined
+            ? { retiredThrough: nextRetiredThrough }
+            : {}),
+          retirementBlocked: nextRetirementBlocked,
+          ...(nextRetirementBlockedAt !== undefined
+            ? { retirementBlockedAt: nextRetirementBlockedAt }
+            : {}),
+        }),
         { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
       );
     }
+    state.overflow.retiredThrough = nextRetiredThrough;
+    state.overflow.retirementBlocked = nextRetirementBlocked;
+    state.overflow.retirementBlockedAt = nextRetirementBlockedAt;
+    state.overflow.pendingRecords.delete(record.completionId);
+    state.overflow.failedRecords = state.overflow.failedRecords.filter(
+      (failed) => failed.completionId !== record.completionId,
+    );
+    state.overflow.failedIds = state.overflow.failedIds.filter(
+      (id) => id !== record.completionId,
+    );
+    state.records.delete(record.completionId);
+    state.pendingNotices.delete(record.completionId);
+    state.dispatchAttempted.delete(record.completionId);
     refreshOverflowIndex(state);
     return true;
   } catch (error) {
     state.overflow.appendFailures++;
-    if (state.overflow.failedIds.length < 8) {
-      state.overflow.failedIds.push(record.completionId);
+    state.overflow.retirementBlocked = true;
+    if (record.sequence !== undefined) {
+      state.overflow.retirementBlockedAt = Math.min(
+        state.overflow.retirementBlockedAt ?? record.sequence,
+        record.sequence,
+      );
+    }
+    if (
+      !state.overflow.pendingRecords.has(record.completionId) &&
+      state.overflow.pendingRecords.size < MAX_PENDING_OVERFLOW_RECORDS
+    ) {
+      state.overflow.pendingRecords.set(record.completionId, record);
+    }
+    if (
+      !state.overflow.failedRecords.some(
+        (failed) => failed.completionId === record.completionId,
+      )
+    ) {
+      if (state.overflow.failedRecords.length < MAX_FAILED_OVERFLOW_RECORDS) {
+        state.overflow.failedRecords.push(record);
+        state.overflow.failedIds.push(record.completionId);
+      } else {
+        state.overflow.failedRecordsOmitted++;
+      }
     }
     debugLog("warn", "completion_overflow_persist_failed", {
       completionId: record.completionId,
@@ -629,6 +781,11 @@ function completionOverflowMessage(
                 ? "ledger_rotated"
                 : "none",
           completionIds: state.overflow.failedIds,
+          retainedRecords: state.overflow.failedRecords.map((record) =>
+            compactRecord(record, false),
+          ),
+          omittedRecords: state.overflow.failedRecordsOmitted,
+          retirementBlocked: state.overflow.retirementBlocked,
         },
         retrieve: `read(path: ${JSON.stringify(path)})`,
         references: [
@@ -638,6 +795,10 @@ function completionOverflowMessage(
           {
             label: "append failures",
             value: String(state.overflow.appendFailures),
+          },
+          {
+            label: "retirement blocked",
+            value: String(state.overflow.retirementBlocked),
           },
         ],
       }),
@@ -653,6 +814,9 @@ function completionOverflowMessage(
       overflowRotated: state.overflow.rotated,
       overflowAppendFailures: state.overflow.appendFailures,
       overflowFailedIds: state.overflow.failedIds,
+      overflowFailedRetained: state.overflow.failedRecords.length,
+      overflowFailedOmitted: state.overflow.failedRecordsOmitted,
+      overflowRetirementBlocked: state.overflow.retirementBlocked,
     },
   };
 }
@@ -669,8 +833,15 @@ function reconcileState(state: CompletionCoordinatorState): void {
     const entry = entries[index];
     if (entryCustomType(entry) === COMPLETION_ENTRY_TYPE) {
       try {
-        const record = normalizeRecord(entryData(entry));
-        if (record.ownerSessionId === currentSessionId) {
+        const parsed = normalizeRecord(entryData(entry));
+        if (parsed.ownerSessionId === currentSessionId) {
+          const sequence = parsed.sequence ?? index;
+          const record =
+            parsed.sequence === undefined ? { ...parsed, sequence } : parsed;
+          state.nextCompletionSequence = Math.max(
+            state.nextCompletionSequence,
+            sequence + 1,
+          );
           completionEntries.set(record.completionId, record);
           if (record.policy === "group") {
             const group = state.groups.get(record.groupId!) ?? {
@@ -701,7 +872,14 @@ function reconcileState(state: CompletionCoordinatorState): void {
   }
   state.sessionEntryCount = entries.length;
   for (const record of completionEntries.values()) {
-    if (state.overflow.ids.has(record.completionId)) continue;
+    if (
+      state.overflow.ids.has(record.completionId) ||
+      (state.overflow.retiredThrough !== undefined &&
+        record.sequence !== undefined &&
+        record.sequence <= state.overflow.retiredThrough)
+    ) {
+      continue;
+    }
     state.records.set(record.completionId, record);
     state.pendingNotices.delete(record.completionId);
   }
@@ -755,6 +933,7 @@ function getState(
     turnStarting: false,
     groups: new Map(),
     sessionEntryCount: 0,
+    nextCompletionSequence: 0,
     consumptionLedgerPath: completionConsumptionPath(resolvedOwner),
     fallbackReceiptsScanned: false,
     groupReservations: new Map(),
@@ -762,6 +941,7 @@ function getState(
     groupsSealed: false,
     overflow: undefined as unknown as CompletionOverflowState,
     manifestRetryAttempt: 0,
+    manifestRetryExhausted: false,
   };
   created.overflow = loadOverflowState(resolvedOwner);
   coordinatorRegistry().set(key, created);
@@ -789,10 +969,24 @@ function groupIsReady(
   );
 }
 
+function retryPendingOverflowRecords(state: CompletionCoordinatorState): void {
+  const pending = [...state.overflow.pendingRecords.values()].sort(
+    (left, right) =>
+      (left.sequence ?? Number.MAX_SAFE_INTEGER) -
+      (right.sequence ?? Number.MAX_SAFE_INTEGER),
+  );
+  for (const record of pending) {
+    if (!appendOverflowRecord(state, record)) break;
+  }
+}
+
 function pruneCoordinatorState(state: CompletionCoordinatorState): void {
+  retryPendingOverflowRecords(state);
   if (state.records.size <= MAX_COMPLETION_RECORDS) return;
   const records = [...state.records.values()].sort(
-    (left, right) => left.completedAt - right.completedAt,
+    (left, right) =>
+      (left.sequence ?? Number.MAX_SAFE_INTEGER) -
+      (right.sequence ?? Number.MAX_SAFE_INTEGER),
   );
   for (const record of records) {
     if (state.records.size <= MAX_COMPLETION_RECORDS) break;
@@ -804,6 +998,7 @@ function pruneCoordinatorState(state: CompletionCoordinatorState): void {
   for (const record of records) {
     if (state.records.size <= MAX_COMPLETION_RECORDS) break;
     if (state.consumed.has(record.completionId)) continue;
+    if (state.overflow.pendingRecords.has(record.completionId)) continue;
     appendOverflowRecord(state, record);
     state.records.delete(record.completionId);
     state.pendingNotices.delete(record.completionId);
@@ -836,11 +1031,11 @@ function retrievalCall(record: CompletionRecord): string {
   return `get_subagent_result(jobId: ${JSON.stringify(record.sourceId)})`;
 }
 
-function formatRecord(
+function compactRecord(
   record: CompletionRecord,
   includeReferences: boolean,
-): string {
-  return JSON.stringify({
+): Record<string, unknown> {
+  return {
     completionId: record.completionId,
     source: record.source,
     sourceId: record.sourceId,
@@ -849,7 +1044,14 @@ function formatRecord(
     status: record.status,
     retrieve: retrievalCall(record),
     ...(includeReferences ? { references: record.references } : {}),
-  });
+  };
+}
+
+function formatRecord(
+  record: CompletionRecord,
+  includeReferences: boolean,
+): string {
+  return JSON.stringify(compactRecord(record, includeReferences));
 }
 
 function manifestContent(
@@ -877,6 +1079,9 @@ interface CompletionManifestMessage {
     overflowRotated?: boolean;
     overflowAppendFailures?: number;
     overflowFailedIds?: string[];
+    overflowFailedRetained?: number;
+    overflowFailedOmitted?: number;
+    overflowRetirementBlocked?: boolean;
   };
 }
 
@@ -977,7 +1182,14 @@ function scheduleFlush(state: CompletionCoordinatorState): void {
 }
 
 function scheduleManifestRetry(state: CompletionCoordinatorState): void {
-  if (state.manifestRetryTimer) return;
+  if (state.manifestRetryTimer || state.manifestRetryExhausted) return;
+  if (state.manifestRetryAttempt >= MAX_MANIFEST_RETRY_ATTEMPTS) {
+    state.manifestRetryExhausted = true;
+    debugLog("warn", "completion_manifest_retry_exhausted", {
+      attempts: state.manifestRetryAttempt,
+    });
+    return;
+  }
   const delay = Math.min(
     50 * 2 ** Math.min(state.manifestRetryAttempt++, 7),
     5_000,
@@ -1076,9 +1288,7 @@ export function releaseCompletionGroup(
     reservation.state.groupReservations.get(reservation.groupId) ?? 0;
   if (count <= 1) {
     reservation.state.groupReservations.delete(reservation.groupId);
-    if (!reservation.state.groups.has(reservation.groupId)) {
-      reservation.state.reservedGroups.delete(reservation.groupId);
-    }
+    reservation.state.reservedGroups.delete(reservation.groupId);
   } else {
     reservation.state.groupReservations.set(reservation.groupId, count - 1);
   }
@@ -1178,6 +1388,14 @@ export function publishCompletion(
     ownerSessionId: sessionId(resolveLiveSessionScope(state.owner)),
   });
   reconcileState(state);
+  if (record.sequence === undefined) {
+    record = { ...record, sequence: state.nextCompletionSequence++ };
+  } else {
+    state.nextCompletionSequence = Math.max(
+      state.nextCompletionSequence,
+      record.sequence + 1,
+    );
+  }
   if (record.policy === "group") {
     try {
       const memberKey = completionMemberKey(record.source, record.sourceId);
@@ -1343,6 +1561,7 @@ export function prepareCompletionManifest(
   const state = getState(owner);
   if (!state) return undefined;
   reconcileState(state);
+  retryPendingOverflowRecords(state);
   if (!persistPendingNotices(state)) {
     scheduleManifestRetry(state);
     return undefined;
@@ -1395,6 +1614,7 @@ export function flushCompletionManifests(owner?: SessionOwnerToken): void {
     return;
   }
   state.manifestRetryAttempt = 0;
+  state.manifestRetryExhausted = false;
   if (message.details.overflowPath === state.overflow.path) {
     state.overflow.noticeDelivered = true;
   }
