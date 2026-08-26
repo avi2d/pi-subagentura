@@ -651,6 +651,9 @@ describe("completion coordinator", () => {
       for (let index = 0; index < MAX_COMPLETION_RECORDS; index++) {
         publishCompletion(record(`filler-${index}`), owner);
       }
+      clearCompletionCoordinator(owner);
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      sealCompletionGroups(owner);
       publishCompletion(
         record("group-source", {
           completionId: "group-second",

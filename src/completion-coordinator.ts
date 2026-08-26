@@ -25,6 +25,7 @@ export const MAX_COMPLETION_RECORDS = 4096;
 const MAX_COMPLETION_GROUPS = 512;
 const MAX_LEDGER_RECORDS = 512;
 const MAX_LEDGER_BYTES = 256 * 1024;
+const MAX_FALLBACK_RECEIPT_LINE_BYTES = 1024 * 1024;
 const MAX_GROUP_MEMBERS = 32;
 const MAX_COMPLETION_ID_LENGTH = 128;
 const MAX_SOURCE_ID_LENGTH = 128;
@@ -149,6 +150,7 @@ interface CompletionCoordinatorState {
   groups: Map<string, CompletionGroupState>;
   sessionEntryCount: number;
   consumptionLedgerPath: string;
+  fallbackReceiptsScanned: boolean;
   groupReservations: Map<string, number>;
   reservedGroups: Set<string>;
   groupsSealed: boolean;
@@ -517,18 +519,23 @@ function reconcileFallbackConsumptions(
   state: CompletionCoordinatorState,
 ): void {
   const records = [...state.records.values()];
-  if (records.length === 0) return;
+  if (state.fallbackReceiptsScanned || records.length === 0) return;
+  state.fallbackReceiptsScanned = true;
   try {
-    scanLedgerLines(state.consumptionLedgerPath, 64 * 1024, (line) => {
-      const consumption = parsedFallbackConsumption(line);
-      if (!consumption) return;
-      for (const record of records) {
-        if (matchesConsumption(record, consumption)) {
-          state.consumed.add(record.completionId);
-          state.dispatchAttempted.delete(record.completionId);
+    scanLedgerLines(
+      state.consumptionLedgerPath,
+      MAX_FALLBACK_RECEIPT_LINE_BYTES,
+      (line) => {
+        const consumption = parsedFallbackConsumption(line);
+        if (!consumption) return;
+        for (const record of records) {
+          if (matchesConsumption(record, consumption)) {
+            state.consumed.add(record.completionId);
+            state.dispatchAttempted.delete(record.completionId);
+          }
         }
-      }
-    });
+      },
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       debugLog("warn", "completion_consumption_ledger_scan_failed", {
@@ -544,27 +551,12 @@ function fallbackConsumptionMatches(
   sourceId: string,
   turnId: string | undefined,
 ): boolean {
-  let found = false;
-  try {
-    scanLedgerLines(state.consumptionLedgerPath, 64 * 1024, (line) => {
-      const consumption = parsedFallbackConsumption(line);
-      if (
-        consumption &&
-        consumption.source === source &&
-        consumption.sourceId === sourceId &&
-        (!consumption.turnId || consumption.turnId === turnId)
-      ) {
-        found = true;
-      }
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      debugLog("warn", "completion_consumption_ledger_scan_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-  return found;
+  return state.sourceConsumptions.some(
+    (consumption) =>
+      consumption.source === source &&
+      consumption.sourceId === sourceId &&
+      (!consumption.turnId || consumption.turnId === turnId),
+  );
 }
 
 function refreshOverflowIndex(state: CompletionCoordinatorState): void {
@@ -764,6 +756,7 @@ function getState(
     groups: new Map(),
     sessionEntryCount: 0,
     consumptionLedgerPath: completionConsumptionPath(resolvedOwner),
+    fallbackReceiptsScanned: false,
     groupReservations: new Map(),
     reservedGroups: new Set(),
     groupsSealed: false,
@@ -1245,7 +1238,9 @@ export function publishCompletion(
   ) {
     state.consumed.add(record.completionId);
   }
-  reconcileFallbackConsumptions(state);
+  if (!state.fallbackReceiptsScanned) {
+    reconcileFallbackConsumptions(state);
+  }
   pruneCoordinatorState(state);
   scheduleFlush(state);
 }
