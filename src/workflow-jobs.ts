@@ -155,6 +155,23 @@ export function cleanupWorkflowJobsForOwner(
   }
 }
 
+/** Roll back a just-created workflow whose completion registration failed. */
+export function discardWorkflowJob(job: WorkflowJobState): void {
+  job.suppressCompletionNotification = true;
+  if (job.status === "running") {
+    try {
+      job.abort.abort();
+    } catch {
+      /* The workflow may already be aborting. */
+    }
+    job.status = "cancelled";
+    normalizeCancelledWorkflowState(job);
+  }
+  if (workflowJobRegistry.get(job.id) === job) {
+    workflowJobRegistry.delete(job.id);
+  }
+}
+
 async function runTrackedWorkflowAgent(
   state: WorkflowJobState,
   runner: WorkflowAgentRunner,

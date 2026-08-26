@@ -155,6 +155,25 @@ describe("rehydrateInteractiveSubagents", () => {
     expect(rehydrated?.startedAt).toBe(0); // falls back to 0
   });
 
+  it("does not rehydrate a failed completion-registration tombstone", async () => {
+    const mod =
+      await importFresh<typeof import("../src/subagent")>("../src/subagent");
+    const id = "tombstoned-spawn";
+    appendInteractiveState(cwd, {
+      id,
+      paneId: "%100",
+      mux: "tmux",
+      artifactDir: join(cwd, id),
+      sessionFile: "/tmp/tombstoned.jsonl",
+      parentSessionId: "reload-parent",
+      completionPolicy: "group",
+      completionGroupId: "failed-group",
+      completionTombstone: "failed",
+    });
+    mod.rehydrateInteractiveSubagents(cwd, "reload-parent");
+    expect(interactiveSubagentRegistry.has(id)).toBe(false);
+  });
+
   it("rehydrates same-session artifacts into the current scope generation", async () => {
     const mod =
       await importFresh<typeof import("../src/subagent")>("../src/subagent");

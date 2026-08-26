@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import {
   clearSessionScopes,
   registerSessionScope,
   sessionOwner,
@@ -7,6 +16,7 @@ import {
 } from "../src/session-scope";
 import {
   clearCompletionCoordinator,
+  MAX_COMPLETION_RECORDS,
   assertCompletionGroupOpen,
   consumeCompletionSource,
   flushCompletionManifests,
@@ -16,11 +26,13 @@ import {
   publishCompletion,
   registerCompletionCoordinator,
   registerCompletionMember,
+  reserveCompletionGroup,
   resolveCompletionPolicy,
   sealCompletionGroups,
   settleCompletionParentTurn,
   type CompletionRecord,
 } from "../src/completion-coordinator";
+import { sessionLedgerPath } from "../src/completion-ledger";
 
 function record(
   sourceId: string,
@@ -166,10 +178,32 @@ describe("completion coordinator", () => {
     await vi.waitFor(() =>
       expect(setupResult.pi.appendEntry).toHaveBeenCalledTimes(2),
     );
+    const callsAfterInitialRetry = setupResult.pi.appendEntry.mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    expect(setupResult.pi.appendEntry).toHaveBeenCalledTimes(2);
+    expect(setupResult.pi.appendEntry.mock.calls.length).toBeLessThanOrEqual(
+      callsAfterInitialRetry + 1,
+    );
     expect(manifests(setupResult.pi)).toHaveLength(0);
+  });
+
+  it("recovers a transient completion notice append failure", async () => {
+    vi.useRealTimers();
+    const setupResult = setup();
+    scope = setupResult.scope;
+    let failed = true;
+    setupResult.pi.appendEntry.mockImplementation(
+      (customType: string, data: unknown) => {
+        if (failed && customType === "subagentura-completion") {
+          failed = false;
+          throw new Error("transient storage failure");
+        }
+        setupResult.entries.push({ type: "custom", customType, data });
+      },
+    );
+    publishCompletion(record("notice-retry"), sessionOwner(scope));
+    await vi.waitFor(() => expect(manifests(setupResult.pi)).toHaveLength(1));
+    expect(userCompletions(setupResult.entries)).toHaveLength(1);
   });
 
   it("preserves protocol-valid interactive turn IDs in retrieval selectors", () => {
@@ -578,5 +612,238 @@ describe("completion coordinator", () => {
         completionGroupId: "mixed",
       }),
     ).toThrow(/cannot be combined/i);
+  });
+
+  it("rejects unregistered grouped publication after sealing", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    sealCompletionGroups(owner);
+    publishCompletion(
+      record("late", { policy: "group", groupId: "late-group" }),
+      owner,
+    );
+    expect(userCompletions(setupResult.entries)).toHaveLength(0);
+  });
+
+  it("downgrades repeated grouped turns after the first record is spilled", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-group-overflow-"));
+    scope.parentStreaming = true;
+    try {
+      registerCompletionMember(
+        "interactive",
+        "group-source",
+        "group",
+        "g",
+        owner,
+      );
+      publishCompletion(
+        record("group-source", {
+          completionId: "group-first",
+          policy: "group",
+          groupId: "g",
+        }),
+        owner,
+      );
+      for (let index = 0; index < MAX_COMPLETION_RECORDS; index++) {
+        publishCompletion(record(`filler-${index}`), owner);
+      }
+      publishCompletion(
+        record("group-source", {
+          completionId: "group-second",
+          turnId: "turn-group-second",
+          policy: "group",
+          groupId: "g",
+        }),
+        owner,
+      );
+      expect(
+        userCompletions(setupResult.entries).find(
+          (entry) => entry.data.completionId === "group-second",
+        )?.data.policy,
+      ).toBe("each");
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves group capacity across concurrent prepared spawns", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    const reservations = Array.from({ length: 32 }, () =>
+      reserveCompletionGroup("group", "reserved", owner),
+    );
+    expect(reservations).toHaveLength(32);
+    expect(() => reserveCompletionGroup("group", "reserved", owner)).toThrow(
+      /full/,
+    );
+  });
+
+  it("preflights the maximum number of completion groups", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    for (let index = 0; index < 512; index++) {
+      registerCompletionMember(
+        "in-process",
+        `job-${index}`,
+        "group",
+        `group-${index}`,
+        owner,
+      );
+    }
+    expect(() =>
+      assertCompletionGroupOpen("group", "group-overflow", owner),
+    ).toThrow(/Too many completion groups/);
+  });
+
+  it("retries a failed manifest dispatch with backoff", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    let failed = true;
+    setupResult.pi.sendMessage.mockImplementation((message: any) => {
+      if (failed) {
+        failed = false;
+        throw new Error("stale context");
+      }
+      setupResult.entries.push({ type: "custom_message", ...message });
+    });
+    scope.parentStreaming = true;
+    publishCompletion(record("retry"), sessionOwner(scope));
+    scope.parentStreaming = false;
+    flushCompletionManifests(sessionOwner(scope));
+    expect(
+      setupResult.entries.filter((entry) => entry.type === "custom_message"),
+    ).toHaveLength(0);
+    vi.advanceTimersByTime(50);
+    expect(
+      setupResult.entries.filter((entry) => entry.type === "custom_message"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps successful consumption durable when the receipt append fails", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-receipt-"));
+    setupResult.pi.appendEntry.mockImplementationOnce(() => {
+      throw new Error("receipt storage unavailable");
+    });
+    try {
+      expect(() =>
+        consumeCompletionSource(
+          setupResult.pi as never,
+          "interactive",
+          "consumed",
+          sessionOwner(scope),
+          "turn-consumed",
+        ),
+      ).not.toThrow();
+      publishCompletion(
+        record("consumed", { turnId: "turn-consumed" }),
+        sessionOwner(scope),
+      );
+      clearCompletionCoordinator(sessionOwner(scope));
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      flushCompletionManifests(sessionOwner(scope));
+      expect(manifests(setupResult.pi)).toHaveLength(0);
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps more than 512 fallback receipts across coordinator recreation", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-receipt-many-"));
+    setupResult.pi.appendEntry.mockImplementation(
+      (customType: string, data: unknown) => {
+        if (customType === "subagentura-completion-consumed") {
+          throw new Error("receipt store unavailable");
+        }
+        setupResult.entries.push({ type: "custom", customType, data });
+      },
+    );
+    try {
+      for (let index = 0; index < 513; index++) {
+        const sourceId = `receipt-${index}`;
+        const turnId = `turn-${index}`;
+        consumeCompletionSource(
+          setupResult.pi as never,
+          "in-process",
+          sourceId,
+          sessionOwner(scope),
+          turnId,
+        );
+        publishCompletion(
+          record(sourceId, {
+            source: "in-process",
+            completionId: `receipt-completion-${index}`,
+            turnId,
+          }),
+          sessionOwner(scope),
+        );
+      }
+      clearCompletionCoordinator(sessionOwner(scope));
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      flushCompletionManifests(sessionOwner(scope));
+      expect(manifests(setupResult.pi)).toHaveLength(0);
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("shows failed overflow identities in the model-visible selector", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-overflow-failure-"));
+    mkdirSync(join(scope.cwd, ".pi"), { recursive: true });
+    const ledger = sessionLedgerPath(
+      scope.cwd,
+      "parent-session",
+      "subagentura-completion-overflow",
+    );
+    symlinkSync(join(scope.cwd, "missing-target"), ledger);
+    scope.parentStreaming = true;
+    try {
+      for (let index = 0; index <= MAX_COMPLETION_RECORDS; index++) {
+        publishCompletion(record(`failure-${index}`), sessionOwner(scope));
+      }
+      scope.parentStreaming = false;
+      const message = prepareCompletionManifest(sessionOwner(scope));
+      expect(message?.content).toContain("ledger_append_failed");
+      expect(message?.content).toContain("completion-failure-0");
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("moves unconsumed records past the bound to a durable overflow selector", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    scope.cwd = mkdtempSync(join(tmpdir(), "completion-overflow-"));
+    scope.parentStreaming = true;
+    try {
+      for (let index = 0; index <= MAX_COMPLETION_RECORDS; index++) {
+        publishCompletion(record(`overflow-${index}`), sessionOwner(scope));
+      }
+      scope.parentStreaming = false;
+      const message = prepareCompletionManifest(sessionOwner(scope));
+      expect(message?.content).toContain("Completion metadata exceeded");
+      expect(message?.content).toContain("read(path:");
+      expect(message?.details.overflowCount).toBe(1);
+      const ledger = message!.details.overflowPath!;
+      expect(readFileSync(ledger, "utf8")).toContain("overflow-0");
+      expect(message?.details.completionIds).toEqual([]);
+      clearCompletionCoordinator(sessionOwner(scope));
+      registerCompletionCoordinator(setupResult.pi as never, scope);
+      const rehydrated = prepareCompletionManifest(sessionOwner(scope));
+      expect(rehydrated?.details.overflowPath).toBe(ledger);
+    } finally {
+      rmSync(scope.cwd, { recursive: true, force: true });
+    }
   });
 });

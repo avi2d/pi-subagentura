@@ -913,15 +913,19 @@ export function readEvents(
   since?: number,
 ): SubagentEvent[] {
   const events: SubagentEvent[] = [];
+  const snapshotEndOffset = eventLogEndOffset(art);
   let cursor = 0;
-  for (;;) {
+  while (cursor < snapshotEndOffset) {
     const batch = readEventBatch(art, cursor);
-    for (const { event } of batch.records) {
-      if (since === undefined || event.ts >= since) events.push(event);
+    for (const record of batch.records) {
+      if (record.endOffset > snapshotEndOffset) break;
+      if (since === undefined || record.event.ts >= since) {
+        events.push(record.event);
+      }
     }
-    if (batch.endOffset <= cursor) break;
-    cursor = batch.endOffset;
-    if (cursor >= eventLogEndOffset(art)) break;
+    const nextOffset = batch.records.at(-1)?.endOffset ?? batch.endOffset;
+    if (nextOffset <= cursor) break;
+    cursor = Math.min(nextOffset, snapshotEndOffset);
   }
   return events;
 }
@@ -1366,6 +1370,7 @@ export interface InteractiveSubagentPersistedStateV1 {
   notifyOnComplete?: "notify" | "inject";
   triggerTurnOnComplete?: boolean;
   completionPolicy?: "each" | "group";
+  completionTombstone?: "failed";
   completionGroupId?: string;
 
   /** Parent pi session id; only rehydrated when the current session matches. */
@@ -1709,6 +1714,9 @@ function migrateStatePayload(
           : {}),
         ...(completionPolicy ? { completionPolicy } : {}),
         ...(completionPolicy === "group" ? { completionGroupId } : {}),
+        ...(entry.completionTombstone === "failed"
+          ? { completionTombstone: "failed" as const }
+          : {}),
         ...(typeof entry.parentSessionId === "string"
           ? { parentSessionId: entry.parentSessionId }
           : {}),

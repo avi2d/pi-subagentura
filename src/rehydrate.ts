@@ -49,6 +49,7 @@ export function rehydrateInteractiveSubagents(
   for (const entry of Object.values(
     payload.states,
   ) as Array<InteractiveSubagentPersistedStateV2>) {
+    if (entry.completionTombstone === "failed") continue;
     if (currentSessionId && entry.parentSessionId !== currentSessionId) {
       continue;
     }

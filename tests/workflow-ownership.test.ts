@@ -3,6 +3,7 @@ import {
   registerWorkflowTool,
   MAX_WORKFLOW_JOBS,
   cleanupWorkflowJobsForOwner,
+  discardWorkflowJob,
   getWorkflowJobForActiveSession,
   getWorkflowJobForOwner,
   getRunningWorkflowCount,
@@ -98,6 +99,15 @@ describe("workflow parent session ownership", () => {
 
     expect(scope.lifecycle).toBe("started");
     expect(getStartedSessionScopes()).toEqual([scope]);
+  });
+
+  it("discards a workflow when completion registration cannot commit", () => {
+    const workflow = makeJob("discard", "running", owner(6, 1));
+    workflowJobRegistry.set(workflow.id, workflow);
+    discardWorkflowJob(workflow);
+    expect(workflow.abort.signal.aborted).toBe(true);
+    expect(workflow.suppressCompletionNotification).toBe(true);
+    expect(workflowJobRegistry.has(workflow.id)).toBe(false);
   });
 
   it("requires exact {id,generation}, treats wrong owners as missing, and cleans up only the owning lifecycle", () => {

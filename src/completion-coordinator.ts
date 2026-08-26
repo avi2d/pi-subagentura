@@ -1,4 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  appendLedgerLine,
+  appendLedgerLineLossless,
+  readLedgerLines,
+  scanLedgerLines,
+  sessionLedgerPath,
+} from "./completion-ledger";
 import { Text } from "@earendil-works/pi-tui";
 import { MAX_TURN_ID_LENGTH } from "./artifact";
 import {
@@ -14,8 +21,10 @@ export const COMPLETION_ENTRY_TYPE = "subagentura-completion";
 export const COMPLETION_CONSUMED_ENTRY_TYPE = "subagentura-completion-consumed";
 export const COMPLETION_MANIFEST_TYPE = "subagent-manifest";
 export const COMPLETION_RECORD_SCHEMA_VERSION = 1;
-const MAX_COMPLETION_RECORDS = 4096;
+export const MAX_COMPLETION_RECORDS = 4096;
 const MAX_COMPLETION_GROUPS = 512;
+const MAX_LEDGER_RECORDS = 512;
+const MAX_LEDGER_BYTES = 256 * 1024;
 const MAX_GROUP_MEMBERS = 32;
 const MAX_COMPLETION_ID_LENGTH = 128;
 const MAX_SOURCE_ID_LENGTH = 128;
@@ -104,7 +113,26 @@ export interface CompletionConsumption {
 interface CompletionGroupState {
   groupId: string;
   members: Set<string>;
+  terminalMembers: Set<string>;
   sealed: boolean;
+}
+
+export interface CompletionGroupReservation {
+  state: CompletionCoordinatorState;
+  groupId: string;
+  active: boolean;
+  newGroup: boolean;
+}
+
+interface CompletionOverflowState {
+  path: string;
+  ids: Set<string>;
+  count: number;
+  rotated: boolean;
+  appendFailures: number;
+  noticeAttempted: boolean;
+  noticeDelivered: boolean;
+  failedIds: string[];
 }
 
 interface CompletionCoordinatorState {
@@ -119,6 +147,14 @@ interface CompletionCoordinatorState {
   humanInputPending: boolean;
   turnStarting: boolean;
   groups: Map<string, CompletionGroupState>;
+  sessionEntryCount: number;
+  consumptionLedgerPath: string;
+  groupReservations: Map<string, number>;
+  reservedGroups: Set<string>;
+  groupsSealed: boolean;
+  overflow: CompletionOverflowState;
+  manifestRetryAttempt: number;
+  manifestRetryTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface CoordinatorGlobalState {
@@ -282,12 +318,10 @@ function completionIdsFromManifest(entry: unknown): string[] {
     : [];
 }
 
-function consumptionFromEntry(
-  entry: unknown,
+function normalizeConsumption(
+  value: unknown,
 ): CompletionConsumption | undefined {
-  if (entryCustomType(entry) !== COMPLETION_CONSUMED_ENTRY_TYPE)
-    return undefined;
-  const data = objectRecord(entryData(entry));
+  const data = objectRecord(value);
   if (!data || data.schemaVersion !== COMPLETION_RECORD_SCHEMA_VERSION) {
     return undefined;
   }
@@ -320,6 +354,15 @@ function consumptionFromEntry(
   };
 }
 
+function consumptionFromEntry(
+  entry: unknown,
+): CompletionConsumption | undefined {
+  if (entryCustomType(entry) !== COMPLETION_CONSUMED_ENTRY_TYPE) {
+    return undefined;
+  }
+  return normalizeConsumption(entryData(entry));
+}
+
 function matchesConsumption(
   record: CompletionRecord,
   consumption: CompletionConsumption,
@@ -343,47 +386,348 @@ function entriesFor(state: CompletionCoordinatorState): unknown[] {
   }
 }
 
+function sessionLedgerFile(owner: SessionOwnerToken, name: string): string {
+  const scope = resolveLiveSessionScope(owner);
+  const identity = sessionId(scope) ?? `owner-${owner.id}-${owner.generation}`;
+  return sessionLedgerPath(scope?.cwd ?? process.cwd(), identity, name);
+}
+
+function completionOverflowPath(owner: SessionOwnerToken): string {
+  return sessionLedgerFile(owner, "subagentura-completion-overflow");
+}
+
+function completionConsumptionPath(owner: SessionOwnerToken): string {
+  return sessionLedgerFile(owner, "subagentura-completion-consumed");
+}
+
+function parseLedgerCompletion(line: string): CompletionRecord | undefined {
+  try {
+    return normalizeRecord(JSON.parse(line));
+  } catch {
+    return undefined;
+  }
+}
+
+function ledgerMarksOverflow(line: string): boolean {
+  try {
+    const value = JSON.parse(line) as Record<string, unknown>;
+    return value.kind === "overflow-meta" && value.rotated === true;
+  } catch {
+    return false;
+  }
+}
+
+function overflowIndexFromLedger(
+  owner: SessionOwnerToken,
+  path: string,
+): { ids: Set<string>; count: number; rotated: boolean; failed: boolean } {
+  const ids = new Set<string>();
+  let count = 0;
+  let rotated = false;
+  let failed = false;
+  try {
+    const loaded = readLedgerLines(path, MAX_LEDGER_BYTES);
+    rotated = loaded.truncated;
+    for (const line of loaded.lines) {
+      if (ledgerMarksOverflow(line)) rotated = true;
+      const record = parseLedgerCompletion(line);
+      if (
+        !record ||
+        record.ownerSessionId !== sessionId(resolveLiveSessionScope(owner))
+      ) {
+        continue;
+      }
+      if (ids.has(record.completionId)) continue;
+      ids.add(record.completionId);
+      count++;
+      if (ids.size > MAX_LEDGER_RECORDS) {
+        const oldest = ids.values().next().value as string | undefined;
+        if (oldest) ids.delete(oldest);
+        rotated = true;
+      }
+    }
+  } catch (error) {
+    failed = true;
+    debugLog("warn", "completion_ledger_read_failed", {
+      path,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return {
+    ids,
+    count: Math.min(count, MAX_LEDGER_RECORDS),
+    rotated,
+    failed,
+  };
+}
+
+function loadOverflowState(owner: SessionOwnerToken): CompletionOverflowState {
+  const path = completionOverflowPath(owner);
+  const index = overflowIndexFromLedger(owner, path);
+  return {
+    path,
+    ids: index.ids,
+    count: index.count,
+    rotated: index.rotated,
+    appendFailures: index.failed ? 1 : 0,
+    noticeAttempted: false,
+    noticeDelivered: false,
+    failedIds: [],
+  };
+}
+
+function loadFallbackConsumptions(
+  owner: SessionOwnerToken,
+  path: string,
+): CompletionConsumption[] {
+  const consumptions: CompletionConsumption[] = [];
+  try {
+    for (const line of readLedgerLines(path, MAX_LEDGER_BYTES).lines) {
+      const consumption = normalizeConsumption(
+        (() => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return undefined;
+          }
+        })(),
+      );
+      if (consumption) consumptions.push(consumption);
+    }
+  } catch (error) {
+    debugLog("warn", "completion_consumption_ledger_read_failed", {
+      path,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return consumptions.slice(-MAX_COMPLETION_RECORDS);
+}
+
+function parsedFallbackConsumption(
+  line: string,
+): CompletionConsumption | undefined {
+  try {
+    return normalizeConsumption(JSON.parse(line));
+  } catch {
+    return undefined;
+  }
+}
+
+function reconcileFallbackConsumptions(
+  state: CompletionCoordinatorState,
+): void {
+  const records = [...state.records.values()];
+  if (records.length === 0) return;
+  try {
+    scanLedgerLines(state.consumptionLedgerPath, 64 * 1024, (line) => {
+      const consumption = parsedFallbackConsumption(line);
+      if (!consumption) return;
+      for (const record of records) {
+        if (matchesConsumption(record, consumption)) {
+          state.consumed.add(record.completionId);
+          state.dispatchAttempted.delete(record.completionId);
+        }
+      }
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog("warn", "completion_consumption_ledger_scan_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+function fallbackConsumptionMatches(
+  state: CompletionCoordinatorState,
+  source: CompletionSource,
+  sourceId: string,
+  turnId: string | undefined,
+): boolean {
+  let found = false;
+  try {
+    scanLedgerLines(state.consumptionLedgerPath, 64 * 1024, (line) => {
+      const consumption = parsedFallbackConsumption(line);
+      if (
+        consumption &&
+        consumption.source === source &&
+        consumption.sourceId === sourceId &&
+        (!consumption.turnId || consumption.turnId === turnId)
+      ) {
+        found = true;
+      }
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog("warn", "completion_consumption_ledger_scan_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return found;
+}
+
+function refreshOverflowIndex(state: CompletionCoordinatorState): void {
+  const index = overflowIndexFromLedger(state.owner, state.overflow.path);
+  state.overflow.ids = index.ids;
+  state.overflow.count = index.count;
+  state.overflow.rotated ||= index.rotated;
+  if (index.failed) state.overflow.appendFailures++;
+}
+
+function appendOverflowRecord(
+  state: CompletionCoordinatorState,
+  record: CompletionRecord,
+): boolean {
+  try {
+    const result = appendLedgerLine(
+      state.overflow.path,
+      JSON.stringify(record),
+      { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
+    );
+    state.overflow.rotated ||= result.dropped > 0;
+    const meta = appendLedgerLine(
+      state.overflow.path,
+      JSON.stringify({
+        kind: "overflow-meta",
+        rotated: state.overflow.rotated,
+      }),
+      { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
+    );
+    state.overflow.rotated ||= meta.dropped > 0;
+    if (meta.dropped > 0 && state.overflow.rotated) {
+      appendLedgerLine(
+        state.overflow.path,
+        JSON.stringify({ kind: "overflow-meta", rotated: true }),
+        { maxRecords: MAX_LEDGER_RECORDS, maxBytes: MAX_LEDGER_BYTES },
+      );
+    }
+    refreshOverflowIndex(state);
+    return true;
+  } catch (error) {
+    state.overflow.appendFailures++;
+    if (state.overflow.failedIds.length < 8) {
+      state.overflow.failedIds.push(record.completionId);
+    }
+    debugLog("warn", "completion_overflow_persist_failed", {
+      completionId: record.completionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+function completionOverflowMessage(
+  state: CompletionCoordinatorState,
+): ReturnType<typeof manifestMessage> {
+  const path = state.overflow.path;
+  return {
+    customType: COMPLETION_MANIFEST_TYPE,
+    content: [
+      "<completion-manifest>",
+      "Completion metadata exceeded the in-memory bound; inspect the bounded ledger selector for retained identities.",
+      JSON.stringify({
+        completionId: "completion-overflow",
+        status: "done",
+        failure: {
+          status:
+            state.overflow.appendFailures > 0
+              ? "ledger_append_failed"
+              : state.overflow.rotated
+                ? "ledger_rotated"
+                : "none",
+          completionIds: state.overflow.failedIds,
+        },
+        retrieve: `read(path: ${JSON.stringify(path)})`,
+        references: [
+          { label: "ledger", value: path },
+          { label: "records", value: String(state.overflow.count) },
+          { label: "rotated", value: String(state.overflow.rotated) },
+          {
+            label: "append failures",
+            value: String(state.overflow.appendFailures),
+          },
+        ],
+      }),
+      "</completion-manifest>",
+    ].join("\n"),
+    display: false,
+    details: {
+      schemaVersion: COMPLETION_RECORD_SCHEMA_VERSION,
+      completionIds: [],
+      groups: [],
+      overflowPath: path,
+      overflowCount: state.overflow.count,
+      overflowRotated: state.overflow.rotated,
+      overflowAppendFailures: state.overflow.appendFailures,
+      overflowFailedIds: state.overflow.failedIds,
+    },
+  };
+}
+
 function reconcileState(state: CompletionCoordinatorState): void {
   const entries = entriesFor(state);
+  const startIndex =
+    entries.length >= state.sessionEntryCount ? state.sessionEntryCount : 0;
   const completionEntries = new Map<string, CompletionRecord>();
   const manifestIds = new Set<string>();
   const consumptions: CompletionConsumption[] = [];
-  for (const entry of entries) {
+  const currentSessionId = sessionId(resolveLiveSessionScope(state.owner));
+  for (let index = startIndex; index < entries.length; index++) {
+    const entry = entries[index];
     if (entryCustomType(entry) === COMPLETION_ENTRY_TYPE) {
       try {
         const record = normalizeRecord(entryData(entry));
-        completionEntries.set(record.completionId, record);
+        if (record.ownerSessionId === currentSessionId) {
+          completionEntries.set(record.completionId, record);
+          if (record.policy === "group") {
+            const group = state.groups.get(record.groupId!) ?? {
+              groupId: record.groupId!,
+              members: new Set<string>(),
+              terminalMembers: new Set<string>(),
+              sealed: false,
+            };
+            group.members.add(`${record.source}:${record.sourceId}`);
+            group.terminalMembers.add(`${record.source}:${record.sourceId}`);
+            state.groups.set(group.groupId, group);
+          }
+        }
       } catch {
         /* malformed custom entries are ignored */
+      }
+    }
+    if (entryCustomType(entry) === COMPLETION_MANIFEST_TYPE) {
+      const data = objectRecord(entryData(entry));
+      if (data?.overflowPath === state.overflow.path) {
+        state.overflow.noticeDelivered = true;
+        state.overflow.noticeAttempted = false;
       }
     }
     for (const id of completionIdsFromManifest(entry)) manifestIds.add(id);
     const consumption = consumptionFromEntry(entry);
     if (consumption) consumptions.push(consumption);
   }
+  state.sessionEntryCount = entries.length;
   for (const record of completionEntries.values()) {
-    if (
-      record.ownerSessionId !== sessionId(resolveLiveSessionScope(state.owner))
-    ) {
-      continue;
-    }
+    if (state.overflow.ids.has(record.completionId)) continue;
     state.records.set(record.completionId, record);
     state.pendingNotices.delete(record.completionId);
-    if (record.policy === "group") {
-      const group = state.groups.get(record.groupId!) ?? {
-        groupId: record.groupId!,
-        members: new Set<string>(),
-        sealed: false,
-      };
-      group.members.add(`${record.source}:${record.sourceId}`);
-      state.groups.set(group.groupId, group);
-    }
   }
-  state.sourceConsumptions = consumptions.slice(-MAX_COMPLETION_RECORDS);
+  const mergedConsumptions = new Map<string, CompletionConsumption>();
+  for (const consumption of state.sourceConsumptions) {
+    mergedConsumptions.set(JSON.stringify(consumption), consumption);
+  }
+  for (const consumption of consumptions) {
+    mergedConsumptions.set(JSON.stringify(consumption), consumption);
+  }
+  state.sourceConsumptions = [...mergedConsumptions.values()].slice(
+    -MAX_COMPLETION_RECORDS,
+  );
+  reconcileFallbackConsumptions(state);
   for (const record of state.records.values()) {
     if (
       manifestIds.has(record.completionId) ||
-      consumptions.some((consumption) =>
+      state.sourceConsumptions.some((consumption) =>
         matchesConsumption(record, consumption),
       )
     ) {
@@ -410,14 +754,26 @@ function getState(
     pendingNotices: new Map(),
     consumed: new Set(),
     dispatchAttempted: new Set(),
-    sourceConsumptions: [],
+    sourceConsumptions: loadFallbackConsumptions(
+      resolvedOwner,
+      completionConsumptionPath(resolvedOwner),
+    ),
     flushScheduled: false,
     humanInputPending: false,
     turnStarting: false,
     groups: new Map(),
+    sessionEntryCount: 0,
+    consumptionLedgerPath: completionConsumptionPath(resolvedOwner),
+    groupReservations: new Map(),
+    reservedGroups: new Set(),
+    groupsSealed: false,
+    overflow: undefined as unknown as CompletionOverflowState,
+    manifestRetryAttempt: 0,
   };
+  created.overflow = loadOverflowState(resolvedOwner);
   coordinatorRegistry().set(key, created);
   reconcileState(created);
+  pruneCoordinatorState(created);
   return created;
 }
 
@@ -435,15 +791,9 @@ function groupIsReady(
   if (record.policy === "each") return true;
   const group = state.groups.get(record.groupId!);
   if (!group?.sealed || group.members.size === 0) return false;
-  const terminalMembers = new Set<string>();
-  for (const candidate of state.records.values()) {
-    if (candidate.policy === "group" && candidate.groupId === group.groupId) {
-      terminalMembers.add(
-        completionMemberKey(candidate.source, candidate.sourceId),
-      );
-    }
-  }
-  return [...group.members].every((member) => terminalMembers.has(member));
+  return [...group.members].every((member) =>
+    group.terminalMembers.has(member),
+  );
 }
 
 function pruneCoordinatorState(state: CompletionCoordinatorState): void {
@@ -456,6 +806,14 @@ function pruneCoordinatorState(state: CompletionCoordinatorState): void {
     if (!state.consumed.has(record.completionId)) continue;
     state.records.delete(record.completionId);
     state.consumed.delete(record.completionId);
+    state.dispatchAttempted.delete(record.completionId);
+  }
+  for (const record of records) {
+    if (state.records.size <= MAX_COMPLETION_RECORDS) break;
+    if (state.consumed.has(record.completionId)) continue;
+    appendOverflowRecord(state, record);
+    state.records.delete(record.completionId);
+    state.pendingNotices.delete(record.completionId);
     state.dispatchAttempted.delete(record.completionId);
   }
 }
@@ -513,7 +871,25 @@ function manifestContent(
   ].join("\n");
 }
 
-function manifestMessage(records: CompletionRecord[]) {
+interface CompletionManifestMessage {
+  customType: typeof COMPLETION_MANIFEST_TYPE;
+  content: string;
+  display: false;
+  details: {
+    schemaVersion: typeof COMPLETION_RECORD_SCHEMA_VERSION;
+    completionIds: string[];
+    groups: string[];
+    overflowPath?: string;
+    overflowCount?: number;
+    overflowRotated?: boolean;
+    overflowAppendFailures?: number;
+    overflowFailedIds?: string[];
+  };
+}
+
+function manifestMessage(
+  records: CompletionRecord[],
+): CompletionManifestMessage {
   const completionIds = records.map((record) => record.completionId);
   const groups = [
     ...new Set(
@@ -541,7 +917,29 @@ function appendConsumption(
   state: CompletionCoordinatorState,
   consumption: CompletionConsumption,
 ): void {
-  state.pi.appendEntry?.(COMPLETION_CONSUMED_ENTRY_TYPE, consumption);
+  let durable = false;
+  try {
+    if (typeof state.pi.appendEntry === "function") {
+      state.pi.appendEntry(COMPLETION_CONSUMED_ENTRY_TYPE, consumption);
+      durable = true;
+    }
+  } catch (error) {
+    debugLog("warn", "completion_consumption_persist_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!durable) {
+    try {
+      appendLedgerLineLossless(
+        state.consumptionLedgerPath,
+        JSON.stringify(consumption),
+      );
+    } catch (error) {
+      debugLog("warn", "completion_consumption_ledger_write_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   state.sourceConsumptions.push(consumption);
   for (const record of state.records.values()) {
     if (matchesConsumption(record, consumption)) {
@@ -583,6 +981,19 @@ function scheduleFlush(state: CompletionCoordinatorState): void {
     state.flushScheduled = false;
     flushCompletionManifests(state.owner);
   });
+}
+
+function scheduleManifestRetry(state: CompletionCoordinatorState): void {
+  if (state.manifestRetryTimer) return;
+  const delay = Math.min(
+    50 * 2 ** Math.min(state.manifestRetryAttempt++, 7),
+    5_000,
+  );
+  state.manifestRetryTimer = setTimeout(() => {
+    state.manifestRetryTimer = undefined;
+    flushCompletionManifests(state.owner);
+  }, delay);
+  state.manifestRetryTimer.unref?.();
 }
 
 export function registerCompletionCoordinator(
@@ -629,6 +1040,57 @@ export function registerCompletionCoordinator(
   }
 }
 
+export function reserveCompletionGroup(
+  policy: CompletionPolicy | undefined,
+  groupId: string | undefined,
+  owner?: SessionOwnerToken,
+): CompletionGroupReservation | undefined {
+  if (policy !== "group") return undefined;
+  const state = getState(owner);
+  if (!state) return undefined;
+  const normalizedGroupId = normalizeGroupId(groupId);
+  const group = state.groups.get(normalizedGroupId);
+  const hasReservation = state.reservedGroups.has(normalizedGroupId);
+  if (group?.sealed) {
+    throw new Error(`Completion group ${normalizedGroupId} is already sealed`);
+  }
+  if (state.groupsSealed && !group) {
+    throw new Error(`Completion group ${normalizedGroupId} is already sealed`);
+  }
+  const reserved = state.groupReservations.get(normalizedGroupId) ?? 0;
+  if ((group?.members.size ?? 0) + reserved >= MAX_GROUP_MEMBERS) {
+    throw new Error(`Completion group ${normalizedGroupId} is full`);
+  }
+  const newGroup = !group && !state.reservedGroups.has(normalizedGroupId);
+  if (
+    newGroup &&
+    !state.reservedGroups.has(normalizedGroupId) &&
+    state.groups.size + state.reservedGroups.size >= MAX_COMPLETION_GROUPS
+  ) {
+    throw new Error("Too many completion groups in this parent session");
+  }
+  state.groupReservations.set(normalizedGroupId, reserved + 1);
+  if (newGroup) state.reservedGroups.add(normalizedGroupId);
+  return { state, groupId: normalizedGroupId, active: true, newGroup };
+}
+
+export function releaseCompletionGroup(
+  reservation: CompletionGroupReservation | undefined,
+): void {
+  if (!reservation?.active) return;
+  reservation.active = false;
+  const count =
+    reservation.state.groupReservations.get(reservation.groupId) ?? 0;
+  if (count <= 1) {
+    reservation.state.groupReservations.delete(reservation.groupId);
+    if (!reservation.state.groups.has(reservation.groupId)) {
+      reservation.state.reservedGroups.delete(reservation.groupId);
+    }
+  } else {
+    reservation.state.groupReservations.set(reservation.groupId, count - 1);
+  }
+}
+
 export function assertCompletionGroupOpen(
   policy: CompletionPolicy | undefined,
   groupId: string | undefined,
@@ -639,11 +1101,22 @@ export function assertCompletionGroupOpen(
   if (!state) return;
   const normalizedGroupId = normalizeGroupId(groupId);
   const group = state.groups.get(normalizedGroupId);
-  if (group?.sealed) {
+  const reserved = state.groupReservations.get(normalizedGroupId) ?? 0;
+  if (group?.sealed && !state.reservedGroups.has(normalizedGroupId)) {
     throw new Error(`Completion group ${normalizedGroupId} is already sealed`);
   }
-  if (group && group.members.size >= MAX_GROUP_MEMBERS) {
+  if ((group?.members.size ?? 0) + reserved >= MAX_GROUP_MEMBERS) {
     throw new Error(`Completion group ${normalizedGroupId} is full`);
+  }
+  if (
+    !group &&
+    !state.reservedGroups.has(normalizedGroupId) &&
+    state.groups.size + state.reservedGroups.size >= MAX_COMPLETION_GROUPS
+  ) {
+    throw new Error("Too many completion groups in this parent session");
+  }
+  if (state.groupsSealed && !group) {
+    throw new Error(`Completion group ${normalizedGroupId} is already sealed`);
   }
 }
 
@@ -653,29 +1126,40 @@ export function registerCompletionMember(
   policy: CompletionPolicy,
   groupId: string | undefined,
   owner?: SessionOwnerToken,
+  reservation?: CompletionGroupReservation,
 ): void {
   if (policy !== "group") return;
   const state = getState(owner);
   if (!state) return;
   const normalizedGroupId = normalizeGroupId(groupId);
+  const hasReservation =
+    reservation?.active &&
+    reservation.state === state &&
+    reservation.groupId === normalizedGroupId;
+  if (hasReservation) {
+    releaseCompletionGroup(reservation);
+  }
   if (
     !state.groups.has(normalizedGroupId) &&
-    state.groups.size >= MAX_COMPLETION_GROUPS
+    state.groups.size + state.reservedGroups.size >= MAX_COMPLETION_GROUPS
   ) {
     throw new Error("Too many completion groups in this parent session");
   }
   const group = state.groups.get(normalizedGroupId) ?? {
     groupId: normalizedGroupId,
     members: new Set<string>(),
-    sealed: false,
+    terminalMembers: new Set<string>(),
+    sealed: state.groupsSealed,
   };
   const memberKey = completionMemberKey(source, sourceId);
-  if (group.sealed && !group.members.has(memberKey)) {
+  if (group.sealed && !group.members.has(memberKey) && !hasReservation) {
     throw new Error(`Completion group ${normalizedGroupId} is already sealed`);
   }
   if (
     !group.members.has(memberKey) &&
-    group.members.size >= MAX_GROUP_MEMBERS
+    group.members.size +
+      (state.groupReservations.get(normalizedGroupId) ?? 0) >=
+      MAX_GROUP_MEMBERS
   ) {
     throw new Error(`Completion group ${normalizedGroupId} is full`);
   }
@@ -686,6 +1170,7 @@ export function registerCompletionMember(
 export function sealCompletionGroups(owner?: SessionOwnerToken): void {
   const state = getState(owner);
   if (!state) return;
+  state.groupsSealed = true;
   for (const group of state.groups.values()) group.sealed = true;
 }
 
@@ -701,25 +1186,51 @@ export function publishCompletion(
   });
   reconcileState(state);
   if (record.policy === "group") {
-    const memberKey = completionMemberKey(record.source, record.sourceId);
-    const priorTurn = [...state.records.values()].some(
-      (candidate) =>
-        candidate.completionId !== record.completionId &&
-        candidate.policy === "group" &&
-        candidate.groupId === record.groupId &&
-        completionMemberKey(candidate.source, candidate.sourceId) === memberKey,
-    );
-    if (priorTurn) {
-      record = { ...record, policy: "each" };
-      delete record.groupId;
-    } else {
-      registerCompletionMember(
-        record.source,
-        record.sourceId,
-        record.policy,
-        record.groupId,
-        state.owner,
-      );
+    try {
+      const memberKey = completionMemberKey(record.source, record.sourceId);
+      let group = state.groups.get(record.groupId!);
+      if (!group) {
+        if (state.groupsSealed) {
+          throw new Error(
+            `Completion group ${record.groupId} is already sealed`,
+          );
+        }
+        registerCompletionMember(
+          record.source,
+          record.sourceId,
+          record.policy,
+          record.groupId,
+          state.owner,
+        );
+        group = state.groups.get(record.groupId!);
+      } else if (!group.members.has(memberKey)) {
+        if (group.sealed || state.groupsSealed) {
+          throw new Error(
+            `Completion group ${record.groupId} is already sealed`,
+          );
+        }
+        registerCompletionMember(
+          record.source,
+          record.sourceId,
+          record.policy,
+          record.groupId,
+          state.owner,
+        );
+        group = state.groups.get(record.groupId!);
+      }
+      if (!group) throw new Error("Completion group registration failed");
+      if (group.terminalMembers.has(memberKey)) {
+        record = { ...record, policy: "each" };
+        delete record.groupId;
+      } else {
+        group.terminalMembers.add(memberKey);
+      }
+    } catch (error) {
+      debugLog("warn", "completion_publication_rejected", {
+        completionId: record.completionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
     }
   }
   if (!state.records.has(record.completionId)) {
@@ -734,6 +1245,7 @@ export function publishCompletion(
   ) {
     state.consumed.add(record.completionId);
   }
+  reconcileFallbackConsumptions(state);
   pruneCoordinatorState(state);
   scheduleFlush(state);
 }
@@ -756,6 +1268,12 @@ export function consumeCompletionSource(
         consumption.source === source &&
         consumption.sourceId === normalizedSourceId &&
         consumption.turnId === normalizedTurnId,
+    ) ||
+    fallbackConsumptionMatches(
+      state,
+      source,
+      normalizedSourceId,
+      normalizedTurnId,
     )
   ) {
     return;
@@ -830,7 +1348,21 @@ export function prepareCompletionManifest(
   const state = getState(owner);
   if (!state) return undefined;
   reconcileState(state);
-  if (!persistPendingNotices(state)) return undefined;
+  if (!persistPendingNotices(state)) {
+    scheduleManifestRetry(state);
+    return undefined;
+  }
+  if (
+    (state.overflow.count > 0 ||
+      state.overflow.rotated ||
+      state.overflow.appendFailures > 0) &&
+    !state.overflow.noticeDelivered &&
+    !state.overflow.noticeAttempted
+  ) {
+    state.overflow.noticeAttempted = true;
+    state.turnStarting = true;
+    return completionOverflowMessage(state);
+  }
   const ready = selectManifestRecords(readyRecords(state));
   if (ready.length === 0) return undefined;
   state.turnStarting = true;
@@ -859,11 +1391,17 @@ export function flushCompletionManifests(owner?: SessionOwnerToken): void {
     for (const id of message.details.completionIds) {
       state.dispatchAttempted.delete(id);
     }
+    state.overflow.noticeAttempted = false;
     state.turnStarting = false;
     debugLog("warn", "completion_manifest_dispatch_failed", {
       error: error instanceof Error ? error.message : String(error),
     });
+    scheduleManifestRetry(state);
     return;
+  }
+  state.manifestRetryAttempt = 0;
+  if (message.details.overflowPath === state.overflow.path) {
+    state.overflow.noticeDelivered = true;
   }
   reconcileState(state);
 }
@@ -889,5 +1427,7 @@ export function retireSessionScopedCompletions(
 }
 
 export function clearCompletionCoordinator(owner: SessionOwnerToken): void {
+  const state = coordinatorRegistry().get(ownerKey(owner));
+  if (state?.manifestRetryTimer) clearTimeout(state.manifestRetryTimer);
   coordinatorRegistry().delete(ownerKey(owner));
 }

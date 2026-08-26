@@ -20,6 +20,7 @@ const {
   mockScheduleJobCleanup,
   mockDeliverNotification,
   mockPublishCompletion,
+  mockRegisterCompletionMember,
 } = vi.hoisted(() => ({
   mockStartSubagentJob: vi.fn(),
   mockDebugLog: vi.fn(),
@@ -28,6 +29,7 @@ const {
   mockScheduleJobCleanup: vi.fn(),
   mockDeliverNotification: vi.fn(),
   mockPublishCompletion: vi.fn(),
+  mockRegisterCompletionMember: vi.fn(),
 }));
 
 // We need a separate hoisted mock for `convertToLlm` / `serializeConversation`
@@ -65,6 +67,7 @@ vi.mock("../src/completion-coordinator", async (importOriginal) => {
   return {
     ...actual,
     publishCompletion: mockPublishCompletion,
+    registerCompletionMember: mockRegisterCompletionMember,
   };
 });
 
@@ -261,6 +264,7 @@ beforeEach(() => {
   mockStartSubagentJob.mockReset();
   mockStartSubagentJob.mockResolvedValue(defaultStartSubagentJobResult);
   mockFormatUsage.mockReturnValue("mock usage 1 turn");
+  mockRegisterCompletionMember.mockReset();
   mockBuildLiveUpdate.mockReturnValue({
     content: [{ type: "text", text: "running..." }],
     details: { status: "running", subagentStatus: {} },
@@ -510,6 +514,24 @@ describe("subagent_isolated tool", () => {
     // Result should come from the mocked runSubagent path
     expect(result.content[0].text).toBe("task completed");
     expect(result.details.status).toBe("done");
+  });
+
+  it("rejects completion coordination controls on the sync path", async () => {
+    const result = await toolDef.execute(
+      "sync-group",
+      {
+        task: "analyze code",
+        async: false,
+        completionPolicy: "group",
+        completionGroupId: "sync-group",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("only for background");
+    expect(mockStartSubagentJob).not.toHaveBeenCalled();
   });
 
   it("defaults to async (background) when the flag is omitted", async () => {
@@ -1931,6 +1953,34 @@ describe("subagent_with_context async path", () => {
       undefined,
     );
     expect(mockDeliverNotification).not.toHaveBeenCalled();
+  });
+
+  it("rolls back a prepared isolated job when completion registration fails", async () => {
+    const setup = setupScopedExtension(804);
+    const abort = vi.fn().mockResolvedValue(undefined);
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobId: "rollback-job",
+      session: { abort },
+    });
+    mockRegisterCompletionMember.mockImplementationOnce(() => {
+      throw new Error("group registration failed");
+    });
+    const result = await getToolDef(setup.api, "subagent_isolated").execute(
+      "rollback-call",
+      {
+        task: "test",
+        async: true,
+        completionPolicy: "group",
+        completionGroupId: "rollback-group",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(jobRegistry.has("rollback-job")).toBe(false);
   });
 
   it("does not deliver notification when job is cancelled before completion", async () => {

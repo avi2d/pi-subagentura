@@ -55,6 +55,7 @@
     "src/child-protocol.ts",
     "src/delivery.ts",
     "src/completion-coordinator.ts",
+    "src/completion-ledger.ts",
     "src/helpers.ts",
     "src/orchestration-context.ts",
     "src/pi-sdk-compat.ts",

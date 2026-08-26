@@ -21,6 +21,7 @@ import {
   debugLog,
   formatUsage,
   getInProcessJob,
+  removeInProcessJob,
   inProcessJobOwner,
   inProcessJobsForOwner,
   pruneCompletedJobs,
@@ -48,11 +49,14 @@ import { abortableWait } from "../abortable-wait";
 import { snapshotInProcessSession } from "../cancellation-snapshots";
 import {
   assertCompletionGroupOpen,
+  reserveCompletionGroup,
+  releaseCompletionGroup,
   consumeCompletionSource,
   publishCompletion,
   registerCompletionMember,
   resolveCompletionPolicy,
   type ResolvedCompletionPolicy,
+  type CompletionGroupReservation,
 } from "../completion-coordinator";
 import {
   completionTriggersTurn,
@@ -259,7 +263,17 @@ function resolveAsyncCompletionPolicy(
   params: Record<string, unknown>,
   runAsync: boolean,
 ): ResolvedCompletionPolicy {
-  if (!runAsync) return { legacy: false };
+  if (!runAsync) {
+    if (
+      params.completionPolicy !== undefined ||
+      params.completionGroupId !== undefined
+    ) {
+      throw new Error(
+        "completionPolicy or completionGroupId is available only for background sub-agents",
+      );
+    }
+    return { legacy: false };
+  }
   return resolveCompletionPolicy(params);
 }
 
@@ -536,19 +550,19 @@ function registerSubagentWithContextTool(
         const conversationText = serializeConversation(llmMessages);
         const targetCwd = params.cwd ?? ctx.cwd;
 
+        let completionReservation: CompletionGroupReservation | undefined;
+        try {
+          completionReservation = reserveCompletionGroup(
+            completion.policy,
+            completion.groupId,
+            owner,
+          );
+        } catch (error) {
+          return completionPolicyErrorResult(error);
+        }
         // Own the child's session so any ancestor abort cascades to it.
         const abort = new AbortController();
-        const {
-          jobId,
-          jobPromise,
-          session,
-          liveStatus,
-          modelLabel,
-          modelWarning,
-          thinkingLevel,
-          start,
-          disposeBeforeStart,
-        } = await startSubagentJob({
+        const startResult = await startSubagentJob({
           task: params.task,
           persona: params.persona,
           modelOverride: params.model,
@@ -563,8 +577,23 @@ function registerSubagentWithContextTool(
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
           owner,
+        }).catch((error) => {
+          releaseCompletionGroup(completionReservation);
+          throw error;
         });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+          thinkingLevel,
+          start,
+          disposeBeforeStart,
+        } = startResult;
         if (owner && !resolveLiveSessionScope(owner)) {
+          releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
@@ -595,17 +624,25 @@ function registerSubagentWithContextTool(
         };
 
         if (!registerInProcessJob(jobState, owner)) {
+          releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
         if (completion.policy) {
-          registerCompletionMember(
-            "in-process",
-            jobId,
-            completion.policy,
-            completion.groupId,
-            owner,
-          );
+          try {
+            registerCompletionMember(
+              "in-process",
+              jobId,
+              completion.policy,
+              completion.groupId,
+              owner,
+              completionReservation,
+            );
+          } catch (error) {
+            removeInProcessJob(jobId, owner);
+            discardAsyncSpawn(abort, session, disposeBeforeStart);
+            return completionPolicyErrorResult(error);
+          }
         }
         updateRunningFooter(ctx, owner);
 
@@ -768,19 +805,19 @@ function registerSubagentIsolatedTool(
       const deliveryOwner = captureDeliveryOwner(pi, ctx, owner);
       if (runAsync) {
         const targetCwd = params.cwd ?? ctx.cwd;
+        let completionReservation: CompletionGroupReservation | undefined;
+        try {
+          completionReservation = reserveCompletionGroup(
+            completion.policy,
+            completion.groupId,
+            owner,
+          );
+        } catch (error) {
+          return completionPolicyErrorResult(error);
+        }
         // Own the child's session so any ancestor abort cascades to it.
         const abort = new AbortController();
-        const {
-          jobId,
-          jobPromise,
-          session,
-          liveStatus,
-          modelLabel,
-          modelWarning,
-          thinkingLevel,
-          start,
-          disposeBeforeStart,
-        } = await startSubagentJob({
+        const startResult = await startSubagentJob({
           task: params.task,
           persona: params.persona,
           modelOverride: params.model,
@@ -795,8 +832,23 @@ function registerSubagentIsolatedTool(
           depth: spawn.childDepth,
           rootSessionId: spawn.rootSessionId,
           owner,
+        }).catch((error) => {
+          releaseCompletionGroup(completionReservation);
+          throw error;
         });
+        const {
+          jobId,
+          jobPromise,
+          session,
+          liveStatus,
+          modelLabel,
+          modelWarning,
+          thinkingLevel,
+          start,
+          disposeBeforeStart,
+        } = startResult;
         if (owner && !resolveLiveSessionScope(owner)) {
+          releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
@@ -827,17 +879,25 @@ function registerSubagentIsolatedTool(
         };
 
         if (!registerInProcessJob(jobState, owner)) {
+          releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
           return cancelledAsyncSpawnResult();
         }
         if (completion.policy) {
-          registerCompletionMember(
-            "in-process",
-            jobId,
-            completion.policy,
-            completion.groupId,
-            owner,
-          );
+          try {
+            registerCompletionMember(
+              "in-process",
+              jobId,
+              completion.policy,
+              completion.groupId,
+              owner,
+              completionReservation,
+            );
+          } catch (error) {
+            removeInProcessJob(jobId, owner);
+            discardAsyncSpawn(abort, session, disposeBeforeStart);
+            return completionPolicyErrorResult(error);
+          }
         }
         updateRunningFooter(ctx, owner);
 

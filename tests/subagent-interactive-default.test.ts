@@ -40,6 +40,7 @@ import {
   formatInteractiveState,
   interactiveSubagentRegistry,
 } from "../src/interactive-tmux";
+import { registerCompletionMember } from "../src/completion-coordinator";
 import {
   clearSessionScopes,
   getStartedSessionScopes,
@@ -255,6 +256,33 @@ describe("subagent_interactive tool lifecycle", () => {
       }),
     );
     expect(result.content[0].text).toContain("group review");
+  });
+
+  it("rejects a new group before launching at the group cap", async () => {
+    const scope = getStartedSessionScopes()[0]!;
+    const owner = { id: scope.id, generation: scope.generation };
+    for (let index = 0; index < 512; index++) {
+      registerCompletionMember(
+        "interactive",
+        `filled-${index}`,
+        "group",
+        `filled-group-${index}`,
+        owner,
+      );
+    }
+    const result = await getInteractiveToolDef(api).execute(
+      "call-group-overflow",
+      {
+        task: "review shard",
+        completionPolicy: "group",
+        completionGroupId: "overflow",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
   });
 
   it("rejects conflicting coordinated and legacy delivery options", async () => {

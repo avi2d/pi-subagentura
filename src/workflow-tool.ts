@@ -31,6 +31,7 @@ import {
   workflowUsageFromUsage,
 } from "./workflow-core";
 import {
+  discardWorkflowJob,
   getWorkflowCompletionPresentation,
   getWorkflowJobForOwner,
   invokeWorkflowCompletionHook,
@@ -65,12 +66,15 @@ import { attachAsyncJobSettlement } from "./tools/in-process";
 import { registerToolWithDefaultGuidance } from "./tool-guidance";
 import {
   assertCompletionGroupOpen,
+  reserveCompletionGroup,
+  releaseCompletionGroup,
   consumeCompletionSource,
   MAX_COMPLETION_LABEL_LENGTH,
   publishCompletion,
   registerCompletionMember,
   resolveCompletionPolicy,
   type ResolvedCompletionPolicy,
+  type CompletionGroupReservation,
 } from "./completion-coordinator";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
@@ -366,6 +370,7 @@ export function registerWorkflowTool(
     job: WorkflowJobState,
     completion: ResolvedCompletionPolicy,
     workflowOwner: SessionOwnerToken | undefined,
+    reservation?: CompletionGroupReservation,
   ): void {
     job.completionPolicy = completion.policy;
     job.completionGroupId = completion.groupId;
@@ -376,6 +381,7 @@ export function registerWorkflowTool(
         completion.policy,
         completion.groupId,
         workflowOwner,
+        reservation,
       );
     }
   }
@@ -664,6 +670,21 @@ export function registerWorkflowTool(
             isError: true,
           };
         }
+        let completionReservation: CompletionGroupReservation | undefined;
+        try {
+          completionReservation = reserveCompletionGroup(
+            completion.policy,
+            completion.groupId,
+            workflowOwner,
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `Workflow not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
         const jobStartedAt = Date.now();
         let job: WorkflowJobState;
         try {
@@ -677,6 +698,7 @@ export function registerWorkflowTool(
             "async",
           );
         } catch (err) {
+          releaseCompletionGroup(completionReservation);
           const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text", text: `Workflow not started: ${msg}` }],
@@ -684,7 +706,23 @@ export function registerWorkflowTool(
             isError: true,
           };
         }
-        configureWorkflowCompletion(job, completion, workflowOwner);
+        try {
+          configureWorkflowCompletion(
+            job,
+            completion,
+            workflowOwner,
+            completionReservation,
+          );
+        } catch (error) {
+          discardWorkflowJob(job);
+          releaseCompletionGroup(completionReservation);
+          const msg = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `Workflow not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
         return {
           content: [
             {

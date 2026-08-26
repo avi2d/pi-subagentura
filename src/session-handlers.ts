@@ -279,6 +279,7 @@ export function registerSessionHandlers(
     advanceSessionScopeGeneration(scope.id);
     scope.lifecycle = "started";
     scope.ui = ctx.ui;
+    scope.cwd = ctx.cwd;
     scope.sessionManager = ctx.sessionManager;
     clearFreshChildLineage(scope, event.reason);
     const sessionId = ctx.sessionManager?.getSessionId?.();

@@ -33,6 +33,7 @@ import {
   sessionOwner,
   type SessionScope,
 } from "../src/session-scope";
+import { publishCompletion } from "../src/completion-coordinator";
 
 interface HandlerRegistration {
   handlers: Map<string, Function[]>;
@@ -52,6 +53,7 @@ function registerHandlers(
       handlers.set(name, registered);
     }),
     sendMessage: vi.fn(),
+    appendEntry: vi.fn(),
   };
   const sessionScope = registerSessionHandlers(
     pi as any,
@@ -284,6 +286,33 @@ describe("session handler lifecycle callbacks", () => {
     expect((globalThis as any).__piSubagenturaPiRef).toBeUndefined();
   });
 
+  it("continues shutdown when lifecycle completion receipt persistence fails", () => {
+    const registration = registerHandlers();
+    const ctx = startSession(registration, root, "session-a");
+    registration.pi.appendEntry.mockImplementation(() => {
+      throw new Error("session storage unavailable");
+    });
+    publishCompletion(
+      {
+        schemaVersion: 1,
+        completionId: "shutdown-receipt",
+        source: "in-process",
+        sourceId: "shutdown-job",
+        label: "shutdown job",
+        status: "done",
+        policy: "each",
+        references: [{ label: "result", value: "job" }],
+        completedAt: 1,
+      },
+      sessionOwner(registration.sessionScope),
+    );
+    registration.handlers.get("session_shutdown")![0]({ reason: "quit" }, ctx);
+    expect(registration.sessionScope.lifecycle).toBe("shutdown");
+    expect(getSessionScopes()).toEqual([]);
+    expect(
+      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+    ).toBeUndefined();
+  });
   it.each([
     ["A-first", "a"],
     ["B-first", "b"],

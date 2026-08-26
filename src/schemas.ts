@@ -72,7 +72,7 @@ export const BaseParams = Type.Object({
   completionPolicy: Type.Optional(
     Type.Union([Type.Literal("each"), Type.Literal("group")], {
       description:
-        'Completion coordination policy. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; deprecated legacy fields also map to "each".',
+        'Completion coordination policy for background work. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; sync sub-agent calls reject completionPolicy/completionGroupId.',
     }),
   ),
   completionGroupId: Type.Optional(
@@ -182,7 +182,7 @@ export const InteractiveParams = Type.Object({
   completionPolicy: Type.Optional(
     Type.Union([Type.Literal("each"), Type.Literal("group")], {
       description:
-        'Completion coordination policy. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; deprecated legacy fields also map to "each".',
+        'Completion coordination policy for background work. "each" resumes the parent for ready independent work (coalesced while busy). "group" waits for every explicitly registered member sharing completionGroupId after the spawning parent turn settles. Defaults to "each"; sync sub-agent calls reject completionPolicy/completionGroupId.',
     }),
   ),
   completionGroupId: Type.Optional(

@@ -27,6 +27,7 @@ export interface SessionScope {
   generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
+  cwd?: string;
   lifecycle: SessionScopeLifecycle;
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
@@ -43,6 +44,7 @@ export interface SessionScopeRegistration {
   generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
+  cwd?: string;
   lifecycle?: SessionScopeLifecycle;
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
@@ -152,6 +154,7 @@ export function registerSessionScope(
     existing.parentStreaming =
       registration.parentStreaming ?? existing.parentStreaming;
     if (registration.ui !== undefined) existing.ui = registration.ui;
+    if (registration.cwd !== undefined) existing.cwd = registration.cwd;
     if (registration.sessionManager !== undefined) {
       existing.sessionManager = registration.sessionManager;
     }
@@ -181,6 +184,7 @@ export function registerSessionScope(
         generation: registration.generation,
         pi: registration.pi,
         ui: registration.ui,
+        cwd: registration.cwd,
         lifecycle: registration.lifecycle ?? "started",
         sessionManager: registration.sessionManager,
         spawnTreeContext: registration.spawnTreeContext,

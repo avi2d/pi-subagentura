@@ -263,6 +263,8 @@ export interface InteractiveSubagentState {
   triggerTurnOnComplete?: boolean;
   /** Coordinated default: independent readiness or an explicit group barrier. */
   completionPolicy?: CompletionPolicy;
+  /** Durable tombstone for a spawn that failed completion registration. */
+  completionTombstone?: "failed";
   /** Required for coordinated grouped completion. */
   completionGroupId?: string;
   /** @deprecated Legacy v1 inject cursor retained for API compatibility. */

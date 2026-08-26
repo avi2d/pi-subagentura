@@ -11,6 +11,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  eventLogEndOffset,
+  removeInteractiveState,
   INTERACTIVE_ARTIFACT_OWNER_FILE,
   isArtifactOutputSettled,
   isCompletionEvent,
@@ -29,12 +31,16 @@ import {
 } from "../artifact";
 import {
   assertCompletionGroupOpen,
+  reserveCompletionGroup,
+  releaseCompletionGroup,
   consumeCompletionSource,
   registerCompletionMember,
+  type CompletionGroupReservation,
   resolveCompletionPolicy,
 } from "../completion-coordinator";
 import {
   cancelInteractiveSubagent,
+  removeInteractiveSubagentState,
   formatInteractiveState,
   interactiveSubagentRegistry,
   launchInteractiveSubagent,
@@ -71,6 +77,44 @@ const FOLLOWUP_COMPLETION_REMINDER =
 function formatFollowupPreview(message: string): string {
   if (message.length <= MAX_FOLLOWUP_PREVIEW_CHARS) return message;
   return `${message.slice(0, MAX_FOLLOWUP_PREVIEW_CHARS)}… [truncated; ${message.length} chars total]`;
+}
+
+function persistInteractiveRollbackTombstone(
+  state: InteractiveSubagentState,
+): void {
+  if (!state.parentSessionId) return;
+  try {
+    updateInteractiveState(state.cwd, state.id, (entry) => {
+      delete entry.completionPolicy;
+      delete entry.completionGroupId;
+      delete entry.notifyOnComplete;
+      delete entry.triggerTurnOnComplete;
+      entry.completionTombstone = "failed";
+    });
+  } catch (error) {
+    debugLog("warn", "interactive_spawn_tombstone_failed", {
+      id: state.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function rollbackInteractiveSpawn(state: InteractiveSubagentState): void {
+  state.completionPolicy = undefined;
+  state.completionGroupId = undefined;
+  try {
+    cancelInteractiveSubagent(state.id, "cancel_interactive_subagent", state);
+  } catch {
+    /* Registration failed; pane cleanup is best effort. */
+  }
+  removeInteractiveSubagentState(state);
+  if (state.parentSessionId) {
+    try {
+      removeInteractiveState(state.cwd, state.id);
+    } catch {
+      persistInteractiveRollbackTombstone(state);
+    }
+  }
 }
 
 export function findArtifactById(id: string): SubagentArtifact | null {
@@ -142,14 +186,17 @@ function completionForRead(
   selector: { turn?: number; turnId?: string },
 ): SelectedCompletion | undefined {
   const completions: ReturnType<typeof readEventBatch>["records"] = [];
+  const snapshotEndOffset = eventLogEndOffset(art);
   let cursor = 0;
-  for (;;) {
+  while (cursor < snapshotEndOffset) {
     const batch = readEventBatch(art, cursor);
-    completions.push(
-      ...batch.records.filter(({ event }) => isCompletionEvent(event)),
-    );
-    if (batch.endOffset <= cursor) break;
-    cursor = batch.endOffset;
+    for (const record of batch.records) {
+      if (record.endOffset > snapshotEndOffset) break;
+      if (isCompletionEvent(record.event)) completions.push(record);
+    }
+    const nextOffset = batch.records.at(-1)?.endOffset ?? batch.endOffset;
+    if (nextOffset <= cursor) break;
+    cursor = Math.min(nextOffset, snapshotEndOffset);
   }
   const selected = selector.turnId
     ? completions.find(
@@ -319,6 +366,21 @@ export function registerInteractiveSubagentTools(
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
       const name = params.name ?? `Subagent: ${taskPreview || "interactive"}`;
       const targetCwd = params.cwd ?? ctx.cwd;
+      let completionReservation: CompletionGroupReservation | undefined;
+      try {
+        completionReservation = reserveCompletionGroup(
+          completion.policy,
+          completion.groupId,
+          registration.scope ? sessionOwner(registration.scope) : undefined,
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Sub-agent not started: ${msg}` }],
+          details: { status: "error", error: msg },
+          isError: true,
+        };
+      }
 
       try {
         const state = launchInteractiveSubagent({
@@ -341,13 +403,28 @@ export function registerInteractiveSubagentTools(
           spawnTreeContext: registration.scope?.spawnTreeContext,
         });
         if (completion.policy) {
-          registerCompletionMember(
-            "interactive",
-            state.id,
-            completion.policy,
-            completion.groupId,
-            registration.scope ? sessionOwner(registration.scope) : undefined,
-          );
+          try {
+            registerCompletionMember(
+              "interactive",
+              state.id,
+              completion.policy,
+              completion.groupId,
+              registration.scope ? sessionOwner(registration.scope) : undefined,
+              completionReservation,
+            );
+          } catch (error) {
+            rollbackInteractiveSpawn(state);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to start interactive sub-agent: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { status: "error", error: String(error) },
+              isError: true,
+            };
+          }
         }
         updateRunningSubagentFooter(
           ctx.ui,
@@ -390,6 +467,7 @@ export function registerInteractiveSubagentTools(
           },
         };
       } catch (error) {
+        releaseCompletionGroup(completionReservation);
         const msg = error instanceof Error ? error.message : String(error);
         return {
           content: [
