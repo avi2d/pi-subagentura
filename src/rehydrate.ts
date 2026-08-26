@@ -16,10 +16,16 @@ import { join } from "node:path";
 import {
   INTERACTIVE_ARTIFACT_OWNER_FILE,
   loadInteractiveStates,
+  updateInteractiveState,
   type InteractiveSubagentPersistedStateV2,
 } from "./artifact";
 import { reconcileDeliveryReceipts } from "./delivery";
-import { registerCompletionMember } from "./completion-coordinator";
+import {
+  registerCompletionExpectations,
+  registerCompletionMember,
+  type CompletionExpectation,
+} from "./completion-coordinator";
+import { debugLog } from "./helpers";
 import {
   buildAttachCommandsForState,
   deriveInteractiveSubagentStatusFromLifecycle,
@@ -28,9 +34,123 @@ import {
   isPaneAlive,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
-import { sessionOwner, type SessionScope } from "./session-scope";
+import {
+  sessionOwner,
+  type SessionOwnerToken,
+  type SessionScope,
+} from "./session-scope";
 
 export const FAILED_TOMBSTONE_TTL_MS = 5 * 60 * 1000;
+
+interface RecoverableCompletionState {
+  completionPolicy?: "each" | "group";
+  completionGroupId?: string;
+  pendingDeliveries?: Array<{
+    completionPolicy?: "each" | "group";
+    completionGroupId?: string;
+  }>;
+}
+
+function recoveredGroupIds(state: RecoverableCompletionState): string[] {
+  const groupIds = new Set<string>();
+  if (state.completionPolicy === "group" && state.completionGroupId) {
+    groupIds.add(state.completionGroupId);
+  }
+  for (const intent of state.pendingDeliveries ?? []) {
+    if (intent.completionPolicy === "group" && intent.completionGroupId) {
+      groupIds.add(intent.completionGroupId);
+    }
+  }
+  return [...groupIds];
+}
+
+function downgradeRecoveredGroupPolicies(
+  state: RecoverableCompletionState,
+  groupIds: ReadonlySet<string>,
+): boolean {
+  let changed = false;
+  if (
+    state.completionPolicy === "group" &&
+    state.completionGroupId &&
+    groupIds.has(state.completionGroupId)
+  ) {
+    state.completionPolicy = "each";
+    delete state.completionGroupId;
+    changed = true;
+  }
+  for (const intent of state.pendingDeliveries ?? []) {
+    if (
+      intent.completionPolicy !== "group" ||
+      !intent.completionGroupId ||
+      !groupIds.has(intent.completionGroupId)
+    ) {
+      continue;
+    }
+    intent.completionPolicy = "each";
+    delete intent.completionGroupId;
+    changed = true;
+  }
+  return changed;
+}
+
+function persistRecoveredGroupSanitization(
+  cwd: string,
+  entry: InteractiveSubagentPersistedStateV2,
+  failedGroupIds: ReadonlySet<string>,
+): void {
+  try {
+    updateInteractiveState(cwd, entry.id, (persisted) => {
+      if (
+        persisted.artifactDir !== entry.artifactDir ||
+        persisted.parentSessionId !== entry.parentSessionId
+      ) {
+        return;
+      }
+      downgradeRecoveredGroupPolicies(persisted, failedGroupIds);
+    });
+  } catch (error) {
+    debugLog("warn", "rehydrate_group_sanitization_failed", {
+      stateId: entry.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function registerRecoveredGroups(
+  state: InteractiveSubagentState,
+  owner: SessionOwnerToken | undefined,
+  attemptedMemberships: Set<string>,
+  failedGroupIds: Set<string>,
+): Set<string> {
+  const affectedGroupIds = new Set<string>();
+  for (const groupId of recoveredGroupIds(state)) {
+    if (failedGroupIds.has(groupId)) {
+      affectedGroupIds.add(groupId);
+      continue;
+    }
+    const membershipKey = JSON.stringify(["interactive", state.id, groupId]);
+    if (attemptedMemberships.has(membershipKey)) continue;
+    attemptedMemberships.add(membershipKey);
+    try {
+      registerCompletionMember(
+        "interactive",
+        state.id,
+        "group",
+        groupId,
+        owner,
+      );
+    } catch (error) {
+      failedGroupIds.add(groupId);
+      affectedGroupIds.add(groupId);
+      debugLog("warn", "rehydrate_group_registration_failed", {
+        stateId: state.id,
+        groupId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return affectedGroupIds;
+}
 
 export function rehydrateInteractiveSubagents(
   cwd: string,
@@ -47,8 +167,20 @@ export function rehydrateInteractiveSubagents(
 
   let alive = 0;
   let terminal = 0;
+  const owner: SessionOwnerToken | undefined = scope
+    ? sessionOwner(scope)
+    : undefined;
+  const attemptedMemberships = new Set<string>();
+  const failedGroupIds = new Set<string>();
 
+  // A rejected group is full or closed for this recovery pass; downgrade only
+  // its remaining persisted members and keep recovering unrelated states.
   const now = Date.now();
+  const recoveredStates: Array<{
+    entry: InteractiveSubagentPersistedStateV2;
+    state: InteractiveSubagentState;
+  }> = [];
+  const expectations: CompletionExpectation[] = [];
   for (const entry of Object.values(
     payload.states,
   ) as Array<InteractiveSubagentPersistedStateV2>) {
@@ -160,21 +292,53 @@ export function rehydrateInteractiveSubagents(
       paneAlive,
     );
     rehydrated.status = next;
-    reconcileDeliveryReceipts(
-      rehydrated,
-      sessionEntries,
-      scope ? sessionOwner(scope) : undefined,
-    );
+    recoveredStates.push({ entry, state: rehydrated });
     if (next === "exited" || next === "cancelled") terminal++;
     else if (next === "running" || next === "idle") alive++;
-    if (rehydrated.completionPolicy) {
-      registerCompletionMember(
-        "interactive",
-        rehydrated.id,
-        rehydrated.completionPolicy,
-        rehydrated.completionGroupId,
-        scope ? sessionOwner(scope) : undefined,
-      );
+    for (const intent of rehydrated.pendingDeliveries ?? []) {
+      if (
+        !intent.completionPolicy ||
+        intent.deliveryId.length === 0 ||
+        intent.deliveryId.length > 128 ||
+        intent.turnId.length === 0 ||
+        intent.turnId.length > 256
+      ) {
+        continue;
+      }
+      expectations.push({
+        completionId: intent.deliveryId,
+        source: "interactive",
+        sourceId: rehydrated.id,
+        turnId: intent.turnId,
+      });
+    }
+  }
+
+  // Register every pending coordinated intent before any group registration
+  // or receipt reconciliation can create the coordinator's first ledger scan.
+  if (owner && expectations.length > 0) {
+    try {
+      registerCompletionExpectations(expectations, owner);
+    } catch (error) {
+      debugLog("warn", "rehydrate_completion_expectation_registration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  for (const { entry, state: rehydrated } of recoveredStates) {
+    reconcileDeliveryReceipts(rehydrated, sessionEntries, owner);
+    const affectedGroupIds = registerRecoveredGroups(
+      rehydrated,
+      owner,
+      attemptedMemberships,
+      failedGroupIds,
+    );
+    if (
+      affectedGroupIds.size > 0 &&
+      downgradeRecoveredGroupPolicies(rehydrated, affectedGroupIds)
+    ) {
+      persistRecoveredGroupSanitization(cwd, entry, affectedGroupIds);
     }
     registerInteractiveSubagentState(rehydrated, scope);
   }

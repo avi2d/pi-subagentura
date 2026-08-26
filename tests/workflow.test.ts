@@ -28,6 +28,7 @@ import {
   sanitizeWorkflowName,
   startWorkflowJob,
   type WorkflowAgentRunner,
+  type WorkflowJobState,
   type WorkflowProgress,
   type WorkflowRunResult,
   type WorkflowRunResultWithUsage,
@@ -1574,6 +1575,241 @@ describe("background workflow jobs", () => {
     expect(job.status).toBe("error");
     expect(job.snapshot.runningCount).toBe(0);
   });
+  it("keeps an earlier grouped workflow result through cap pressure until collection", async () => {
+    clearSessionScopes();
+    workflowJobRegistry.clear();
+    const grouped = "workflow-retention-group";
+    let releaseB!: () => void;
+    let markBStarted!: () => void;
+    const bStarted = new Promise<void>((resolve) => {
+      markBStarted = resolve;
+    });
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const workflowA = startWorkflowJob(
+      "retention-a",
+      `export const meta = { name: "retention-a", description: "d" };\nreturn "A";`,
+      { runAgent: echoRunner() },
+    );
+    await workflowA.promise;
+    workflowA.completionPolicy = "group";
+    workflowA.completionGroupId = grouped;
+
+    const workflowB = startWorkflowJob(
+      "retention-b",
+      `export const meta = { name: "retention-b", description: "d" };\nreturn await agent("B");`,
+      {
+        runAgent: async () => {
+          markBStarted();
+          await bGate;
+          return ok("B");
+        },
+      },
+    );
+    workflowB.completionPolicy = "group";
+    workflowB.completionGroupId = grouped;
+    const fillerIds: string[] = [];
+    let collectedWorkflow: WorkflowRunResult | undefined;
+    try {
+      await bStarted;
+      while (workflowJobRegistry.size < MAX_WORKFLOW_JOBS) {
+        const id = `workflow-running-filler-${fillerIds.length}`;
+        workflowJobRegistry.set(id, {
+          id,
+          name: id,
+          status: "running",
+          startedAt: Date.now(),
+          promise: undefined,
+          abort: new AbortController(),
+          snapshot: {
+            agentsSpawned: 0,
+            errorCount: 0,
+            tokensSpent: 0,
+            phases: [],
+          },
+        } as unknown as WorkflowJobState);
+        fillerIds.push(id);
+      }
+      expect(workflowJobRegistry.size).toBe(MAX_WORKFLOW_JOBS);
+      expect(() =>
+        startWorkflowJob(
+          "retention-c",
+          `export const meta = { name: "retention-c", description: "d" };\nreturn "C";`,
+          { runAgent: echoRunner() },
+        ),
+      ).toThrow(/workflow jobs are retained or running/);
+      expect(workflowJobRegistry.get(workflowA.id)).toBe(workflowA);
+
+      const tools: Array<{
+        name: string;
+        execute: (...args: unknown[]) => Promise<unknown>;
+      }> = [];
+      registerWorkflowTool({
+        registerTool: vi.fn((definition: unknown) => {
+          if (
+            definition &&
+            typeof definition === "object" &&
+            "name" in definition &&
+            typeof definition.name === "string" &&
+            "execute" in definition &&
+            typeof definition.execute === "function"
+          ) {
+            tools.push({
+              name: definition.name,
+              execute: definition.execute as (
+                ...args: unknown[]
+              ) => Promise<unknown>,
+            });
+          }
+        }),
+        registerCommand: vi.fn(),
+      } as unknown as Parameters<typeof registerWorkflowTool>[0]);
+      const resultTool = tools.find(
+        (definition) => definition.name === "get_workflow_result",
+      );
+      expect(resultTool).toBeDefined();
+      if (!resultTool)
+        throw new Error("get_workflow_result was not registered");
+      await resultTool.execute(
+        "collect-retention-a",
+        { workflowId: workflowA.id },
+        undefined,
+        undefined,
+        {},
+      );
+      collectedWorkflow = workflowA.result;
+      expect(workflowA.result?.result).toBe("A");
+      expect(workflowA.resultRetrieved).toBe(true);
+
+      const replacement = startWorkflowJob(
+        "retention-c",
+        `export const meta = { name: "retention-c", description: "d" };\nreturn "C";`,
+        { runAgent: echoRunner() },
+      );
+      await replacement.promise;
+      expect(workflowJobRegistry.has(workflowA.id)).toBe(false);
+      workflowJobRegistry.delete(replacement.id);
+    } finally {
+      releaseB();
+      workflowB.abort.abort();
+      await workflowB.promise.catch(() => undefined);
+      workflowJobRegistry.delete(workflowA.id);
+      workflowJobRegistry.delete(workflowB.id);
+      if (collectedWorkflow) expect(collectedWorkflow.result).toBe("A");
+      for (const id of fillerIds) workflowJobRegistry.delete(id);
+      clearSessionScopes();
+    }
+  });
+  it("publishes coordinated resolved errors with an error completion status", async () => {
+    workflowJobRegistry.clear();
+    clearSessionScopes();
+    const entries: Array<{ customType: string; data: unknown }> = [];
+    const tools: Array<{
+      name: string;
+      execute: (...args: unknown[]) => Promise<unknown>;
+    }> = [];
+    const pi = {
+      registerTool: vi.fn((definition: unknown) => {
+        if (
+          definition &&
+          typeof definition === "object" &&
+          "name" in definition &&
+          typeof definition.name === "string" &&
+          "execute" in definition &&
+          typeof definition.execute === "function"
+        ) {
+          tools.push({
+            name: definition.name,
+            execute: definition.execute as (
+              ...args: unknown[]
+            ) => Promise<unknown>,
+          });
+        }
+      }),
+      registerFlag: vi.fn(),
+      registerCommand: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entries.push({ customType, data });
+      }),
+      on: vi.fn(),
+    };
+    const scope = registerSessionScope({
+      id: 993,
+      generation: 1,
+      lifecycle: "started",
+      pi: pi as never,
+      sessionManager: {
+        getSessionId: () => "workflow-errors",
+        getEntries: () => entries,
+      },
+      parentStreaming: false,
+      inProcessJobs: new Map(),
+      pendingInProcessDeliveries: [],
+      interactiveStates: new Map(),
+    });
+    const workflowOwner = sessionOwner(scope);
+    registerCompletionCoordinator(pi as never, scope);
+    registerWorkflowTool(pi as never, scope);
+    const workflowTool = tools.find(
+      (definition) => definition.name === "workflow",
+    );
+    const resultTool = tools.find(
+      (definition) => definition.name === "get_workflow_result",
+    );
+    expect(workflowTool).toBeDefined();
+    expect(resultTool).toBeDefined();
+    if (!workflowTool || !resultTool) {
+      throw new Error("workflow tools were not registered");
+    }
+
+    try {
+      const started = (await workflowTool.execute(
+        "resolved-error",
+        {
+          script:
+            `export const meta = { name: "resolved-error", description: "d" };\n` +
+            `return "complete";`,
+          async: true,
+          completionPolicy: "group",
+          completionGroupId: "resolved-errors",
+        },
+        undefined,
+        undefined,
+        { cwd: "/tmp", modelRegistry: undefined },
+      )) as { details: { workflowId: string } };
+      const job = workflowJobRegistry.get(started.details.workflowId);
+      expect(job).toBeDefined();
+      if (!job) throw new Error("workflow job was not registered");
+      job.suppressCompletionNotification = true;
+      await job.promise;
+
+      // The runner result is deliberately changed to the resolved partial-failure
+      // shape before invoking the real tool callback. The public job status remains
+      // `done`; only the compact completion record needs the error status.
+      if (!job.result) throw new Error("workflow did not produce a result");
+      job.result = { ...job.result, errorCount: 2 };
+      job.snapshot.errorCount = 2;
+      clearCompletionCoordinator(workflowOwner);
+      job.completionNotificationDelivered = false;
+      job.suppressCompletionNotification = false;
+      expect(job.completionNotification?.(job)).toBe(true);
+
+      const published = entries.filter(
+        (entry) => entry.customType === "subagentura-completion",
+      );
+      expect(published.at(-1)?.data).toMatchObject({ status: "error" });
+      expect(job.status).toBe("done");
+    } finally {
+      const jobIds = [...workflowJobRegistry.values()]
+        .filter((job) => job.parentSessionOwner?.id === workflowOwner.id)
+        .map((job) => job.id);
+      for (const id of jobIds) workflowJobRegistry.delete(id);
+      clearCompletionCoordinator(workflowOwner);
+      clearSessionScopes();
+    }
+  });
 });
 it("sets startedAt from the passed timestamp", () => {
   const script = `export const meta = { name: "ts", description: "d" };\nreturn 1;`;
@@ -1619,7 +1855,7 @@ it("throws when all 100 job slots are full and none can be evicted", () => {
     const script = `export const meta = { name: "x", description: "d" };\nreturn "ok";`;
     expect(() =>
       startWorkflowJob("x", script, { runAgent: echoRunner() }),
-    ).toThrow(/100 workflow jobs already running/);
+    ).toThrow(/100 workflow jobs are retained or running/);
   } finally {
     for (const id of filled) workflowJobRegistry.delete(id);
   }
@@ -2577,7 +2813,7 @@ describe("registerWorkflowTool", () => {
 
       expect(() =>
         startWorkflowJob("async-at-cap", script, { runAgent: echoRunner() }),
-      ).toThrow(/workflow jobs already running/);
+      ).toThrow(/workflow jobs are retained or running/);
 
       const job = startWorkflowJob(
         "sync-at-cap",

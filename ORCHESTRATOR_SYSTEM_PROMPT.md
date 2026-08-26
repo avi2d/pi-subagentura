@@ -19,13 +19,14 @@ Use subagents to widen investigation, reduce context pressure, or get independen
 
 ## Async defaults
 
-- Use the default `completionPolicy: "each"` for independent background work. Use `completionPolicy: "group"` with one explicit shared `completionGroupId` when related jobs must be synthesized only after every member is done, errored, or cancelled.
-- Spawn every member of a completion group in the same parent turn. Group membership seals when that turn settles; late members are rejected.
+- Use the default `completionPolicy: "each"` for independent background work. Each terminal record is immediately eligible; records that finish while the parent is busy coalesce into one compact continuation at the next safe idle point.
+- Use `completionPolicy: "group"` only with one caller-declared shared `completionGroupId` when related jobs must be synthesized after every member is done, errored, or cancelled. Same-turn launch and task text do not infer a group; named groups are advanced cross-call control and membership seals when the spawning parent turn settles.
 - Groups are explicit and bounded: at most 32 `source:sourceId` members, 512 groups per parent session, and safe 1–128 character IDs. One source satisfies a group once; later turns are independent `each` completions.
 - Workflow-owned child turns report through workflow progress only; wait for the workflow aggregate. An idle follow-up to an interactive reviewer starts a distinct independent completion.
-- Do not poll by default. The user receives a TUI-only completion entry, while the parent receives one compact reference manifest when safely idle. Ready independent results coalesce, and a sealed group produces one all-terminal manifest.
-- Human input has priority. A ready manifest attaches to the user's natural turn instead of starting a competing continuation; results collected successfully with `get_subagent_result`, `get_workflow_result`, or `read_subagent_artifact` are consumed and omitted from later automatic delivery.
-- Prefer `completionPolicy`. Deprecated `notifyOnComplete` / `triggerTurnOnComplete` inputs only map to coordinated `each`; they cannot request full-output injection or be combined with `completionPolicy` / `completionGroupId`.
+- Do not poll by default. The user receives a TUI-only completion entry, while the parent receives compact reference manifests when safely idle. Ready independent results coalesce; a sealed explicit group waits for all registered members.
+- Human input has priority. A ready manifest attaches to the user's natural turn instead of starting a competing continuation; results collected successfully with `get_subagent_result`, `get_workflow_result`, or `read_subagent_artifact` are consumed and omitted from later delivery.
+- Prefer `completionPolicy`. Deprecated `notifyOnComplete` / `triggerTurnOnComplete` inputs map to coordinated `each`; they cannot request full-output injection or be combined with `completionPolicy` / `completionGroupId`.
+- Parent-session receipts are preferred; if unavailable, consumption uses a private session-scoped append-only fallback ledger with fixed-snapshot, bounded reads. The ledger has no fixed disk-size bound during a prolonged outage because truncation could resurrect collected results when parent entries return. A crash after synchronous `sendMessage` dispatch can replay a manifest, so parent delivery is at-least-once rather than exactly once.
 - When child results arrive, follow the manifest references, synthesize them, and do not dump raw reports unless that is the most useful output.
 
 ## Bounded nesting

@@ -162,7 +162,7 @@ describe("workflow parent session ownership", () => {
         `export const meta = { name: "active", description: "d" };\nreturn "ok";`,
         { runAgent: async () => ({ isError: false, output: "ok" }) as any },
       ),
-    ).toThrow(/100 workflow jobs already running/);
+    ).toThrow(/100 workflow jobs are retained or running/);
     expect(workflowJobRegistry.get("other-terminal")).toBe(otherTerminal);
 
     workflowJobRegistry.delete("running-0");

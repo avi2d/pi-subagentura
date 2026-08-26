@@ -16,15 +16,15 @@ The implementation separates those channels and coordinates parent readiness.
 
 ## Goals and scope
 
-- Notify the user once for every parent-visible standalone terminal turn and every
-  background workflow aggregate terminal result.
+- Notify the user once for every parent-visible standalone terminal turn and every background workflow aggregate terminal result.
 - Keep user notices out of parent LLM context.
 - Deliver compact references instead of full child output by default.
-- Support independent `each` readiness and explicit sealed `group` barriers.
+- Make independent `completionPolicy: "each"` readiness the default: terminal records are immediately eligible, and records completing while the parent is busy coalesce into a safe-idle continuation.
+- Support an explicit, caller-declared `completionPolicy: "group"` barrier for related work; same-turn launch and task text never infer membership.
 - Give human prompts, steering, and queued follow-ups priority.
 - Consume manually retrieved terminal results before automatic delivery.
-- Preserve bounded state, explicit ownership, immutable artifact identity, and
-  workflow-owned child suppression.
+- Preserve bounded state, explicit ownership, immutable artifact identity, and workflow-owned child suppression.
+- Map deprecated legacy notify fields to coordinated `each`.
 
 Workflow-owned child turns remain visible through workflow progress but do not
 publish direct completion notices or manifests. Only the background workflow
@@ -40,7 +40,11 @@ aggregate joins the parent coordinator.
   retrieval references, never full child output by default.
 - **Consumed**: terminal output was retrieved manually, so later automatic
   delivery omits the matching completion.
-- **Completion group**: an explicit barrier keyed by `completionGroupId`.
+- **Consumption receipt**: a durable marker that manual or lifecycle handling
+  consumed a terminal result, normally a parent-session custom entry.
+- **Fallback consumption ledger**: a private, session-scoped append-only NDJSON
+  ledger used when the parent session cannot persist a consumption entry.
+- **Completion group**: an explicit barrier keyed by a caller-declared `completionGroupId`.
 - **Sealed**: the spawning parent turn settled, so no new group members may join.
 
 ## Two-channel contract
@@ -50,13 +54,16 @@ aggregate joins the parent coordinator.
 For each parent-visible terminal record, the coordinator:
 
 1. normalizes and bounds the record;
-2. appends one `subagentura-completion` entry with `pi.appendEntry()`;
+2. appends one deterministic `subagentura-completion` entry with `pi.appendEntry()`;
 3. renders it with `pi.registerEntryRenderer()`;
 4. reconciles deterministic IDs against parent session entries; and
 5. excludes the entry from provider context.
 
-`pi.sendMessage()` is never used for a user-only notice because custom messages
-participate in later model context even when they do not trigger a turn.
+This produces one immediate, exactly-once, user-only TUI notice per terminal
+member. `pi.sendMessage()` is never used for a user-only notice because custom
+messages participate in later model context even when they do not trigger a
+turn. Retry and reconciliation preserve the exactly-once notice identity when
+storage is transiently unavailable.
 
 Parent delivery fails closed behind notice persistence. A failed notice append
 remains pending and blocks manifest preparation. One scheduled retry occurs when
@@ -84,19 +91,26 @@ Manifests are capped at 32 KiB and 128 records. A grouped unit is selected
 atomically and is never split to fit. If references exceed the budget, the
 manifest retains bounded retrieval calls and omits the expanded reference array.
 Physical publication order is authoritative.
+By default, `completionPolicy="each"` makes each terminal record eligible
+immediately. Records that arrive while the parent is busy are coalesced into a
+single bounded manifest at the next safe-idle dispatch. A caller can instead
+select an explicit `completionPolicy="group"` with a shared
+`completionGroupId`; same-turn launch and task text never infer a group.
 
 ## Readiness policies
 
-### `each`
+### `each` (default)
 
-Independent records become ready immediately. Records that finish while the
-parent is busy coalesce at the next safe dispatch instead of creating a burst of
-turns.
+Independent terminal records become ready immediately. Records that finish while
+the parent is busy coalesce at the next safe dispatch instead of creating a
+burst of turns. The default does not wait for unrelated records or infer
+relatedness from a shared parent turn or prompt text.
 
-### `group`
+### `group` (explicit named barrier)
 
-Related top-level work declares `completionPolicy: "group"` and one shared,
-explicit `completionGroupId`. Relatedness is never inferred from prompt text.
+Related top-level work may declare `completionPolicy: "group"` and one shared,
+caller-declared `completionGroupId` for advanced cross-call control. Relatedness
+is never inferred from prompt text or same-turn launch.
 
 - Every member is registered at spawn.
 - The spawning parent turn's settlement seals the group.
@@ -112,8 +126,9 @@ at most 32 members, a parent session supports at most 512 groups, and IDs are
 group once; later turns from the same source/group are independent `each` records
 with distinct completion IDs.
 
-Workflow schedulers do not seal parent completion groups for internal children.
-Internal children are suppressed, and only the background workflow aggregate participates.
+Workflow schedulers do not create or infer parent completion groups for internal
+children. Internal children are suppressed, and only the background workflow
+aggregate participates.
 
 ## Human-input priority
 
@@ -134,6 +149,14 @@ consumption entry before returning:
 - `read_subagent_artifact` when it successfully returns a selected or latest terminal output (requesting output without a terminal snapshot does not consume);
 - `get_subagent_result`;
 - `get_workflow_result`.
+
+Parent session entries are the preferred receipt location. If `appendEntry` is
+unavailable or fails, the coordinator losslessly appends the receipt to a
+private, session-scoped append-only NDJSON ledger under `<cwd>/.pi/`, keyed by
+the parent session identity. Fallback-ledger reads take a fixed snapshot of the
+current file size and stream it with bounded chunks and line buffers.
+Reconciliation advances through later snapshots so late-published receipts are
+not lost without repeatedly loading or scanning the whole file.
 
 Events-only artifact reads do not consume output. Interactive consumption matches
 the immutable terminal turn, not mutable follow-up staging bytes. Protocol-v2
@@ -160,9 +183,14 @@ legacy synthetic-receipt suppression.
 Spawnable asynchronous work accepts:
 
 ```text
-completionPolicy: "each" | "group"  // default: "each"
-completionGroupId?: string           // required for "group"
+completionPolicy?: "each" | "group"  // default: "each"
+completionGroupId?: string           // required for explicit "group"; caller-declared
 ```
+
+`completionPolicy: "each"` is the default independent-readiness behavior.
+`completionPolicy: "group"` requires a caller-declared `completionGroupId` and
+is the advanced named cross-call barrier. Same-turn launch and task text never
+infer membership.
 
 Deprecated `notifyOnComplete` and `triggerTurnOnComplete` inputs remain accepted.
 Either legacy value maps deterministically to coordinated `each`, cannot request
@@ -174,9 +202,23 @@ changing workflow IDs, retained workflow names, or retrieval identity.
 ## Lifecycle and durability
 
 Interactive completion policy, group identity, event cursors, pending intents,
-and legacy receipts rehydrate only into the matching parent session. In-process
-jobs and background workflows remain parent-session scoped and do not survive
-session replacement. `new` and `fork` do not import prior completion work.
+and legacy receipts rehydrate only into the matching parent session. Consumption
+receipts prefer parent-session entries and fall back to the private ledger keyed
+by the parent session identity and working directory. In-process jobs and
+background workflows remain parent-session scoped and do not survive session
+replacement. `new` and `fork` do not import prior completion work.
+
+The fallback ledger is append-only and has no fixed disk-size bound while a
+prolonged parent-session-entry outage lasts. This is an accepted durability
+tradeoff: truncating it could resurrect results already collected when parent
+entries become available again. Reads remain fixed-snapshot and bounded-memory,
+and reconciliation must preserve late-published receipts without repeated
+whole-file scans.
+
+Session shutdown clears live coordinator state after recording lifecycle
+retirements; it does not truncate or delete fallback ledgers. Same-session
+reload, resume, or restart can reconcile the matching ledger, while replacement
+sessions leave old private files on disk without importing them.
 
 A successful Pi `sendMessage()` proves synchronous dispatch, not durable session
 commit. Deterministic completion IDs prevent ordinary replay, but a crash in that
@@ -187,12 +229,17 @@ not described as exactly once.
 
 Permanent regressions cover:
 
-- independent coalescing and sealed all-terminal groups;
+- default independent `each` readiness and safe-idle coalescing;
+- explicit named groups, sealed all-terminal membership, and cross-call control;
 - errors, cancellation, late-member rejection, and one-shot group membership;
 - human-input and turn-start races;
 - manual consumption and immutable retrieval selection;
 - bounded queues, manifests, group units, and crash/rehydrate replay;
 - transient notice retry, append-then-throw reconciliation, and no retry spin;
+- fallback receipt preference, lossless append, fixed-snapshot bounded-memory
+  reads, late-receipt reconciliation without repeated whole-file scans, and the
+  accepted unbounded disk-growth tradeoff while parent entry persistence is
+  unavailable;
 - workflow-owned suppression and cancellation deduplication;
 - accepted long workflow names and 256-character turn IDs;
 - tmux, Zellij, Pi-session provider context, and terminal E2E behavior.

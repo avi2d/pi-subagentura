@@ -21,6 +21,7 @@ import {
   debugLog,
   formatUsage,
   getInProcessJob,
+  MAX_REGISTRY_SIZE,
   removeInProcessJob,
   inProcessJobOwner,
   inProcessJobsForOwner,
@@ -207,6 +208,19 @@ function unavailableSessionResult(): AgentToolResult<InProcessSubagentDetails> {
       },
     ],
     details: { status: "not_found" },
+    isError: true,
+  } as AgentToolResult<InProcessSubagentDetails>;
+}
+
+function inProcessCapacityResult(): AgentToolResult<InProcessSubagentDetails> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `${MAX_REGISTRY_SIZE} in-process sub-agent jobs are retained or running. Collect a terminal result with get_subagent_result, or cancel a running job, before starting another.`,
+      },
+    ],
+    details: { status: "error", usage: ZERO_USAGE },
     isError: true,
   } as AgentToolResult<InProcessSubagentDetails>;
 }
@@ -626,7 +640,9 @@ function registerSubagentWithContextTool(
         if (!registerInProcessJob(jobState, owner)) {
           releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
-          return cancelledAsyncSpawnResult();
+          return owner && !resolveLiveSessionScope(owner)
+            ? cancelledAsyncSpawnResult()
+            : inProcessCapacityResult();
         }
         if (completion.policy) {
           try {
@@ -881,7 +897,9 @@ function registerSubagentIsolatedTool(
         if (!registerInProcessJob(jobState, owner)) {
           releaseCompletionGroup(completionReservation);
           discardAsyncSpawn(abort, session, disposeBeforeStart);
-          return cancelledAsyncSpawnResult();
+          return owner && !resolveLiveSessionScope(owner)
+            ? cancelledAsyncSpawnResult()
+            : inProcessCapacityResult();
         }
         if (completion.policy) {
           try {
@@ -1231,6 +1249,10 @@ function registerGetSubagentResultTool(
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
       consumeCompletionSource(pi, "in-process", job.id, execution.owner);
+      if (job.cleanupAfterCollection) {
+        job.cleanupAfterCollection = false;
+        scheduleJobCleanup(job.id, true, undefined, execution.owner);
+      }
 
       if ((job.status as JobStatus) === "cancelled") {
         return {

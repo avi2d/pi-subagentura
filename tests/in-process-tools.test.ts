@@ -96,6 +96,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 // ── Imports (after mocks, vitest resolves to mocked modules) ─────────
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type * as HelpersModule from "../src/helpers";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
@@ -103,6 +104,7 @@ import {
   type SubagentResult,
   inProcessJobsForOwner,
   jobRegistry,
+  MAX_REGISTRY_SIZE,
   pruneCompletedJobs,
   registerInProcessJob,
 } from "../src/helpers";
@@ -553,6 +555,31 @@ describe("subagent_isolated tool", () => {
     );
   });
 
+  it("reports retained-job capacity instead of session shutdown", async () => {
+    for (let index = 0; index < MAX_REGISTRY_SIZE; index++) {
+      jobRegistry.set(
+        `running-capacity-${index}`,
+        createJobState({
+          id: `running-capacity-${index}`,
+          status: "running",
+        }),
+      );
+    }
+
+    const result = await toolDef.execute(
+      "call-at-capacity",
+      { task: "analyze code" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("retained or running");
+    expect(result.content[0].text).not.toContain("session shutdown");
+    expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+  });
+
   it("refuses to spawn once the orchestration depth cap is reached", async () => {
     const ctx = mockCtx();
     const result = await withOrchestrationContext(
@@ -925,6 +952,79 @@ describe("get_subagent_result tool", () => {
     expect(result.isError).toBeFalsy();
     // resultRetrieved should have been set
     expect(job.resultRetrieved).toBe(true);
+  });
+  it("keeps a grouped result through TTL, prune, and cap pressure until collection", async () => {
+    vi.useFakeTimers();
+    try {
+      const resultA: SubagentResult = {
+        ...defaultSuccessResult,
+        output: "grouped result A",
+      };
+      const groupedA = createJobState({
+        id: "grouped-a",
+        status: "done",
+        result: resultA,
+        promise: Promise.resolve(resultA),
+        completionPolicy: "group",
+        completionGroupId: "grouped-retention",
+        maxAge: 10,
+      });
+      const groupedB = createJobState({
+        id: "grouped-b",
+        status: "running",
+        promise: new Promise<SubagentResult>(() => {}),
+        completionPolicy: "group",
+        completionGroupId: "grouped-retention",
+      });
+      expect(registerInProcessJob(groupedA)).toBe(true);
+      expect(registerInProcessJob(groupedB)).toBe(true);
+
+      const actualHelpers =
+        await vi.importActual<typeof HelpersModule>("../src/helpers");
+      actualHelpers.scheduleJobCleanup(groupedA.id, false, groupedA.maxAge);
+      vi.advanceTimersByTime(20);
+      expect(jobRegistry.get(groupedA.id)).toBe(groupedA);
+      expect(pruneCompletedJobs()).toBe(0);
+
+      for (let index = 0; jobRegistry.size < MAX_REGISTRY_SIZE; index++) {
+        jobRegistry.set(
+          `running-filler-${index}`,
+          createJobState({
+            id: `running-filler-${index}`,
+            status: "running",
+          }),
+        );
+      }
+      expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+      expect(
+        registerInProcessJob(
+          createJobState({ id: "over-cap", status: "running" }),
+        ),
+      ).toBe(false);
+      expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+      expect(jobRegistry.get(groupedA.id)).toBe(groupedA);
+      expect(jobRegistry.get(groupedB.id)).toBe(groupedB);
+
+      const collected = await toolDef.execute(
+        "collect-grouped-a",
+        { jobId: groupedA.id },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      expect(collected.content[0].text).toBe("grouped result A");
+      expect(groupedA.resultRetrieved).toBe(true);
+      expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
+        groupedA.id,
+        true,
+        undefined,
+        undefined,
+      );
+      expect(pruneCompletedJobs()).toBe(1);
+      expect(jobRegistry.has(groupedA.id)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("handles cancellation race (status changes to cancelled after await)", async () => {

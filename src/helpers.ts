@@ -340,6 +340,8 @@ export interface JobState {
   notificationDelivered?: boolean;
   /** Set true by get_subagent_result to suppress redundant notification */
   resultRetrieved?: boolean;
+  /** A maxAge timer fired while coordinated result retention was active. */
+  cleanupAfterCollection?: boolean;
   /** Active get_subagent_result waits suppress settlement notifications. */
   activeResultWaits?: number;
   /** Optional TTL in ms for completed job retention */
@@ -379,7 +381,8 @@ export interface CancellationInfo {
  *
  * Lifecycle:
  *   - Jobs added on async subagent spawn
- *   - Completed/error jobs persist indefinitely (no TTL)
+ *   - Completed/error jobs follow their optional maxAge; uncollected coordinated
+ *     results remain protected until explicit collection
  *   - Cancelled jobs removed immediately
  *   - All jobs lost on Pi restart (in-memory only)
  */
@@ -461,7 +464,12 @@ export function registerInProcessJob(
   if (effectiveOwner) {
     const registry = exactSessionJobRegistry(effectiveOwner);
     if (!registry) return false;
+    if (!registry.has(job.id) && !ensureInProcessJobCapacity(effectiveOwner)) {
+      return false;
+    }
     registry.set(job.id, job);
+  } else {
+    if (!ensureInProcessJobCapacity()) return false;
   }
   jobRegistry.set(job.id, job);
   return true;
@@ -499,6 +507,23 @@ export function removeInProcessJob(
   return true;
 }
 
+function isProtectedCoordinatedResult(job: JobState): boolean {
+  return (
+    (job.status === "done" || job.status === "error") &&
+    job.completionPolicy !== undefined &&
+    !job.resultRetrieved
+  );
+}
+
+function ensureInProcessJobCapacity(owner?: SessionOwnerToken): boolean {
+  const registry = inProcessJobsForOwner(owner);
+  while (registry.size >= MAX_REGISTRY_SIZE && pruneOldestJob(owner)) {
+    // Evict only unprotected terminal rows; running and coordinated results
+    // remain available for their completion references.
+  }
+  return registry.size < MAX_REGISTRY_SIZE;
+}
+
 declare global {
   var __piSubagenturaRegistry: Map<string, JobState> | undefined;
   var __piSubagenturaInteractiveRegistry:
@@ -523,20 +548,24 @@ export const JOB_CLEANUP_TTL_MS = 0;
 /** Maximum number of jobs to retain in the registry */
 export const MAX_REGISTRY_SIZE = 100;
 
-/** Remove the oldest completed or error job from the registry */
+/** Remove the oldest unprotected completed or error job from the registry. */
 export function pruneOldestJob(owner?: SessionOwnerToken): boolean {
   for (const [jobId, job] of inProcessJobsForOwner(owner)) {
     if (job.status !== "done" && job.status !== "error") continue;
+    if (isProtectedCoordinatedResult(job)) continue;
     if (removeInProcessJob(jobId, owner ?? inProcessJobOwner(job))) return true;
   }
   return false;
 }
 
-/** Remove all completed and error jobs from one owner registry. Returns count removed. */
+/** Remove all unprotected completed and error jobs from one owner registry. Returns count removed. */
 export function pruneCompletedJobs(owner?: SessionOwnerToken): number {
   let removed = 0;
   for (const [jobId, job] of inProcessJobsForOwner(owner)) {
-    if (job.status === "done" || job.status === "error") {
+    if (
+      (job.status === "done" || job.status === "error") &&
+      !isProtectedCoordinatedResult(job)
+    ) {
       if (removeInProcessJob(jobId, owner ?? inProcessJobOwner(job))) removed++;
     }
   }
@@ -642,17 +671,19 @@ export function scheduleJobCleanup(
   maxAge?: number,
   owner?: SessionOwnerToken,
 ): void {
-  if (!immediate) {
-    if (maxAge && maxAge > 0) {
-      setTimeout(() => {
-        removeInProcessJob(jobId, owner);
-      }, maxAge);
+  const cleanup = (): void => {
+    const job = getInProcessJob(jobId, owner);
+    if (job && isProtectedCoordinatedResult(job)) {
+      job.cleanupAfterCollection = true;
+      return;
     }
+    removeInProcessJob(jobId, owner);
+  };
+  if (!immediate) {
+    if (maxAge && maxAge > 0) setTimeout(cleanup, maxAge);
     return; // persist indefinitely unless maxAge specified
   }
-  setTimeout(() => {
-    removeInProcessJob(jobId, owner);
-  }, 0);
+  setTimeout(cleanup, 0);
 }
 
 /** Generate a unique job ID (16 hex chars from crypto.randomBytes) */
@@ -824,7 +855,7 @@ export async function startSubagentJob(
 
   // Enforce the cap within this exact scope; peer sessions never evict each other.
   while (inProcessJobsForOwner(owner).size >= MAX_REGISTRY_SIZE) {
-    if (!pruneOldestJob(owner)) break; // no old jobs to evict, allow slight overcap
+    if (!pruneOldestJob(owner)) break; // registration rejects when no slot is available
   }
 
   const jobId = generateJobId();

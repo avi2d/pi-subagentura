@@ -1555,10 +1555,19 @@ function migrateStatePayload(
               const rawIntent = intent as unknown as Record<string, unknown>;
               if (
                 typeof rawIntent.deliveryId !== "string" ||
+                rawIntent.deliveryId.length === 0 ||
+                rawIntent.deliveryId.length > MAX_EVENT_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.deliveryId) ||
                 typeof rawIntent.subagentId !== "string" ||
                 rawIntent.subagentId !== id ||
                 typeof rawIntent.turnId !== "string" ||
+                rawIntent.turnId.length === 0 ||
+                rawIntent.turnId.length > MAX_TURN_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.turnId) ||
                 typeof rawIntent.eventId !== "string" ||
+                rawIntent.eventId.length === 0 ||
+                rawIntent.eventId.length > MAX_EVENT_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.eventId) ||
                 (rawIntent.mode !== "notify" && rawIntent.mode !== "inject") ||
                 typeof rawIntent.triggerTurn !== "boolean" ||
                 (rawIntent.status !== "done" &&

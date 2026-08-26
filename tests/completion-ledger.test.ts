@@ -1,10 +1,21 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   appendLedgerLine,
+  appendLedgerLineLossless,
   readLedgerLines,
+  scanLedgerLines,
   sessionLedgerPath,
 } from "../src/completion-ledger";
 
@@ -66,5 +77,64 @@ describe("completion ledger", () => {
         maxBytes: 100,
       }),
     ).toThrow();
+  });
+  it("scans a fixed initial snapshot and bounds oversized multi-chunk lines", () => {
+    root = mkdtempSync(join(tmpdir(), "completion-ledger-scan-"));
+    const path = sessionLedgerPath(root, "session-a", "scan");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(path, `${"x".repeat(128 * 1024)}\nfirst\nsecond\n`, {
+      mode: 0o600,
+    });
+
+    const lines: string[] = [];
+    scanLedgerLines(path, 1024, (line) => {
+      lines.push(line);
+      if (line === "first") appendLedgerLineLossless(path, "late");
+    });
+
+    expect(lines).toEqual(["first", "second"]);
+    expect(readFileSync(path, "utf8")).toContain("late\n");
+  });
+
+  it("continues dropping oversized lines across scan snapshots", () => {
+    root = mkdtempSync(join(tmpdir(), "completion-ledger-scan-resume-"));
+    const path = sessionLedgerPath(root, "session-a", "scan-resume");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(path, "x".repeat(2 * 1024), { mode: 0o600 });
+
+    const firstLines: string[] = [];
+    const first = scanLedgerLines(path, 1024, (line) => firstLines.push(line));
+    expect(firstLines).toEqual([]);
+    expect(first.dropping).toBe(true);
+
+    appendFileSync(path, `${JSON.stringify({ consumed: true })}\nkept\n`);
+    const resumedLines: string[] = [];
+    const resumed = scanLedgerLines(
+      path,
+      1024,
+      (line) => resumedLines.push(line),
+      {
+        startOffset: first.nextOffset,
+        dropping: first.dropping,
+      },
+    );
+    expect(resumedLines).toEqual(["kept"]);
+    expect(resumed.dropping).toBe(false);
+  });
+
+  it("repairs partial tails before byte-accurate lossless appends", () => {
+    root = mkdtempSync(join(tmpdir(), "completion-ledger-lossless-"));
+    const path = sessionLedgerPath(root, "session-a", "receipts");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+
+    writeFileSync(path, Buffer.from('{"partial":true}', "utf8"), {
+      mode: 0o600,
+    });
+    appendLedgerLineLossless(path, JSON.stringify({ text: "π" }));
+    expect(readFileSync(path, "utf8")).toBe('{"partial":true}\n{"text":"π"}\n');
+
+    writeFileSync(path, Buffer.from('{"newlyPartial":', "utf8"));
+    appendLedgerLineLossless(path, JSON.stringify({ text: "€" }));
+    expect(readFileSync(path, "utf8")).toBe('{"newlyPartial":\n{"text":"€"}\n');
   });
 });

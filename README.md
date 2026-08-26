@@ -198,9 +198,13 @@ The guidance gives the parent agent reasonable default behavior when the user as
 The defaults prefer async `subagent_isolated` for fresh scouts/reviewers,
 `subagent_with_context` for oracle checks, coordinated reference manifests
 instead of polling or full-output injection, and one writer at a time for
-implementation. Related fan-out uses an explicit completion group. For cheap
-fan-out, the guidance suggests validating model availability before using
-optional model overrides.
+implementation. Asynchronous completion defaults to `completionPolicy: "each"`:
+each terminal record becomes immediately eligible, while records that finish
+while the parent is busy coalesce into a safe-idle continuation. Related work
+uses an explicit `completionPolicy: "group"` and caller-declared
+`completionGroupId`; relatedness is never inferred from being launched in the
+same turn or from task text. For cheap fan-out, the guidance suggests
+validating model availability before using optional model overrides.
 
 ## Cancellation context snapshots (opt-in)
 
@@ -232,10 +236,10 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
-- `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
-- `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
+- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for an explicit barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Deprecated compatibility fields cannot be combined with `completionPolicy` or
@@ -259,10 +263,10 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
-- `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
-- `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
+- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for an explicit barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
 Deprecated compatibility fields cannot be combined with `completionPolicy` or
@@ -279,10 +283,15 @@ Best for:
 ### Async Workflow Tools
 
 When you spawn a sub-agent with `async: true`, it returns a **jobId**
-immediately and runs in the background. The coordinated default reports a
-compact result reference automatically rather than injecting full output, so
-you usually do not need to poll. Use these tools only when the user asks for
-status or explicit collection, when a job appears stuck, or when manual
+immediately and runs in the background. The coordinated default is
+`completionPolicy: "each"`: terminal records become independently eligible
+immediately, and records that finish while the parent is busy coalesce into one
+safe-idle continuation rather than a burst of turns. A related group is formed
+only when the caller explicitly selects `completionPolicy: "group"` and supplies
+a shared `completionGroupId`; same-turn launch or task text never infers a
+group. The default reports compact result references rather than injecting full
+output, so you usually do not need to poll. Use these tools only when the user
+asks for status or explicit collection, when a job appears stuck, or when manual
 follow-up is needed:
 
 Background jobs are scoped to the current parent session. This includes both
@@ -357,10 +366,10 @@ Parameters:
 - `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `completionPolicy` — `"each"` (default) or `"group"`
-- `completionGroupId` — required with `completionPolicy: "group"`; safe 1–128 character ID shared by related agents (max 32 members per group, 512 groups per parent session)
-- `notifyOnComplete` — deprecated compatibility input; either value maps to coordinated `"each"` delivery with no full-output injection
-- `triggerTurnOnComplete` — deprecated compatibility input; coordinated timing and human priority remain authoritative
+- `completionPolicy` — `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for a caller-declared named barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related agents (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 
 Deprecated compatibility fields cannot be combined with `completionPolicy` or
 `completionGroupId`. The spawn result describes the selected coordinated behavior.
@@ -514,54 +523,62 @@ from the parent-model channel:
    plus every background workflow aggregate completion, appends one deterministic
    `subagentura-completion` entry rendered in the TUI. This entry is excluded
    from LLM context, and event replay does not append it again. Workflow-owned
-   child turns remain visible through workflow progress but do not publish directly.
+   child turns remain visible through workflow progress but do not publish
+   directly.
 2. The parent model receives one bounded, hidden `subagent-manifest` containing
    statuses and references—not child output. Interactive records point to the
    immutable `outputs/<eventId>.md` snapshot when available plus
    `events.ndjson`; legacy artifacts may fall back to mutable `output.md`.
    In-process and workflow records point to `get_subagent_result` and
    `get_workflow_result`.
-   Coordinated workflow completion labels are capped at 160 characters without
-   changing the workflow ID, retained workflow name, or retrieval identity.
-3. The manifest attaches to a pending human-initiated turn when possible.
+3. A ready manifest attaches to a pending human-initiated turn when possible.
    Otherwise Pi receives one triggered follow-up after the parent is safely
    idle. Human prompts and steering always take priority.
 
 `completionPolicy` controls readiness:
 
-- `"each"` (default) makes every independent result ready immediately. Results
-  that finish while the parent is busy are coalesced into one manifest.
-- `"group"` requires an explicit shared `completionGroupId`. Spawn all members
-  in the same parent turn: settlement seals the group, rejects late members,
-  and blocks model delivery until every registered member is terminal. Errors
-  and cancellations satisfy the barrier. Per-member TUI notices still appear
-  immediately, and an entirely consumed group does not trigger an empty turn.
+- `"each"` (default) makes every independent result eligible immediately.
+  Results that finish while the parent is busy are coalesced into one manifest
+  at the next safe-idle dispatch; this is the default independent-delivery
+  behavior.
+- `"group"` requires the caller to provide one shared, explicit
+  `completionGroupId`. Same-turn launch and task text do not infer
+  relatedness. Register all members in the intended group before the spawning
+  parent turn settles; settlement seals the group, rejects late members, and
+  blocks model delivery until every registered member is `done`, `error`, or
+  `cancelled`. Per-member TUI notices still appear immediately, and an entirely
+  consumed group does not trigger an empty turn.
 
-A group supports at most 32 distinct `source:sourceId` members, with at most
-512 groups per parent session. `completionGroupId` is 1–128 characters and must
-match `[A-Za-z0-9][A-Za-z0-9._:-]*`. A source can satisfy a group only once;
-later turns from the same source/group are delivered independently as `each`.
+A named group is advanced cross-call control. A group supports at most 32
+distinct `source:sourceId` members, with at most 512 groups per parent session.
+`completionGroupId` is 1–128 characters and must match
+`[A-Za-z0-9][A-Za-z0-9._:-]*`. A source can satisfy a group only once; later
+turns from the same source/group are delivered independently as `each`.
 
 Successful terminal retrieval through `get_subagent_result`,
 `get_workflow_result`, or `read_subagent_artifact` with output consumes the
 matching pending record before returning it. Automatic and manual delivery share
-the same receipts, so normal runtime paths do not deliver the result twice.
+the same receipts, so a consumed record is suppressed from normal subsequent
+dispatch. This is not an exactly-once delivery guarantee: a crash around parent
+dispatch can still replay a manifest as described below.
 Workflow-owned process or in-process children never publish directly; only the
 background workflow aggregate completion participates in coordinated delivery.
 
 The deprecated `notifyOnComplete` and `triggerTurnOnComplete` fields remain
 accepted for compatibility. Either legacy value maps deterministically to
 coordinated `"each"`: the notice is TUI-only, the parent receives only compact
-references, and policy/barrier plus human-priority rules control timing. Combining
-either field with `completionPolicy` or `completionGroupId` is rejected. Persisted
-pre-coordinator intents may still drain through the bounded legacy broker during
-upgrade recovery, but new API calls cannot select full-output injection.
+references, and policy plus human-priority rules control timing. Combining
+either field with `completionPolicy` or `completionGroupId` is rejected.
+Persisted pre-coordinator intents may still drain through the bounded legacy
+broker during upgrade recovery, but new API calls cannot select full-output
+injection.
 
-Interactive coordinated policy, group membership, intents, and receipts survive
+Interactive coordinated policy, group membership, and intents survive
 same-session startup/reload/resume through `.pi/subagentura-state.json` and
-parent session entries. In-process jobs and background workflows remain
-parent-session scoped and are retired on session replacement. `new` and `fork`
-do not import prior completion work.
+parent session entries. Consumption receipts prefer those entries and use the
+private fallback ledger when needed. In-process jobs and background workflows
+remain parent-session scoped and are retired on session replacement. `new` and
+`fork` do not import prior completion work.
 
 Parent delivery fails closed behind durable notice storage. If `appendEntry`
 fails, the notice remains pending and the manifest is withheld; later coordinator
@@ -570,6 +587,29 @@ exception, session-entry reconciliation prevents a duplicate. Deterministic
 identities prevent routine replay, but Pi's synchronous `sendMessage` proves
 dispatch rather than durable commit, so a crash in that separate window can still
 replay a manifest.
+
+#### Consumption-receipt fallback
+
+Parent session entries are the preferred durable location for consumption
+receipts. If the parent cannot append an entry because `appendEntry` is
+unavailable or fails, the coordinator losslessly appends each receipt to a
+private, session-scoped NDJSON ledger under `.pi/`. The ledger is keyed by the
+parent session identity and working directory, not shared across sessions.
+
+Ledger readers take a fixed snapshot of the file's current size and process it
+in bounded chunks and line buffers. Reconciliation advances through later
+snapshots so late-published receipts are not lost without repeatedly loading or
+scanning the whole file. The append-only ledger has no fixed disk-size bound
+while a prolonged parent-session-entry outage lasts. This is an intentional
+durability tradeoff: truncating the ledger could resurrect results that were
+already collected when parent entries become available again.
+
+Session shutdown clears live coordinator state and records lifecycle
+retirements: non-interactive session-scoped work is retired, while interactive
+state and receipts remain eligible for same-session reload, resume, or restart.
+`/new` and `/fork` also retire interactive work and do not import prior
+completion work. Cleanup does not truncate or delete the fallback ledger, so
+old private files can remain on disk after a replacement session starts.
 
 #### `get_interactive_subagent_status`
 

@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { abortableWait } from "./abortable-wait";
 import {
   debugLog,
+  MAX_REGISTRY_SIZE,
   registerInProcessJob,
   removeInProcessJob,
   startSubagentJob,
@@ -332,7 +333,7 @@ export function registerWorkflowTool(
           signal?.removeEventListener("abort", forwardAbort);
           discardWorkflowChildSpawn(abort, prepared);
           throw new Error(
-            "Workflow agent cancelled: parent session shut down before the child was registered.",
+            `Workflow agent could not start: ${MAX_REGISTRY_SIZE} in-process sub-agent jobs are retained or running.`,
           );
         }
         // Without settlement the row would stay "running" forever: cancellable in
@@ -403,6 +404,12 @@ export function registerWorkflowTool(
   }
 
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
+    const run = job.result;
+    const errorCount = run?.errorCount ?? job.snapshot.errorCount;
+    const presentation = getWorkflowCompletionPresentation(
+      job.status,
+      errorCount,
+    );
     if (job.completionPolicy) {
       publishCompletion(
         {
@@ -414,29 +421,27 @@ export function registerWorkflowTool(
           status:
             job.status === "cancelled"
               ? "cancelled"
-              : job.status === "error"
+              : job.status === "error" ||
+                  presentation.label === "completed with errors"
                 ? "error"
                 : "done",
           policy: job.completionPolicy,
           ...(job.completionGroupId ? { groupId: job.completionGroupId } : {}),
-          references: [
-            {
-              label: "result",
-              value: `call get_workflow_result with workflowId ${JSON.stringify(job.id)}`,
-            },
-          ],
+          references:
+            job.status === "cancelled"
+              ? [{ label: "status", value: "cancelled; no result retained" }]
+              : [
+                  {
+                    label: "result",
+                    value: `call get_workflow_result with workflowId ${JSON.stringify(job.id)}`,
+                  },
+                ],
           completedAt: Date.now(),
         },
         job.parentSessionOwner,
       );
       return true;
     }
-    const run = job.result;
-    const errorCount = run?.errorCount ?? job.snapshot.errorCount;
-    const presentation = getWorkflowCompletionPresentation(
-      job.status,
-      errorCount,
-    );
     const icon = presentation.icon || (job.status === "done" ? "✅" : "❌");
     const rawSummary = formatWorkflowNotificationSummary(job);
     const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
@@ -964,6 +969,7 @@ export function registerWorkflowTool(
         const usage = presentWorkflowUsage(st.snapshot?.usage);
         const outputBudget = st.snapshot?.budgetTotal;
         const usageDetails = usage ? { usage } : {};
+        st.resultRetrieved = true;
         consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
         return {
           content: [
@@ -996,6 +1002,7 @@ export function registerWorkflowTool(
         run.errorCount,
       );
       const usage = presentWorkflowUsage(run.usage);
+      st.resultRetrieved = true;
       consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
       return {
         content: [

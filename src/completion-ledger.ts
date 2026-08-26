@@ -42,6 +42,18 @@ export interface LedgerAppendResult {
   dropped: number;
 }
 
+export interface LedgerScanOptions {
+  startOffset?: number;
+  includeUnterminated?: boolean;
+  dropping?: boolean;
+}
+
+export interface LedgerScanResult {
+  snapshotSize: number;
+  nextOffset: number;
+  dropping: boolean;
+}
+
 function ensureLedgerParent(path: string): void {
   const parent = dirname(resolve(path));
   const root = parse(parent).root;
@@ -219,13 +231,40 @@ export function appendLedgerLineLossless(path: string, line: string): void {
   try {
     fd = openLedger(
       path,
-      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT,
+      constants.O_RDWR | constants.O_APPEND | constants.O_CREAT,
       0o600,
     );
-    const content = `${line}\n`;
+    const stat = fstatSync(fd);
+    if (stat.size > 0) {
+      const lastByte = Buffer.alloc(1);
+      const bytesRead = readSync(fd, lastByte, 0, 1, stat.size - 1);
+      if (bytesRead !== 1) {
+        throw new Error(`Ledger tail read made no progress: ${path}`);
+      }
+      if (lastByte[0] !== 0x0a) {
+        const separator = Buffer.from("\n", "utf8");
+        const separatorWritten = writeSync(
+          fd,
+          separator,
+          0,
+          separator.length,
+          null,
+        );
+        if (separatorWritten !== separator.length) {
+          throw new Error(`Ledger separator write was incomplete: ${path}`);
+        }
+      }
+    }
+    const content = Buffer.from(`${line}\n`, "utf8");
     let offset = 0;
     while (offset < content.length) {
-      const written = writeSync(fd, content.slice(offset), undefined, "utf8");
+      const written = writeSync(
+        fd,
+        content,
+        offset,
+        content.length - offset,
+        null,
+      );
       if (written <= 0)
         throw new Error(`Ledger write made no progress: ${path}`);
       offset += written;
@@ -240,31 +279,90 @@ export function scanLedgerLines(
   path: string,
   maxLineBytes: number,
   onLine: (line: string) => void,
-): void {
+  options: LedgerScanOptions = {},
+): LedgerScanResult {
   let fd: number | undefined;
   try {
     fd = openLedger(path, constants.O_RDONLY);
+    const snapshotSize = fstatSync(fd).size;
+    const requestedStart =
+      typeof options.startOffset === "number" &&
+      Number.isSafeInteger(options.startOffset)
+        ? Math.max(0, options.startOffset)
+        : 0;
+    const startOffset =
+      requestedStart > snapshotSize
+        ? 0
+        : Math.min(requestedStart, snapshotSize);
+    const includeUnterminated = options.includeUnterminated !== false;
     const chunk = Buffer.alloc(64 * 1024);
-    let carry = "";
-    let dropping = false;
-    for (;;) {
-      const bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+    let offset = startOffset;
+    let lastCompleteOffset = startOffset;
+    let carry = Buffer.alloc(0);
+    let dropping = requestedStart <= snapshotSize && options.dropping === true;
+
+    while (offset < snapshotSize) {
+      const bytesToRead = Math.min(chunk.length, snapshotSize - offset);
+      const bytesRead = readSync(fd, chunk, 0, bytesToRead, offset);
       if (bytesRead <= 0) break;
-      carry += chunk.subarray(0, bytesRead).toString("utf8");
-      for (;;) {
-        const newline = carry.indexOf("\n");
-        if (newline < 0) break;
-        const line = carry.slice(0, newline);
-        carry = carry.slice(newline + 1);
-        if (!dropping) onLine(line);
-        dropping = false;
+      const data = chunk.subarray(0, bytesRead);
+      let cursor = 0;
+      while (cursor < data.length) {
+        const newline = data.indexOf(0x0a, cursor);
+        const segmentEnd = newline < 0 ? data.length : newline;
+        const segment = data.subarray(cursor, segmentEnd);
+
+        if (dropping) {
+          if (newline < 0) {
+            cursor = data.length;
+          } else {
+            dropping = false;
+            carry = Buffer.alloc(0);
+            lastCompleteOffset = offset + newline + 1;
+            cursor = newline + 1;
+          }
+          continue;
+        }
+
+        if (carry.length + segment.length > maxLineBytes) {
+          carry = Buffer.alloc(0);
+          if (newline < 0) {
+            dropping = true;
+            cursor = data.length;
+          } else {
+            lastCompleteOffset = offset + newline + 1;
+            cursor = newline + 1;
+          }
+          continue;
+        }
+
+        if (segment.length > 0) {
+          carry =
+            carry.length === 0
+              ? Buffer.from(segment)
+              : Buffer.concat([carry, segment]);
+        }
+        if (newline < 0) {
+          cursor = data.length;
+          continue;
+        }
+        onLine(carry.toString("utf8"));
+        carry = Buffer.alloc(0);
+        lastCompleteOffset = offset + newline + 1;
+        cursor = newline + 1;
       }
-      if (!dropping && Buffer.byteLength(carry, "utf8") > maxLineBytes) {
-        carry = "";
-        dropping = true;
-      }
+      offset += bytesRead;
     }
-    if (!dropping && carry) onLine(carry);
+
+    if (!dropping && carry.length > 0 && includeUnterminated) {
+      onLine(carry.toString("utf8"));
+      return { snapshotSize, nextOffset: offset, dropping: false };
+    }
+    return {
+      snapshotSize,
+      nextOffset: dropping ? offset : lastCompleteOffset,
+      dropping,
+    };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }

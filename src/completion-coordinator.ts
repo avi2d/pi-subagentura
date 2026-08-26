@@ -40,7 +40,6 @@ const MAX_REFERENCES = 8;
 const MAX_MANIFEST_BYTES = 32 * 1024;
 const MAX_MANIFEST_RECORDS = 128;
 const COMPLETION_GROUP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
-
 export type CompletionPolicy = "each" | "group";
 export type CompletionSource = "interactive" | "in-process" | "workflow";
 export type CompletionStatus = "done" | "error" | "cancelled";
@@ -117,6 +116,13 @@ export interface CompletionConsumption {
   reason: "manual" | "manifest" | "lifecycle";
 }
 
+export interface CompletionExpectation {
+  completionId: string;
+  source: CompletionSource;
+  sourceId: string;
+  turnId?: string;
+}
+
 interface CompletionGroupState {
   groupId: string;
   members: Set<string>;
@@ -141,8 +147,9 @@ interface CompletionOverflowState {
   retirementBlockedAt?: number;
   pendingRecords: Map<string, CompletionRecord>;
   appendFailures: number;
-  noticeAttempted: boolean;
-  noticeDelivered: boolean;
+  noticeGeneration: number;
+  noticeDeliveredGeneration: number;
+  noticeAttemptedGeneration?: number;
   failedIds: string[];
   failedRecords: CompletionRecord[];
   failedRecordsOmitted: number;
@@ -163,7 +170,10 @@ interface CompletionCoordinatorState {
   sessionEntryCount: number;
   nextCompletionSequence: number;
   consumptionLedgerPath: string;
-  fallbackReceiptsScanned: boolean;
+  fallbackReceiptOffset: number;
+  fallbackReceiptDropping: boolean;
+  fallbackExpectations: Map<string, CompletionExpectation>;
+  deferredConsumedIds: Set<string>;
   groupReservations: Map<string, number>;
   reservedGroups: Set<string>;
   groupsSealed: boolean;
@@ -464,6 +474,38 @@ function overflowLedgerMeta(line: string):
   }
 }
 
+function overflowNoticeFingerprint(
+  overflow: Pick<
+    CompletionOverflowState,
+    | "count"
+    | "rotated"
+    | "appendFailures"
+    | "retirementBlocked"
+    | "retirementBlockedAt"
+    | "failedIds"
+    | "failedRecordsOmitted"
+  >,
+): string {
+  return JSON.stringify({
+    hasRetainedRecords: overflow.count > 0,
+    rotated: overflow.rotated,
+    appendFailed: overflow.appendFailures > 0,
+    failedIds: overflow.failedIds,
+    failedRecordsOmitted: overflow.failedRecordsOmitted,
+    retirementBlocked: overflow.retirementBlocked,
+    retirementBlockedAt: overflow.retirementBlockedAt,
+  });
+}
+
+function markOverflowNoticeDirty(
+  state: CompletionCoordinatorState,
+  previousFingerprint: string,
+): void {
+  if (overflowNoticeFingerprint(state.overflow) !== previousFingerprint) {
+    state.overflow.noticeGeneration++;
+  }
+}
+
 function overflowIndexFromLedger(
   owner: SessionOwnerToken,
   path: string,
@@ -534,7 +576,7 @@ function overflowIndexFromLedger(
 function loadOverflowState(owner: SessionOwnerToken): CompletionOverflowState {
   const path = completionOverflowPath(owner);
   const index = overflowIndexFromLedger(owner, path);
-  return {
+  const state: CompletionOverflowState = {
     path,
     ids: index.ids,
     count: index.count,
@@ -544,12 +586,21 @@ function loadOverflowState(owner: SessionOwnerToken): CompletionOverflowState {
     retirementBlockedAt: index.retirementBlockedAt,
     pendingRecords: new Map(),
     appendFailures: index.failed ? 1 : 0,
-    noticeAttempted: false,
-    noticeDelivered: false,
+    noticeGeneration: 0,
+    noticeDeliveredGeneration: 0,
     failedIds: [],
     failedRecords: [],
     failedRecordsOmitted: 0,
   };
+  if (
+    state.count > 0 ||
+    state.rotated ||
+    state.appendFailures > 0 ||
+    state.retirementBlocked
+  ) {
+    state.noticeGeneration = 1;
+  }
+  return state;
 }
 
 function loadFallbackConsumptions(
@@ -589,27 +640,80 @@ function parsedFallbackConsumption(
   }
 }
 
+function expectationMatchesConsumption(
+  expectation: CompletionExpectation,
+  consumption: CompletionConsumption,
+): boolean {
+  if (consumption.completionIds?.includes(expectation.completionId))
+    return true;
+  if (
+    consumption.source !== expectation.source ||
+    consumption.sourceId !== expectation.sourceId
+  ) {
+    return false;
+  }
+  return !consumption.turnId || consumption.turnId === expectation.turnId;
+}
+
 function reconcileFallbackConsumptions(
   state: CompletionCoordinatorState,
 ): void {
   const records = [...state.records.values()];
-  if (state.fallbackReceiptsScanned || records.length === 0) return;
-  state.fallbackReceiptsScanned = true;
+  for (const record of records) {
+    if (state.deferredConsumedIds.has(record.completionId)) {
+      state.consumed.add(record.completionId);
+      state.dispatchAttempted.delete(record.completionId);
+    }
+  }
+  const known = new Set(
+    state.sourceConsumptions.map((consumption) => JSON.stringify(consumption)),
+  );
   try {
-    scanLedgerLines(
+    const result = scanLedgerLines(
       state.consumptionLedgerPath,
       MAX_FALLBACK_RECEIPT_LINE_BYTES,
       (line) => {
         const consumption = parsedFallbackConsumption(line);
         if (!consumption) return;
+        const key = JSON.stringify(consumption);
+        if (!known.has(key)) {
+          known.add(key);
+          state.sourceConsumptions.push(consumption);
+          if (state.sourceConsumptions.length > MAX_COMPLETION_RECORDS) {
+            const removed = state.sourceConsumptions.shift();
+            if (removed) known.delete(JSON.stringify(removed));
+          }
+        }
         for (const record of records) {
-          if (matchesConsumption(record, consumption)) {
+          if (
+            !state.fallbackExpectations.has(record.completionId) &&
+            matchesConsumption(record, consumption)
+          ) {
             state.consumed.add(record.completionId);
             state.dispatchAttempted.delete(record.completionId);
           }
         }
+        for (const expectation of state.fallbackExpectations.values()) {
+          if (expectationMatchesConsumption(expectation, consumption)) {
+            state.deferredConsumedIds.add(expectation.completionId);
+          }
+        }
+      },
+      {
+        startOffset: state.fallbackReceiptOffset,
+        includeUnterminated: false,
+        dropping: state.fallbackReceiptDropping,
       },
     );
+    state.fallbackReceiptOffset = result.nextOffset;
+    state.fallbackReceiptDropping = result.dropping;
+    for (const record of records) {
+      if (state.deferredConsumedIds.delete(record.completionId)) {
+        state.consumed.add(record.completionId);
+        state.dispatchAttempted.delete(record.completionId);
+      }
+      state.fallbackExpectations.delete(record.completionId);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       debugLog("warn", "completion_consumption_ledger_scan_failed", {
@@ -655,6 +759,7 @@ function appendOverflowRecord(
   state: CompletionCoordinatorState,
   record: CompletionRecord,
 ): boolean {
+  const previousFingerprint = overflowNoticeFingerprint(state.overflow);
   const previousRetiredThrough = state.overflow.retiredThrough;
   const wasPending = state.overflow.pendingRecords.has(record.completionId);
   const resolvesBlocked =
@@ -725,8 +830,14 @@ function appendOverflowRecord(
     state.pendingNotices.delete(record.completionId);
     state.dispatchAttempted.delete(record.completionId);
     refreshOverflowIndex(state);
+    markOverflowNoticeDirty(state, previousFingerprint);
     return true;
   } catch (error) {
+    const failureKnown =
+      wasPending ||
+      state.overflow.failedRecords.some(
+        (failed) => failed.completionId === record.completionId,
+      );
     state.overflow.appendFailures++;
     state.overflow.retirementBlocked = true;
     if (record.sequence !== undefined) {
@@ -741,11 +852,7 @@ function appendOverflowRecord(
     ) {
       state.overflow.pendingRecords.set(record.completionId, record);
     }
-    if (
-      !state.overflow.failedRecords.some(
-        (failed) => failed.completionId === record.completionId,
-      )
-    ) {
+    if (!failureKnown) {
       if (state.overflow.failedRecords.length < MAX_FAILED_OVERFLOW_RECORDS) {
         state.overflow.failedRecords.push(record);
         state.overflow.failedIds.push(record.completionId);
@@ -753,6 +860,7 @@ function appendOverflowRecord(
         state.overflow.failedRecordsOmitted++;
       }
     }
+    markOverflowNoticeDirty(state, previousFingerprint);
     debugLog("warn", "completion_overflow_persist_failed", {
       completionId: record.completionId,
       error: error instanceof Error ? error.message : String(error),
@@ -817,6 +925,7 @@ function completionOverflowMessage(
       overflowFailedRetained: state.overflow.failedRecords.length,
       overflowFailedOmitted: state.overflow.failedRecordsOmitted,
       overflowRetirementBlocked: state.overflow.retirementBlocked,
+      overflowNoticeGeneration: state.overflow.noticeGeneration,
     },
   };
 }
@@ -862,8 +971,17 @@ function reconcileState(state: CompletionCoordinatorState): void {
     if (entryCustomType(entry) === COMPLETION_MANIFEST_TYPE) {
       const data = objectRecord(entryData(entry));
       if (data?.overflowPath === state.overflow.path) {
-        state.overflow.noticeDelivered = true;
-        state.overflow.noticeAttempted = false;
+        const generation =
+          typeof data.overflowNoticeGeneration === "number" &&
+          Number.isSafeInteger(data.overflowNoticeGeneration) &&
+          data.overflowNoticeGeneration >= 0
+            ? data.overflowNoticeGeneration
+            : state.overflow.noticeGeneration;
+        state.overflow.noticeDeliveredGeneration = Math.max(
+          state.overflow.noticeDeliveredGeneration,
+          Math.min(generation, state.overflow.noticeGeneration),
+        );
+        state.overflow.noticeAttemptedGeneration = undefined;
       }
     }
     for (const id of completionIdsFromManifest(entry)) manifestIds.add(id);
@@ -897,18 +1015,20 @@ function reconcileState(state: CompletionCoordinatorState): void {
   for (const record of state.records.values()) {
     if (
       manifestIds.has(record.completionId) ||
-      state.sourceConsumptions.some((consumption) =>
-        matchesConsumption(record, consumption),
-      )
+      (!state.fallbackExpectations.has(record.completionId) &&
+        state.sourceConsumptions.some((consumption) =>
+          matchesConsumption(record, consumption),
+        ))
     ) {
       state.consumed.add(record.completionId);
       state.dispatchAttempted.delete(record.completionId);
+      state.fallbackExpectations.delete(record.completionId);
     }
   }
 }
-
 function getState(
   owner?: SessionOwnerToken,
+  options: { reconcile?: boolean } = {},
 ): CompletionCoordinatorState | undefined {
   const resolvedOwner = effectiveOwner(owner);
   if (!resolvedOwner) return undefined;
@@ -935,7 +1055,10 @@ function getState(
     sessionEntryCount: 0,
     nextCompletionSequence: 0,
     consumptionLedgerPath: completionConsumptionPath(resolvedOwner),
-    fallbackReceiptsScanned: false,
+    fallbackReceiptOffset: 0,
+    fallbackReceiptDropping: false,
+    fallbackExpectations: new Map(),
+    deferredConsumedIds: new Set(),
     groupReservations: new Map(),
     reservedGroups: new Set(),
     groupsSealed: false,
@@ -945,8 +1068,10 @@ function getState(
   };
   created.overflow = loadOverflowState(resolvedOwner);
   coordinatorRegistry().set(key, created);
-  reconcileState(created);
-  pruneCoordinatorState(created);
+  if (options.reconcile !== false) {
+    reconcileState(created);
+    pruneCoordinatorState(created);
+  }
   return created;
 }
 
@@ -994,6 +1119,8 @@ function pruneCoordinatorState(state: CompletionCoordinatorState): void {
     state.records.delete(record.completionId);
     state.consumed.delete(record.completionId);
     state.dispatchAttempted.delete(record.completionId);
+    state.fallbackExpectations.delete(record.completionId);
+    state.deferredConsumedIds.delete(record.completionId);
   }
   for (const record of records) {
     if (state.records.size <= MAX_COMPLETION_RECORDS) break;
@@ -1003,6 +1130,8 @@ function pruneCoordinatorState(state: CompletionCoordinatorState): void {
     state.records.delete(record.completionId);
     state.pendingNotices.delete(record.completionId);
     state.dispatchAttempted.delete(record.completionId);
+    state.fallbackExpectations.delete(record.completionId);
+    state.deferredConsumedIds.delete(record.completionId);
   }
 }
 
@@ -1082,6 +1211,7 @@ interface CompletionManifestMessage {
     overflowFailedRetained?: number;
     overflowFailedOmitted?: number;
     overflowRetirementBlocked?: boolean;
+    overflowNoticeGeneration?: number;
   };
 }
 
@@ -1139,10 +1269,19 @@ function appendConsumption(
     }
   }
   state.sourceConsumptions.push(consumption);
+  if (state.sourceConsumptions.length > MAX_COMPLETION_RECORDS) {
+    state.sourceConsumptions.shift();
+  }
+  for (const expectation of state.fallbackExpectations.values()) {
+    if (expectationMatchesConsumption(expectation, consumption)) {
+      state.deferredConsumedIds.add(expectation.completionId);
+    }
+  }
   for (const record of state.records.values()) {
     if (matchesConsumption(record, consumption)) {
       state.consumed.add(record.completionId);
       state.dispatchAttempted.delete(record.completionId);
+      state.fallbackExpectations.delete(record.completionId);
     }
   }
 }
@@ -1343,6 +1482,7 @@ export function registerCompletionMember(
     releaseCompletionGroup(reservation);
   }
   if (
+    !hasReservation &&
     !state.groups.has(normalizedGroupId) &&
     state.groups.size + state.reservedGroups.size >= MAX_COMPLETION_GROUPS
   ) {
@@ -1375,6 +1515,54 @@ export function sealCompletionGroups(owner?: SessionOwnerToken): void {
   if (!state) return;
   state.groupsSealed = true;
   for (const group of state.groups.values()) group.sealed = true;
+}
+
+export function registerCompletionExpectations(
+  expectations: CompletionExpectation[],
+  owner?: SessionOwnerToken,
+): void {
+  if (expectations.length === 0) return;
+  const state = getState(owner, { reconcile: false });
+  if (!state) return;
+  for (const expectation of expectations) {
+    if (
+      expectation.source !== "interactive" &&
+      expectation.source !== "in-process" &&
+      expectation.source !== "workflow"
+    ) {
+      throw new Error("Invalid completion expectation source");
+    }
+    const normalized: CompletionExpectation = {
+      completionId: boundedString(
+        expectation.completionId,
+        "completionId",
+        MAX_COMPLETION_ID_LENGTH,
+      ),
+      source: expectation.source,
+      sourceId: boundedString(
+        expectation.sourceId,
+        "sourceId",
+        MAX_SOURCE_ID_LENGTH,
+      ),
+      ...(expectation.turnId
+        ? {
+            turnId: boundedString(
+              expectation.turnId,
+              "turnId",
+              MAX_TURN_ID_LENGTH,
+            ),
+          }
+        : {}),
+    };
+    if (
+      !state.fallbackExpectations.has(normalized.completionId) &&
+      state.fallbackExpectations.size < MAX_COMPLETION_RECORDS
+    ) {
+      state.fallbackExpectations.set(normalized.completionId, normalized);
+    }
+  }
+  reconcileState(state);
+  pruneCoordinatorState(state);
 }
 
 export function publishCompletion(
@@ -1450,15 +1638,15 @@ export function publishCompletion(
     persistPendingNotices(state);
   }
   if (
-    state.sourceConsumptions.some((consumption) =>
-      matchesConsumption(record, consumption),
-    )
+    (!state.fallbackExpectations.has(record.completionId) &&
+      state.sourceConsumptions.some((consumption) =>
+        matchesConsumption(record, consumption),
+      )) ||
+    state.deferredConsumedIds.has(record.completionId)
   ) {
     state.consumed.add(record.completionId);
   }
-  if (!state.fallbackReceiptsScanned) {
-    reconcileFallbackConsumptions(state);
-  }
+  reconcileFallbackConsumptions(state);
   pruneCoordinatorState(state);
   scheduleFlush(state);
 }
@@ -1508,7 +1696,10 @@ export function markCompletionHumanInput(owner?: SessionOwnerToken): void {
 
 export function markCompletionTurnStarting(owner?: SessionOwnerToken): void {
   const state = getState(owner);
-  if (state) state.turnStarting = true;
+  if (state) {
+    state.groupsSealed = false;
+    state.turnStarting = true;
+  }
 }
 
 export function settleCompletionParentTurn(
@@ -1570,10 +1761,11 @@ export function prepareCompletionManifest(
     (state.overflow.count > 0 ||
       state.overflow.rotated ||
       state.overflow.appendFailures > 0) &&
-    !state.overflow.noticeDelivered &&
-    !state.overflow.noticeAttempted
+    state.overflow.noticeGeneration >
+      state.overflow.noticeDeliveredGeneration &&
+    state.overflow.noticeAttemptedGeneration !== state.overflow.noticeGeneration
   ) {
-    state.overflow.noticeAttempted = true;
+    state.overflow.noticeAttemptedGeneration = state.overflow.noticeGeneration;
     state.turnStarting = true;
     return completionOverflowMessage(state);
   }
@@ -1605,7 +1797,9 @@ export function flushCompletionManifests(owner?: SessionOwnerToken): void {
     for (const id of message.details.completionIds) {
       state.dispatchAttempted.delete(id);
     }
-    state.overflow.noticeAttempted = false;
+    if (message.details.overflowPath === state.overflow.path) {
+      state.overflow.noticeAttemptedGeneration = undefined;
+    }
     state.turnStarting = false;
     debugLog("warn", "completion_manifest_dispatch_failed", {
       error: error instanceof Error ? error.message : String(error),
@@ -1616,11 +1810,17 @@ export function flushCompletionManifests(owner?: SessionOwnerToken): void {
   state.manifestRetryAttempt = 0;
   state.manifestRetryExhausted = false;
   if (message.details.overflowPath === state.overflow.path) {
-    state.overflow.noticeDelivered = true;
+    const generation =
+      message.details.overflowNoticeGeneration ??
+      state.overflow.noticeGeneration;
+    state.overflow.noticeDeliveredGeneration = Math.max(
+      state.overflow.noticeDeliveredGeneration,
+      Math.min(generation, state.overflow.noticeGeneration),
+    );
+    state.overflow.noticeAttemptedGeneration = generation;
   }
   reconcileState(state);
 }
-
 export function retireSessionScopedCompletions(
   owner: SessionOwnerToken,
   includeInteractive = false,
