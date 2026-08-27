@@ -129,6 +129,8 @@ function setupScenario(orchestratorv2 = false): ScenarioEnvironment {
   scope.lifecycle = "started";
   scope.ui = ctx.ui as never;
   scope.sessionManager = ctx.sessionManager;
+  scope.cwd = root;
+  scope.isParentIdle = () => true;
   return { api, ctx, root, scope };
 }
 
@@ -155,6 +157,8 @@ function makeRuntimeState(
     artifactDir: join(params.parentCwd, ".artifacts", id),
     notifyOnComplete: params.notifyOnComplete,
     triggerTurnOnComplete: params.triggerTurnOnComplete,
+    completionPolicy: params.completionPolicy,
+    completionGroupId: params.completionGroupId,
   };
 }
 
@@ -494,7 +498,7 @@ describe("Orchestratorv2 thin-router scenarios", () => {
     expect(mockSendCommandToPane).not.toHaveBeenCalled();
   });
 
-  it("delivers an important completion through the existing pointer-only artifact path without auto-spawn", async () => {
+  it("delivers an important completion through one compact manifest without auto-spawn", async () => {
     const environment = setupScenario(true);
     const spawn = registeredTool(environment.api, "subagent_interactive");
     await executeTool(
@@ -504,7 +508,7 @@ describe("Orchestratorv2 thin-router scenarios", () => {
         task: "Inspect the API migration",
         routingDescription: "Own API migration and compatibility",
         routingAliases: ["api"],
-        notifyOnComplete: "notify",
+        completionPolicy: "each",
       },
       environment.ctx,
     );
@@ -529,12 +533,13 @@ describe("Orchestratorv2 thin-router scenarios", () => {
 
     expect(environment.api.sendMessage).toHaveBeenCalledOnce();
     const [message, options] = environment.api.sendMessage.mock.calls[0];
-    expect(message.details).toMatchObject({ mode: "notify", status: "done" });
-    expect(message.content).toContain(
-      "Additional concern: review downstream compatibility separately.",
-    );
-    expect(message.content).toContain("Output:");
-    expect(message.content).toContain("Activity log:");
+    expect(message).toHaveProperty("customType", "subagent-manifest");
+    expect(message.details).toMatchObject({
+      completionIds: [expect.any(String)],
+    });
+    expect(message.content).toContain("<completion-manifest>");
+    expect(message.content).toContain(CHILD_A);
+    expect(message.content).toContain("read_subagent_artifact");
     expect(message.content).not.toContain(
       "PRIVATE CHILD OUTPUT THAT MUST REMAIN POINTER-ONLY",
     );

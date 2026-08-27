@@ -19,6 +19,7 @@ import {
   MAX_WORKFLOW_AGENT_RECORDS,
   zeroWorkflowUsage,
 } from "./workflow-core";
+import type { CompletionPolicy } from "./completion-coordinator";
 
 // ── Background workflow-job registry ─────────────────────────────────
 
@@ -56,6 +57,11 @@ export interface WorkflowJobState {
   };
   result?: WorkflowRunResult;
   error?: string;
+  /**
+   * Coordinated terminal rows retain their backing result until explicit
+   * get_workflow_result collection releases this protection.
+   */
+  resultRetrieved?: boolean;
   /** Completion notification callback bound to the current parent session. */
   completionNotification?: (job: WorkflowJobState) => boolean | void;
   /** Set only after the completion callback reports a successful delivery. */
@@ -74,6 +80,16 @@ export interface WorkflowJobState {
   notificationAttempt?: number;
   /** Parent session lifecycle that owns this workflow job. */
   parentSessionOwner?: SessionOwnerToken;
+  completionPolicy?: CompletionPolicy;
+  completionGroupId?: string;
+}
+
+function isProtectedCoordinatedResult(job: WorkflowJobState): boolean {
+  return (
+    (job.status === "done" || job.status === "error") &&
+    job.completionPolicy !== undefined &&
+    !job.resultRetrieved
+  );
 }
 const g = typeof global !== "undefined" ? global : globalThis;
 declare global {
@@ -152,6 +168,23 @@ export function cleanupWorkflowJobsForOwner(
   }
 }
 
+/** Roll back a just-created workflow whose completion registration failed. */
+export function discardWorkflowJob(job: WorkflowJobState): void {
+  job.suppressCompletionNotification = true;
+  if (job.status === "running") {
+    try {
+      job.abort.abort();
+    } catch {
+      /* The workflow may already be aborting. */
+    }
+    job.status = "cancelled";
+    normalizeCancelledWorkflowState(job);
+  }
+  if (workflowJobRegistry.get(job.id) === job) {
+    workflowJobRegistry.delete(job.id);
+  }
+}
+
 async function runTrackedWorkflowAgent(
   state: WorkflowJobState,
   runner: WorkflowAgentRunner,
@@ -203,11 +236,13 @@ export function startWorkflowJob(
     executionMode === "async" &&
     workflowJobRegistry.size >= MAX_WORKFLOW_JOBS
   ) {
-    // Evict the oldest terminal job; if none, throw — the caller must cancel one first.
+    // Evict the oldest unprotected terminal job; protected results and running
+    // jobs require explicit collection or cancellation.
     let evicted = false;
     for (const [id, st] of workflowJobRegistry) {
       if (
         st.status !== "running" &&
+        !isProtectedCoordinatedResult(st) &&
         workflowJobBelongsToOwner(st, parentSessionOwner)
       ) {
         debugLog("info", "workflow_job_evicted", { evictedId: id });
@@ -218,7 +253,7 @@ export function startWorkflowJob(
     }
     if (!evicted) {
       throw new Error(
-        `${MAX_WORKFLOW_JOBS} workflow jobs already running — cancel one with cancel_workflow before starting another.`,
+        `${MAX_WORKFLOW_JOBS} workflow jobs are retained or running — collect a terminal result with get_workflow_result, or cancel a running workflow, before starting another.`,
       );
     }
   }
@@ -303,7 +338,7 @@ export function startWorkflowJob(
       state.snapshot.liveUsage = undefined;
       liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
-      invokeCompletionHook(state);
+      invokeWorkflowCompletionHook(state);
       return r;
     })
     .catch((err) => {
@@ -317,7 +352,7 @@ export function startWorkflowJob(
       state.snapshot.liveUsage = undefined;
       liveUsageByAgent.clear();
       if (state.status === "cancelled") normalizeCancelledWorkflowState(state);
-      invokeCompletionHook(state);
+      invokeWorkflowCompletionHook(state);
       throw err;
     })
     .finally(() => {
@@ -335,7 +370,7 @@ export function startWorkflowJob(
   return state;
 }
 
-function invokeCompletionHook(job: WorkflowJobState): void {
+export function invokeWorkflowCompletionHook(job: WorkflowJobState): void {
   const callback = job.completionNotification;
   if (
     !callback ||
@@ -397,7 +432,7 @@ export function retryPendingWorkflowNotifications(
 ): void {
   for (const job of workflowJobsForOwner(owner)) {
     if (job.status === "running") continue;
-    invokeCompletionHook(job);
+    invokeWorkflowCompletionHook(job);
   }
 }
 

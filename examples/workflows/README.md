@@ -40,6 +40,35 @@ workflow({
 });
 ```
 
+## Background completion
+
+Background workflows default to `completionPolicy: "each"`. The workflow
+aggregate emits one TUI-only terminal notice and, when the parent is safely
+ready, one compact `get_workflow_result` selector. Internal workflow-owned
+agents report through workflow progress and never publish direct completion
+notices or manifests. Independent terminal results that arrive while the
+parent is busy coalesce into a safe-idle continuation.
+
+Use `completionPolicy: "group"` only with a caller-declared shared
+`completionGroupId` for related top-level background work. Same-turn launch and
+task text never infer membership. Named groups are advanced cross-call control:
+they seal when the spawning parent turn settles and release after every
+registered member is terminal, including `done`, `error`, and `cancelled`.
+Human input takes priority, successful terminal retrieval consumes pending
+automatic delivery, and an entirely consumed group creates no turn. Jobs and
+results remain scoped to the current parent session.
+
+Deprecated `notifyOnComplete` and `triggerTurnOnComplete` fields map to
+coordinated `each`.
+
+Parent-session consumption receipts are preferred; when unavailable, a private
+session-scoped append-only fallback ledger is read from fixed snapshots in
+bounded chunks and line buffers. It has no fixed disk-size bound during a
+prolonged outage; truncating it could resurrect results already collected when
+parent entries become available again. The parent-model channel is not exactly
+once: a crash after synchronous `sendMessage` dispatch can replay a manifest,
+so delivery is at-least-once.
+
 ## Authoring guidance
 
 Write raw JavaScript without fences. Include a top-level pure-literal

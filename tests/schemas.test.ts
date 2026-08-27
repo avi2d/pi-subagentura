@@ -68,9 +68,9 @@ describe("BaseParams", () => {
       persona: "You are a senior engineer",
       model: "anthropic/claude-sonnet-4-5",
       thinkingLevel: "high" as const,
-      cwd: "/home/user/project",
       async: true,
-      notifyOnComplete: "inject" as const,
+      completionPolicy: "group" as const,
+      completionGroupId: "review-shards",
       maxAge: 60_000,
     };
     expect(check(BaseParams)(value)).toBe(true);
@@ -402,7 +402,9 @@ describe("InteractiveParams", () => {
       routingAliases: ["memory", "leak"],
       background: false,
       notifyOnComplete: "inject" as const,
-      mux: "auto" as const,
+      triggerTurnOnComplete: true,
+      completionPolicy: "group" as const,
+      completionGroupId: "review-shards",
     };
     expect(check(InteractiveParams)(value)).toBe(true);
   });
@@ -583,6 +585,8 @@ describe("InteractiveParams", () => {
     expect(commonProperties).toHaveProperty("task");
     expect(commonProperties).toHaveProperty("routingDescription");
     expect(commonProperties).toHaveProperty("routingAliases");
+    expect(commonProperties).toHaveProperty("completionPolicy");
+    expect(commonProperties).toHaveProperty("completionGroupId");
     expect(schema.allOf[0].dependentRequired).toEqual({
       routingAliases: ["routingDescription"],
     });
@@ -605,6 +609,8 @@ describe("InteractiveParams", () => {
     expect(Object.keys(providerSchema.properties).sort()).toEqual(
       [
         "background",
+        "completionGroupId",
+        "completionPolicy",
         "context",
         "cwd",
         "includeContext",
@@ -629,6 +635,28 @@ describe("InteractiveParams", () => {
 
   /* ---------- optional initial routing metadata ---------- */
 
+  it("accepts coordinated completion policies and validates group identifiers", () => {
+    expect(
+      check(InteractiveParams)({ task: "t", completionPolicy: "each" }),
+    ).toBe(true);
+    expect(
+      check(InteractiveParams)({
+        task: "t",
+        completionPolicy: "group",
+        completionGroupId: "review-shards",
+      }),
+    ).toBe(true);
+    expect(
+      check(InteractiveParams)({ task: "t", completionPolicy: "invalid" }),
+    ).toBe(false);
+    expect(
+      check(InteractiveParams)({
+        task: "t",
+        completionPolicy: "group",
+        completionGroupId: "-invalid",
+      }),
+    ).toBe(false);
+  });
   it("accepts an initial routing description and aliases", () => {
     expect(
       check(InteractiveParams)({

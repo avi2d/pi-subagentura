@@ -348,6 +348,58 @@ describe("Orchestratorv2 completion turns", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("notifies the coordinator once when bounded wake attempts are exhausted", () => {
+    vi.useFakeTimers();
+    const pi = mockPi();
+    const exhausted = vi.fn();
+
+    sendCompletionTurn(pi as never, completion("one"), {
+      deliverAs: "followUp",
+      triggerTurn: true,
+      parentStreaming: false,
+      onWakeExhausted: exhausted,
+    });
+
+    vi.advanceTimersByTime(
+      ORCHESTRATOR_V2_WAKE_WATCHDOG_DELAY_MS *
+        ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS,
+    );
+
+    expect(exhausted).toHaveBeenCalledOnce();
+    vi.advanceTimersByTime(ORCHESTRATOR_V2_WAKE_WATCHDOG_DELAY_MS * 2);
+    expect(exhausted).toHaveBeenCalledOnce();
+    clearCompletionTurnWake(pi as never);
+  });
+
+  it("allows the final wake attempt to start before exhaustion releases the fence", () => {
+    vi.useFakeTimers();
+    const pi = mockPi();
+    const exhausted = vi.fn();
+
+    sendCompletionTurn(pi as never, completion("one"), {
+      deliverAs: "followUp",
+      triggerTurn: true,
+      parentStreaming: false,
+      onWakeExhausted: exhausted,
+    });
+    const wakePrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    vi.advanceTimersByTime(
+      ORCHESTRATOR_V2_WAKE_WATCHDOG_DELAY_MS *
+        (ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS - 1),
+    );
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(
+      ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS,
+    );
+    expect(exhausted).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+    expect(markCompletionTurnWakeStarted(pi as never, wakePrompt)).toBe(true);
+    expect(exhausted).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    clearCompletionTurnWake(pi as never);
+  });
+
   it("clears the wake watchdog when the exact run starts and settles", () => {
     vi.useFakeTimers();
     const pi = mockPi();

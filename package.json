@@ -56,6 +56,8 @@
     "src/child-protocol.ts",
     "src/completion-turn.ts",
     "src/delivery.ts",
+    "src/completion-coordinator.ts",
+    "src/completion-ledger.ts",
     "src/helpers.ts",
     "src/orchestrator-routing.ts",
     "src/orchestration-context.ts",

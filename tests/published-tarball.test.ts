@@ -222,10 +222,13 @@ describe("published tarball", () => {
     ).toContain("src/helpers.ts");
   });
 
-  it("contains the Orchestratorv2 prompt and routing import closure", () => {
+  it("contains both orchestrator prompts and the combined completion/routing closure", () => {
     expect(entries).toEqual(
       expect.arrayContaining([
+        "ORCHESTRATOR_SYSTEM_PROMPT.md",
         "ORCHESTRATOR_V2_SYSTEM_PROMPT.md",
+        "src/completion-coordinator.ts",
+        "src/completion-ledger.ts",
         "src/completion-turn.ts",
         "src/orchestrator-routing.ts",
         "src/tools/orchestrator.ts",
@@ -238,6 +241,10 @@ describe("published tarball", () => {
     );
     expect(sourceReferences(extensionSource)).toEqual(
       expect.arrayContaining([
+        {
+          specifier: "../ORCHESTRATOR_SYSTEM_PROMPT.md",
+          runtime: true,
+        },
         {
           specifier: "../ORCHESTRATOR_V2_SYSTEM_PROMPT.md",
           runtime: true,

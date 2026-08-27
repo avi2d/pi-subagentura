@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import {
   appendCompletionEvent,
   appendEvent,
+  appendInteractiveState,
   artifactPath,
   eventLogEndOffset,
   MAX_EVENT_BATCH_BYTES,
@@ -44,6 +45,11 @@ import { pollArtifactChanges } from "../src/artifact-poller";
 import { renderSubagentNotify } from "../src/rendering";
 import { appendDeterministicTurn } from "./helpers/deterministic-artifacts";
 import { clearSessionScopes, registerSessionScope } from "../src/session-scope";
+import {
+  flushCompletionManifests,
+  registerCompletionCoordinator,
+} from "../src/completion-coordinator";
+import { rehydrateInteractiveSubagents } from "../src/rehydrate";
 
 const roots: string[] = [];
 
@@ -390,6 +396,170 @@ describe("artifact protocol v2 delivery", () => {
       expect.objectContaining({ eventId: first.eventId }),
       expect.objectContaining({ eventId: second.eventId }),
     ]);
+  });
+
+  it("drains coordinated poll bursts in bounded chunks without losing identities", async () => {
+    const art = makeArtifact();
+    const owner = { id: 412, generation: 1 };
+    const entries: any[] = [];
+    const sendMessage = vi.fn();
+    const pi = {
+      sendMessage,
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entries.push({ type: "custom", customType, data });
+      }),
+      registerEntryRenderer: vi.fn(),
+    };
+    const scope = registerSessionScope({
+      ...owner,
+      pi: pi as any,
+      sessionManager: {
+        getSessionId: () => "parent",
+        getEntries: () => entries,
+      },
+      parentStreaming: true,
+    });
+    registerCompletionCoordinator(pi as any, scope);
+    const state = {
+      ...makeState(art.dir),
+      sessionOwner: owner,
+      completionPolicy: "each" as const,
+      eventByteCursor: 0,
+    };
+    scope.interactiveStates.set(state.id, state);
+    interactiveSubagentRegistry.set(state.id, state);
+    __setTmuxMultiplexer({
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
+    } as any);
+    for (let index = 1; index <= MAX_DELIVERY_RECORDS + 10; index++) {
+      appendDeterministicTurn(art, index, `result-${index}`);
+    }
+
+    await pollArtifactChanges(pi as any, owner);
+
+    const completionEntries = entries.filter(
+      (entry) => entry.customType === "subagentura-completion",
+    );
+    expect(completionEntries).toHaveLength(MAX_DELIVERY_RECORDS + 10);
+    expect(
+      new Set(completionEntries.map((entry) => entry.data.completionId)).size,
+    ).toBe(MAX_DELIVERY_RECORDS + 10);
+    expect(state.pendingDeliveries).toEqual([]);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("rehydrates a pre-cursor chunk and replays every identity exactly once", async () => {
+    const art = makeArtifact();
+    const owner = { id: 413, generation: 1 };
+    const total = MAX_DELIVERY_RECORDS + 10;
+    for (let index = 1; index <= total; index++) {
+      appendDeterministicTurn(art, index, `result-${index}`);
+    }
+    const entries: any[] = Array.from(
+      { length: MAX_DELIVERY_RECORDS },
+      (_, offset) => {
+        const index = offset + 1;
+        const completionId = deliveryIdFor({
+          parentSessionId: "parent",
+          subagentId: art.id,
+          turnId: `turn-${index}`,
+          mode: "notify",
+        });
+        return {
+          type: "custom",
+          customType: "subagentura-completion",
+          data: {
+            schemaVersion: 1,
+            completionId,
+            source: "interactive",
+            sourceId: art.id,
+            turnId: `turn-${index}`,
+            label: `Sub-agent ${art.id}`,
+            status: "done",
+            policy: "each",
+            references: [
+              {
+                label: "output",
+                value: join(art.dir, "outputs", `completion-${index}.md`),
+              },
+              { label: "activity", value: art.statusFile },
+            ],
+            completedAt: index,
+            ownerSessionId: "parent",
+          },
+        };
+      },
+    );
+    appendInteractiveState(art.dir, {
+      id: art.id,
+      paneId: "%1",
+      mux: "tmux",
+      artifactDir: art.dir,
+      sessionFile: "/tmp/session.jsonl",
+      parentSessionId: "parent",
+      completionPolicy: "each",
+      eventByteCursor: 0,
+      sessionByteCursor: 0,
+      pendingDeliveries: [],
+      deliveryReceipts: [],
+      legacyCutoverOffset: 0,
+    });
+    const sendMessage = vi.fn((message: any) => {
+      entries.push({
+        type: "custom_message",
+        customType: message.customType,
+        details: message.details,
+      });
+    });
+    const pi = {
+      sendMessage,
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entries.push({ type: "custom", customType, data });
+      }),
+      registerEntryRenderer: vi.fn(),
+    };
+    const scope = registerSessionScope({
+      ...owner,
+      pi: pi as any,
+      sessionManager: {
+        getSessionId: () => "parent",
+        getEntries: () => entries,
+      },
+      parentStreaming: true,
+    });
+    registerCompletionCoordinator(pi as any, scope);
+    __setTmuxMultiplexer({
+      isPaneAlive: () => true,
+      isPaneAliveAsync: async () => true,
+      getPaneLiveness: () => "alive",
+      getPaneLivenessAsync: async () => "alive",
+      buildAttachCommands: () => ({ attachCommand: "", focusCommand: "" }),
+    } as any);
+
+    rehydrateInteractiveSubagents(art.dir, "parent", entries, scope);
+    const state = scope.interactiveStates.get(art.id)!;
+    expect(state.eventByteCursor).toBe(0);
+    await pollArtifactChanges(pi as any, owner);
+
+    const completionEntries = entries.filter(
+      (entry) => entry.customType === "subagentura-completion",
+    );
+    expect(completionEntries).toHaveLength(total);
+    expect(
+      new Set(completionEntries.map((entry) => entry.data.completionId)).size,
+    ).toBe(total);
+    expect(state.pendingDeliveries).toEqual([]);
+    scope.parentStreaming = false;
+    flushCompletionManifests(owner);
+    flushCompletionManifests(owner);
+    expect(
+      entries.filter(
+        (entry) =>
+          entry.type === "custom_message" &&
+          entry.customType === "subagent-manifest",
+      ),
+    ).toHaveLength(1);
   });
 
   it("does not independently deliver workflow-owned completions", async () => {
@@ -779,6 +949,44 @@ describe("artifact protocol v2 delivery", () => {
     );
   });
 
+  it("fails closed at the coordinated queue bound without collapsing identities", () => {
+    const art = makeArtifact();
+    const state = makeState(art.dir);
+    for (let index = 0; index < MAX_DELIVERY_RECORDS; index++) {
+      enqueueDelivery(state, {
+        deliveryId: `coordinated-${index}`,
+        subagentId: state.id,
+        turnId: `turn-${index}`,
+        eventId: `event-${index}`,
+        mode: "notify",
+        triggerTurn: true,
+        status: "done",
+        artifactDir: art.dir,
+        completionPolicy: "each",
+        state: "queued",
+      });
+    }
+
+    expect(() =>
+      enqueueDelivery(state, {
+        deliveryId: "coordinated-overflow",
+        subagentId: state.id,
+        turnId: "turn-overflow",
+        eventId: "event-overflow",
+        mode: "notify",
+        triggerTurn: true,
+        status: "done",
+        artifactDir: art.dir,
+        completionPolicy: "each",
+        state: "queued",
+      }),
+    ).toThrow(/record bound/);
+    expect(state.pendingDeliveries).toHaveLength(MAX_DELIVERY_RECORDS);
+    expect(
+      state.pendingDeliveries?.some((intent) => !intent.completionPolicy),
+    ).toBe(false);
+  });
+
   it("reconciles dispatchAttempted intents from same-session custom entries", () => {
     const art = makeArtifact();
     const state = makeState(art.dir);
@@ -803,7 +1011,11 @@ describe("artifact protocol v2 delivery", () => {
     flushDeliveries(
       {
         sendMessage: vi.fn((message) => {
-          entries.push({ type: "custom_message", details: message.details });
+          entries.push({
+            type: "custom_message",
+            customType: message.customType,
+            details: message.details,
+          });
         }),
       } as any,
       undefined,
@@ -811,6 +1023,65 @@ describe("artifact protocol v2 delivery", () => {
 
     expect(state.pendingDeliveries).toEqual([]);
     expect(state.deliveryReceipts).toContain("same-session");
+  });
+
+  it("reconciles coordinated manifest receipts", () => {
+    const art = makeArtifact();
+    const state = makeState(art.dir);
+    enqueueDelivery(state, {
+      deliveryId: "coordinated-receipt",
+      subagentId: state.id,
+      turnId: "turn",
+      eventId: "event",
+      mode: "notify",
+      triggerTurn: true,
+      status: "done",
+      artifactDir: art.dir,
+      completionPolicy: "each",
+      state: "queued",
+    });
+
+    reconcileDeliveryReceipts(state, [
+      {
+        type: "custom_message",
+        customType: "subagent-manifest",
+        details: {
+          schemaVersion: 1,
+          completionIds: ["coordinated-receipt"],
+        },
+      },
+    ]);
+
+    expect(state.pendingDeliveries).toEqual([]);
+    expect(state.deliveryReceipts).toContain("coordinated-receipt");
+  });
+
+  it("ignores completionIds from unrelated custom entries", () => {
+    const art = makeArtifact();
+    const state = makeState(art.dir);
+    enqueueDelivery(state, {
+      deliveryId: "not-a-receipt",
+      subagentId: state.id,
+      turnId: "turn",
+      eventId: "event",
+      mode: "notify",
+      triggerTurn: true,
+      status: "done",
+      artifactDir: art.dir,
+      completionPolicy: "each",
+      state: "queued",
+    });
+
+    reconcileDeliveryReceipts(state, [
+      {
+        type: "custom_message",
+        customType: "other-extension",
+        details: { schemaVersion: 1, completionIds: ["not-a-receipt"] },
+      },
+    ]);
+
+    expect(state.pendingDeliveries).toHaveLength(1);
+    expect(state.deliveryReceipts).not.toContain("not-a-receipt");
   });
 
   it("deduplicates and bounds long-lived delivery receipts", () => {
@@ -838,6 +1109,7 @@ describe("artifact protocol v2 delivery", () => {
     reconcileDeliveryReceipts(state, [
       {
         type: "custom_message",
+        customType: "subagent-notify",
         details: {
           deliveryIds: ["current-receipt", "current-receipt"],
         },

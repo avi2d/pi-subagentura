@@ -50,7 +50,14 @@ describe("README public surface", () => {
       "## Bundled orchestration defaults",
       "## Cancellation context snapshots",
     );
-
+    const orchestratorV2 = section(
+      "### Orchestratorv2 thin-router mode",
+      "## Cancellation context snapshots",
+    );
+    const coordinatedDelivery = section(
+      "#### Coordinated completion delivery",
+      "#### Consumption-receipt fallback",
+    );
     expect(tools).toHaveLength(23);
     expect(
       tools.filter((name) => name.includes("orchestrator")).sort(),
@@ -78,5 +85,15 @@ describe("README public surface", () => {
         `Missing flag documentation for --${name}`,
       ).toContain(`--${name}`);
     }
+    expect(orchestrationDefaults).toContain('completionPolicy: "each"');
+    expect(orchestrationDefaults).toContain('completionPolicy: "group"');
+    expect(orchestrationDefaults).toContain("completionGroupId");
+    expect(orchestratorV2).toContain("authority ledger");
+    expect(orchestratorV2).toContain("project-local routing cache");
+    expect(orchestratorV2).toContain("same-UID");
+    expect(coordinatedDelivery).toContain("completion coordinator");
+    expect(coordinatedDelivery).toContain("sendCompletionTurn");
+    expect(coordinatedDelivery).toContain("actual parent streaming state");
+    expect(coordinatedDelivery).toContain("Non-v2 modes fall through");
   });
 });

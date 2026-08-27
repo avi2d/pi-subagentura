@@ -6,6 +6,7 @@ import {
   appendCompletionEvent,
   appendEvent,
   artifactPath,
+  snapshotOutput,
   writeOutput,
 } from "../src/artifact";
 import { importFresh } from "./test-utils";
@@ -24,6 +25,7 @@ import {
   setLegacyActiveSessionRefs,
   type SessionScope,
 } from "../src/session-scope";
+import { settleCompletionParentTurn } from "../src/completion-coordinator";
 
 // ── Hoisted mock: startSubagentJob must be mocked before any imports ──────
 const { mockStartSubagentJob } = vi.hoisted(() => ({
@@ -243,11 +245,12 @@ describe("notifyOnComplete", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      appendEntry: vi.fn(),
       registerFlag: vi.fn(),
       getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
       sendUserMessage: vi.fn(),
-      appendEntry: vi.fn(),
       on: vi.fn(),
       notify: vi.fn(),
     };
@@ -299,7 +302,7 @@ describe("notifyOnComplete", () => {
     expect(statusToolDef).toBeDefined();
   });
 
-  it("does not instruct Orchestratorv2 to call an in-process result tool", async () => {
+  it("routes a deprecated v2 in-process notification through one compact manifest", async () => {
     api.getFlag.mockImplementation((name: string) => name === "orchestratorv2");
     const control = createJobControl();
     mockStartSubagentJob.mockImplementationOnce(() =>
@@ -317,9 +320,11 @@ describe("notifyOnComplete", () => {
     await vi.waitFor(() => expect(api.sendMessage).toHaveBeenCalledOnce());
 
     const content = sentMessageAt(api, 0).content;
-    expect(content).toContain("compatibility job");
-    expect(content).toContain("without calling in-process tools");
-    expect(content).not.toContain("use get_subagent_result");
+    expect(content).toContain("<completion-manifest>");
+    expect(content).toContain('"source":"in-process"');
+    expect(content).toContain("get_subagent_result");
+    expect(content).toContain("compatibility-job");
+    expect(api.sendUserMessage).toHaveBeenCalledOnce();
   });
 
   afterEach(() => {
@@ -340,7 +345,7 @@ describe("notifyOnComplete", () => {
 
     for (const [label, getToolDef, getCtx] of toolCases) {
       describe(label, () => {
-        it("persists a pointer-only custom message in notify mode", async () => {
+        it("maps legacy notify mode to coordinated compact delivery", async () => {
           const toolDef = getToolDef();
           const jobId = `both-notify-${label}`;
           const control = createJobControl();
@@ -355,38 +360,32 @@ describe("notifyOnComplete", () => {
             undefined,
             getCtx(),
           );
-
           expect(spawnResult.content[0].text).toContain(
-            "Completion output will not be injected into the parent LLM",
-          );
-          expect(spawnResult.content[0].text).toContain(
-            "No new parent turn will start automatically",
+            "compact result reference when safely idle",
           );
 
           control.resolve(SUCCESS_RESULT);
-
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
           });
 
-          const content = sentMessageAt(api, 0).content;
-          expect(content).toContain(jobId);
-          expect(content).toContain("✅");
-          expect(content).toContain("get_subagent_result");
-          expect(content).not.toContain(SUCCESS_RESULT.output);
+          const message = sentMessageAt(api, 0);
+          expect(message).toMatchObject({
+            customType: "subagent-manifest",
+            display: false,
+          });
+          expect(message.content).toContain(jobId);
+          expect(message.content).toContain("get_subagent_result");
+          expect(message.content).not.toContain(SUCCESS_RESULT.output);
           expect(sentMessageOptsAt(api, 0)).toMatchObject({
             deliverAs: "followUp",
-            triggerTurn: false,
+            triggerTurn: true,
           });
-          expect(api.notify).toHaveBeenCalledWith(
-            expect.stringContaining(
-              "Completion output was not injected into the parent LLM",
-            ),
-            "info",
+          expect(api.appendEntry).toHaveBeenCalledWith(
+            "subagentura-completion",
+            expect.objectContaining({ sourceId: jobId, policy: "each" }),
           );
-          expect(api.notify.mock.calls[0][0]).toContain(
-            "No new parent turn will start automatically",
-          );
+          expect(api.notify).not.toHaveBeenCalled();
           expect(api.sendUserMessage).not.toHaveBeenCalled();
         });
 
@@ -422,7 +421,7 @@ describe("notifyOnComplete", () => {
           });
         });
 
-        it("defaults async completion delivery to inject", async () => {
+        it("defaults async completion delivery to coordinated references", async () => {
           const toolDef = getToolDef();
           const jobId = `both-default-inject-${label}`;
           const control = createJobControl();
@@ -438,34 +437,41 @@ describe("notifyOnComplete", () => {
             getCtx(),
           );
           expect(spawnResult.content[0].text).toContain(
-            "Completion output will be injected into the parent LLM",
+            "notify the user immediately",
           );
           expect(spawnResult.content[0].text).toContain(
-            "A new parent turn will start automatically after the injection",
+            "compact result reference when safely idle",
           );
           control.resolve(SUCCESS_RESULT);
 
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
           });
-          expect(sentMessageAt(api, 0).content).toContain(
+          expect(sentMessageAt(api, 0)).toMatchObject({
+            customType: "subagent-manifest",
+            display: false,
+          });
+          expect(sentMessageAt(api, 0).content).toContain(jobId);
+          expect(sentMessageAt(api, 0).content).not.toContain(
             SUCCESS_RESULT.output,
           );
-          expect(sentMessageAt(api, 0).details.mode).toBe("inject");
           expect(sentMessageOptsAt(api, 0)).toMatchObject({
             deliverAs: "followUp",
             triggerTurn: true,
           });
+          expect(api.appendEntry).toHaveBeenCalledWith(
+            "subagentura-completion",
+            expect.objectContaining({ sourceId: jobId, policy: "each" }),
+          );
         });
 
-        it("adds triggerTurn when triggerTurnOnComplete is true in notify mode", async () => {
+        it("accepts legacy triggerTurnOnComplete through coordinated delivery", async () => {
           const toolDef = getToolDef();
           const jobId = `both-trigger-turn-${label}`;
           const control = createJobControl();
           mockStartSubagentJob.mockImplementationOnce(() =>
             mockJobResult(jobId, control.jobPromise),
           );
-
           await toolDef.execute(
             "call-trigger-turn",
             {
@@ -478,13 +484,10 @@ describe("notifyOnComplete", () => {
             undefined,
             getCtx(),
           );
-
           control.resolve(SUCCESS_RESULT);
-
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
           });
-
           expect(sentMessageOptsAt(api, 0)).toMatchObject({
             deliverAs: "followUp",
             triggerTurn: true,
@@ -492,29 +495,16 @@ describe("notifyOnComplete", () => {
           expect(sentMessageAt(api, 0).content).not.toContain(
             SUCCESS_RESULT.output,
           );
-          expect(sentMessageAt(api, 0).content).toContain(
-            "get_subagent_result",
-          );
-          expect(api.sendUserMessage).not.toHaveBeenCalled();
-          expect(api.notify).toHaveBeenCalledWith(
-            expect.stringContaining(
-              "Completion output was not injected into the parent LLM",
-            ),
-            "info",
-          );
-          expect(api.notify.mock.calls[0][0]).toContain(
-            "A new parent turn will start automatically after the pointer delivery",
-          );
+          expect(api.notify).not.toHaveBeenCalled();
         });
 
-        it("injects full result in one attributed custom message", async () => {
+        it("maps legacy inject mode to a compact manifest", async () => {
           const toolDef = getToolDef();
           const jobId = `both-inject-${label}`;
           const control = createJobControl();
           mockStartSubagentJob.mockImplementationOnce(() =>
             mockJobResult(jobId, control.jobPromise),
           );
-
           await toolDef.execute(
             "call-2",
             { async: true, task: "test", notifyOnComplete: "inject" },
@@ -522,45 +512,32 @@ describe("notifyOnComplete", () => {
             undefined,
             getCtx(),
           );
-
           control.resolve(SUCCESS_RESULT);
-
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
           });
 
-          const msg = sentMessageAt(api, 0);
-          const msgOpts = sentMessageOptsAt(api, 0);
-          expect(msg).toMatchObject({
-            customType: "subagent-notify",
-            display: true,
-            details: { jobId, mode: "inject" },
+          const message = sentMessageAt(api, 0);
+          expect(message).toMatchObject({
+            customType: "subagent-manifest",
+            display: false,
           });
-          expect(msg.content).toContain(SUCCESS_RESULT.output);
-          expect(msgOpts).toMatchObject({
+          expect(message.content).toContain(jobId);
+          expect(message.content).not.toContain(SUCCESS_RESULT.output);
+          expect(sentMessageOptsAt(api, 0)).toMatchObject({
             deliverAs: "followUp",
             triggerTurn: true,
           });
-          expect(api.sendUserMessage).not.toHaveBeenCalled();
-          expect(api.notify).toHaveBeenCalledWith(
-            expect.stringContaining(
-              "Completion output was injected into the parent LLM",
-            ),
-            "info",
-          );
-          expect(api.notify.mock.calls[0][0]).toContain(
-            "A new parent turn will start automatically after the injection",
-          );
+          expect(api.notify).not.toHaveBeenCalled();
         });
 
-        it("delivers notification when job promise rejects", async () => {
+        it("delivers a compact error reference when the job promise rejects", async () => {
           const toolDef = getToolDef();
           const jobId = `both-reject-${label}`;
           const control = createJobControl();
           mockStartSubagentJob.mockImplementationOnce(() =>
             mockJobResult(jobId, control.jobPromise),
           );
-
           await toolDef.execute(
             "call-3",
             { async: true, task: "test", notifyOnComplete: "notify" },
@@ -568,16 +545,15 @@ describe("notifyOnComplete", () => {
             undefined,
             getCtx(),
           );
-
           control.reject(new Error("Connection timeout"));
-
           await vi.waitFor(() => {
             expect(api.sendMessage).toHaveBeenCalledTimes(1);
           });
 
           const content = sentMessageAt(api, 0).content;
-          expect(content).toContain("❌");
-          expect(content).toContain("Connection timeout");
+          expect(content).toContain(jobId);
+          expect(content).toContain('"status":"error"');
+          expect(content).not.toContain("Connection timeout");
         });
       });
     }
@@ -585,14 +561,12 @@ describe("notifyOnComplete", () => {
 
   // ── Notify mode ───────────────────────────────────────────────────
   describe("notify mode", () => {
-    it("persists a pointer summary without triggering a parent turn", async () => {
+    it("maps legacy notify to one triggering compact manifest", async () => {
       const jobId = "notify-test-1";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
-      // Fire execute — triggers async subagent spawn, returns immediately
       await isolatedToolDef.execute(
         "call-1",
         { async: true, task: "test", notifyOnComplete: "notify" },
@@ -600,36 +574,52 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
-      // Complete the subagent job
       control.resolve(SUCCESS_RESULT);
-
-      // Wait for the .then() handler and deliverNotification to run
       await vi.waitFor(() => {
         expect(api.sendMessage).toHaveBeenCalledTimes(1);
       });
 
       const content = sentMessageAt(api, 0).content;
       expect(content).toContain(jobId);
-      expect(content).toContain("✅");
+      expect(content).toContain("get_subagent_result");
       expect(content).not.toContain(SUCCESS_RESULT.output);
-      expect(sentMessageOptsAt(api, 0).triggerTurn).toBe(false);
-      expect(api.notify).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "Completion output was not injected into the parent LLM",
-        ),
-        "info",
-      );
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
+      expect(sentMessageOptsAt(api, 0).triggerTurn).toBe(true);
+      expect(api.notify).not.toHaveBeenCalled();
     });
 
-    it("includes usage info in the summary when usage is non-zero", async () => {
+    it("retries a transient durable completion notice failure", async () => {
+      const jobId = "notify-transient-append-failure";
+      const control = createJobControl();
+      let completionAttempts = 0;
+      api.appendEntry.mockImplementation((customType: string) => {
+        if (customType !== "subagentura-completion") return;
+        completionAttempts += 1;
+        if (completionAttempts === 1) throw new Error("disk unavailable");
+      });
+      mockStartSubagentJob.mockImplementationOnce(() =>
+        mockJobResult(jobId, control.jobPromise),
+      );
+      await isolatedToolDef.execute(
+        "call-transient-append-failure",
+        { async: true, task: "test" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      control.resolve(SUCCESS_RESULT);
+
+      await vi.waitFor(() => expect(completionAttempts).toBe(2));
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(sentMessageAt(api, 0).content).toContain(jobId);
+    });
+
+    it("keeps usage out of the compact legacy manifest", async () => {
       const jobId = "notify-usage";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
       await isolatedToolDef.execute(
         "call-2",
         { async: true, task: "test", notifyOnComplete: "notify" },
@@ -637,31 +627,26 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
       control.resolve(SUCCESS_RESULT);
-
       await vi.waitFor(() => {
         expect(api.sendMessage).toHaveBeenCalledTimes(1);
       });
 
       const content: string = sentMessageAt(api, 0).content;
-      // formatUsage for SUCCESS_RESULT produces: "1 turn ↑10 ↓50 $0.0010 test/test-model"
-      expect(content).toContain("1 turn");
-      expect(content).toContain("↑10");
-      expect(content).toContain("↓50");
-      expect(content).toContain("$0.0010");
+      expect(content).toContain(jobId);
+      expect(content).not.toContain("↑10");
+      expect(content).not.toContain("$0.0010");
     });
   });
 
   // ── Inject mode ───────────────────────────────────────────────────
   describe("inject mode", () => {
-    it("injects the full result in one custom completion envelope", async () => {
+    it("maps legacy inject to one compact completion envelope", async () => {
       const jobId = "inject-test-1";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
       await isolatedToolDef.execute(
         "call-3",
         { async: true, task: "test", notifyOnComplete: "inject" },
@@ -669,45 +654,32 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
       control.resolve(SUCCESS_RESULT);
-
       await vi.waitFor(() => {
         expect(api.sendMessage).toHaveBeenCalledTimes(1);
       });
 
-      const msg = sentMessageAt(api, 0);
-      const msgOpts = sentMessageOptsAt(api, 0);
-      expect(msg).toMatchObject({
-        customType: "subagent-notify",
-        display: true,
-        details: { jobId, mode: "inject" },
+      const message = sentMessageAt(api, 0);
+      expect(message).toMatchObject({
+        customType: "subagent-manifest",
+        display: false,
       });
-      expect(msg.content).toContain(SUCCESS_RESULT.output);
-      expect(msgOpts).toMatchObject({
+      expect(message.content).toContain(jobId);
+      expect(message.content).not.toContain(SUCCESS_RESULT.output);
+      expect(sentMessageOptsAt(api, 0)).toMatchObject({
         deliverAs: "followUp",
         triggerTurn: true,
       });
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
-      expect(api.notify).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "Completion output was injected into the parent LLM",
-        ),
-        "info",
-      );
-      expect(api.notify.mock.calls[0][0]).toContain(
-        "A new parent turn will start automatically after the injection",
-      );
+      expect(api.notify).not.toHaveBeenCalled();
     });
 
-    it("queues triggering inject completion through Pi while streaming", async () => {
+    it("defers a legacy inject completion while the parent is streaming", async () => {
       scope.parentStreaming = true;
       const jobId = "inject-cap";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
       await isolatedToolDef.execute(
         "call-4",
         {
@@ -720,47 +692,42 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
       control.resolve(SUCCESS_RESULT);
       await vi.waitFor(() => {
         expect(jobRegistry.get(jobId)?.status).toBe("done");
-        expect(api.sendMessage).toHaveBeenCalledOnce();
       });
-      expect(api.sendMessage.mock.calls[0][1]).toMatchObject({
+      expect(api.sendMessage).not.toHaveBeenCalled();
+
+      scope.parentStreaming = false;
+      settleCompletionParentTurn(sessionOwner(scope));
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(sentMessageOptsAt(api, 0)).toMatchObject({
         deliverAs: "followUp",
         triggerTurn: true,
       });
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
-
-      scope.parentStreaming = false;
-      flushInProcessDeliveries(sessionOwner(scope));
-      expect(api.sendMessage).toHaveBeenCalledOnce();
     });
 
-    it("allows sequential inject completions without a lifetime cap", async () => {
+    it("allows sequential legacy completions after each parent settlement", async () => {
       const completions = 6;
-      for (let i = 0; i < completions; i++) {
-        const jobId = `inject-sequential-${i}`;
+      for (let index = 0; index < completions; index++) {
+        const jobId = `inject-sequential-${index}`;
         const control = createJobControl();
         mockStartSubagentJob.mockImplementationOnce(() =>
           mockJobResult(jobId, control.jobPromise),
         );
-
         await isolatedToolDef.execute(
-          `call-sequential-${i}`,
+          `call-sequential-${index}`,
           { async: true, task: "test", notifyOnComplete: "inject" },
           undefined,
           undefined,
           mockCtx(),
         );
-
-        control.resolve({ ...SUCCESS_RESULT, output: `done ${i}` });
-
+        control.resolve({ ...SUCCESS_RESULT, output: `done ${index}` });
         await vi.waitFor(() => {
-          expect(api.sendMessage).toHaveBeenCalledTimes(i + 1);
+          expect(api.sendMessage).toHaveBeenCalledTimes(index + 1);
         });
+        settleCompletionParentTurn(sessionOwner(scope));
       }
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
     });
 
     it("degrades in-process overflow to a bounded identity ledger", () => {
@@ -889,14 +856,14 @@ describe("notifyOnComplete", () => {
       expect(status.details.status).toBe("done");
       expect(api.sendMessage).toHaveBeenCalledOnce();
       expect(sentMessageAt(api, 0)).toMatchObject({
-        customType: "subagent-notify",
-        details: { jobId },
+        customType: "subagent-manifest",
+        details: { completionIds: [`job:${jobId}`] },
       });
       expect(sentMessageOptsAt(api, 0)).toMatchObject({
         deliverAs: "followUp",
         triggerTurn: true,
       });
-      expect(api.notify).toHaveBeenCalledOnce();
+      expect(api.notify).not.toHaveBeenCalled();
       expect(child.api.sendMessage).not.toHaveBeenCalled();
     });
 
@@ -1168,7 +1135,8 @@ describe("notifyOnComplete", () => {
         expect(api.sendMessage).toHaveBeenCalledTimes(1);
       });
 
-      expect(sentMessageAt(api, 0).content).toContain(
+      expect(sentMessageAt(api, 0).content).toContain(jobId);
+      expect(sentMessageAt(api, 0).content).not.toContain(
         "(sub-agent produced no output)",
       );
     });
@@ -1242,13 +1210,12 @@ describe("notifyOnComplete", () => {
       );
     });
 
-    it("keeps the UI notification when a retrieved result suppresses parent delivery", async () => {
+    it("does not let the legacy resultRetrieved flag suppress coordinated delivery", async () => {
       const jobId = "retrieve-suppress";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
       await isolatedToolDef.execute(
         "call-7",
         { async: true, task: "test", notifyOnComplete: "notify" },
@@ -1256,32 +1223,27 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
-      // Simulate get_subagent_result having been called: set resultRetrieved
       const jobState = jobRegistry.get(jobId)!;
-      expect(jobState).toBeDefined();
       jobState.resultRetrieved = true;
-
       control.resolve(SUCCESS_RESULT);
 
       await vi.waitFor(() => {
         expect(jobState.status).toBe("done");
-        expect(api.notify).toHaveBeenCalledWith(
-          expect.stringContaining(`Job ${jobId}`),
-          "info",
-        );
+        expect(api.sendMessage).toHaveBeenCalledOnce();
       });
-      expect(api.sendMessage).not.toHaveBeenCalled();
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
+      expect(api.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion",
+        expect.objectContaining({ sourceId: jobId }),
+      );
+      expect(api.notify).not.toHaveBeenCalled();
     });
 
-    it("keeps the inject UI notification when result delivery is suppressed", async () => {
+    it("maps legacy inject retrieval flags to coordinated delivery", async () => {
       const jobId = "retrieve-inject-suppress";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
         mockJobResult(jobId, control.jobPromise),
       );
-
       await isolatedToolDef.execute(
         "call-8",
         { async: true, task: "test", notifyOnComplete: "inject" },
@@ -1289,21 +1251,18 @@ describe("notifyOnComplete", () => {
         undefined,
         mockCtx(),
       );
-
       const jobState = jobRegistry.get(jobId)!;
       jobState.resultRetrieved = true;
-
       control.resolve(SUCCESS_RESULT);
 
       await vi.waitFor(() => {
         expect(jobState.status).toBe("done");
-        expect(api.notify).toHaveBeenCalledWith(
-          expect.stringContaining(`Job ${jobId}`),
-          "info",
-        );
+        expect(api.sendMessage).toHaveBeenCalledOnce();
       });
-      expect(api.sendMessage).not.toHaveBeenCalled();
-      expect(api.sendUserMessage).not.toHaveBeenCalled();
+      expect(sentMessageAt(api, 0).content).not.toContain(
+        SUCCESS_RESULT.output,
+      );
+      expect(api.notify).not.toHaveBeenCalled();
     });
   });
 
@@ -1331,8 +1290,9 @@ describe("notifyOnComplete", () => {
       });
 
       const content = sentMessageAt(api, 0).content;
-      expect(content).toContain("❌");
-      expect(content).toContain(ERROR_RESULT.errorMessage);
+      expect(content).toContain(jobId);
+      expect(content).toContain('"status":"error"');
+      expect(content).not.toContain(ERROR_RESULT.errorMessage);
     });
 
     it("delivers notification via promise rejection handler when the job promise rejects", async () => {
@@ -1358,8 +1318,9 @@ describe("notifyOnComplete", () => {
       });
 
       const content = sentMessageAt(api, 0).content;
-      expect(content).toContain("❌");
-      expect(content).toContain("Connection timeout");
+      expect(content).toContain(jobId);
+      expect(content).toContain('"status":"error"');
+      expect(content).not.toContain("Connection timeout");
     });
 
     it("does NOT deliver via rejection handler if notification already delivered", async () => {
@@ -1395,7 +1356,7 @@ describe("notifyOnComplete", () => {
 
   // ── Default delivery ──────────────────────────────────────────────
   describe("default delivery", () => {
-    it("injects and triggers when notifyOnComplete is omitted", async () => {
+    it("delivers a compact reference and triggers by default", async () => {
       const jobId = "no-notify";
       const control = createJobControl();
       mockStartSubagentJob.mockImplementationOnce(() =>
@@ -1415,7 +1376,11 @@ describe("notifyOnComplete", () => {
       await vi.waitFor(() => {
         expect(api.sendMessage).toHaveBeenCalledTimes(1);
       });
-      expect(sentMessageAt(api, 0).content).toContain(SUCCESS_RESULT.output);
+      expect(sentMessageAt(api, 0).content).toContain(jobId);
+      expect(sentMessageAt(api, 0).content).not.toContain(
+        SUCCESS_RESULT.output,
+      );
+      expect(sentMessageAt(api, 0).customType).toBe("subagent-manifest");
       expect(sentMessageOptsAt(api, 0).triggerTurn).toBe(true);
     });
   });
@@ -1445,7 +1410,7 @@ describe("notifyOnComplete", () => {
       });
 
       const content = sentMessageAt(api, 0).content;
-      expect(content).toContain("✅");
+      expect(content).toContain('"status":"done"');
       expect(content).toContain(jobId);
       expect(content).toContain("done");
     });
@@ -1478,8 +1443,7 @@ describe("notifyOnComplete", () => {
       expect(content).not.toContain(
         "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890",
       );
-      // sanitizeOutput replaces it with [REDACTED]
-      expect(content).toContain("[REDACTED]");
+      expect(content).not.toContain("[REDACTED]");
       expect(content).toContain(jobId);
     });
 
@@ -1520,13 +1484,19 @@ describe("notifyOnComplete", () => {
       control2.resolve(ERROR_RESULT);
 
       await vi.waitFor(() => {
-        expect(api.sendMessage).toHaveBeenCalledTimes(2);
+        expect(api.appendEntry).toHaveBeenCalledWith(
+          "subagentura-completion",
+          expect.objectContaining({ sourceId: jobId1 }),
+        );
+        expect(api.appendEntry).toHaveBeenCalledWith(
+          "subagentura-completion",
+          expect.objectContaining({ sourceId: jobId2 }),
+        );
       });
-
-      expect(sentMessageAt(api, 0).content).toContain(jobId1);
-      expect(sentMessageAt(api, 0).content).toContain("✅");
-      expect(sentMessageAt(api, 1).content).toContain(jobId2);
-      expect(sentMessageAt(api, 1).content).toContain("❌");
+      expect(api.sendMessage).toHaveBeenCalledOnce();
+      expect(sentMessageAt(api, 0).details.completionIds).toEqual(
+        expect.arrayContaining([`job:${jobId1}`, `job:${jobId2}`]),
+      );
     });
 
     it("does not deliver after the owning scope shuts down", async () => {
@@ -1582,7 +1552,7 @@ describe("notifyOnComplete", () => {
       });
 
       const content = sentMessageAt(api, 0).content;
-      expect(content).toContain("✅");
+      expect(content).toContain('"status":"done"');
       expect(content).toContain(jobId);
     });
 
@@ -1678,6 +1648,7 @@ describe("read_subagent_artifact (output reporting)", () => {
   function tmp() {
     return mkdtempSync(join(tmpdir(), "pi-subagentura-read-out-"));
   }
+  let readArtifactApi: { appendEntry: ReturnType<typeof vi.fn> };
 
   function makeArtifactWithDone(
     id: string,
@@ -1715,6 +1686,8 @@ describe("read_subagent_artifact (output reporting)", () => {
     const _api = {
       registerTool: vi.fn(),
       registerMessageRenderer: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      appendEntry: vi.fn(),
       registerFlag: vi.fn(),
       getFlag: vi.fn().mockReturnValue(false),
       sendMessage: vi.fn(),
@@ -1726,6 +1699,7 @@ describe("read_subagent_artifact (output reporting)", () => {
     if (!ownerScope) throw new Error("Expected artifact tool session scope");
     ownerScope.lifecycle = "started";
     if (state) ownerScope.interactiveStates.set(state.id, state);
+    readArtifactApi = _api;
     return _api.registerTool.mock.calls.find(
       ([t]: any[]) => t.name === "read_subagent_artifact",
     )?.[0];
@@ -1769,7 +1743,7 @@ describe("read_subagent_artifact (output reporting)", () => {
     }
   });
 
-  it("reports a protocol-v2 completion as exited when output.md is missing", async () => {
+  it("treats a protocol-v2 empty immutable snapshot as a consumed result", async () => {
     const id = "ab12cd3800000002";
     const parent = tmp();
     try {
@@ -1794,11 +1768,186 @@ describe("read_subagent_artifact (output reporting)", () => {
       );
       const text = result.content[0].text;
 
-      expect(text).toContain(
-        "Output: (sub-agent exited without writing output.md",
+      expect(text).toContain("Output: (empty — 0 chars)");
+      expect(text).toContain("Last event: completion @ 2");
+      expect(readArtifactApi.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({ turnId: "turn-without-output" }),
       );
-      expect(text).toContain("last event: completion @ 2");
-      expect(text).not.toContain("not written yet");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("consumes only a terminal result whose output was requested", async () => {
+    const id = "ab12cd3800000010";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      writeOutput(art, "terminal result");
+      appendCompletionEvent(art, {
+        turnId: "terminal-turn",
+        eventId: "terminal-event",
+        outcome: "done",
+        source: "agent_settled",
+        ts: 2,
+      });
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const readTool = makeReadTool(mod, state);
+
+      await readTool.execute(
+        "events-only",
+        { id, includeOutput: false },
+        undefined,
+        undefined,
+        {} as any,
+      );
+      expect(readArtifactApi.appendEntry).not.toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.anything(),
+      );
+
+      await readTool.execute(
+        "output-after-since",
+        { id, since: 3 },
+        undefined,
+        undefined,
+        {} as any,
+      );
+      expect(readArtifactApi.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({
+          source: "interactive",
+          sourceId: id,
+          turnId: "terminal-turn",
+          reason: "manual",
+        }),
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the latest terminal snapshot instead of active staging output", async () => {
+    const id = "ab12cd3800000011";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      writeOutput(art, "immutable terminal result");
+      appendCompletionEvent(art, {
+        turnId: "completed-turn",
+        eventId: "completed-event",
+        outcome: "done",
+        source: "agent_settled",
+        ts: 2,
+      });
+      writeOutput(art, "new active staging output");
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const readTool = makeReadTool(mod, state);
+
+      const result = await readTool.execute(
+        "latest-terminal",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
+
+      expect(result.details.output).toBe("immutable terminal result");
+      expect(readArtifactApi.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({ turnId: "completed-turn" }),
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("finds a terminal snapshot beyond the first event batch", async () => {
+    const id = "ab12cd3800000012";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      for (let index = 0; index < 3_000; index++) {
+        appendEvent(art, {
+          ts: index + 2,
+          type: "tool_activity",
+          status: "running",
+          tool: "test",
+          summary: "x".repeat(100),
+        });
+      }
+      writeOutput(art, "late immutable result");
+      appendCompletionEvent(art, {
+        turnId: "late-completed-turn",
+        eventId: "late-completed-event",
+        outcome: "done",
+        source: "agent_settled",
+      });
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const readTool = makeReadTool(mod, state);
+
+      const result = await readTool.execute(
+        "late-terminal",
+        { id },
+        undefined,
+        undefined,
+        {} as any,
+      );
+
+      expect(result.details.output).toBe("late immutable result");
+      expect(readArtifactApi.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({ turnId: "late-completed-turn" }),
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("maps numeric selectors only to legacy done snapshots in mixed logs", async () => {
+    const id = "ab12cd3800000013";
+    const parent = tmp();
+    try {
+      const { state, art } = makeArtifactWithDone(id, parent, false);
+      writeOutput(art, "legacy one");
+      snapshotOutput(art, 1);
+      appendEvent(art, { ts: 2, type: "done", status: "done", exitCode: 0 });
+      writeOutput(art, "v2 result");
+      appendCompletionEvent(art, {
+        turnId: "v2-turn",
+        eventId: "v2-event",
+        outcome: "done",
+        source: "agent_settled",
+        ts: 3,
+      });
+      writeOutput(art, "legacy two");
+      snapshotOutput(art, 2);
+      appendEvent(art, { ts: 4, type: "done", status: "done", exitCode: 0 });
+      const mod =
+        await importFresh<typeof import("../src/subagent")>("../src/subagent");
+      const readTool = makeReadTool(mod, state);
+
+      const result = await readTool.execute(
+        "legacy-two",
+        { id, turn: 2 },
+        undefined,
+        undefined,
+        {} as any,
+      );
+
+      expect(result.details.output).toBe("legacy two");
+      expect(readArtifactApi.appendEntry).toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({ turnId: expect.stringMatching(/^legacy-/) }),
+      );
+      expect(readArtifactApi.appendEntry).not.toHaveBeenCalledWith(
+        "subagentura-completion-consumed",
+        expect.objectContaining({ turnId: "v2-turn" }),
+      );
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }

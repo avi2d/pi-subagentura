@@ -13,6 +13,12 @@ interface CompletionTurnOptions {
   deliverAs: "followUp";
   triggerTurn: boolean;
   parentStreaming: boolean;
+  /**
+   * Called once when an idle synthetic wake reaches its bounded retry cap
+   * without entering before_agent_start. The caller may release any
+   * turn-fence state that would otherwise block subsequent completions.
+   */
+  onWakeExhausted?: () => void;
 }
 
 interface WakeState {
@@ -23,6 +29,7 @@ interface WakeState {
   wakePromptSettled: boolean;
   wakeAttempts: number;
   ackAttempts: number;
+  wakeExhaustedCallbacks: Set<() => void>;
   watchdogTimer?: ReturnType<typeof setTimeout>;
   ackRetryTimer?: ReturnType<typeof setTimeout>;
 }
@@ -81,6 +88,32 @@ function clearWakeAcknowledgementRetry(state: WakeState): void {
   if (state.ackRetryTimer === undefined) return;
   clearTimeout(state.ackRetryTimer);
   state.ackRetryTimer = undefined;
+}
+
+function notifyWakeExhausted(pi: ExtensionAPI, state: WakeState): void {
+  if (
+    wakeStates.get(pi) !== state ||
+    state.wakePromptStarted ||
+    state.wakePromptSettled ||
+    state.wakeAttempts < ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS
+  ) {
+    return;
+  }
+  state.inFlight = false;
+  const callbacks = [...state.wakeExhaustedCallbacks];
+  state.wakeExhaustedCallbacks.clear();
+  for (const callback of callbacks) {
+    try {
+      callback();
+    } catch (error) {
+      debugLog("error", "orchestratorv2_wake_exhaustion_callback_failed", {
+        error:
+          error instanceof Error
+            ? (error.stack ?? error.message)
+            : String(error),
+      });
+    }
+  }
 }
 
 export function clearCompletionTurnWake(pi: ExtensionAPI): void {
@@ -166,6 +199,7 @@ export function markCompletionTurnWakeStarted(
   state.wakePromptStarted = true;
   state.wakePromptSettled = false;
   state.inFlight = false;
+  state.wakeExhaustedCallbacks.clear();
   clearWakeWatchdog(state);
   return true;
 }
@@ -233,6 +267,7 @@ export function recoverCompletionTurnWakes(
     wakePromptSettled: false,
     wakeAttempts: 0,
     ackAttempts: 0,
+    wakeExhaustedCallbacks: new Set(),
   };
   wakeStates.set(pi, state);
   requestPromptWake(pi, state);
@@ -278,6 +313,7 @@ export function sendCompletionTurn(
       wakePromptSettled: false,
       wakeAttempts: 0,
       ackAttempts: 0,
+      wakeExhaustedCallbacks: new Set(),
     };
     wakeStates.set(pi, state);
   }
@@ -288,6 +324,7 @@ export function sendCompletionTurn(
     state.wakePromptSettled = false;
     state.wakeAttempts = 0;
     state.ackAttempts = 0;
+    state.wakeExhaustedCallbacks.clear();
   }
 
   if (
@@ -307,6 +344,15 @@ export function sendCompletionTurn(
     state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS
   ) {
     state.wakeAttempts = 0;
+  }
+
+  if (
+    !state.inFlight &&
+    !state.wakePromptStarted &&
+    !state.wakePromptSettled &&
+    options.onWakeExhausted
+  ) {
+    state.wakeExhaustedCallbacks.add(options.onWakeExhausted);
   }
 
   pi.sendMessage(withWakeId(message, state.activeWakeId), {
@@ -350,15 +396,14 @@ function requestPromptWake(pi: ExtensionAPI, state: WakeState): void {
 
 function scheduleWakeWatchdog(pi: ExtensionAPI, state: WakeState): void {
   clearWakeWatchdog(state);
-  if (state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS) {
-    state.inFlight = false;
-    return;
-  }
   const timer = setTimeout(() => {
     state.watchdogTimer = undefined;
     if (wakeStates.get(pi) !== state || state.wakePromptStarted) return;
     state.inFlight = false;
-    if (state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS) return;
+    if (state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS) {
+      notifyWakeExhausted(pi, state);
+      return;
+    }
     try {
       requestPromptWake(pi, state);
     } catch (error) {

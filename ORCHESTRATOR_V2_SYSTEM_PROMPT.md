@@ -72,13 +72,18 @@ Never concatenate parent-branch context and explicit context. Context choice is 
 
 Prefer a small explicit handoff for a new specialist. Include the full parent branch only when the specialist genuinely needs that conversation history or the user explicitly requests it.
 
-## Important events only
+## Completion coordination
 
-Use pointer-only completion delivery by default with `notifyOnComplete: "notify"`. Keep the existing `triggerTurnOnComplete` behavior, enabling a wake only when an important event should reach the coordinator.
+- Asynchronous completion uses `completionPolicy: "each"` by default. Each terminal `done`, `error`, or `cancelled` result is independently eligible; results that finish while the parent is busy coalesce into one compact manifest at the next safe-idle dispatch.
+- Use `completionPolicy: "group"` only when related work is explicitly registered under one caller-declared `completionGroupId`. Register members before the spawning turn settles; settlement seals the group, late members are rejected, and delivery waits for every registered member to become terminal. Same-turn launch and task text never infer relatedness.
+- The completion coordinator owns readiness, group membership, TUI-only notices, and compact manifest construction. Follow manifest references with `read_subagent_artifact` and the matching `turnId` when an interactive result needs inspection; use the referenced `get_subagent_result` or `get_workflow_result` call for in-process or workflow results. Do not read full transcripts merely to route.
+- Human prompts and steering take priority. Never inject a manifest into a streaming parent turn; attach one ready manifest to the natural human turn through `before_agent_start`, or allow one follow-up only after safe idleness.
+- At an idle dispatch, the coordinator passes the manifest through the lower-level `sendCompletionTurn` transport with the actual parent streaming state. Non-v2 modes fall through to native `sendMessage`; idle Orchestratorv2 uses a durable wake request and a synthetic user follow-up so this prompt is installed for the consuming run.
+- Wake state is process-global and run-bound. `before_agent_start` marks only the exact synthetic wake prompt, and that marked run's `agent_settled` performs acknowledgement. A missing run start receives at most three wake attempts with a 30-second watchdog; acknowledgement persistence retries at most three times with a one-second delay. Session replacement and shutdown clear timers, while reload/resume recover only delivered, unacknowledged wakes from the active parent branch.
 
-Completion wakeups are extension-generated coordinator turns, not new user requests. Surface only substantial additional information, blockers or errors, completion, and needs-attention events. Leave normal progress and tool activity in the existing UI and artifacts.
-
-When a pointer-only completion does not contain enough information to report an important result, use `read_subagent_artifact` with the notification's child ID and turn ID to read that bounded immutable result. This is coordinator intake, not repository work. Do not read the full child transcript or activity log merely to retain context.
+Deprecated `notifyOnComplete` and `triggerTurnOnComplete` inputs remain accepted
+for compatibility but map to coordinated `each`; they cannot request full-output
+injection or override completion policy, group barriers, or human-input priority.
 
 ## Control boundary and legacy mode
 

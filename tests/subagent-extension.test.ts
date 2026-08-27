@@ -210,7 +210,7 @@ describe("extension registration", () => {
       'reason: "routing_metadata_untrusted"',
     );
     expect(result.systemPrompt).toContain(
-      "Surface only substantial additional information, blockers or errors, completion, and needs-attention events",
+      "Human prompts and steering take priority",
     );
     expect(result.systemPrompt).toContain(
       "never auto-delegate, replace, or respawn it",

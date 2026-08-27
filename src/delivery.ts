@@ -24,6 +24,13 @@ import {
 import type { InteractiveSubagentState } from "./interactive-tmux";
 import { notifyCompletionDelivery, sanitizeOutput } from "./notifications";
 import {
+  COMPLETION_CONSUMED_ENTRY_TYPE,
+  COMPLETION_ENTRY_TYPE,
+  COMPLETION_MANIFEST_TYPE,
+  COMPLETION_RECORD_SCHEMA_VERSION,
+  publishCompletion,
+} from "./completion-coordinator";
+import {
   interactiveStateBelongsToOwner,
   ownerlessEntitiesVisible,
   resolveActualStreamingFlag,
@@ -211,21 +218,21 @@ function mergeOverflowSemantics(
   }
 }
 
-function collapseOldestIntent(state: InteractiveSubagentState): void {
+function collapseOldestIntent(state: InteractiveSubagentState): boolean {
   const queue = state.pendingDeliveries ?? [];
   const summary = queue.find((item) => item.eventId === "delivery-overflow");
   const oldestIndex = queue.findIndex(
-    (item) => item.eventId !== "delivery-overflow",
+    (item) => item.eventId !== "delivery-overflow" && !item.completionPolicy,
   );
-  if (oldestIndex < 0) return;
+  if (oldestIndex < 0) return false;
   const [oldest] = queue.splice(oldestIndex, 1);
   persistOverflowIdentity(state, oldest);
   if (summary) {
     mergeOverflowSemantics(summary, oldest);
-    return;
+    return true;
   }
   const secondIndex = queue.findIndex(
-    (item) => item.eventId !== "delivery-overflow",
+    (item) => item.eventId !== "delivery-overflow" && !item.completionPolicy,
   );
   const second = secondIndex >= 0 ? queue.splice(secondIndex, 1)[0] : undefined;
   if (second) persistOverflowIdentity(state, second);
@@ -250,6 +257,7 @@ function collapseOldestIntent(state: InteractiveSubagentState): void {
   mergeOverflowSemantics(overflow, oldest);
   if (second) mergeOverflowSemantics(overflow, second);
   queue.unshift(overflow);
+  return true;
 }
 
 export function enqueueDelivery(
@@ -281,7 +289,11 @@ export function enqueueDelivery(
     queue.length > MAX_DELIVERY_RECORDS ||
     queueBytes(queue) > MAX_DELIVERY_QUEUE_BYTES
   ) {
-    collapseOldestIntent(state);
+    if (collapseOldestIntent(state)) continue;
+    if (queue.at(-1) === intent) queue.pop();
+    throw new Error(
+      `Coordinated delivery queue exceeded its ${MAX_DELIVERY_RECORDS}-record bound before it could be drained`,
+    );
   }
   if (options.persist !== false) persistState(state);
 }
@@ -374,6 +386,49 @@ function formatIntent(
   );
 }
 
+function publishCoordinatedInteractiveCompletion(
+  intent: PersistedDeliveryIntent,
+  owner?: SessionOwnerToken,
+): void {
+  if (!intent.completionPolicy) return;
+  const outputReference = intent.output
+    ? {
+        label: "output",
+        value: join(intent.artifactDir, "outputs", `${intent.eventId}.md`),
+      }
+    : intent.eventId.startsWith("legacy-")
+      ? {
+          label: "output (legacy)",
+          value: join(intent.artifactDir, "output.md"),
+        }
+      : undefined;
+  const references = [
+    ...(outputReference ? [outputReference] : []),
+    {
+      label: "activity",
+      value: join(intent.artifactDir, "events.ndjson"),
+    },
+  ];
+  publishCompletion(
+    {
+      schemaVersion: 1,
+      completionId: intent.deliveryId,
+      source: "interactive",
+      sourceId: intent.subagentId,
+      turnId: intent.turnId,
+      label: `Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}`,
+      status: intent.status,
+      policy: intent.completionPolicy,
+      ...(intent.completionGroupId
+        ? { groupId: intent.completionGroupId }
+        : {}),
+      references,
+      completedAt: Date.now(),
+    },
+    owner,
+  );
+}
+
 export function flushDeliveries(
   pi: ExtensionAPI,
   ui: ExtensionUIContext | undefined,
@@ -390,9 +445,14 @@ export function flushDeliveries(
     if (state.completionOwner === "workflow") continue;
     for (const intent of state.pendingDeliveries ?? []) {
       if (intent.state === "dispatchAttempted") continue;
+      if (intent.completionPolicy) {
+        publishCoordinatedInteractiveCompletion(intent, owner);
+        continue;
+      }
       llm.push({ state, intent, content: formatIntent(intent, owner) });
     }
   }
+  reconcileAllDeliveryReceipts(owner);
   const runningJobsCount = runningInProcessJobCount(owner);
   if (llm.length === 0) return;
   const selected: typeof llm = [];
@@ -460,15 +520,53 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function deliveryIdsFromEntry(entry: unknown): unknown[] | undefined {
+function deliveryIdsFromEntry(
+  entry: unknown,
+  state: InteractiveSubagentState,
+): unknown[] | undefined {
   const record = objectRecord(entry);
   if (record?.type !== "custom" && record?.type !== "custom_message") {
     return undefined;
   }
-  const details = objectRecord(record.details);
-  const messageDetails = objectRecord(objectRecord(record.message)?.details);
-  const ids = details?.deliveryIds ?? messageDetails?.deliveryIds;
-  return Array.isArray(ids) ? ids : undefined;
+  const message = objectRecord(record.message);
+  const customType = record.customType ?? message?.customType;
+  const data = objectRecord(record.data);
+  const details =
+    objectRecord(record.details) ?? objectRecord(message?.details);
+  if (customType === COMPLETION_ENTRY_TYPE) {
+    return data?.schemaVersion === COMPLETION_RECORD_SCHEMA_VERSION &&
+      data.source === "interactive" &&
+      data.sourceId === state.id &&
+      typeof data.completionId === "string"
+      ? [data.completionId]
+      : undefined;
+  }
+  if (customType === COMPLETION_MANIFEST_TYPE) {
+    return details?.schemaVersion === COMPLETION_RECORD_SCHEMA_VERSION &&
+      Array.isArray(details.completionIds)
+      ? details.completionIds
+      : undefined;
+  }
+  if (customType !== "subagent-notify") return undefined;
+  return Array.isArray(details?.deliveryIds) ? details.deliveryIds : undefined;
+}
+
+function consumedInteractiveDeliveryIds(
+  entry: unknown,
+  state: InteractiveSubagentState,
+): string[] {
+  const record = objectRecord(entry);
+  if (
+    record?.type !== "custom" ||
+    record.customType !== COMPLETION_CONSUMED_ENTRY_TYPE
+  ) {
+    return [];
+  }
+  const data = objectRecord(record.data);
+  if (data?.source !== "interactive" || data.sourceId !== state.id) return [];
+  return (state.pendingDeliveries ?? [])
+    .filter((intent) => !data.turnId || intent.turnId === data.turnId)
+    .map((intent) => intent.deliveryId);
 }
 
 function reconcileDeliveryReceiptsInMemory(
@@ -479,8 +577,10 @@ function reconcileDeliveryReceiptsInMemory(
   compactDeliveryReceipts(state);
   const seen = new Set<string>();
   for (const entry of entries) {
-    const ids = deliveryIdsFromEntry(entry);
-    if (!ids) continue;
+    const ids = [
+      ...(deliveryIdsFromEntry(entry, state) ?? []),
+      ...consumedInteractiveDeliveryIds(entry, state),
+    ];
     for (const id of ids) if (typeof id === "string") seen.add(id);
   }
   let changed = false;

@@ -2279,7 +2279,11 @@ describe("pollArtifactChanges — terminal cleanup of state.json", () => {
     };
     await mod.pollArtifactChanges({
       sendMessage: vi.fn((message) => {
-        entries.push({ type: "custom_message", details: message.details });
+        entries.push({
+          type: "custom_message",
+          customType: message.customType,
+          details: message.details,
+        });
       }),
     } as any);
 
