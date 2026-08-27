@@ -252,6 +252,7 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
     steps,
     "npm publish --access public",
   );
+  const githubReleaseStepIdx = findStepIndex(steps, "gh release create");
 
   // ---- Trigger ----
 
@@ -272,7 +273,7 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
     it("grants registry publishing permissions", () => {
       const perms = root.permissions as Record<string, unknown>;
       expect(perms).toBeDefined();
-      expect(perms.contents).toBe("read");
+      expect(perms.contents).toBe("write");
       expect(perms["id-token"]).toBe("write");
       expect(perms.packages).toBe("write");
     });
@@ -319,8 +320,8 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
       expect(githubPublishStepIdx).toBeGreaterThan(npmPublishStepIdx);
     });
 
-    it("GitHub Packages publish is the final step", () => {
-      expect(githubPublishStepIdx).toBe(steps.length - 1);
+    it("creates the GitHub Release after package publishing", () => {
+      expect(githubReleaseStepIdx).toBeGreaterThan(githubPublishStepIdx);
     });
   });
 
@@ -383,6 +384,19 @@ describe("publish workflow (.github/workflows/publish.yml)", () => {
     it("publishes the GitHub package publicly", () => {
       const step = steps[githubPublishStepIdx];
       expect(step?.run).toContain("--access public");
+    });
+  });
+
+  describe("GitHub Release", () => {
+    it("creates a verified release with generated notes", () => {
+      const step = steps[githubReleaseStepIdx];
+      expect(step?.run).toContain("--verify-tag");
+      expect(step?.run).toContain("--generate-notes");
+      expect(step?.env?.GH_TOKEN).toBe("${{ github.token }}");
+    });
+
+    it("creates the GitHub Release as the final step", () => {
+      expect(githubReleaseStepIdx).toBe(steps.length - 1);
     });
   });
 
