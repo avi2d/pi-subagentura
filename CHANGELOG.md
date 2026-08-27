@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session. Delivery is bounded and at-least-once; in-process jobs and background
   workflows remain session scoped.
 - Consumption receipts prefer parent-session entries. When `appendEntry` is unavailable or fails, receipts append losslessly to a private, session-scoped append-only ledger keyed by parent session identity; fixed snapshots and bounded streaming reads preserve memory bounds while retaining late-published receipts.
+- Completion-consumption selectors now use explicit source variants: interactive turn receipts require `turnId`, source-level interactive receipts use `scope: "source"`, and in-process/workflow receipts remain source-scoped. Legacy interactive receipts without `scope` are migrated safely without matching turn-scoped completions.
 
 ### Fixed
 

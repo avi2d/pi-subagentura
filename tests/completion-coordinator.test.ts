@@ -309,10 +309,8 @@ describe("completion coordinator", () => {
 
     consumeCompletionSource(
       setupResult.pi as never,
-      "interactive",
-      "a",
+      { source: "interactive", sourceId: "a", turnId: "turn-a" },
       sessionOwner(scope),
-      "turn-a",
     );
     publishCompletion(record("a"), sessionOwner(scope));
     flushCompletionManifests(sessionOwner(scope));
@@ -328,10 +326,8 @@ describe("completion coordinator", () => {
     for (let index = 0; index < 2; index++) {
       consumeCompletionSource(
         setupResult.pi as never,
-        "interactive",
-        "a",
+        { source: "interactive", sourceId: "a", turnId: "turn-a" },
         sessionOwner(scope),
-        "turn-a",
       );
     }
 
@@ -365,18 +361,14 @@ describe("completion coordinator", () => {
     publishCompletion(record("a", group), sessionOwner(scope));
     consumeCompletionSource(
       setupResult.pi as never,
-      "interactive",
-      "a",
+      { source: "interactive", sourceId: "a", turnId: "turn-a" },
       sessionOwner(scope),
-      "turn-a",
     );
     publishCompletion(record("b", group), sessionOwner(scope));
     consumeCompletionSource(
       setupResult.pi as never,
-      "interactive",
-      "b",
+      { source: "interactive", sourceId: "b", turnId: "turn-b" },
       sessionOwner(scope),
-      "turn-b",
     );
     flushCompletionManifests(sessionOwner(scope));
 
@@ -887,10 +879,12 @@ describe("completion coordinator", () => {
       expect(() =>
         consumeCompletionSource(
           setupResult.pi as never,
-          "interactive",
-          "consumed",
+          {
+            source: "interactive",
+            sourceId: "consumed",
+            turnId: "turn-consumed",
+          },
           sessionOwner(scope),
-          "turn-consumed",
         ),
       ).not.toThrow();
       publishCompletion(
@@ -1001,6 +995,75 @@ describe("completion coordinator", () => {
     );
   });
 
+  it("ignores malformed persisted consumption selectors", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    const ledgerPath = sessionLedgerPath(
+      setupResult.ledgerRoot,
+      "parent-session",
+      "subagentura-completion-consumed",
+    );
+    mkdirSync(join(setupResult.ledgerRoot, ".pi"), { recursive: true });
+    writeFileSync(
+      ledgerPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        source: "interactive",
+        sourceId: "malformed",
+        scope: "turn",
+        consumedAt: 1,
+        reason: "manual",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    registerCompletionExpectations(
+      [
+        {
+          completionId: "completion-malformed",
+          source: "interactive",
+          sourceId: "malformed",
+          turnId: "turn-malformed",
+        },
+      ],
+      owner,
+    );
+    publishCompletion(record("malformed", { turnId: "turn-malformed" }), owner);
+    flushCompletionManifests(owner);
+    expect(manifests(setupResult.pi)[0]?.[0].details.completionIds).toEqual([
+      "completion-malformed",
+    ]);
+  });
+
+  it("does not let an explicit source receipt consume a turn-scoped completion", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const owner = sessionOwner(scope);
+    consumeCompletionSource(
+      setupResult.pi as never,
+      { source: "interactive", sourceId: "source-selector", scope: "source" },
+      owner,
+    );
+    publishCompletion(
+      record("source-selector", {
+        completionId: "source-selector-unscoped",
+        turnId: undefined,
+      }),
+      owner,
+    );
+    publishCompletion(
+      record("source-selector", {
+        completionId: "source-selector-turn",
+        turnId: "turn-selector",
+      }),
+      owner,
+    );
+    flushCompletionManifests(owner);
+    expect(manifests(setupResult.pi)[0]?.[0].details.completionIds).toEqual([
+      "source-selector-turn",
+    ]);
+  });
+
   it("records a specific turn after an earlier source-only consumption", () => {
     const setupResult = setup();
     scope = setupResult.scope;
@@ -1008,16 +1071,17 @@ describe("completion coordinator", () => {
 
     consumeCompletionSource(
       setupResult.pi as never,
-      "interactive",
-      "reused-source",
+      { source: "interactive", sourceId: "reused-source", scope: "source" },
       owner,
     );
     consumeCompletionSource(
       setupResult.pi as never,
-      "interactive",
-      "reused-source",
+      {
+        source: "interactive",
+        sourceId: "reused-source",
+        turnId: "later-turn",
+      },
       owner,
-      "later-turn",
     );
 
     const receipts = setupResult.entries.filter(
@@ -1026,6 +1090,7 @@ describe("completion coordinator", () => {
         entry.customType === "subagentura-completion-consumed",
     );
     expect(receipts).toHaveLength(2);
+    expect(receipts[0]).toHaveProperty("data.scope", "source");
     expect(receipts[1]).toHaveProperty("data.turnId", "later-turn");
   });
 
@@ -1044,19 +1109,16 @@ describe("completion coordinator", () => {
     try {
       for (let index = 0; index < 513; index++) {
         const sourceId = `receipt-${index}`;
-        const turnId = `turn-${index}`;
         consumeCompletionSource(
           setupResult.pi as never,
-          "in-process",
-          sourceId,
+          { source: "in-process", sourceId },
           sessionOwner(scope),
-          turnId,
         );
         publishCompletion(
           record(sourceId, {
             source: "in-process",
             completionId: `receipt-completion-${index}`,
-            turnId,
+            turnId: undefined,
           }),
           sessionOwner(scope),
         );
@@ -1296,7 +1358,6 @@ describe("completion coordinator", () => {
             completionId: "recovered-completion",
             source: "in-process",
             sourceId: "recovered",
-            turnId: "recovered-turn",
           },
         ],
         owner,
@@ -1308,7 +1369,6 @@ describe("completion coordinator", () => {
           schemaVersion: 1,
           source: "in-process",
           sourceId: "recovered",
-          turnId: "recovered-turn",
           consumedAt: 1,
           reason: "manual",
         })}\n`,
@@ -1319,7 +1379,7 @@ describe("completion coordinator", () => {
         record("recovered", {
           source: "in-process",
           completionId: "recovered-completion",
-          turnId: "recovered-turn",
+          turnId: undefined,
         }),
         owner,
       );

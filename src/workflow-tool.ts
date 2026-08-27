@@ -993,7 +993,11 @@ export function registerWorkflowTool(
         const outputBudget = st.snapshot?.budgetTotal;
         const usageDetails = usage ? { usage } : {};
         st.resultRetrieved = true;
-        consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
+        consumeCompletionSource(
+          pi,
+          { source: "workflow", sourceId: st.id },
+          workflowOwner,
+        );
         return {
           content: [
             {
@@ -1026,7 +1030,11 @@ export function registerWorkflowTool(
       );
       const usage = presentWorkflowUsage(run.usage);
       st.resultRetrieved = true;
-      consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
+      consumeCompletionSource(
+        pi,
+        { source: "workflow", sourceId: st.id },
+        workflowOwner,
+      );
       return {
         content: [
           {

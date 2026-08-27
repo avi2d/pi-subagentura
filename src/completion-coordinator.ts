@@ -111,15 +111,51 @@ export function resolveCompletionPolicy(
   return { policy, groupId, legacy: false };
 }
 
-export interface CompletionConsumption {
+interface CompletionConsumptionBase {
   schemaVersion: typeof COMPLETION_RECORD_SCHEMA_VERSION;
-  completionIds?: string[];
-  source?: CompletionSource;
-  sourceId?: string;
-  turnId?: string;
   consumedAt: number;
   reason: "manual" | "manifest" | "lifecycle";
 }
+
+export interface InteractiveTurnConsumption extends CompletionConsumptionBase {
+  source: "interactive";
+  sourceId: string;
+  turnId: string;
+  scope?: never;
+}
+
+export interface InteractiveSourceConsumption extends CompletionConsumptionBase {
+  source: "interactive";
+  sourceId: string;
+  scope: "source";
+  turnId?: never;
+}
+
+export interface NonInteractiveCompletionConsumption extends CompletionConsumptionBase {
+  source: "in-process" | "workflow";
+  sourceId: string;
+  turnId?: never;
+  scope?: never;
+}
+
+export interface CompletionIdsConsumption extends CompletionConsumptionBase {
+  completionIds: string[];
+  source?: never;
+  sourceId?: never;
+  turnId?: never;
+  scope?: never;
+}
+
+export type CompletionConsumption =
+  | InteractiveTurnConsumption
+  | InteractiveSourceConsumption
+  | NonInteractiveCompletionConsumption
+  | CompletionIdsConsumption;
+
+export type CompletionConsumptionSelector =
+  | Pick<InteractiveTurnConsumption, "source" | "sourceId" | "turnId">
+  | Pick<InteractiveSourceConsumption, "source" | "sourceId" | "scope">
+  | Pick<NonInteractiveCompletionConsumption, "source" | "sourceId">;
 
 export interface CompletionExpectation {
   completionId: string;
@@ -429,14 +465,32 @@ function normalizeConsumption(
     turnId = data.turnId;
   }
 
+  const hasScope = Object.hasOwn(data, "scope");
+  let scope: "source" | undefined;
+  if (hasScope) {
+    if (data.scope !== "source") return undefined;
+    scope = "source";
+  }
+
   const hasIdSelector = (completionIds?.length ?? 0) > 0;
   const hasSourceSelector =
-    source !== undefined || sourceId !== undefined || turnId !== undefined;
+    source !== undefined ||
+    sourceId !== undefined ||
+    turnId !== undefined ||
+    scope !== undefined;
   if (
     (hasIdSelector && hasSourceSelector) ||
     (hasSourceSelector && (source === undefined || sourceId === undefined)) ||
     (!hasIdSelector && !hasSourceSelector)
   ) {
+    return undefined;
+  }
+  if (source === "interactive") {
+    // Older source-only receipts omitted scope; migrate them to the explicit
+    // source selector while never treating them as a turn wildcard.
+    if (turnId === undefined && scope === undefined) scope = "source";
+    if (turnId !== undefined && scope !== undefined) return undefined;
+  } else if (turnId !== undefined || scope !== undefined) {
     return undefined;
   }
 
@@ -454,15 +508,19 @@ function normalizeConsumption(
   ) {
     return undefined;
   }
-  return {
-    schemaVersion: COMPLETION_RECORD_SCHEMA_VERSION,
-    ...(completionIds !== undefined ? { completionIds } : {}),
-    ...(source !== undefined ? { source } : {}),
-    ...(sourceId !== undefined ? { sourceId } : {}),
-    ...(turnId !== undefined ? { turnId } : {}),
+  const base = {
+    schemaVersion:
+      COMPLETION_RECORD_SCHEMA_VERSION as typeof COMPLETION_RECORD_SCHEMA_VERSION,
     consumedAt: data.consumedAt,
     reason: data.reason,
-  };
+  } as const;
+  if (completionIds !== undefined) return { ...base, completionIds };
+  if (source === "interactive") {
+    return turnId !== undefined
+      ? { ...base, source, sourceId: sourceId!, turnId }
+      : { ...base, source, sourceId: sourceId!, scope: "source" as const };
+  }
+  return { ...base, source: source!, sourceId: sourceId! };
 }
 
 function consumptionFromEntry(
@@ -478,17 +536,21 @@ function matchesConsumption(
   record: CompletionRecord,
   consumption: CompletionConsumption,
 ): boolean {
-  if (consumption.completionIds?.includes(record.completionId)) return true;
-  if (!consumption.source || !consumption.sourceId) return false;
+  if ("completionIds" in consumption) {
+    return consumption.completionIds.includes(record.completionId);
+  }
   if (
     record.source !== consumption.source ||
     record.sourceId !== consumption.sourceId
   ) {
     return false;
   }
-  return record.turnId === undefined
-    ? consumption.turnId === undefined
-    : consumption.turnId === record.turnId;
+  if (consumption.source === "interactive") {
+    return "scope" in consumption
+      ? record.turnId === undefined
+      : record.turnId === consumption.turnId;
+  }
+  return record.turnId === undefined;
 }
 
 function entriesFor(state: CompletionCoordinatorState): unknown[] {
@@ -748,17 +810,21 @@ function expectationMatchesConsumption(
   expectation: CompletionExpectation,
   consumption: CompletionConsumption,
 ): boolean {
-  if (consumption.completionIds?.includes(expectation.completionId))
-    return true;
+  if ("completionIds" in consumption) {
+    return consumption.completionIds.includes(expectation.completionId);
+  }
   if (
     consumption.source !== expectation.source ||
     consumption.sourceId !== expectation.sourceId
   ) {
     return false;
   }
-  return expectation.turnId === undefined
-    ? consumption.turnId === undefined
-    : consumption.turnId === expectation.turnId;
+  if (consumption.source === "interactive") {
+    return "scope" in consumption
+      ? expectation.turnId === undefined
+      : consumption.turnId === expectation.turnId;
+  }
+  return expectation.turnId === undefined;
 }
 
 function reconcileFallbackConsumptions(
@@ -871,17 +937,24 @@ function reconcileFallbackConsumptions(
 
 function fallbackConsumptionMatches(
   state: CompletionCoordinatorState,
-  source: CompletionSource,
-  sourceId: string,
-  turnId: string | undefined,
+  selector: CompletionConsumptionSelector,
 ): boolean {
   return state.sourceConsumptions.some((consumption) => {
-    if (consumption.source !== source || consumption.sourceId !== sourceId) {
+    if (!("source" in consumption)) return false;
+    if (
+      consumption.source !== selector.source ||
+      consumption.sourceId !== selector.sourceId
+    ) {
       return false;
     }
-    return turnId === undefined
-      ? consumption.turnId === undefined
-      : consumption.turnId === turnId;
+    if (selector.source === "interactive") {
+      return "scope" in selector
+        ? "scope" in consumption
+          ? consumption.scope === "source"
+          : false
+        : "turnId" in consumption && consumption.turnId === selector.turnId;
+    }
+    return true;
   });
 }
 
@@ -1832,37 +1905,31 @@ export function publishCompletion(
 
 export function consumeCompletionSource(
   pi: ExtensionAPI,
-  source: CompletionSource,
-  sourceId: string,
+  selector: CompletionConsumptionSelector,
   owner?: SessionOwnerToken,
-  turnId?: string,
 ): void {
   const state = getState(owner);
   if (!state || state.pi !== pi) return;
   reconcileState(state);
-  const normalizedSourceId = sourceId.slice(0, MAX_SOURCE_ID_LENGTH);
-  const normalizedTurnId = turnId?.slice(0, MAX_TURN_ID_LENGTH);
-  if (
-    state.sourceConsumptions.some(
-      (consumption) =>
-        consumption.source === source &&
-        consumption.sourceId === normalizedSourceId &&
-        consumption.turnId === normalizedTurnId,
-    ) ||
-    fallbackConsumptionMatches(
-      state,
-      source,
-      normalizedSourceId,
-      normalizedTurnId,
-    )
-  ) {
-    return;
-  }
+  const normalizedSourceId = selector.sourceId.slice(0, MAX_SOURCE_ID_LENGTH);
+  const normalizedSelector: CompletionConsumptionSelector =
+    selector.source === "interactive"
+      ? "scope" in selector
+        ? {
+            source: "interactive",
+            sourceId: normalizedSourceId,
+            scope: "source",
+          }
+        : {
+            source: "interactive",
+            sourceId: normalizedSourceId,
+            turnId: selector.turnId.slice(0, MAX_TURN_ID_LENGTH),
+          }
+      : { source: selector.source, sourceId: normalizedSourceId };
+  if (fallbackConsumptionMatches(state, normalizedSelector)) return;
   appendConsumption(state, {
     schemaVersion: COMPLETION_RECORD_SCHEMA_VERSION,
-    source,
-    sourceId: normalizedSourceId,
-    ...(normalizedTurnId ? { turnId: normalizedTurnId } : {}),
+    ...normalizedSelector,
     consumedAt: Date.now(),
     reason: "manual",
   });
