@@ -9,7 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A separate prompt-directed `--orchestratorv2` thin-router mode with bounded project-local responsibility metadata, runtime-authoritative interactive-agent routing, and legacy interactive-session compatibility.
+- Promoted `--orchestratorv2` as a routing-first interactive mode. Its prompt
+  guides the parent to route work to attachable interactive subagents, ask for
+  clarification when a request is ambiguous or a narrow request has no matching
+  child, and leave
+  specialist work to those children. Compatibility workflow and in-process tools
+  remain registered; this is prompt guidance rather than an enforced boundary.
 - Orchestratorv2 routing now treats the current parent branch as the sole authority ledger and the project-local JSON file as repairable untrusted cache data, preventing child-written records from becoming actionable, consuming authority capacity, blocking approved writes, or hiding authoritative stale records.
 - Idle Orchestratorv2 completions now use process-global, run-bound durable wake state with bounded prompt and acknowledgement retries, exact settled-run acknowledgement, and session-replacement recovery without changing delivery behavior in other modes.
 - Explicit `completionPolicy: "each" | "group"` coordination for asynchronous sub-agents and background workflows, with caller-declared bounded `completionGroupId` barriers, human-input priority, manual-result consumption, and compact reference manifests. Relatedness is never inferred from same-turn launch or task text.
@@ -19,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Asynchronous completion now defaults to coordinated `each` delivery: each terminal result is immediately eligible, while results that finish while the parent is busy coalesce into one safe-idle compact continuation without injecting full child output.
 - Explicit `group` completion seals when the spawning parent turn settles and releases one aggregate manifest only after every caller-registered member is terminal; `done`, `error`, and `cancelled` all satisfy the barrier. An entirely consumed group creates no empty continuation, and workflow-owned children remain suppressed in favor of the background workflow aggregate.
-- Interactive coordinated policy, group membership, intents, and receipts rehydrate only into the matching parent session. In-process jobs and background workflows remain session scoped.
+- Documented the durability boundary: interactive artifacts, routing state, pending
+  deliveries, and receipts persist and rehydrate within the matching parent
+  session. Delivery is bounded and at-least-once; in-process jobs and background
+  workflows remain session scoped.
 - Consumption receipts prefer parent-session entries. When `appendEntry` is unavailable or fails, receipts append losslessly to a private, session-scoped append-only ledger keyed by parent session identity; fixed snapshots and bounded streaming reads preserve memory bounds while retaining late-published receipts.
 
 ### Fixed
