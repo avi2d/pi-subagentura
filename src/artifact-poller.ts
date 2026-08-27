@@ -173,7 +173,7 @@ function mergeFooterContributions(
       if (contribution.kind === "subagent") total += contribution.count;
     }
     if (total === 0) return undefined;
-    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} active`;
+    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive`;
   }
   if (key === WORKFLOW_FOOTER_KEY) {
     let total = 0;
@@ -236,7 +236,7 @@ function updateFooterStatus(
 }
 
 /**
- * Repaint the "N sub-agents active" footer, scoped to `owner` when supplied.
+ * Repaint the "N sub-agents alive" footer, scoped to `owner` when supplied.
  *
  * Liveness is decided here rather than at the call sites: callers pass the raw
  * active token, so a token whose lifecycle already ended reads as "this session

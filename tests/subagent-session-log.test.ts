@@ -530,7 +530,7 @@ describe("session-log tail-read", () => {
     // Footer status shows count.
     expect(setStatus).toHaveBeenCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent active",
+      "⚡ 1 sub-agent alive",
     );
     // Widget shows the activity row. Workflow widget is also cleared in the same poll.
     const activityWidgetCall = setWidget.mock.calls.find(
