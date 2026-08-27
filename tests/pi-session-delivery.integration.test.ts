@@ -315,6 +315,8 @@ describe("Pi session delivery integration", () => {
     );
     scope.parentStreaming = true;
 
+    // The delivery helper is loaded by Vitest while lifecycle hooks run through
+    // Pi's jiti-loaded extension copy; settlement proves the global wake map is shared.
     flushHarnessDeliveries(scope);
 
     await vi.waitFor(() => expect(harness.contexts).toHaveLength(1));
@@ -343,6 +345,18 @@ describe("Pi session delivery integration", () => {
     );
     harness.completeNext();
     await harness.session.waitForIdle();
+    await vi.waitFor(() =>
+      expect(
+        harness.sessionManager
+          .getEntries()
+          .filter(
+            (entry: any) =>
+              entry.type === "custom" &&
+              entry.customType === ORCHESTRATOR_V2_WAKE_ENTRY_TYPE &&
+              entry.data?.state === "acknowledged",
+          ),
+      ).toHaveLength(1),
+    );
   });
 
   it("queues a streaming Orchestratorv2 completion under the current router prompt", async () => {
@@ -966,18 +980,20 @@ describe("persisted delivery Pi session integration", () => {
         .getEntries()
         .filter((entry: any) => entry.type === "custom_message"),
     ).toHaveLength(1);
-    expect(
-      harness.sessionManager
-        .getEntries()
-        .some(
-          (entry: any) =>
-            entry.type === "custom" &&
-            entry.customType === "orchestratorv2-completion-wake" &&
-            entry.data?.state === "acknowledged",
-        ),
-    ).toBe(true);
     harness.completeNext();
     await harness.session.waitForIdle();
+    await vi.waitFor(() =>
+      expect(
+        harness.sessionManager
+          .getEntries()
+          .some(
+            (entry: any) =>
+              entry.type === "custom" &&
+              entry.customType === "orchestratorv2-completion-wake" &&
+              entry.data?.state === "acknowledged",
+          ),
+      ).toBe(true),
+    );
   });
 
   it("does not recover an Orchestratorv2 wake from an inactive session branch", async () => {

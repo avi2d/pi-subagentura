@@ -4,6 +4,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type CompletionMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
 
+type SendUserMessage = (
+  content: string,
+  options: { deliverAs: "followUp" },
+) => unknown;
+
 interface CompletionTurnOptions {
   deliverAs: "followUp";
   triggerTurn: boolean;
@@ -14,6 +19,20 @@ interface WakeState {
   activeWakeId: string;
   wakeIds: Set<string>;
   inFlight: boolean;
+  wakePromptStarted: boolean;
+  wakePromptSettled: boolean;
+  wakeAttempts: number;
+  ackAttempts: number;
+  watchdogTimer?: ReturnType<typeof setTimeout>;
+  ackRetryTimer?: ReturnType<typeof setTimeout>;
+}
+interface CompletionTurnGlobalState {
+  __piSubagenturaCompletionTurnWakeStates?: WeakMap<ExtensionAPI, WakeState>;
+}
+
+function completionTurnGlobals(): typeof globalThis &
+  CompletionTurnGlobalState {
+  return globalThis as typeof globalThis & CompletionTurnGlobalState;
 }
 
 interface WakeRequestEntry {
@@ -37,15 +56,61 @@ export const ORCHESTRATOR_V2_WAKEUP_MESSAGE =
   "specialist work.";
 const ORCHESTRATOR_V2_WAKE_ID_TAG = "orchestratorv2-wake-id";
 
-const wakeStates = new WeakMap<ExtensionAPI, WakeState>();
+/** Delay between a wake request and a retry when no matching run starts. */
+export const ORCHESTRATOR_V2_WAKE_WATCHDOG_DELAY_MS = 30_000;
+/** Maximum automatic wake requests in one bounded retry cycle. */
+export const ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS = 3;
+/** Delay between durable acknowledgement attempts after a transient failure. */
+export const ORCHESTRATOR_V2_WAKE_ACK_RETRY_DELAY_MS = 1_000;
+/** Maximum durable acknowledgement attempts in one bounded retry cycle. */
+export const ORCHESTRATOR_V2_WAKE_ACK_MAX_ATTEMPTS = 3;
+
+// Pi may load delivery and lifecycle extension graphs with separate module
+// caches. Process-global state lets both copies coordinate the same live wake.
+const wakeStates =
+  (completionTurnGlobals().__piSubagenturaCompletionTurnWakeStates ??=
+    new WeakMap<ExtensionAPI, WakeState>());
+
+function clearWakeWatchdog(state: WakeState): void {
+  if (state.watchdogTimer === undefined) return;
+  clearTimeout(state.watchdogTimer);
+  state.watchdogTimer = undefined;
+}
+
+function clearWakeAcknowledgementRetry(state: WakeState): void {
+  if (state.ackRetryTimer === undefined) return;
+  clearTimeout(state.ackRetryTimer);
+  state.ackRetryTimer = undefined;
+}
 
 export function clearCompletionTurnWake(pi: ExtensionAPI): void {
+  const state = wakeStates.get(pi);
+  if (state) {
+    clearWakeWatchdog(state);
+    clearWakeAcknowledgementRetry(state);
+  }
   wakeStates.delete(pi);
 }
 
-export function acknowledgeCompletionTurnWake(pi: ExtensionAPI): void {
+/**
+ * Persist the acknowledgement for the active wake. Callers that observe
+ * lifecycle events should use settleCompletionTurnWake() so unrelated runs
+ * cannot acknowledge a pending request.
+ */
+export function acknowledgeCompletionTurnWake(pi: ExtensionAPI): boolean {
   const state = wakeStates.get(pi);
-  if (!state) return;
+  if (!state) return false;
+  clearWakeWatchdog(state);
+  clearWakeAcknowledgementRetry(state);
+  return attemptWakeAcknowledgement(pi, state);
+}
+
+function attemptWakeAcknowledgement(
+  pi: ExtensionAPI,
+  state: WakeState,
+): boolean {
+  if (wakeStates.get(pi) !== state) return false;
+  state.ackAttempts += 1;
   try {
     const entry: WakeAcknowledgementEntry = {
       schemaVersion: 1,
@@ -54,13 +119,65 @@ export function acknowledgeCompletionTurnWake(pi: ExtensionAPI): void {
     };
     pi.appendEntry(ORCHESTRATOR_V2_WAKE_ENTRY_TYPE, entry);
     clearCompletionTurnWake(pi);
+    return true;
   } catch (error) {
-    if (wakeStates.get(pi) === state) state.inFlight = false;
+    if (wakeStates.get(pi) === state) {
+      state.inFlight = false;
+      if (state.wakePromptSettled) {
+        scheduleWakeAcknowledgementRetry(pi, state);
+      }
+    }
     debugLog("error", "orchestratorv2_wake_ack_failed", {
       error:
         error instanceof Error ? (error.stack ?? error.message) : String(error),
     });
+    return false;
   }
+}
+
+function scheduleWakeAcknowledgementRetry(
+  pi: ExtensionAPI,
+  state: WakeState,
+): void {
+  clearWakeAcknowledgementRetry(state);
+  if (state.ackAttempts >= ORCHESTRATOR_V2_WAKE_ACK_MAX_ATTEMPTS) return;
+  const timer = setTimeout(() => {
+    state.ackRetryTimer = undefined;
+    if (wakeStates.get(pi) !== state || !state.wakePromptSettled) return;
+    attemptWakeAcknowledgement(pi, state);
+  }, ORCHESTRATOR_V2_WAKE_ACK_RETRY_DELAY_MS);
+  state.ackRetryTimer = timer;
+  timer.unref?.();
+}
+
+/**
+ * Mark the exact synthetic user prompt that belongs to the active wake. Pi
+ * does not include a run id in lifecycle events, so the prompt observed by
+ * before_agent_start is the run identity we can safely carry to settlement.
+ */
+export function markCompletionTurnWakeStarted(
+  pi: ExtensionAPI,
+  prompt: string,
+): boolean {
+  const state = wakeStates.get(pi);
+  if (!state || prompt !== orchestratorV2WakeupMessage(state.activeWakeId)) {
+    return false;
+  }
+  state.wakePromptStarted = true;
+  state.wakePromptSettled = false;
+  state.inFlight = false;
+  clearWakeWatchdog(state);
+  return true;
+}
+
+/** Acknowledge only the run previously marked by markCompletionTurnWakeStarted. */
+export function settleCompletionTurnWake(pi: ExtensionAPI): boolean {
+  const state = wakeStates.get(pi);
+  if (!state || !state.wakePromptStarted || state.wakePromptSettled) {
+    return false;
+  }
+  state.wakePromptSettled = true;
+  return acknowledgeCompletionTurnWake(pi);
 }
 
 export function isOrchestratorV2Enabled(pi: ExtensionAPI): boolean {
@@ -96,11 +213,26 @@ export function recoverCompletionTurnWakes(
     (wakeId) => !acknowledged.has(wakeId) && delivered.has(wakeId),
   );
   if (recoverable.length === 0) return false;
+
+  const existing = wakeStates.get(pi);
+  if (
+    existing &&
+    existing.activeWakeId === recoverable[0] &&
+    existing.wakeIds.size === recoverable.length &&
+    recoverable.every((wakeId) => existing.wakeIds.has(wakeId))
+  ) {
+    return true;
+  }
+
   clearCompletionTurnWake(pi);
   const state: WakeState = {
     activeWakeId: recoverable[0],
     wakeIds: new Set(recoverable),
     inFlight: false,
+    wakePromptStarted: false,
+    wakePromptSettled: false,
+    wakeAttempts: 0,
+    ackAttempts: 0,
   };
   wakeStates.set(pi, state);
   requestPromptWake(pi, state);
@@ -142,8 +274,39 @@ export function sendCompletionTurn(
       activeWakeId: wakeId,
       wakeIds: new Set([wakeId]),
       inFlight: false,
+      wakePromptStarted: false,
+      wakePromptSettled: false,
+      wakeAttempts: 0,
+      ackAttempts: 0,
     };
     wakeStates.set(pi, state);
+  }
+
+  if (!state.inFlight && state.wakePromptSettled) {
+    clearWakeAcknowledgementRetry(state);
+    state.wakePromptStarted = false;
+    state.wakePromptSettled = false;
+    state.wakeAttempts = 0;
+    state.ackAttempts = 0;
+  }
+
+  if (
+    !state.inFlight &&
+    !state.wakePromptStarted &&
+    !state.wakePromptSettled &&
+    state.ackRetryTimer === undefined &&
+    state.ackAttempts >= ORCHESTRATOR_V2_WAKE_ACK_MAX_ATTEMPTS
+  ) {
+    state.ackAttempts = 0;
+  }
+
+  if (
+    !state.inFlight &&
+    !state.wakePromptStarted &&
+    !state.wakePromptSettled &&
+    state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS
+  ) {
+    state.wakeAttempts = 0;
   }
 
   pi.sendMessage(withWakeId(message, state.activeWakeId), {
@@ -154,16 +317,72 @@ export function sendCompletionTurn(
 }
 
 function requestPromptWake(pi: ExtensionAPI, state: WakeState): void {
-  if (state.inFlight) return;
+  if (
+    state.inFlight ||
+    state.wakePromptStarted ||
+    state.wakePromptSettled ||
+    state.ackRetryTimer !== undefined ||
+    state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS
+  ) {
+    return;
+  }
   state.inFlight = true;
+  state.wakeAttempts += 1;
   try {
-    pi.sendUserMessage(orchestratorV2WakeupMessage(state.activeWakeId), {
-      deliverAs: "followUp",
-    });
+    const sendUserMessage = pi.sendUserMessage as unknown as SendUserMessage;
+    const result = sendUserMessage(
+      orchestratorV2WakeupMessage(state.activeWakeId),
+      {
+        deliverAs: "followUp",
+      },
+    );
+    if (isPromiseLike(result)) void Promise.resolve(result).catch(() => {});
   } catch (error) {
     state.inFlight = false;
+    if (wakeStates.get(pi) === state && !state.wakePromptStarted) {
+      scheduleWakeWatchdog(pi, state);
+    }
     throw error;
   }
+  if (wakeStates.get(pi) !== state || state.wakePromptStarted) return;
+  scheduleWakeWatchdog(pi, state);
+}
+
+function scheduleWakeWatchdog(pi: ExtensionAPI, state: WakeState): void {
+  clearWakeWatchdog(state);
+  if (state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS) {
+    state.inFlight = false;
+    return;
+  }
+  const timer = setTimeout(() => {
+    state.watchdogTimer = undefined;
+    if (wakeStates.get(pi) !== state || state.wakePromptStarted) return;
+    state.inFlight = false;
+    if (state.wakeAttempts >= ORCHESTRATOR_V2_WAKE_MAX_ATTEMPTS) return;
+    try {
+      requestPromptWake(pi, state);
+    } catch (error) {
+      debugLog("error", "orchestratorv2_wake_send_failed", {
+        error:
+          error instanceof Error
+            ? (error.stack ?? error.message)
+            : String(error),
+      });
+    }
+  }, ORCHESTRATOR_V2_WAKE_WATCHDOG_DELAY_MS);
+  state.watchdogTimer = timer;
+  timer.unref?.();
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function") ||
+    !("then" in value)
+  ) {
+    return false;
+  }
+  return typeof value.then === "function";
 }
 
 export function orchestratorV2WakeupMessage(wakeId: string): string {

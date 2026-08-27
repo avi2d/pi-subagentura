@@ -48,9 +48,10 @@ import {
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
 import {
-  acknowledgeCompletionTurnWake,
   clearCompletionTurnWake,
+  markCompletionTurnWakeStarted,
   recoverCompletionTurnWakes,
+  settleCompletionTurnWake,
 } from "./completion-turn";
 
 function getGlobalState() {
@@ -229,15 +230,18 @@ export function registerSessionHandlers(
   registerSessionScope(scope);
   setLegacyActiveSessionRefs(scope);
 
+  pi.on("before_agent_start", (event) => {
+    if (scope.lifecycle !== "started") return;
+    markCompletionTurnWakeStarted(pi, event.prompt);
+  });
   pi.on("agent_start", () => {
     if (scope.lifecycle !== "started") return;
-    acknowledgeCompletionTurnWake(pi);
     scope.parentStreaming = true;
     setLegacyActiveSessionRefs(scope);
   });
   pi.on("agent_settled", () => {
     if (scope.lifecycle !== "started") return;
-    acknowledgeCompletionTurnWake(pi);
+    settleCompletionTurnWake(pi);
     scope.parentStreaming = false;
     const owner = sessionOwner(scope);
     setLegacyActiveSessionRefs(scope);
@@ -246,6 +250,9 @@ export function registerSessionHandlers(
   });
 
   pi.on("session_start", (event, ctx) => {
+    // A replacement session must never inherit an old wake request or its
+    // watchdog while branch recovery reconstructs durable state.
+    clearCompletionTurnWake(pi);
     if (scope.lifecycle === "started") {
       const previousOwner = sessionOwner(scope);
       closeActiveInteractiveSupervisor(previousOwner);
