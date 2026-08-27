@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit `group` completion seals when the spawning parent turn settles and releases one aggregate manifest only after every caller-registered member is terminal; `done`, `error`, and `cancelled` all satisfy the barrier. An entirely consumed group creates no empty continuation, and workflow-owned children remain suppressed in favor of the background workflow aggregate.
 - Interactive coordinated policy, group membership, intents, and receipts rehydrate only into the matching parent session. In-process jobs and background workflows remain session scoped.
 - Consumption receipts prefer parent-session entries. When `appendEntry` is unavailable or fails, receipts append losslessly to a private, session-scoped append-only ledger keyed by parent session identity; fixed snapshots and bounded streaming reads preserve memory bounds while retaining late-published receipts.
+- Completion-consumption selectors now use explicit source variants: interactive turn receipts require `turnId`, source-level interactive receipts use `scope: "source"`, and in-process/workflow receipts remain source-scoped. Legacy interactive receipts without `scope` are migrated safely without matching turn-scoped completions.
 
 ### Fixed
 

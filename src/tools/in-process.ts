@@ -1154,7 +1154,11 @@ function registerGetSubagentResultTool(
       }
 
       if (job.status === "cancelled") {
-        consumeCompletionSource(pi, "in-process", job.id, execution.owner);
+        consumeCompletionSource(
+          pi,
+          { source: "in-process", sourceId: job.id },
+          execution.owner,
+        );
         return {
           content: [
             {
@@ -1278,7 +1282,11 @@ function registerGetSubagentResultTool(
       const result = waitResult.value!;
       // Only set resultRetrieved after successful completion (not on abort)
       job.resultRetrieved = true;
-      consumeCompletionSource(pi, "in-process", job.id, execution.owner);
+      consumeCompletionSource(
+        pi,
+        { source: "in-process", sourceId: job.id },
+        execution.owner,
+      );
       if (job.cleanupAfterCollection) {
         job.cleanupAfterCollection = false;
         scheduleJobCleanup(job.id, true, undefined, execution.owner);

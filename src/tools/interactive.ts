@@ -1252,10 +1252,12 @@ export function registerInteractiveSubagentTools(
       if (wantsOutput && output !== null && selectedCompletion) {
         consumeCompletionSource(
           pi,
-          "interactive",
-          params.id,
+          {
+            source: "interactive",
+            sourceId: params.id,
+            turnId: selectedCompletion.turnId,
+          },
           registration?.scope ? sessionOwner(registration.scope) : undefined,
-          selectedCompletion.turnId,
         );
       }
       return {
