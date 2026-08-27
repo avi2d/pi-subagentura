@@ -44,6 +44,7 @@ import {
   MAX_ORCHESTRATOR_ROUTING_ALIASES,
   MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
   MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
+  appendOrchestratorRoutingAuthorityEntry,
   isValidOrchestratorChildId,
   upsertOrchestratorRoutingEntry,
   type OrchestratorRoutingEntry,
@@ -105,11 +106,27 @@ type InitialRoutingMetadataResult =
   | { status: "persisted"; entry: OrchestratorRoutingEntry }
   | { status: "warning"; error: string };
 
+function parentBranchEntries(ctx: unknown): readonly unknown[] {
+  if (!ctx || typeof ctx !== "object") return [];
+  const sessionManager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (!sessionManager || typeof sessionManager !== "object") return [];
+  const getBranch = (sessionManager as { getBranch?: unknown }).getBranch;
+  if (typeof getBranch !== "function") return [];
+  try {
+    const branch = getBranch.call(sessionManager);
+    return Array.isArray(branch) ? branch : [];
+  } catch {
+    return [];
+  }
+}
+
 function persistInitialRoutingMetadata(params: {
   cwd: string;
   childId: string;
   description?: string;
   aliases?: string[];
+  authorityEntries?: readonly unknown[];
+  pi?: ExtensionAPI;
 }): InitialRoutingMetadataResult | undefined {
   if (params.description === undefined) return undefined;
   if (!isValidSubagentId(params.childId)) {
@@ -119,16 +136,21 @@ function persistInitialRoutingMetadata(params: {
     };
   }
   try {
-    const overlay = upsertOrchestratorRoutingEntry(params.cwd, {
-      childId: params.childId,
-      description: params.description,
-      ...(params.aliases === undefined ? {} : { aliases: params.aliases }),
-      provenance: "orchestratorv2",
-    });
+    const overlay = upsertOrchestratorRoutingEntry(
+      params.cwd,
+      {
+        childId: params.childId,
+        description: params.description!,
+        ...(params.aliases === undefined ? {} : { aliases: params.aliases }),
+        provenance: "orchestratorv2",
+      },
+      { authorityEntries: params.authorityEntries ?? [] },
+    );
     const entry = overlay.records.find(
       (record) => record.childId === params.childId,
     );
     if (!entry) throw new Error("routing metadata update was not persisted");
+    appendOrchestratorRoutingAuthorityEntry(params.pi ?? {}, params.cwd, entry);
     return { status: "persisted", entry };
   } catch (error) {
     return {
@@ -416,14 +438,18 @@ export function registerInteractiveSubagentTools(
         contextParams.includeContext === false
           ? (contextParams.context ?? null)
           : null;
+      let authorityEntries: readonly unknown[] | undefined;
       if (contextParams.includeContext === true) {
         const branch = ctx.sessionManager.getBranch();
+        authorityEntries = branch;
         const messages = branch
           .filter(
             (e): e is typeof e & { type: "message" } => e.type === "message",
           )
           .map((e) => e.message);
         contextText = serializeConversation(convertToLlm(messages));
+      } else if (topLevelOrchestratorV2) {
+        authorityEntries = parentBranchEntries(ctx);
       }
 
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
@@ -453,6 +479,8 @@ export function registerInteractiveSubagentTools(
           childId: state.id,
           description: params.routingDescription,
           aliases: params.routingAliases,
+          authorityEntries,
+          pi,
         });
         updateRunningSubagentFooter(
           ctx.ui,

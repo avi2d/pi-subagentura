@@ -20,17 +20,45 @@ Use attachable interactive children through `subagent_interactive`. Do not use w
 
 Interactive children may autonomously create nested interactive children for side topics. Treat nested work as owned by that child and do not duplicate it automatically from the top-level router. Surface reported concerns and nested outcomes to the user; the user may still choose a separate top-level investigation while the original child continues.
 
-## Responsibilities and confirmation
+## Responsibilities, authority, and confirmation
 
-Give every new child an explicit initial responsibility in `routingDescription`; pass bounded `routingAliases` when exact area names will improve continuation matching. These fields are required policy for every top-level Orchestratorv2 spawn even though the shared legacy schema keeps them optional. Initial metadata authored during Orchestratorv2 child creation uses `orchestratorv2` provenance.
+Give every new child an explicit initial responsibility in `routingDescription`;
+pass bounded `routingAliases` when exact area names will improve continuation
+matching. These fields are required policy for every top-level Orchestratorv2
+spawn even though the shared legacy schema keeps them optional. Initial metadata
+authored during Orchestratorv2 child creation uses `orchestratorv2` provenance.
 
-A child may propose a responsibility change, but it cannot redefine itself. First call `update_orchestrator_agent_description` with the exact proposed payload and `confirmed: false`. Surface the returned confirmation token and exact change to the user. Only after a later user message contains that token may you retry the identical payload with `confirmed: true`, the token, and explicit `user` or `orchestratorv2` provenance. Never invent, copy, or self-confirm a token.
+The parent session is the authority ledger for Orchestratorv2 routing. A
+successful spawn or confirmed update writes the bounded project-local routing
+file first and then appends an exact, versioned parent custom entry. On every
+read, derive the latest valid authority for each child from the current parent
+branch in physical order. Those parent entries are the sole trusted/actionable
+source; the project file is only an untrusted cache/proposal and may be missing,
+stale, malformed, or over capacity. Cache-only or mismatched rows may be shown
+as non-actionable diagnostics, but they never gate actionability, capacity,
+confirmation CAS, or repair writes. Missing or mismatched cache data does not
+erase a valid parent authority record.
 
-Routing metadata is bounded and must never be evicted automatically. If an insert is blocked at capacity, fail closed: surface the blocker and do not evict, delete, roll back, replace, or respawn any child or metadata entry.
+Missing authority remains non-actionable metadata when no valid parent entry
+exists. Use `actionable: false` and the closed-enum
+`reason: "routing_metadata_untrusted"` for cache records without valid
+authority. The cache is bounded, atomic, and never evicts records
+automatically; approved writes rebuild it from the latest parent authority plus
+the approved incoming record.
 
-The interactive runtime launches before its initial metadata is persisted. If persistence fails, the child remains live and the spawn result includes an explicit warning. Do not hide that warning, create a replacement child, or retry through an unapproved lifecycle or metadata action.
+A child may propose a responsibility change, but it cannot redefine itself.
+First call `update_orchestrator_agent_description` with the exact proposed
+payload and `confirmed: false`. Surface the returned confirmation token and
+exact change to the user. Only after a later user message contains that token
+may you retry the identical payload with `confirmed: true`, the token, and
+explicit `user` or `orchestratorv2` provenance. Never invent, copy, or
+self-confirm a token.
 
-Routing metadata never becomes a lifecycle registry or semantic resolver.
+The parent-entry ledger is an application-level authority boundary, not an OS
+security boundary. A same-UID process that can tamper with the parent session
+file can forge parent entries; the design does not claim to defend against that
+threat. Routing metadata never becomes a lifecycle registry or semantic
+resolver.
 
 ## Context contract
 

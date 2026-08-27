@@ -212,7 +212,8 @@ the intended lightweight model separately, and do not enable
 `--orchestrator` and `--orchestratorv2` together. Normal workflow and in-process
 tools remain registered for compatibility, while the Orchestratorv2 prompt
 directs the parent to delegate only through attachable interactive children and
-use project-local confirmed descriptions and aliases to route continuations.
+use the parent session's authoritative routing ledger together with the
+project-local routing cache.
 
 Orchestratorv2 adds exactly two routing-metadata tools:
 `list_orchestrator_agents` and `update_orchestrator_agent_description`.
@@ -220,7 +221,29 @@ Confirmed records include explicit `provenance`: `user` or `orchestratorv2`.
 Responsibility updates use a server-issued, single-use confirmation token bound
 to the exact payload, current session generation, and a later user message; a
 model-supplied `confirmed: true` is not sufficient by itself.
-Routing metadata is capped at 128 records and is never evicted automatically.
+
+The parent session's current branch is the authority ledger. Every approved
+top-level spawn and confirmed update persists the bounded project-local record
+first, then appends an exact versioned parent custom entry. On reload/resume,
+the latest valid authority entry for each child is selected by physical branch
+order. Those parent entries are the sole trusted/actionable source; the project
+file is only untrusted cache/proposal data and may be missing, stale, malformed,
+or over capacity. Cache-only or mismatched rows may be shown as non-actionable
+diagnostics, but they never gate actionability, capacity, confirmation CAS, or
+repair writes. Missing cache rows do not erase valid parent authority.
+
+When no valid parent authority exists, cache metadata remains visible only as
+non-actionable metadata with a closed-enum untrusted reason. Approved writes
+rebuild the cache from the latest parent authority plus the incoming record, so
+forged cache rows cannot consume the 128-record capacity or become
+authoritative.
+
+The parent-entry ledger is an application-level boundary, not an OS security
+boundary: a same-UID process that can tamper with the parent session file can
+forge parent entries. This limitation is intentional and documented; the
+ledger does not claim to defend against arbitrary same-UID session-file
+tampering. Routing metadata is never a lifecycle registry or semantic resolver.
+
 The interactive runtime launches before its initial routing metadata is
 persisted. If persistence fails, the child intentionally remains live and the
 spawn result includes an explicit warning; the extension does not cancel, roll
@@ -533,12 +556,26 @@ LLM turn. Both payload modes display the same user-facing notification;
 | `notify` + `triggerTurnOnComplete: false` | Artifact pointer only       | No                              |
 
 Triggering completions are handed to Pi's native `followUp` queue while the
-parent is busy. For an idle Orchestratorv2 parent, the extension first persists
-the custom completion and a durable wake intent, then starts an
-extension-generated user turn so Pi runs `before_agent_start` and installs the
-thin-router prompt. Concurrent completions coalesce into one wake; an
-unacknowledged wake is retried after reload without duplicating the custom
-completion. Other idle modes use Pi's native custom-message trigger.
+parent is busy. For an idle Orchestratorv2 parent, the extension persists the
+custom completion and a durable wake request before starting an
+extension-generated user turn. That path deliberately uses a user message so
+Pi runs `before_agent_start` and installs the thin-router prompt; other idle
+modes retain Pi's native custom-message trigger.
+
+Wake state is process-global because Pi can load the delivery and lifecycle
+extension graphs as separate module instances. The exact synthetic prompt marks
+the consuming run in `before_agent_start`; only that run's `agent_settled`
+acknowledges the wake, so unrelated turns cannot consume it. Concurrent
+completions coalesce under the active wake ID.
+
+Pi's `sendUserMessage` extension API is fire-and-forget, so a missing run start
+uses at most three wake attempts separated by a 30-second watchdog. Durable
+acknowledgement writes independently retry at most three times with a one-second
+delay. Session replacement and shutdown clear both timers; reload/resume
+reconstruct only delivered, unacknowledged wakes from the active parent branch.
+A new completion during acknowledgement retry starts a fresh exact wake under
+the still-unacknowledged ID rather than losing its trigger.
+
 Non-triggering completions wait until the parent is idle before delivery into
 parent context, which prevents them from accidentally starting a provider turn.
 

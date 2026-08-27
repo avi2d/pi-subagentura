@@ -6,7 +6,9 @@ import { join } from "node:path";
 import {
   MAX_ORCHESTRATOR_AGENT_VIEW_ITEMS,
   MAX_ORCHESTRATOR_TASK_PREVIEW_BYTES,
+  ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
   buildOrchestratorAgentProjection,
+  createOrchestratorRoutingAuthorityEntry,
   listOrchestratorRoutingEntries,
   saveOrchestratorRoutingEntries,
   upsertOrchestratorRoutingEntry,
@@ -105,17 +107,32 @@ function tool(api: ReturnType<typeof mockApi>, name: string): any {
   })?.[0];
 }
 
-function toolContext(root: string, userId?: string, userText?: string) {
-  const branch =
-    userId && userText !== undefined
-      ? [
-          {
-            id: userId,
-            type: "message",
-            message: { role: "user", content: userText },
-          },
-        ]
-      : [];
+function toolContext(
+  root: string,
+  userId?: string,
+  userText?: string,
+  authorityRecords?: readonly OrchestratorRoutingEntry[],
+) {
+  const branch: unknown[] = [];
+  try {
+    for (const record of authorityRecords ??
+      listOrchestratorRoutingEntries(root)) {
+      branch.push({
+        type: "custom",
+        customType: ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+        data: createOrchestratorRoutingAuthorityEntry(root, record),
+      });
+    }
+  } catch {
+    // Tests that intentionally use malformed metadata provide no authority.
+  }
+  if (userId && userText !== undefined) {
+    branch.push({
+      id: userId,
+      type: "message",
+      message: { role: "user", content: userText },
+    });
+  }
   return {
     cwd: root,
     sessionManager: { getBranch: () => branch },
@@ -423,7 +440,7 @@ describe("Orchestratorv2 metadata tools", () => {
       {},
       undefined,
       undefined,
-      { cwd: root },
+      toolContext(root),
     );
 
     expect(result.isError).toBeFalsy();
@@ -460,7 +477,7 @@ describe("Orchestratorv2 metadata tools", () => {
       {},
       undefined,
       undefined,
-      { cwd: root },
+      toolContext(root),
     );
     expect(missing.details).toMatchObject({
       status: "ok",
@@ -472,9 +489,13 @@ describe("Orchestratorv2 metadata tools", () => {
     );
 
     saveOrchestratorRoutingEntries(root, []);
-    const empty = await list.execute("list-empty", {}, undefined, undefined, {
-      cwd: root,
-    });
+    const empty = await list.execute(
+      "list-empty",
+      {},
+      undefined,
+      undefined,
+      toolContext(root),
+    );
     expect(empty.details).toMatchObject({
       status: "ok",
       routingMetadataStatus: "empty",
@@ -483,9 +504,13 @@ describe("Orchestratorv2 metadata tools", () => {
     expect(empty.content[0].text).toContain('"routingMetadataStatus": "empty"');
 
     upsertOrchestratorRoutingEntry(root, routingEntry(CHILD_A));
-    const loaded = await list.execute("list-loaded", {}, undefined, undefined, {
-      cwd: root,
-    });
+    const loaded = await list.execute(
+      "list-loaded",
+      {},
+      undefined,
+      undefined,
+      toolContext(root),
+    );
     expect(loaded.details).toMatchObject({
       status: "ok",
       routingMetadataStatus: "loaded",
@@ -720,7 +745,9 @@ describe("Orchestratorv2 metadata tools", () => {
   });
 
   it("atomically rejects a confirmed update when metadata changes during the write", async () => {
-    upsertOrchestratorRoutingEntry(root, routingEntry(CHILD_A));
+    const initial = routingEntry(CHILD_A);
+    upsertOrchestratorRoutingEntry(root, initial);
+    const authorityRecords = [initial];
     const api = mockApi();
     const scope = startedScope(api, 1, "parent-a");
     registerState(scope, CHILD_A);
@@ -736,21 +763,30 @@ describe("Orchestratorv2 metadata tools", () => {
       { ...params, confirmed: false },
       undefined,
       undefined,
-      toolContext(root, "user-1", "Make the change"),
+      toolContext(root, "user-1", "Make the change", authorityRecords),
     );
     const confirmationToken = requested.details.confirmationToken;
     const originalUpsert = orchestratorRouting.upsertOrchestratorRoutingEntry;
+    const confirmedCtx = toolContext(
+      root,
+      "user-2",
+      `Confirm ${confirmationToken}`,
+      authorityRecords,
+    );
+    const confirmedBranch = confirmedCtx.sessionManager.getBranch();
     vi.spyOn(
       orchestratorRouting,
       "upsertOrchestratorRoutingEntry",
     ).mockImplementationOnce((cwd, entry, options) => {
-      originalUpsert(
-        cwd,
-        routingEntry(CHILD_A, {
-          description: "Concurrent checkout ownership",
-          updatedAt: "2026-08-23T20:30:00.000Z",
-        }),
-      );
+      const newer = routingEntry(CHILD_A, {
+        description: "Concurrent checkout ownership",
+        updatedAt: "2026-08-23T20:30:00.000Z",
+      });
+      confirmedBranch.push({
+        type: "custom",
+        customType: ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+        data: createOrchestratorRoutingAuthorityEntry(cwd, newer),
+      });
       return originalUpsert(cwd, entry, options);
     });
 
@@ -759,14 +795,16 @@ describe("Orchestratorv2 metadata tools", () => {
       { ...params, confirmed: true, confirmationToken },
       undefined,
       undefined,
-      toolContext(root, "user-2", `Confirm ${confirmationToken}`),
+      confirmedCtx,
     );
 
     expect(result.details.status).toBe("routing_metadata_error");
-    expect(listOrchestratorRoutingEntries(root)[0]).toMatchObject({
-      description: "Concurrent checkout ownership",
-      updatedAt: "2026-08-23T20:30:00.000Z",
-    });
+    expect(listOrchestratorRoutingEntries(root, confirmedBranch)).toEqual([
+      expect.objectContaining({
+        description: "Concurrent checkout ownership",
+        updatedAt: "2026-08-23T20:30:00.000Z",
+      }),
+    ]);
   });
 
   it("rejects model-asserted confirmation and mismatched payloads", async () => {

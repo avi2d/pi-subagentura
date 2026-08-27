@@ -42,7 +42,10 @@ import {
 } from "../src/interactive-tmux";
 import {
   MAX_ORCHESTRATOR_ROUTING_RECORDS,
+  ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+  createOrchestratorRoutingAuthorityEntry,
   listOrchestratorRoutingEntries,
+  loadOrchestratorAgentRegistryView,
   orchestratorRoutingFilePath,
   saveOrchestratorRoutingEntries,
   upsertOrchestratorRoutingEntry,
@@ -113,7 +116,11 @@ function setupScenario(orchestratorv2 = false): ScenarioEnvironment {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-scenarios-"));
   roots.push(root);
   const api = mockApi(orchestratorv2);
-  const ctx = mockContext(root);
+  const branch: unknown[] = [];
+  const ctx = mockContext(root, branch);
+  api.appendEntry.mockImplementation((customType: string, data: unknown) => {
+    branch.push({ type: "custom", customType, data });
+  });
   registerExtension(api as never);
   const scope = getSessionScopes().find(
     (candidate) => candidate.pi === (api as unknown as typeof candidate.pi),
@@ -262,8 +269,81 @@ describe("Orchestratorv2 thin-router scenarios", () => {
       CHILD_B,
     ]);
   });
+  it("persists parent authority after spawn and update and recovers it from branch order", async () => {
+    const environment = setupScenario(true);
+    await spawnAgentsAB(environment);
+    const branch = environment.ctx.sessionManager.getBranch();
+    const authorityCalls = environment.api.appendEntry.mock.calls.filter(
+      ([customType]) => customType === "orchestratorv2-routing-authority",
+    );
 
-  it("fails closed when the routing overlay is full without eviction", async () => {
+    expect(authorityCalls).toHaveLength(2);
+    expect(authorityCalls[0][1]).toMatchObject({
+      schemaVersion: 1,
+      projectId: expect.any(String),
+      record: {
+        childId: CHILD_A,
+        description: "Own API migration and compatibility",
+      },
+    });
+    const recovered = await loadOrchestratorAgentRegistryView(
+      environment.root,
+      environment.scope.interactiveStates,
+      { authorityEntries: branch },
+    );
+    expect(
+      recovered.agents
+        .filter((agent) => agent.stale === false)
+        .every((agent) => agent.actionable),
+    ).toBe(true);
+
+    const update = registeredTool(
+      environment.api,
+      "update_orchestrator_agent_description",
+    );
+    const updateParams = {
+      childId: CHILD_A,
+      description: "Own API migration and compatibility follow-ups",
+      aliases: ["api", "compatibility"],
+      provenance: "orchestratorv2" as const,
+    };
+    const requested = await executeTool(
+      update,
+      { ...updateParams, confirmed: false },
+      environment.ctx,
+    );
+    const token = requested.details.confirmationToken;
+    branch.push({
+      id: "user-confirmation",
+      type: "message",
+      message: { role: "user", content: `Confirm ${token}` },
+    });
+    const confirmed = await executeTool(
+      update,
+      { ...updateParams, confirmed: true, confirmationToken: token },
+      environment.ctx,
+    );
+
+    expect(confirmed.details.status).toBe("updated");
+    expect(
+      environment.api.appendEntry.mock.calls.filter(
+        ([customType]) => customType === "orchestratorv2-routing-authority",
+      ),
+    ).toHaveLength(3);
+    const resumed = await loadOrchestratorAgentRegistryView(
+      environment.root,
+      environment.scope.interactiveStates,
+      { authorityEntries: branch },
+    );
+    expect(
+      resumed.agents.find((agent) => agent.childId === CHILD_A),
+    ).toMatchObject({
+      description: "Own API migration and compatibility follow-ups",
+      actionable: true,
+    });
+  });
+
+  it("does not let forged capacity rows block an approved Orchestratorv2 insert", async () => {
     const environment = setupScenario(true);
     const historical = Array.from(
       { length: MAX_ORCHESTRATOR_ROUTING_RECORDS },
@@ -292,13 +372,13 @@ describe("Orchestratorv2 thin-router scenarios", () => {
 
     expect(spawned.isError).not.toBe(true);
     expect(spawned.details.routingMetadata).toMatchObject({
-      status: "warning",
-      error: expect.stringContaining("routing record count exceeds"),
+      status: "persisted",
+      entry: { childId: CHILD_A },
     });
-    expect(readFileSync(routingFile, "utf8")).toBe(beforeSpawn);
-    expect(listOrchestratorRoutingEntries(environment.root)).toEqual(
-      historical,
-    );
+    const persisted = readFileSync(routingFile, "utf8");
+    expect(persisted).not.toBe(beforeSpawn);
+    expect(persisted).not.toContain("Historical responsibility");
+    expect(listOrchestratorRoutingEntries(environment.root)).toHaveLength(1);
     expect(environment.scope.interactiveStates.has(CHILD_A)).toBe(true);
     expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
     const listed = await executeTool(
@@ -310,8 +390,7 @@ describe("Orchestratorv2 thin-router scenarios", () => {
       listed.details.agents.find((agent: any) => agent.childId === CHILD_A),
     ).toMatchObject({
       attachable: true,
-      actionable: false,
-      reason: "routing_metadata_missing",
+      actionable: true,
     });
   });
 
@@ -541,6 +620,11 @@ describe("Orchestratorv2 thin-router scenarios", () => {
       aliases: ["previous-investigation"],
       provenance: "user",
     });
+    const persisted = listOrchestratorRoutingEntries(environment.root)[0]!;
+    environment.api.appendEntry(
+      ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+      createOrchestratorRoutingAuthorityEntry(environment.root, persisted),
+    );
     const list = registeredTool(environment.api, "list_orchestrator_agents");
 
     const listed = await executeTool(list, {}, environment.ctx);

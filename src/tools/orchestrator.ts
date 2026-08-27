@@ -6,13 +6,17 @@ import {
   MAX_ORCHESTRATOR_ROUTING_ALIASES,
   MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
   MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
+  appendOrchestratorRoutingAuthorityEntry,
   listOrchestratorRoutingEntries,
   loadOrchestratorAgentRegistryView,
   upsertOrchestratorRoutingEntry,
   validateOrchestratorRoutingEntryInput,
   type OrchestratorRoutingEntry,
 } from "../orchestrator-routing";
-import { isOrchestratorV2WakeupMessage } from "../completion-turn";
+import {
+  isOrchestratorV2Enabled,
+  isOrchestratorV2WakeupMessage,
+} from "../completion-turn";
 import {
   resolveToolSessionScope,
   type SessionScope,
@@ -31,6 +35,19 @@ interface PendingConfirmation {
   generation: number;
   issuedAfterUserEntryId?: string;
   createdAt: number;
+}
+function parentBranchEntries(ctx: unknown): readonly unknown[] {
+  if (!ctx || typeof ctx !== "object") return [];
+  const sessionManager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (!sessionManager || typeof sessionManager !== "object") return [];
+  const getBranch = (sessionManager as { getBranch?: unknown }).getBranch;
+  if (typeof getBranch !== "function") return [];
+  try {
+    const branch = getBranch.call(sessionManager);
+    return Array.isArray(branch) ? branch : [];
+  } catch {
+    return [];
+  }
 }
 
 const pendingConfirmations = new WeakMap<
@@ -102,7 +119,10 @@ export function registerOrchestratorTools(
         const projection = await loadOrchestratorAgentRegistryView(
           ctx.cwd,
           scope.interactiveStates,
-          { signal },
+          {
+            signal,
+            authorityEntries: parentBranchEntries(ctx),
+          },
         );
         return {
           content: [
@@ -145,11 +165,13 @@ export function registerOrchestratorTools(
         };
       }
 
+      const authorityEntries = parentBranchEntries(ctx);
       let existing: OrchestratorRoutingEntry | undefined;
       try {
-        existing = listOrchestratorRoutingEntries(ctx.cwd).find(
-          (entry) => entry.childId === params.childId,
-        );
+        existing = listOrchestratorRoutingEntries(
+          ctx.cwd,
+          authorityEntries,
+        ).find((entry) => entry.childId === params.childId);
       } catch (error) {
         return routingErrorResult(error);
       }
@@ -197,6 +219,7 @@ export function registerOrchestratorTools(
           },
           {
             expectedEntry: existing,
+            authorityEntries,
           },
         );
         const entry = overlay.records.find(
@@ -204,6 +227,7 @@ export function registerOrchestratorTools(
         );
         if (!entry)
           throw new Error("routing metadata update was not persisted");
+        appendOrchestratorRoutingAuthorityEntry(pi, ctx.cwd, entry);
         consumePendingConfirmation(scope, confirmation.token);
         return {
           content: [

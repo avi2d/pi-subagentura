@@ -204,10 +204,10 @@ describe("extension registration", () => {
       "owned by their immediate parent session",
     );
     expect(result.systemPrompt).toContain(
-      "interactive runtime launches before its initial metadata is persisted",
+      "successful spawn or confirmed update writes the bounded project-local routing",
     );
     expect(result.systemPrompt).toContain(
-      "child remains live and the spawn result includes an explicit warning",
+      'reason: "routing_metadata_untrusted"',
     );
     expect(result.systemPrompt).toContain(
       "Surface only substantial additional information, blockers or errors, completion, and needs-attention events",

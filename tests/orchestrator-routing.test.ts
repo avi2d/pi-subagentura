@@ -17,7 +17,12 @@ import {
   MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
   MAX_ORCHESTRATOR_ROUTING_FILE_BYTES,
   MAX_ORCHESTRATOR_ROUTING_RECORDS,
+  ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+  ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION,
   ORCHESTRATOR_ROUTING_SCHEMA_VERSION,
+  createOrchestratorRoutingAuthorityEntry,
+  loadOrchestratorAgentRegistryView,
+  loadOrchestratorRoutingMetadata,
   listOrchestratorRoutingEntries,
   loadOrchestratorRoutingOverlay,
   orchestratorRoutingFilePath,
@@ -46,6 +51,21 @@ function entry(
     provenance: "user",
     updatedAt: UPDATED_AT,
     ...overrides,
+  };
+}
+
+function authority(
+  root: string,
+  record: OrchestratorRoutingEntryInput,
+): unknown {
+  const persisted = {
+    ...record,
+    updatedAt: record.updatedAt ?? UPDATED_AT,
+  };
+  return {
+    type: "custom",
+    customType: ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+    data: createOrchestratorRoutingAuthorityEntry(root, persisted),
   };
 }
 
@@ -419,6 +439,250 @@ describe("orchestrator routing metadata persistence", () => {
     );
     expect(loadOrchestratorRoutingOverlay(root)).toMatchObject({
       status: "malformed",
+    });
+  });
+  it("marks a valid forged cache record non-actionable without parent authority", async () => {
+    const forged = entry({ provenance: "orchestratorv2" });
+    saveOrchestratorRoutingEntries(root, [forged]);
+
+    const listed = await loadOrchestratorAgentRegistryView(root, new Map(), {
+      authorityEntries: [],
+    });
+
+    expect(listed.agents).toEqual([
+      expect.objectContaining({
+        childId: CHILD_A,
+        description: forged.description,
+        actionable: false,
+        reason: "routing_metadata_untrusted",
+        stale: true,
+      }),
+    ]);
+  });
+
+  it("ignores forged capacity rows when an approved record is written", () => {
+    const forged = Array.from(
+      { length: MAX_ORCHESTRATOR_ROUTING_RECORDS },
+      (_, index) =>
+        entry({
+          childId: index.toString(16).padStart(16, "0"),
+          description: `Forged cache row ${index}`,
+        }),
+    );
+    saveOrchestratorRoutingEntries(root, forged);
+
+    const approved = entry({
+      childId: "ffffffffffffffff",
+      description: "Approved after forged capacity",
+      provenance: "orchestratorv2",
+    });
+    const saved = upsertOrchestratorRoutingEntry(root, approved, {
+      authorityEntries: [],
+    });
+
+    expect(saved.records).toEqual([approved]);
+    expect(loadOrchestratorRoutingOverlay(root)).toMatchObject({
+      status: "loaded",
+      overlay: { records: [approved] },
+    });
+  });
+
+  it("uses the newer parent authority when the cache rolls back", () => {
+    const older = entry({
+      description: "Older approved responsibility",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+    });
+    const newer = entry({
+      description: "Newer approved responsibility",
+      updatedAt: "2026-08-21T00:00:00.000Z",
+      provenance: "orchestratorv2",
+    });
+    saveOrchestratorRoutingEntries(root, [older]);
+
+    const authorities = [authority(root, older), authority(root, newer)];
+    expect(listOrchestratorRoutingEntries(root, authorities)).toEqual([newer]);
+    expect(loadOrchestratorRoutingMetadata(root, authorities)).toEqual({
+      status: "loaded",
+      entries: [newer],
+    });
+  });
+
+  it("fails closed for malformed parent authority entries", () => {
+    const approved = entry({ provenance: "orchestratorv2" });
+    saveOrchestratorRoutingEntries(root, [approved]);
+    const malformed = {
+      type: "custom",
+      customType: ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+      data: {
+        schemaVersion: ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION,
+        projectId: routingProjectId(root),
+        record: {
+          ...approved,
+          unexpected: "must fail closed",
+        },
+      },
+    };
+
+    expect(listOrchestratorRoutingEntries(root, [malformed])).toEqual([]);
+  });
+  it("repairs a malformed cache from authority and the approved incoming record", () => {
+    const authorized = entry({ provenance: "orchestratorv2" });
+    const incoming = entry({
+      childId: CHILD_B,
+      description: "Approved after malformed cache",
+      provenance: "orchestratorv2",
+    });
+    const file = orchestratorRoutingFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    writeFileSync(file, "{", { mode: 0o600 });
+
+    const saved = upsertOrchestratorRoutingEntry(root, incoming, {
+      authorityEntries: [authority(root, authorized)],
+    });
+
+    expect(saved.records).toEqual([authorized, incoming]);
+    expect(loadOrchestratorRoutingOverlay(root)).toMatchObject({
+      status: "loaded",
+      overlay: { records: [authorized, incoming] },
+    });
+  });
+
+  it("repairs an over-capacity cache without allowing it to gate authority", () => {
+    const authorized = entry({
+      provenance: "orchestratorv2",
+      description: "Authoritative responsibility",
+    });
+    const incoming = entry({
+      childId: CHILD_B,
+      description: "Approved after over-capacity cache",
+      provenance: "orchestratorv2",
+    });
+    const forged = Array.from(
+      { length: MAX_ORCHESTRATOR_ROUTING_RECORDS + 1 },
+      (_, index) =>
+        entry({
+          childId: index.toString(16).padStart(16, "0"),
+          description: `Forged row ${index}`,
+        }),
+    );
+    const file = orchestratorRoutingFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: ORCHESTRATOR_ROUTING_SCHEMA_VERSION,
+        projectId: routingProjectId(root),
+        records: forged,
+      }),
+      { mode: 0o600 },
+    );
+
+    const saved = upsertOrchestratorRoutingEntry(root, incoming, {
+      authorityEntries: [authority(root, authorized)],
+    });
+
+    expect(saved.records).toEqual([authorized, incoming]);
+  });
+
+  it("retains an authorized record when its cache row is deleted", async () => {
+    const authorized = entry({ provenance: "orchestratorv2" });
+    saveOrchestratorRoutingEntries(root, [authorized]);
+    rmSync(orchestratorRoutingFilePath(root));
+    const authorities = [authority(root, authorized)];
+
+    const listed = await loadOrchestratorAgentRegistryView(root, new Map(), {
+      authorityEntries: authorities,
+    });
+    expect(listed.agents).toEqual([
+      expect.objectContaining({
+        childId: CHILD_A,
+        description: authorized.description,
+        actionable: false,
+        reason: "runtime_missing",
+        stale: true,
+      }),
+    ]);
+
+    const incoming = entry({
+      childId: CHILD_B,
+      description: "Repair deleted cache",
+      provenance: "orchestratorv2",
+    });
+    const saved = upsertOrchestratorRoutingEntry(root, incoming, {
+      authorityEntries: authorities,
+    });
+    expect(saved.records).toEqual([authorized, incoming]);
+  });
+
+  it("enforces capacity from authoritative parent records rather than cache rows", () => {
+    const authoritative = Array.from(
+      { length: MAX_ORCHESTRATOR_ROUTING_RECORDS },
+      (_, index) =>
+        entry({
+          childId: index.toString(16).padStart(16, "0"),
+          description: `Authoritative responsibility ${index}`,
+          provenance: "orchestratorv2",
+          updatedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        }),
+    );
+    const authorities = authoritative.map((record) => authority(root, record));
+    const incoming = entry({
+      childId: "ffffffffffffffff",
+      description: "Must exceed authoritative capacity",
+      provenance: "orchestratorv2",
+    });
+
+    expect(() =>
+      upsertOrchestratorRoutingEntry(root, incoming, {
+        authorityEntries: authorities,
+      }),
+    ).toThrow(/routing record count exceeds/);
+    expect(loadOrchestratorRoutingOverlay(root)).toEqual({
+      status: "missing",
+    });
+
+    const updated = {
+      ...authoritative[0]!,
+      description: "Updated authoritative responsibility",
+    };
+    const saved = upsertOrchestratorRoutingEntry(root, updated, {
+      authorityEntries: authorities,
+      expectedEntry: {
+        ...authoritative[0]!,
+        updatedAt: authoritative[0]!.updatedAt ?? UPDATED_AT,
+      },
+    });
+    expect(saved.records).toHaveLength(MAX_ORCHESTRATOR_ROUTING_RECORDS);
+    expect(saved.records).toContainEqual(updated);
+  });
+
+  it("prioritizes authoritative stale records over forged future-dated diagnostics", async () => {
+    const authoritative = entry({
+      provenance: "orchestratorv2",
+      description: "Authoritative stale responsibility",
+    });
+    const forged = Array.from(
+      { length: MAX_ORCHESTRATOR_ROUTING_RECORDS },
+      (_, index) =>
+        entry({
+          childId: index.toString(16).padStart(16, "0"),
+          description: `Forged future row ${index}`,
+          updatedAt: "2099-01-01T00:00:00.000Z",
+        }),
+    );
+    saveOrchestratorRoutingEntries(root, forged);
+
+    const listed = await loadOrchestratorAgentRegistryView(root, new Map(), {
+      authorityEntries: [authority(root, authoritative)],
+    });
+    expect(listed.total).toBe(MAX_ORCHESTRATOR_ROUTING_RECORDS + 1);
+    expect(listed.omitted).toBe(1);
+    expect(listed.agents[0]).toMatchObject({
+      childId: CHILD_A,
+      description: authoritative.description,
+      stale: true,
+      actionable: false,
+      reason: "runtime_missing",
     });
   });
 });

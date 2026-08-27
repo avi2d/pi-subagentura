@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A separate prompt-directed `--orchestratorv2` thin-router mode with bounded project-local responsibility metadata, runtime-authoritative interactive-agent routing, and legacy interactive-session compatibility.
+- Orchestratorv2 routing now treats the current parent branch as the sole authority ledger and the project-local JSON file as repairable untrusted cache data, preventing child-written records from becoming actionable, consuming authority capacity, blocking approved writes, or hiding authoritative stale records.
+- Idle Orchestratorv2 completions now use process-global, run-bound durable wake state with bounded prompt and acknowledgement retries, exact settled-run acknowledgement, and session-replacement recovery without changing delivery behavior in other modes.
 
 ## [3.3.1] - 2026-08-25
 

@@ -338,6 +338,7 @@ describe("subagent_interactive tool lifecycle", () => {
     expect(mockUpsertOrchestratorRoutingEntry).toHaveBeenCalledWith(
       "/tmp",
       entry,
+      { authorityEntries: [] },
     );
     expect(
       mockLaunchInteractiveSubagent.mock.invocationCallOrder[0],

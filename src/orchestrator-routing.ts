@@ -22,6 +22,9 @@ import {
 import type { PaneLiveness } from "./multiplexer";
 
 export const ORCHESTRATOR_ROUTING_SCHEMA_VERSION = 1;
+export const ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION = 1;
+export const ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE =
+  "orchestratorv2-routing-authority";
 export const MAX_ORCHESTRATOR_ROUTING_RECORDS = 128;
 export const MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES = 4 * 1024;
 export const MAX_ORCHESTRATOR_ROUTING_ALIASES = 16;
@@ -87,6 +90,11 @@ const RECORD_KEYS = new Set([
   "provenance",
   "updatedAt",
 ]);
+const ROUTING_AUTHORITY_KEYS = new Set([
+  "schemaVersion",
+  "projectId",
+  "record",
+]);
 
 export type OrchestratorRoutingProvenance = "user" | "orchestratorv2";
 
@@ -106,8 +114,24 @@ export interface OrchestratorRoutingEntryInput {
   updatedAt?: string;
 }
 
+/**
+ * Parent-session authority is an append-only custom session entry. The
+ * project-local JSON file is only an advisory cache; the latest valid
+ * authority record for each child is the complete trusted routing state.
+ */
+export interface OrchestratorRoutingAuthorityEntry {
+  schemaVersion: typeof ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION;
+  projectId: string;
+  record: OrchestratorRoutingEntry;
+}
+
 export interface OrchestratorRoutingUpsertOptions {
-  expectedEntry: OrchestratorRoutingEntry | undefined;
+  expectedEntry?: OrchestratorRoutingEntry;
+  authorityEntries?: readonly unknown[];
+}
+
+export interface OrchestratorRoutingSaveOptions {
+  authorityEntries?: readonly unknown[];
 }
 
 export interface OrchestratorRoutingOverlay {
@@ -124,7 +148,8 @@ export type OrchestratorAgentReason =
   | "runtime_exited"
   | "runtime_status_unknown"
   | "workflow_owned"
-  | "routing_metadata_missing";
+  | "routing_metadata_missing"
+  | "routing_metadata_untrusted";
 
 export interface OrchestratorAgentView {
   childId: string;
@@ -198,6 +223,62 @@ export function routingProjectId(cwd: string): string {
     .update(`pi-subagentura-routing\0${canonicalCwd}`)
     .digest("hex");
 }
+type RoutingAuthorityAppender = {
+  appendEntry?: (customType: string, data: unknown) => unknown;
+};
+
+export function createOrchestratorRoutingAuthorityEntry(
+  cwd: string,
+  record: OrchestratorRoutingEntry,
+): OrchestratorRoutingAuthorityEntry {
+  const validated = validateEntry(record);
+  return {
+    schemaVersion: ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION,
+    projectId: routingProjectId(cwd),
+    record: cloneEntry(validated),
+  };
+}
+
+/**
+ * Append a durable parent-session authority record after its project-file
+ * cache write succeeds. Older Pi mocks may not expose appendEntry; those
+ * callers retain the legacy non-v2 behavior.
+ */
+export function appendOrchestratorRoutingAuthorityEntry(
+  pi: RoutingAuthorityAppender,
+  cwd: string,
+  record: OrchestratorRoutingEntry,
+): void {
+  if (typeof pi.appendEntry !== "function") return;
+  pi.appendEntry(
+    ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+    createOrchestratorRoutingAuthorityEntry(cwd, record),
+  );
+}
+
+/**
+ * Parse one raw Pi custom entry. A custom entry with this type is never
+ * accepted partially: the version, canonical project identity, and complete
+ * routing record must all validate.
+ */
+export function parseOrchestratorRoutingAuthorityEntry(
+  value: unknown,
+  expectedProjectId: string,
+): OrchestratorRoutingEntry | undefined {
+  if (!isRecord(value) || value.type !== "custom") return undefined;
+  if (value.customType !== ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE) {
+    return undefined;
+  }
+  const data = value.data;
+  if (!isRecord(data))
+    throw new Error("routing authority data must be an object");
+  rejectUnknownKeys(data, ROUTING_AUTHORITY_KEYS, "routing authority");
+  if (data.schemaVersion !== ORCHESTRATOR_ROUTING_AUTHORITY_SCHEMA_VERSION) {
+    throw new Error("routing authority schemaVersion is missing or malformed");
+  }
+  validateProjectId(data.projectId, expectedProjectId);
+  return cloneEntry(validateEntry(data.record));
+}
 
 export function loadOrchestratorRoutingOverlay(
   cwd: string,
@@ -259,11 +340,16 @@ export function loadOrchestratorRoutingOverlay(
 export function saveOrchestratorRoutingEntries(
   cwd: string,
   entries: readonly OrchestratorRoutingEntryInput[],
+  options?: OrchestratorRoutingSaveOptions,
 ): OrchestratorRoutingOverlay {
   const now = new Date().toISOString();
   const incoming = validateIncomingEntries(entries, now);
   return withInteractiveStateLock(cwd, () => {
-    const current = overlayForWrite(cwd, loadOrchestratorRoutingOverlay(cwd));
+    const current = overlayForWrite(
+      cwd,
+      loadOrchestratorRoutingOverlay(cwd),
+      options?.authorityEntries,
+    );
     assertRoutingRecordCapacity(current.records, incoming);
     const records = new Map(
       current.records.map((record) => [record.childId, record]),
@@ -290,12 +376,16 @@ export function upsertOrchestratorRoutingEntry(
   const now = new Date().toISOString();
   const incoming = validateIncomingEntries([entry], now);
   return withInteractiveStateLock(cwd, () => {
-    const current = overlayForWrite(cwd, loadOrchestratorRoutingOverlay(cwd));
-    if (options !== undefined) {
+    const current = overlayForWrite(
+      cwd,
+      loadOrchestratorRoutingOverlay(cwd),
+      options?.authorityEntries,
+    );
+    if (options?.expectedEntry !== undefined || options !== undefined) {
       const currentEntry = current.records.find(
         (record) => record.childId === incoming[0]!.childId,
       );
-      if (!sameRoutingEntry(currentEntry, options.expectedEntry)) {
+      if (!sameRoutingEntry(currentEntry, options?.expectedEntry)) {
         throw new Error(
           "routing metadata changed after confirmation was requested",
         );
@@ -332,23 +422,107 @@ function sameRoutingEntry(
     JSON.stringify(left.aliases) === JSON.stringify(right.aliases)
   );
 }
+interface TrustedAndUntrustedRoutingRecords {
+  trusted: OrchestratorRoutingEntry[];
+  untrusted: OrchestratorRoutingEntry[];
+}
 
+function latestAuthorityByChild(
+  cwd: string,
+  authorityEntries: readonly unknown[],
+): Map<string, OrchestratorRoutingEntry | undefined> {
+  const expectedProjectId = routingProjectId(cwd);
+  const latest = new Map<string, OrchestratorRoutingEntry | undefined>();
+  for (const value of authorityEntries) {
+    if (!isRecord(value) || value.type !== "custom") continue;
+    if (value.customType !== ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE) {
+      continue;
+    }
+    const childId = authorityChildId(value);
+    try {
+      const record = parseOrchestratorRoutingAuthorityEntry(
+        value,
+        expectedProjectId,
+      );
+      if (record !== undefined) latest.set(record.childId, record);
+      else if (childId !== undefined) latest.set(childId, undefined);
+    } catch {
+      // A malformed authority entry is not evidence of authority. If its
+      // child id is recoverable, it also supersedes an older valid entry.
+      if (childId !== undefined) latest.set(childId, undefined);
+    }
+  }
+  return latest;
+}
+function authoritativeRecords(
+  cwd: string,
+  authorityEntries: readonly unknown[],
+): OrchestratorRoutingEntry[] {
+  return [...latestAuthorityByChild(cwd, authorityEntries).values()]
+    .filter(
+      (record): record is OrchestratorRoutingEntry => record !== undefined,
+    )
+    .map(cloneEntry);
+}
+
+function authorityChildId(value: JsonRecord): string | undefined {
+  const data = value.data;
+  if (!isRecord(data)) return undefined;
+  const record = data.record;
+  if (isRecord(record) && isValidOrchestratorChildId(record.childId)) {
+    return record.childId;
+  }
+  return isValidOrchestratorChildId(data.childId) ? data.childId : undefined;
+}
+
+function trustedAndUntrustedRecords(
+  cwd: string,
+  records: readonly OrchestratorRoutingEntry[],
+  authorityEntries: readonly unknown[] | undefined,
+): TrustedAndUntrustedRoutingRecords {
+  const resolvedAuthorities = authorityEntries;
+  if (resolvedAuthorities === undefined) {
+    return {
+      trusted: records.map(cloneEntry),
+      untrusted: [],
+    };
+  }
+  const authorities = latestAuthorityByChild(cwd, resolvedAuthorities);
+  const trusted = [...authorities.values()]
+    .filter(
+      (record): record is OrchestratorRoutingEntry => record !== undefined,
+    )
+    .map(cloneEntry);
+  const authorityIds = new Set(authorities.keys());
+  const untrusted = records
+    .filter((record) => !authorityIds.has(record.childId))
+    .map(cloneEntry);
+  return { trusted, untrusted };
+}
 export function validateOrchestratorRoutingEntryInput(
   entry: OrchestratorRoutingEntryInput,
 ): void {
   validateIncomingEntries([entry], new Date().toISOString());
 }
 
-export function listOrchestratorRoutingEntries(
-  cwd: string,
-): OrchestratorRoutingEntry[] {
-  return loadOrchestratorRoutingMetadata(cwd).entries;
-}
-
 export function loadOrchestratorRoutingMetadata(
   cwd: string,
+  authorityEntries?: readonly unknown[],
 ): OrchestratorRoutingMetadataView {
   const result = loadOrchestratorRoutingOverlay(cwd);
+  const resolvedAuthorities = authorityEntries;
+  if (resolvedAuthorities !== undefined) {
+    const records = authoritativeRecords(cwd, resolvedAuthorities);
+    return {
+      status:
+        records.length === 0
+          ? result.status === "missing"
+            ? "missing"
+            : "empty"
+          : "loaded",
+      entries: records,
+    };
+  }
   if (result.status === "missing") {
     return { status: result.status, entries: [] };
   }
@@ -361,14 +535,23 @@ export function loadOrchestratorRoutingMetadata(
   throw routingLoadError(result);
 }
 
+export function listOrchestratorRoutingEntries(
+  cwd: string,
+  authorityEntries?: readonly unknown[],
+): OrchestratorRoutingEntry[] {
+  return loadOrchestratorRoutingMetadata(cwd, authorityEntries).entries;
+}
+
 interface OrchestratorRoutingProjectionMetadata {
   status: OrchestratorRoutingMetadataStatus;
   entries: OrchestratorRoutingEntry[];
+  untrustedEntries: OrchestratorRoutingEntry[];
   error?: string;
 }
 
 function loadOrchestratorRoutingProjectionMetadata(
   cwd: string,
+  authorityEntries?: readonly unknown[],
 ): OrchestratorRoutingProjectionMetadata {
   let result: OrchestratorRoutingLoadResult;
   try {
@@ -377,21 +560,47 @@ function loadOrchestratorRoutingProjectionMetadata(
     return {
       status: "unreadable",
       entries: [],
+      untrustedEntries: [],
       error: errorMessage(error),
     };
   }
+  const resolvedAuthorities = authorityEntries;
+  if (resolvedAuthorities !== undefined) {
+    const records = authoritativeRecords(cwd, resolvedAuthorities);
+    const cacheRecords =
+      result.status === "empty" || result.status === "loaded"
+        ? result.overlay.records
+        : [];
+    const diagnostics = trustedAndUntrustedRecords(
+      cwd,
+      cacheRecords,
+      resolvedAuthorities,
+    );
+    return {
+      status: result.status,
+      entries: records,
+      untrustedEntries: diagnostics.untrusted,
+      ...(result.status === "malformed" ||
+      result.status === "unsupported" ||
+      result.status === "unreadable"
+        ? { error: result.error }
+        : {}),
+    };
+  }
   if (result.status === "missing") {
-    return { status: result.status, entries: [] };
+    return { status: result.status, entries: [], untrustedEntries: [] };
   }
   if (result.status === "empty" || result.status === "loaded") {
     return {
       status: result.status,
       entries: result.overlay.records.map(cloneEntry),
+      untrustedEntries: [],
     };
   }
   return {
     status: result.status,
     entries: [],
+    untrustedEntries: [],
     error: result.error,
   };
 }
@@ -399,13 +608,23 @@ function loadOrchestratorRoutingProjectionMetadata(
 export async function loadOrchestratorAgentRegistryView(
   cwd: string,
   interactiveStates: ReadonlyMap<string, InteractiveSubagentState>,
-  options: { signal?: AbortSignal; livenessDeadlineMs?: number } = {},
+  options: {
+    signal?: AbortSignal;
+    livenessDeadlineMs?: number;
+    authorityEntries?: readonly unknown[];
+  } = {},
 ): Promise<OrchestratorAgentRegistryView> {
-  const metadata = loadOrchestratorRoutingProjectionMetadata(cwd);
+  const metadata = loadOrchestratorRoutingProjectionMetadata(
+    cwd,
+    options.authorityEntries,
+  );
   const projection = await buildOrchestratorAgentProjection(
     metadata.entries,
     interactiveStates,
-    options,
+    {
+      ...options,
+      untrustedEntries: metadata.untrustedEntries,
+    },
   );
   return {
     routingMetadataStatus: metadata.status,
@@ -416,12 +635,21 @@ export async function loadOrchestratorAgentRegistryView(
   };
 }
 
+export interface OrchestratorAgentProjectionOptions {
+  signal?: AbortSignal;
+  livenessDeadlineMs?: number;
+  untrustedEntries?: readonly OrchestratorRoutingEntry[];
+}
+
 export async function buildOrchestratorAgentProjection(
   entries: readonly OrchestratorRoutingEntry[],
   interactiveStates: ReadonlyMap<string, InteractiveSubagentState>,
-  options: { signal?: AbortSignal; livenessDeadlineMs?: number } = {},
+  options: OrchestratorAgentProjectionOptions = {},
 ): Promise<OrchestratorAgentProjection> {
   const metadata = new Map(entries.map((entry) => [entry.childId, entry]));
+  const untrustedMetadata = new Map(
+    (options.untrustedEntries ?? []).map((entry) => [entry.childId, entry]),
+  );
   const runtimeIds = [...interactiveStates.keys()].sort();
   const deadlineAt =
     Date.now() +
@@ -433,23 +661,36 @@ export async function buildOrchestratorAgentProjection(
     runtimeIds,
     MAX_ORCHESTRATOR_LIVENESS_CONCURRENCY,
     (childId) => {
+      const trusted = metadata.get(childId);
+      const untrusted = untrustedMetadata.get(childId);
       return projectOrchestratorAgent(
         childId,
-        metadata.get(childId),
+        trusted ?? untrusted,
         interactiveStates.get(childId),
         options.signal,
         deadlineAt,
+        trusted !== undefined || untrusted === undefined,
       );
     },
   );
   runtimeAgents.sort(compareOrchestratorRuntimeAgents);
 
-  const staleMetadataIds = [...metadata.keys()]
+  const trustedStaleIds = [...metadata.keys()]
     .filter((childId) => !interactiveStates.has(childId))
     .sort((leftId, rightId) => {
       return compareNewestRoutingEntries(
         metadata.get(leftId)!,
         metadata.get(rightId)!,
+      );
+    });
+  const untrustedStaleIds = [...untrustedMetadata.keys()]
+    .filter(
+      (childId) => !interactiveStates.has(childId) && !metadata.has(childId),
+    )
+    .sort((leftId, rightId) => {
+      return compareNewestRoutingEntries(
+        untrustedMetadata.get(leftId)!,
+        untrustedMetadata.get(rightId)!,
       );
     });
   const selectedRuntimeAgents = runtimeAgents.slice(
@@ -460,18 +701,27 @@ export async function buildOrchestratorAgentProjection(
     0,
     MAX_ORCHESTRATOR_AGENT_VIEW_ITEMS - selectedRuntimeAgents.length,
   );
-  const selectedStaleIds = staleMetadataIds.slice(0, staleSlots);
+  const selectedStaleIds = [...trustedStaleIds, ...untrustedStaleIds].slice(
+    0,
+    staleSlots,
+  );
   const staleAgents = await Promise.all(
     selectedStaleIds.map((childId) => {
+      const trusted = metadata.get(childId);
+      const untrusted = untrustedMetadata.get(childId);
       return projectOrchestratorAgent(
         childId,
-        metadata.get(childId),
+        trusted ?? untrusted,
         undefined,
+        undefined,
+        Number.POSITIVE_INFINITY,
+        trusted !== undefined || untrusted === undefined,
       );
     }),
   );
   const agents = [...selectedRuntimeAgents, ...staleAgents];
-  const total = runtimeAgents.length + staleMetadataIds.length;
+  const total =
+    runtimeAgents.length + trustedStaleIds.length + untrustedStaleIds.length;
   return {
     agents,
     total,
@@ -513,6 +763,7 @@ async function projectOrchestratorAgent(
   state: InteractiveSubagentState | undefined,
   signal?: AbortSignal,
   deadlineAt = Number.POSITIVE_INFINITY,
+  metadataTrusted = true,
 ): Promise<OrchestratorAgentView> {
   const routingFields = metadata
     ? {
@@ -537,17 +788,22 @@ async function projectOrchestratorAgent(
       stale: true,
       attachable: false,
       actionable: false,
-      reason: "runtime_missing",
+      reason:
+        metadata !== undefined && !metadataTrusted
+          ? "routing_metadata_untrusted"
+          : "runtime_missing",
     };
   }
 
   const liveness = await probeInteractiveLiveness(state, signal, deadlineAt);
   const attachable =
     isValidOrchestratorChildId(childId) && isRuntimeActionable(state, liveness);
-  const actionable = attachable && metadata !== undefined;
+  const actionable = attachable && metadata !== undefined && metadataTrusted;
   const reason =
-    orchestratorAgentReason(state, liveness) ??
-    (metadata === undefined ? "routing_metadata_missing" : undefined);
+    metadata !== undefined && !metadataTrusted
+      ? "routing_metadata_untrusted"
+      : (orchestratorAgentReason(state, liveness) ??
+        (metadata === undefined ? "routing_metadata_missing" : undefined));
   return {
     childId,
     name: boundedPreview(state.name, MAX_ORCHESTRATOR_AGENT_NAME_BYTES),
@@ -876,7 +1132,16 @@ function boundedText(value: string, label: string, maxBytes: number): string {
 function overlayForWrite(
   cwd: string,
   result: OrchestratorRoutingLoadResult,
+  authorityEntries?: readonly unknown[],
 ): OrchestratorRoutingOverlay {
+  const resolvedAuthorities = authorityEntries;
+  if (resolvedAuthorities !== undefined) {
+    return {
+      schemaVersion: ORCHESTRATOR_ROUTING_SCHEMA_VERSION,
+      projectId: routingProjectId(cwd),
+      records: authoritativeRecords(cwd, resolvedAuthorities),
+    };
+  }
   if (result.status === "missing") return emptyOverlay(routingProjectId(cwd));
   if (result.status === "empty" || result.status === "loaded") {
     return result.overlay;
