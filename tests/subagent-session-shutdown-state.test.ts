@@ -5,9 +5,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { appendInteractiveState, loadInteractiveStates } from "../src/artifact";
+import {
+  orchestratorRoutingFilePath,
+  upsertOrchestratorRoutingEntry,
+} from "../src/orchestrator-routing";
 import {
   interactiveSubagentRegistry,
   registerInteractiveSubagentState,
@@ -145,6 +149,25 @@ describe("session_shutdown clean-slate on /new and quit", () => {
     expect(loadInteractiveStates(cwd)).toBeNull();
     expect(peer.scope.interactiveStates.size).toBe(0);
     expect(interactiveSubagentRegistry.has(peerState.id)).toBe(false);
+  });
+
+  it("deletes routing metadata on /new shutdown", async () => {
+    upsertOrchestratorRoutingEntry(cwd, {
+      childId: "0123456789abcdef",
+      description: "Own the routing cleanup regression",
+      provenance: "user",
+    });
+    const routingFile = orchestratorRoutingFilePath(cwd);
+    expect(existsSync(routingFile)).toBe(true);
+
+    const extension = await setupExtension();
+    const ctx = startSession(extension, "new");
+    extension.shutdownHandlers.at(-1)!(
+      { type: "session_shutdown", reason: "new" },
+      ctx,
+    );
+
+    expect(existsSync(routingFile)).toBe(false);
   });
 
   it("session_shutdown with reason='quit' KEEPS the state file (rehydrate depends on it)", async () => {
