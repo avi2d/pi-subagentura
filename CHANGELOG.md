@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A separate prompt-directed `--orchestratorv2` thin-router mode with bounded project-local responsibility metadata, runtime-authoritative interactive-agent routing, and legacy interactive-session compatibility.
+- Orchestratorv2 routing now treats the current parent branch as the sole authority ledger and the project-local JSON file as repairable untrusted cache data, preventing child-written records from becoming actionable, consuming authority capacity, blocking approved writes, or hiding authoritative stale records.
+- Idle Orchestratorv2 completions now use process-global, run-bound durable wake state with bounded prompt and acknowledgement retries, exact settled-run acknowledgement, and session-replacement recovery without changing delivery behavior in other modes.
+- Explicit `completionPolicy: "each" | "group"` coordination for asynchronous sub-agents and background workflows, with caller-declared bounded `completionGroupId` barriers, human-input priority, manual-result consumption, and compact reference manifests. Relatedness is never inferred from same-turn launch or task text.
+- Deterministic, reconciled TUI completion entries for parent-visible standalone and background workflow aggregate `done`, `error`, and `cancelled` outcomes; workflow-owned child turns remain suppressed and entries are excluded from parent LLM context.
+
+### Changed
+
+- Asynchronous completion now defaults to coordinated `each` delivery: each terminal result is immediately eligible, while results that finish while the parent is busy coalesce into one safe-idle compact continuation without injecting full child output.
+- Explicit `group` completion seals when the spawning parent turn settles and releases one aggregate manifest only after every caller-registered member is terminal; `done`, `error`, and `cancelled` all satisfy the barrier. An entirely consumed group creates no empty continuation, and workflow-owned children remain suppressed in favor of the background workflow aggregate.
+- Interactive coordinated policy, group membership, intents, and receipts rehydrate only into the matching parent session. In-process jobs and background workflows remain session scoped.
+- Consumption receipts prefer parent-session entries. When `appendEntry` is unavailable or fails, receipts append losslessly to a private, session-scoped append-only ledger keyed by parent session identity; fixed snapshots and bounded streaming reads preserve memory bounds while retaining late-published receipts.
+
+### Fixed
+
+- Durable TUI completion notice writes retry without duplicating append-then-throw entries or spinning during persistent storage failure; parent manifests wait for notice persistence and each terminal record has one logical notice.
+- Accepted long workflow names are truncated only in bounded completion labels, preserving workflow IDs and completion delivery.
+- Protocol-v2 Pi turn IDs up to 256 characters remain intact in notices, immutable retrieval selectors, and consumption receipts.
+
+### Known limitations
+
+- The private fallback consumption ledger is session-scoped and append-only. It has no fixed disk-size bound during a prolonged parent-session-entry outage; truncation could resurrect results already collected when parent entries become available again. Readers use fixed snapshots and bounded chunks/line buffers, and later snapshots reconcile late-published receipts without repeated whole-file scans. Session cleanup does not truncate or delete these private ledgers; same-session reload, resume, or restart can reconcile them, while `new` and `fork` do not import prior completion work and old files may remain on disk.
+- A successful Pi `sendMessage()` proves synchronous dispatch, not durable session commit. A crash in that separate parent-delivery window can replay a manifest; parent-model delivery is therefore at-least-once, not exactly once.
+
+### Deprecated
+
+- `notifyOnComplete` and `triggerTurnOnComplete` remain accepted as compatibility inputs that map to coordinated `each` delivery. They cannot be combined with `completionPolicy` or `completionGroupId`; full-output legacy injection is no longer selectable by new API calls.
+
 ## [3.3.1] - 2026-08-25
 
 ### Fixed
@@ -52,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - In-process sub-agent calls now run asynchronously by default; pass `async: false` for a single blocking call.
 - `get_subagent_result` returns live state by default and supports explicit bounded waiting with `wait` and `timeoutMs`.
-- Interactive pointer completions trigger a parent turn by default; set `triggerTurnOnComplete: false` to persist without waking the parent.
+- In 3.2.0, interactive pointer completions began triggering a parent turn by default; `triggerTurnOnComplete: false` persisted without waking the parent. This historical default is superseded by the coordinated behavior in Unreleased.
 
 ### Fixed
 
@@ -105,7 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- **Async sub-agents default to inject.** `subagent_with_context` and `subagent_isolated` with `async: true` now default to `notifyOnComplete: "inject"`, delivering the job result into the parent conversation when complete. Pass `notifyOnComplete: "notify"` to persist a pointer-only completion without injecting the full output.
+- **3.0.0 changed async sub-agents to inject by default.** At that release, `subagent_with_context` and `subagent_isolated` with `async: true` defaulted to `notifyOnComplete: "inject"`; `"notify"` persisted a pointer-only completion. This historical default is superseded by the coordinated behavior in Unreleased.
 
 ### Added
 

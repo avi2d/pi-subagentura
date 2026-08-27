@@ -22,12 +22,23 @@ import {
 import { debugLog, removeInProcessJob } from "./helpers";
 import { snapshotInProcessSession } from "./cancellation-snapshots";
 import {
+  clearCompletionCoordinator,
+  markCompletionHumanInput,
+  markCompletionTurnStarting,
+  prepareCompletionManifest,
+  registerCompletionCoordinator,
+  retireSessionScopedCompletions,
+  sealCompletionGroups,
+  settleCompletionParentTurn,
+} from "./completion-coordinator";
+import {
   createRootSpawnTreeContext,
   releaseRuntimeSpawnTreeContext,
   retireLineageBootstraps,
   type ParsedSpawnTreeContext,
 } from "./spawn-tree-context";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
+import { loadOrchestratorRoutingMetadata } from "./orchestrator-routing";
 import {
   cancelInteractiveSubagentByState,
   removeInteractiveSubagentState,
@@ -46,6 +57,12 @@ import {
   type SessionScope,
 } from "./session-scope";
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
+import {
+  clearCompletionTurnWake,
+  markCompletionTurnWakeStarted,
+  recoverCompletionTurnWakes,
+  settleCompletionTurnWake,
+} from "./completion-turn";
 
 function getGlobalState() {
   return typeof global !== "undefined" ? global : globalThis;
@@ -222,33 +239,59 @@ export function registerSessionHandlers(
   const globalState = getGlobalState() as any;
   registerSessionScope(scope);
   setLegacyActiveSessionRefs(scope);
+  registerCompletionCoordinator(pi, scope);
 
+  pi.on("input", (event) => {
+    if (scope.lifecycle === "started" && event.source !== "extension") {
+      markCompletionHumanInput(sessionOwner(scope));
+    }
+    return { action: "continue" as const };
+  });
+  pi.on("before_agent_start", (event) => {
+    if (scope.lifecycle !== "started") return;
+    const owner = sessionOwner(scope);
+    markCompletionTurnWakeStarted(pi, event.prompt);
+    markCompletionTurnStarting(owner);
+    const message = prepareCompletionManifest(owner);
+    return message ? { message } : undefined;
+  });
   pi.on("agent_start", () => {
     if (scope.lifecycle !== "started") return;
     scope.parentStreaming = true;
     setLegacyActiveSessionRefs(scope);
   });
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", (_event, ctx) => {
     if (scope.lifecycle !== "started") return;
+    settleCompletionTurnWake(pi);
     scope.parentStreaming = false;
     const owner = sessionOwner(scope);
     setLegacyActiveSessionRefs(scope);
     flushDeliveries(pi, scope.ui, owner);
     flushInProcessDeliveries(owner);
+    settleCompletionParentTurn(owner, ctx?.hasPendingMessages?.() ?? false);
   });
 
   pi.on("session_start", (event, ctx) => {
+    // A replacement session must never inherit an old wake request or its
+    // watchdog while branch recovery reconstructs durable state.
+    clearCompletionTurnWake(pi);
     if (scope.lifecycle === "started") {
       const previousOwner = sessionOwner(scope);
       closeActiveInteractiveSupervisor(previousOwner);
       clearSessionParsers(previousOwner);
       cleanupScopeGeneration(scope, previousOwner, event, "session_start", ctx);
+      retireSessionScopedCompletions(
+        previousOwner,
+        event.reason === "new" || event.reason === "fork",
+      );
+      clearCompletionCoordinator(previousOwner);
       scope.lifecycle = "shutdown";
     }
 
     advanceSessionScopeGeneration(scope.id);
     scope.lifecycle = "started";
     scope.ui = ctx.ui;
+    scope.cwd = ctx.cwd;
     scope.sessionManager = ctx.sessionManager;
     clearFreshChildLineage(scope, event.reason);
     const sessionId = ctx.sessionManager?.getSessionId?.();
@@ -259,6 +302,8 @@ export function registerSessionHandlers(
     ) {
       scope.spawnTreeContext = createRootSpawnTreeContext(sessionId);
     }
+    scope.isParentIdle =
+      typeof ctx.isIdle === "function" ? ctx.isIdle.bind(ctx) : undefined;
     scope.parentStreaming = false;
     registerSessionScope(scope);
     setLegacyActiveSessionRefs(scope);
@@ -268,6 +313,15 @@ export function registerSessionHandlers(
       event.reason === "reload" ||
       event.reason === "resume";
     if (shouldRehydrate) {
+      if (process.env.PI_SUBAGENTURA_CHILD !== "1") {
+        try {
+          // Tools reload on demand; startup only validates persistence so the
+          // routing overlay never becomes a second runtime registry or cache.
+          loadOrchestratorRoutingMetadata(ctx.cwd);
+        } catch (error) {
+          logSessionError("orchestrator_routing_recovery_failed", error);
+        }
+      }
       try {
         rehydrateInteractiveSubagents(
           ctx.cwd,
@@ -277,6 +331,12 @@ export function registerSessionHandlers(
         );
       } catch {
         /* best effort — rehydrate is a recovery path */
+      }
+      sealCompletionGroups(sessionOwner(scope));
+      try {
+        recoverCompletionTurnWakes(pi, ctx.sessionManager?.getBranch?.() ?? []);
+      } catch (error) {
+        logSessionError("orchestratorv2_wake_recovery_failed", error);
       }
     }
     ensureInteractivePoller(globalState);
@@ -295,7 +355,14 @@ export function registerSessionHandlers(
       clearSessionParsers(owner);
       cleanupScopeGeneration(scope, owner, event, "session_shutdown", ctx);
       clearFreshChildLineage(scope, event?.reason);
+      retireSessionScopedCompletions(
+        owner,
+        event?.reason === "new" || event?.reason === "fork",
+      );
+      clearCompletionCoordinator(owner);
       scope.parentStreaming = false;
+      scope.isParentIdle = undefined;
+      clearCompletionTurnWake(pi);
       scope.lifecycle = "shutdown";
       advanceSessionScopeGeneration(scope.id);
       removeSessionScope(scope.id);

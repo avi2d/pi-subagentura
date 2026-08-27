@@ -3,6 +3,7 @@ import {
   registerWorkflowTool,
   MAX_WORKFLOW_JOBS,
   cleanupWorkflowJobsForOwner,
+  discardWorkflowJob,
   getWorkflowJobForActiveSession,
   getWorkflowJobForOwner,
   getRunningWorkflowCount,
@@ -100,6 +101,15 @@ describe("workflow parent session ownership", () => {
     expect(getStartedSessionScopes()).toEqual([scope]);
   });
 
+  it("discards a workflow when completion registration cannot commit", () => {
+    const workflow = makeJob("discard", "running", owner(6, 1));
+    workflowJobRegistry.set(workflow.id, workflow);
+    discardWorkflowJob(workflow);
+    expect(workflow.abort.signal.aborted).toBe(true);
+    expect(workflow.suppressCompletionNotification).toBe(true);
+    expect(workflowJobRegistry.has(workflow.id)).toBe(false);
+  });
+
   it("requires exact {id,generation}, treats wrong owners as missing, and cleans up only the owning lifecycle", () => {
     const sameIdGeneration1 = owner(7, 1);
     const sameIdGeneration2 = owner(7, 2);
@@ -152,7 +162,7 @@ describe("workflow parent session ownership", () => {
         `export const meta = { name: "active", description: "d" };\nreturn "ok";`,
         { runAgent: async () => ({ isError: false, output: "ok" }) as any },
       ),
-    ).toThrow(/100 workflow jobs already running/);
+    ).toThrow(/100 workflow jobs are retained or running/);
     expect(workflowJobRegistry.get("other-terminal")).toBe(otherTerminal);
 
     workflowJobRegistry.delete("running-0");
@@ -245,15 +255,26 @@ describe("workflow parent session ownership", () => {
     const tools: any[] = [];
     const sendA = vi.fn();
     const sendB = vi.fn();
+    const entriesA: any[] = [];
     const piA = {
       registerTool: vi.fn((tool) => tools.push(tool)),
       registerFlag: vi.fn(),
       registerCommand: vi.fn(),
       on: vi.fn(),
       sendMessage: sendA,
+      appendEntry: vi.fn((customType: string, data: unknown) => {
+        entriesA.push({ type: "custom", customType, data });
+      }),
     } as any;
     const piB = { sendMessage: sendB } as any;
-    const contextA = { ...context(50, 1), pi: piA };
+    const contextA = {
+      ...context(50, 1),
+      pi: piA,
+      sessionManager: {
+        getSessionId: () => "parent-a",
+        getEntries: () => entriesA,
+      },
+    };
     const contextB = { ...context(60, 1), pi: piB };
     registerSessionScope(contextA);
     registerSessionScope(contextB);

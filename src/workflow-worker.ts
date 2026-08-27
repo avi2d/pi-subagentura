@@ -787,8 +787,9 @@ function readCurrentTurnTerminal(
 }
 
 /**
- * Await a process-backed (tmux/zellij) sub-agent's terminal event by polling its artifact dir,
- * then read its output.md. Honors the abort signal and detects a dead pane that never completed.
+ * Await a process-backed sub-agent's owned terminal artifact event, then read the
+ * matching immutable `outputs/<eventId>.md` snapshot by turnId. Mutable output.md
+ * remains legacy/staging fallback only. Honors abort and dead-pane detection.
  */
 export async function awaitInteractiveResult(
   state: InteractiveSubagentState,

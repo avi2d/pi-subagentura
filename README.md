@@ -74,8 +74,9 @@ usable, with status and results available through the UI, slash commands, and
 agent tools. Workflow agents default to separate Pi processes in tmux or
 Zellij, so they are observable and attachable; when no multiplexer is
 available, the runtime falls back to in-process execution. Intermediate agent
-results stay in workflow variables outside the parent model context, and only
-the workflow's final result returns to the parent.
+results stay in workflow variables outside the parent model context. Only the
+workflow completion enters coordinated parent delivery; the retained final
+result is available through `get_workflow_result`.
 
 Workflow scripts are trusted agent-authored JavaScript. The VM improves
 determinism but is not a security boundary, so never run untrusted JavaScript.
@@ -117,31 +118,33 @@ These commands are intended for people at the Pi prompt.
 
 ## Agent-facing tools
 
-The extension registers 21 public tools for parent agents.
+The extension registers these public tools for parent agents.
 
-| Tool                                | Purpose                                                        |
-| ----------------------------------- | -------------------------------------------------------------- |
-| `workflow`                          | Run a trusted workflow script or saved workflow                |
-| `save_workflow`                     | Validate and save a reusable workflow                          |
-| `list_workflows`                    | List saved workflows                                           |
-| `delete_workflow`                   | Delete a saved workflow                                        |
-| `get_workflow_status`               | Inspect a background workflow                                  |
-| `get_workflow_result`               | Wait for and return a workflow result                          |
-| `cancel_workflow`                   | Cancel a background workflow                                   |
-| `subagent_with_context`             | Delegate with the parent conversation                          |
-| `subagent_isolated`                 | Delegate with a fresh context                                  |
-| `get_subagent_status`               | Inspect an async in-process job                                |
-| `get_subagent_result`               | Retrieve current or final async job output                     |
-| `cancel_subagent`                   | Cancel an async job                                            |
-| `prune_subagent_jobs`               | Remove completed and failed jobs                               |
-| `list_available_models`             | List configured model identifiers                              |
-| `subagent_interactive`              | Launch an attachable Pi session in tmux/Zellij                 |
-| `get_interactive_subagent_status`   | Inspect attachable child sessions                              |
-| `cancel_interactive_subagent`       | Kill an attachable child pane                                  |
-| `send_interactive_subagent_message` | Send a follow-up while preserving child context                |
-| `list_subagent_artifacts`           | List durable interactive-agent artifacts                       |
-| `read_subagent_artifact`            | Read lifecycle events and output snapshots                     |
-| `cleanup_subagent_artifacts`        | Remove expired artifact directories and stale registry entries |
+| Tool                                    | Purpose                                                           |
+| --------------------------------------- | ----------------------------------------------------------------- |
+| `workflow`                              | Run a trusted workflow script or saved workflow                   |
+| `save_workflow`                         | Validate and save a reusable workflow                             |
+| `list_workflows`                        | List saved workflows                                              |
+| `delete_workflow`                       | Delete a saved workflow                                           |
+| `get_workflow_status`                   | Inspect a background workflow                                     |
+| `get_workflow_result`                   | Wait for and return a workflow result                             |
+| `cancel_workflow`                       | Cancel a background workflow                                      |
+| `subagent_with_context`                 | Delegate with the parent conversation                             |
+| `subagent_isolated`                     | Delegate with a fresh context                                     |
+| `get_subagent_status`                   | Inspect an async in-process job                                   |
+| `get_subagent_result`                   | Retrieve current or final async job output                        |
+| `cancel_subagent`                       | Cancel an async job                                               |
+| `prune_subagent_jobs`                   | Remove completed and failed jobs                                  |
+| `list_available_models`                 | List configured model identifiers                                 |
+| `list_orchestrator_agents`              | List bounded Orchestratorv2 routing metadata and runtime pointers |
+| `update_orchestrator_agent_description` | Update a child's confirmed routing description and aliases        |
+| `subagent_interactive`                  | Launch an attachable Pi session in tmux/Zellij                    |
+| `get_interactive_subagent_status`       | Inspect attachable child sessions                                 |
+| `cancel_interactive_subagent`           | Kill an attachable child pane                                     |
+| `send_interactive_subagent_message`     | Send a follow-up while preserving child context                   |
+| `list_subagent_artifacts`               | List durable interactive-agent artifacts                          |
+| `read_subagent_artifact`                | Read lifecycle events and output snapshots                        |
+| `cleanup_subagent_artifacts`            | Remove expired artifact directories and stale registry entries    |
 
 ## How it compares with other Pi sub-agent extensions
 
@@ -194,7 +197,74 @@ The guidance gives the parent agent reasonable default behavior when the user as
 - “check my approach” — run a context-aware oracle to challenge assumptions and drift
 - “implement and review” — use one writer, parallel reviewers, and capped fix/review rounds
 
-The defaults prefer async `subagent_isolated` for fresh scouts/reviewers, `subagent_with_context` for oracle checks, injected completions instead of polling, and one writer at a time for implementation. For cheap fanout, they suggest validating model availability before using optional model overrides.
+The defaults prefer async `subagent_isolated` for fresh scouts/reviewers,
+`subagent_with_context` for oracle checks, coordinated reference manifests
+instead of polling or full-output injection, and one writer at a time for
+implementation. Asynchronous completion defaults to `completionPolicy: "each"`:
+each terminal record becomes immediately eligible, while records that finish
+while the parent is busy coalesce into a safe-idle continuation. Related work
+uses an explicit `completionPolicy: "group"` and caller-declared
+`completionGroupId`; relatedness is never inferred from being launched in the
+same turn or from task text. For cheap fan-out, the guidance suggests
+validating model availability before using optional model overrides.
+
+### Orchestratorv2 thin-router mode
+
+Enable the separate prompt-directed thin router with:
+
+```bash
+pi --orchestratorv2
+```
+
+This flag appends `ORCHESTRATOR_V2_SYSTEM_PROMPT.md`; it does not select or
+verify the parent model and does not enforce a host-level tool allowlist. Select
+the intended lightweight model separately, and do not enable
+`--orchestrator` and `--orchestratorv2` together. Normal workflow and in-process
+tools remain registered for compatibility, while the Orchestratorv2 prompt
+directs the parent to delegate only through attachable interactive children and
+use the parent session's authoritative routing ledger together with the
+project-local routing cache.
+
+Orchestratorv2 adds exactly two routing-metadata tools:
+`list_orchestrator_agents` and `update_orchestrator_agent_description`.
+Confirmed records include explicit `provenance`: `user` or `orchestratorv2`.
+Responsibility updates use a server-issued, single-use confirmation token bound
+to the exact payload, current session generation, and a later user message; a
+model-supplied `confirmed: true` is not sufficient by itself.
+
+The parent session's current branch is the authority ledger. Every approved
+top-level spawn and confirmed update persists the bounded project-local record
+first, then appends an exact versioned parent custom entry. On reload/resume,
+the latest valid authority entry for each child is selected by physical branch
+order. Those parent entries are the sole trusted/actionable source; the project
+file is only untrusted cache/proposal data and may be missing, stale, malformed,
+or over capacity. Cache-only or mismatched rows may be shown as non-actionable
+diagnostics, but they never gate actionability, capacity, confirmation CAS, or
+repair writes. Missing cache rows do not erase valid parent authority.
+
+When no valid parent authority exists, cache metadata remains visible only as
+non-actionable metadata with a closed-enum untrusted reason. Approved writes
+rebuild the cache from the latest parent authority plus the incoming record, so
+forged cache rows cannot consume the 128-record capacity or become
+authoritative.
+
+The parent-entry ledger is an application-level boundary, not an OS security
+boundary: a same-UID process that can tamper with the parent session file can
+forge parent entries. This limitation is intentional and documented; the
+ledger does not claim to defend against arbitrary same-UID session-file
+tampering. Routing metadata is never a lifecycle registry or semantic resolver.
+
+The interactive runtime launches before its initial routing metadata is
+persisted. If persistence fails, the child intentionally remains live and the
+spawn result includes an explicit warning; the extension does not cancel, roll
+back, replace, or respawn that child. Capacity exhaustion fails closed without
+evicting or deleting metadata.
+
+Interactive children retain `subagent_interactive` and may autonomously create
+nested children without top-level approval. Nested children belong to the
+immediate child session and are not automatically actionable in the top-level
+Orchestratorv2 routing registry; their important outcomes return through that
+child or the existing artifact and notification paths.
 
 ## Cancellation context snapshots (opt-in)
 
@@ -226,9 +296,14 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only. Both modes show a user-facing completion notification.
-- `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
+- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for an explicit barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
+
+Deprecated compatibility fields cannot be combined with `completionPolicy` or
+`completionGroupId`; `completionGroupId` is valid only with `completionPolicy: "group"`.
 
 Best for:
 
@@ -248,12 +323,15 @@ Parameters:
 - `model` — optional model override like `anthropic/claude-sonnet-4-5`
 - `cwd` — optional working directory override
 - `async` — run in background; returns a jobId immediately instead of blocking
-- `notifyOnComplete` — `"inject"` (default for async) persists full output; `"notify"` persists a pointer only. Both modes show a user-facing completion notification.
-- `triggerTurnOnComplete` — optional override; notify defaults false and inject defaults true
+- `completionPolicy` — async completion coordination: `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for an explicit barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related jobs (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 - `maxAge` — optional TTL in ms for completed job retention (async only)
 
-Async spawn results state whether completion output will be injected into the
-parent LLM and whether delivery will automatically start a new parent turn.
+Deprecated compatibility fields cannot be combined with `completionPolicy` or
+`completionGroupId`; `completionGroupId` is valid only with `completionPolicy: "group"`.
+Async spawn results describe the selected coordinated behavior.
 
 Best for:
 
@@ -264,7 +342,17 @@ Best for:
 
 ### Async Workflow Tools
 
-When you spawn a sub-agent with `async: true`, it returns a **jobId** immediately and runs in the background. Async jobs inject their result into the parent conversation by default when they complete, so you usually do not need to poll. Use these tools only when the user asks for status/collection, when a job appears stuck, or when manual follow-up is needed:
+When you spawn a sub-agent with `async: true`, it returns a **jobId**
+immediately and runs in the background. The coordinated default is
+`completionPolicy: "each"`: terminal records become independently eligible
+immediately, and records that finish while the parent is busy coalesce into one
+safe-idle continuation rather than a burst of turns. A related group is formed
+only when the caller explicitly selects `completionPolicy: "group"` and supplies
+a shared `completionGroupId`; same-turn launch or task text never infers a
+group. The default reports compact result references rather than injecting full
+output, so you usually do not need to poll. Use these tools only when the user
+asks for status or explicit collection, when a job appears stuck, or when manual
+follow-up is needed:
 
 Background jobs are scoped to the current parent session. This includes both
 `async: true` sub-agent jobs and jobs started by the `workflow` tool. They are
@@ -285,6 +373,8 @@ Parameters:
 
 Retrieve an async subagent job's current or final result and usage summary. A
 running job returns immediately unless explicit bounded waiting is requested.
+Successfully retrieving a terminal result consumes its pending coordinated
+delivery, so it is not sent again automatically.
 
 Parameters:
 
@@ -333,16 +423,25 @@ Parameters:
 - `persona` — optional system prompt appended to the child session
 - `model` — optional model override
 - `cwd` — optional working directory
-- `includeContext` — include serialized parent conversation in the child prompt (default: `false`)
+- `includeContext` — context mode selector: `true` serializes the full parent branch; `false` permits an explicit `context`; omitting both fields keeps the legacy independent mode
+- `context` — optional explicit handoff when `includeContext: false`; capped at 64 KiB and never concatenated with the parent branch
+- `routingDescription` — bounded responsibility persisted for top-level Orchestratorv2 routing; required by Orchestratorv2 policy and rejected outside that top-level mode
+- `routingAliases` — optional bounded exact aliases for the responsibility; requires `routingDescription`
 - `mux` — optional backend: `"auto"` (default), `"tmux"`, or `"zellij"`. Auto picks the currently attached mux (via ZELLIJ_SESSION_NAME / TMUX env vars) then falls back to whichever backend binary is available. Explicit choice forces that backend.
 - `background` — spawn in a detached named window/tab (invisible) instead of a visible horizontal split. Default `true` — your mux layout is undisturbed and you can attach later with the returned `focus` command. Pass `background: false` for a side-by-side split you can watch in real time.
-- `notifyOnComplete` — `"notify"` (default) persists only an artifact pointer; `"inject"` persists full output. Both modes show a user-facing completion notification.
-- `triggerTurnOnComplete` — optional override. Defaults to `true` for both modes; `false` disables automatic parent-turn triggering.
+- `completionPolicy` — `"each"` (default) or `"group"`; `"each"` makes records independently eligible, while `"group"` waits for a caller-declared named barrier
+- `completionGroupId` — caller-declared named group ID required with `completionPolicy: "group"`; safe 1–128 character ID shared by related agents (max 32 members per group, 512 groups per parent session)
+- `notifyOnComplete` — deprecated compatibility input; any value maps to coordinated `"each"` delivery with no full-output injection
+- `triggerTurnOnComplete` — deprecated compatibility input; coordinated `"each"` timing and human priority remain authoritative
 
-The spawn result states whether completion output will be injected into the parent
-LLM and whether delivery will automatically start a new parent turn.
+Deprecated compatibility fields cannot be combined with `completionPolicy` or
+`completionGroupId`. The spawn result describes the selected coordinated behavior.
 
-The sub-agent's work is **always** written to the artifact dir as `events.ndjson` (lifecycle log) and `output.md` (clean prose the child writes). The pane is for live monitoring; the artifact is the source of truth. The artifact survives parent restarts — sub-agents that finish while you're away are picked up on the next poll.
+The sub-agent's artifact contains `events.ndjson` lifecycle records, mutable
+`output.md` staging, and immutable protocol-v2 `outputs/<eventId>.md` terminal
+snapshots. Terminal retrieval uses the immutable snapshot by `turnId`; mutable
+output is legacy/staging fallback only. The pane is for live monitoring, and the
+artifact survives parent restarts.
 
 The interactive sub-agent **registry state** survives parent reloads and restarts. When spawned,
 a per-(cwd) state file is written to `<cwd>/.pi/subagentura-state.json`.
@@ -365,9 +464,11 @@ The state file and subagent panes are preserved across these actions:
 
 On `/reload` and `/resume`, the `session_start` handler rehydrates
 the in-memory registry, filtering by `parentSessionId` so only subagents
-that were created in the current session are restored.
-Protocol-v2 byte cursors, pending delivery intents, and receipts are restored so
-reload does not unconditionally replay already-dispatched completions.
+created in the current session are restored. Protocol-v2 byte cursors, pending
+delivery intents, receipts, coordinated policy, and group membership are
+restored. Recovered groups are sealed before polling begins. Parent-session
+completion and consumption entries reconcile notices and manifests so reload
+does not unconditionally replay already-delivered work.
 
 Implementation details for crash-safe ordering and delivery recovery are in the
 [state-file invariants in the source repository](https://github.com/lmn451/pi-subagentura/blob/master/AGENTS.md#rehydrate-state-file-cwdpisubagentura-state-json).
@@ -470,66 +571,101 @@ pointer-only because mutable `output.md` cannot be safely attributed to a turn.
 Immutable snapshots are limited to 1 MiB. The parent and generated child CLI
 check the staging file size before reading it. If `output.md` exceeds the limit,
 the completion is still recorded with `outputError.code = "output_too_large"`
-and its observed byte count, but no immutable snapshot is created or injected
-into parent context. The oversized staging file remains available for manual
+and its observed byte count, but no immutable snapshot is created. The
+coordinated manifest therefore has no snapshot reference, and legacy injection
+cannot load the oversized output. The staging file remains available for manual
 inspection in the artifact directory.
 
-#### Completion notifications: notify vs inject
+#### Coordinated completion delivery
 
-Completion delivery has two independent settings. `notifyOnComplete` controls
-the payload saved for parent LLM context (full output versus artifact pointer);
-`triggerTurnOnComplete` independently controls whether delivery starts a parent
-LLM turn. Both payload modes display the same user-facing notification;
-`notifyOnComplete` does not control toast behavior.
+Coordinated delivery is the default for asynchronous in-process jobs,
+interactive agents, and background workflows. It separates the human channel
+from the parent-model channel:
 
-- `"inject"` persists one attributed custom completion message and triggers a turn by default for async in-process tools. Explicit `triggerTurnOnComplete: false` disables triggering.
-- `"notify"` persists an attributed pointer-only custom message in parent context. The public `subagent_interactive` tool enables triggering by default; explicit `triggerTurnOnComplete: false` disables it.
+1. Every parent-visible standalone `done`, `error`, or `cancelled` completion,
+   plus every background workflow aggregate completion, appends one deterministic
+   `subagentura-completion` entry rendered in the TUI. This entry is excluded
+   from LLM context, and event replay does not append it again. Workflow-owned
+   child turns remain visible through workflow progress but do not publish
+   directly.
+2. The parent model receives one bounded, hidden `subagent-manifest` containing
+   statuses and references—not child output. Interactive records point to the
+   immutable `outputs/<eventId>.md` snapshot when available plus
+   `events.ndjson`; legacy artifacts may fall back to mutable `output.md`.
+   In-process and workflow records point to `get_subagent_result` and
+   `get_workflow_result`.
+3. A ready manifest attaches to a pending human-initiated turn when possible.
+   Otherwise Pi receives one triggered follow-up after the parent is safely
+   idle. Human prompts and steering always take priority.
 
-| Configuration                             | Persisted in parent context | Starts an immediate parent turn |
-| ----------------------------------------- | --------------------------- | ------------------------------- |
-| `inject` (in-process default)             | Full completion output      | Yes (unless overridden)         |
-| `inject` + `triggerTurnOnComplete: false` | Full completion output      | No                              |
-| `notify` (interactive default)            | Artifact pointer only       | Yes                             |
-| `notify` + `triggerTurnOnComplete: false` | Artifact pointer only       | No                              |
+`completionPolicy` controls readiness:
 
-Triggering completions are handed to Pi's native `followUp` queue even while the
-parent is busy, so they run after the active turn without relying on extension-owned
-streaming state. Non-triggering completions wait until the parent is idle before
-delivery into parent context, which prevents them from accidentally starting a
-provider turn.
+- `"each"` (default) makes every independent result eligible immediately. Results that finish while the parent is busy are coalesced into one manifest at the next safe-idle dispatch; this is the default independent-delivery behavior.
+- `"group"` requires the caller to provide one shared, explicit `completionGroupId`. Same-turn launch and task text do not infer relatedness. Register all members in the intended group before the spawning parent turn settles; settlement seals the group, rejects late members, and blocks model delivery until every registered member is `done`, `error`, or `cancelled`. Per-member TUI notices still appear immediately, and an entirely consumed group does not trigger an empty turn.
 
-Therefore plain `notify` records the completion for both the UI and the parent
-conversation, but the LLM does not react immediately. The pointer becomes
-available to the model when the user starts the next parent turn. It is not a
-visual-only notification and the completion is not discarded.
+A named group is advanced cross-call control. A group supports at most 32 distinct `source:sourceId` members, with at most 512 groups per parent session. `completionGroupId` is 1–128 characters and must match `[A-Za-z0-9][A-Za-z0-9._:-]*`. A source can satisfy a group only once; later turns from the same source/group are delivered independently as `each`.
 
-Both modes also show a user notification (`ui.notify`) after successful delivery. The notification
-explicitly states whether completion output was injected into the parent LLM and
-whether a new parent turn will start automatically. Async in-process and
-interactive spawn results state the same behavior in future tense before work
-begins. Errors use an error notification, cancellations use a warning, and
-successful completions use an informational notification.
+The completion coordinator owns readiness, group barriers, TUI notice persistence, and compact manifest construction. When an idle manifest is ready, it passes through `sendCompletionTurn` with the actual parent streaming state. Non-v2 modes fall through to Pi's native `sendMessage`; idle Orchestratorv2 uses the lower-level transport to persist a wake request, publish the manifest with its wake identity, and send a synthetic user follow-up so `before_agent_start` installs the thin-router prompt. A streaming parent keeps Pi's native follow-up behavior.
 
-In the TUI, a normal completion therefore produces two visually separate
-elements (exact colors depend on the active theme):
+Wake state is process-global because Pi can load delivery and lifecycle extension graphs as separate module instances. The exact synthetic prompt is marked in `before_agent_start`, and only that marked run's `agent_settled` acknowledges the wake; unrelated turns cannot consume it. A missing run start receives at most three wake attempts separated by a 30-second watchdog, while durable acknowledgement writes retry at most three times with a one-second delay. Session replacement and shutdown clear both timers; reload/resume recover only delivered, unacknowledged wakes from the active parent branch.
 
-1. A user-notification status line (`ui.notify`). This is UI-only and is never
-   added to session or LLM context.
-2. A custom-message block beginning with `[Sub-agent ...]`. This is the
-   separately persisted LLM-facing delivery: full output in `inject` mode, or
-   only status and artifact pointers in `notify` mode.
+Successful terminal retrieval through `get_subagent_result`,
+`get_workflow_result`, or `read_subagent_artifact` with output consumes the
+matching pending record before returning it. Automatic and manual delivery share
+the same receipts, so a consumed record is suppressed from normal subsequent
+dispatch. This is not an exactly-once delivery guarantee: a crash around parent
+dispatch can still replay a manifest as described below.
+Workflow-owned process or in-process children never publish directly; only the
+background workflow aggregate completion participates in coordinated delivery.
 
-Parent-initiated cancellation is the exception: the cancel tool result already
-acknowledges it to the LLM, so cancellation shows the UI notification without
-adding a duplicate custom-message block.
+The deprecated `notifyOnComplete` and `triggerTurnOnComplete` fields remain
+accepted for compatibility. Either legacy value maps deterministically to
+coordinated `"each"`: the notice is TUI-only, the parent receives only compact
+references, and policy plus human-priority rules control timing. Combining
+either field with `completionPolicy` or `completionGroupId` is rejected.
+Persisted pre-coordinator intents may still drain through the bounded legacy
+broker during upgrade recovery, but new API calls cannot select full-output
+injection.
 
-LLM-facing completions wait while the parent streams and flush as one bounded
-message after `agent_settled`. The durable FIFO is limited to 32 records / 256 KiB,
-with 32 KiB output per record and 64 KiB per flush. Overflow keeps status and
-artifact pointers rather than silently dropping completion. Delivery is
-at-least-once: deterministic delivery IDs and session receipts prevent routine
-reload replay, but a crash between synchronous dispatch and receipt persistence
-can still duplicate one completion.
+Interactive coordinated policy, group membership, and intents survive
+same-session startup/reload/resume through `.pi/subagentura-state.json` and
+parent session entries. Consumption receipts prefer those entries and use the
+private fallback ledger when needed. In-process jobs and background workflows
+remain parent-session scoped and are retired on session replacement. `new` and
+`fork` do not import prior completion work.
+
+Parent delivery fails closed behind durable notice storage. If `appendEntry`
+fails, the notice remains pending and the manifest is withheld; later coordinator
+activity retries without a tight loop. If the entry was written before an
+exception, session-entry reconciliation prevents a duplicate. Deterministic
+identities prevent routine replay, but Pi's synchronous `sendMessage` proves
+dispatch rather than durable commit, so a crash in that separate window can still
+replay a manifest.
+
+#### Consumption-receipt fallback
+
+Parent session entries are the preferred durable location for consumption
+receipts. If the parent cannot append an entry because `appendEntry` is
+unavailable or fails, the coordinator appends the receipt beneath the parent
+Pi session directory, outside the project working tree. The path is keyed by the
+parent session identity and is not shared across sessions. A partial manager
+without a session directory uses a random process-private temporary root and
+does not claim restart durability.
+
+Readers take a fixed snapshot and enforce total byte, record-count, line,
+identifier, and selector bounds. An over-budget or truncated snapshot is ignored
+and advances to its end; this deliberately risks a duplicate manifest instead of
+letting unchecked file data consume or retire trusted completions. Turn-scoped
+receipts require the exact `turnId`, so source-only receipts cannot suppress
+later interactive turns. Reconciliation resumes from the bounded high-water
+mark for receipts appended afterward.
+
+Session shutdown clears live coordinator state and records lifecycle
+retirements: non-interactive session-scoped work is retired, while interactive
+state and receipts remain eligible for same-session reload, resume, or restart.
+`/new` and `/fork` also retire interactive work and do not import prior
+completion work. Cleanup does not truncate or delete protected fallback ledgers,
+so old private files can remain after a replacement session starts.
 
 #### `get_interactive_subagent_status`
 
@@ -543,13 +679,11 @@ Parameters:
 
 Kills the mux pane for an interactive sub-agent by id. Writes a `cancelled`
 event and immutable output snapshot before killing the pane, so artifacts remain
-self-describing. Because the cancel tool result already acknowledges the action
-to the parent LLM, parent-initiated cancellation also shows a warning via
-`ui.notify` and persists a delivery receipt without injecting a duplicate
-cancellation completion. The receipt is written before the pane is killed, so a
-later poll or restart cannot replay that cancellation into LLM context.
-Child-originated or otherwise unacknowledged cancellations still use the normal
-completion-delivery path.
+self-describing. The tool result acknowledges the cancellation to the parent.
+Under coordinated delivery, cancellation also creates one TUI-only terminal
+entry and satisfies an `all-terminal` group barrier; any later manifest contains
+only the bounded cancellation reference. Upgrade-recovered legacy intents retain
+their existing delivery receipt suppression.
 
 Parameters:
 
@@ -557,8 +691,24 @@ Parameters:
 
 #### `send_interactive_subagent_message`
 
-Sends a follow-up prompt to a running or idle interactive sub-agent by id. The message is delivered into the child's existing REPL via the sub-agent's mux backend (tmux send-keys or zellij write-chars + write 13), so the child's model context is preserved — this is a true follow-up turn, not a fresh spawn. A message submitted while the child streams is processed through Pi's one-at-a-time steering queue; its persisted user entry receives a distinct artifact turn and immutable completion snapshot. The child will call `cli.mjs done 0` again when finished, which wakes the parent through the usual `notifyOnComplete` path.
-Refuses to send if the sub-agent is not in the registry, is neither `running` nor `idle`, or if the mux itself rejects the send call (e.g. the pane was killed between the status check and send). All three failure modes return a structured `isError: true` result.
+Sends a follow-up prompt to a running or idle interactive sub-agent by id. The
+message is delivered into the child's existing REPL via the sub-agent's mux
+backend (tmux send-keys or zellij write-chars + write 13), so the child's model
+context is preserved — this is a true follow-up turn, not a fresh spawn.
+
+Every persisted user entry produces a distinct artifact turn and immutable
+completion snapshot. An idle follow-up resets future delivery to independent
+`each`. A source can satisfy a completion group only once, so later turns from
+that source/group are also delivered independently as `each`, even when steering
+retained the active turn's persisted group metadata.
+
+Workflow-owned children reject follow-ups until the workflow has consumed the
+current result and the pane is idle. The first successful follow-up then promotes
+the pane to standalone. The child calls `cli.mjs done 0` again when finished.
+
+The tool refuses to send if the sub-agent is not registered, is neither `running`
+nor `idle`, remains workflow-owned, or the mux rejects the send call. Each failure
+returns a structured `isError: true` result.
 
 Parameters:
 
@@ -573,7 +723,13 @@ parent was away.
 
 #### `read_subagent_artifact`
 
-Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass `since` to fetch only new events) and, by default, the sub-agent's `output.md` content (the latest turn's output). This is the canonical way to get the sub-agent's work product — the parent agent does not need to read the tmux pane or capture rendered TUI.
+Reads a sub-agent's artifact by id. Returns the lifecycle event log (pass
+`since` to fetch only new events) and, by default, the latest terminal immutable
+protocol-v2 snapshot. Mutable `output.md` is used only when no protocol-v2 terminal
+snapshot applies, including legacy or still-running artifacts. This avoids
+misattributing active follow-up staging bytes to an earlier terminal turn. A
+successful read that returns a terminal snapshot consumes that turn's pending
+coordinated delivery; an events-only read does not.
 
 Protocol-v2 completions map each Pi-derived `turnId` to an immutable
 `outputs/<eventId>.md` snapshot. Pass `turnId` to read that output; the response's
@@ -587,7 +743,7 @@ Parameters:
 - `since` — optional unix-ms timestamp; only return events with `ts >= since`
 - `includeOutput` — include the output (default `true`); historical selectors imply output
 - `turn` — optional turn number; read `output-N.md` for that specific turn instead of the latest `output.md`
-- `turnId` — optional protocol-v2 Pi turn id; read its immutable `outputs/<eventId>.md` snapshot
+- `turnId` — optional protocol-v2 Pi turn id, up to 256 characters; read its immutable `outputs/<eventId>.md` snapshot
 
 ### `list_available_models`
 

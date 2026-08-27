@@ -11,20 +11,37 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   artifactPath,
+  eventLogEndOffset,
+  removeInteractiveState,
   INTERACTIVE_ARTIFACT_OWNER_FILE,
   isArtifactOutputSettled,
+  isCompletionEvent,
   loadInteractiveStates,
   lastEvent,
+  MAX_TURN_ID_LENGTH,
   listOutputHistory,
   listOutputTurns,
   readEvents,
+  readEventBatch,
   readOutput,
   readOutputForTurnId,
   readOutputForTurn,
+  updateInteractiveState,
   type SubagentArtifact,
 } from "../artifact";
 import {
+  assertCompletionGroupOpen,
+  reserveCompletionGroup,
+  releaseCompletionGroup,
+  consumeCompletionSource,
+  registerCompletionMember,
+  type CompletionGroupReservation,
+  type ResolvedCompletionPolicy,
+  resolveCompletionPolicy,
+} from "../completion-coordinator";
+import {
   cancelInteractiveSubagent,
+  removeInteractiveSubagentState,
   formatInteractiveState,
   interactiveSubagentRegistry,
   launchInteractiveSubagent,
@@ -37,8 +54,19 @@ import { debugLog } from "../helpers";
 import {
   completionTriggersTurn,
   formatCompletionDeliveryBehavior,
+  sanitizeOutput,
 } from "../notifications";
-import { InteractiveParams } from "../schemas";
+import { isOrchestratorV2Enabled } from "../completion-turn";
+import {
+  MAX_ORCHESTRATOR_ROUTING_ALIASES,
+  MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES,
+  MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES,
+  appendOrchestratorRoutingAuthorityEntry,
+  isValidOrchestratorChildId,
+  upsertOrchestratorRoutingEntry,
+  type OrchestratorRoutingEntry,
+} from "../orchestrator-routing";
+import { InteractiveParams, MAX_INTERACTIVE_CONTEXT_BYTES } from "../schemas";
 import { registerToolWithDefaultGuidance } from "../tool-guidance";
 import { updateRunningSubagentFooter } from "../artifact-poller";
 import {
@@ -49,11 +77,11 @@ import {
   type SessionToolToken,
 } from "../session-scope";
 
-const SUBAGENT_ID_INVALID_CHAR_RE = /[^a-f0-9]/;
 function isValidSubagentId(id: string): boolean {
-  return id.length === 16 && !SUBAGENT_ID_INVALID_CHAR_RE.test(id);
+  return isValidOrchestratorChildId(id);
 }
 const MAX_FOLLOWUP_BYTES = 64 * 1024;
+const MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES = 64 * 1024;
 const MAX_FOLLOWUP_PREVIEW_CHARS = 500;
 const FOLLOWUP_COMPLETION_REMINDER =
   ' [MANDATORY COMPLETION PROTOCOL FOR EVERY FOLLOW-UP TURN: Before sending your final assistant response, write the result to output.md; make "$ARTIFACT_DIR/cli.mjs" done 0 your final tool call and wait for success. If it fails, do not send the final response; fix the cause and retry until completion is recorded. Do not rely on the lifecycle hook. After completion is recorded, remain in the Pi REPL and wait for follow-up; do not intentionally exit or close the pane unless explicitly asked.]';
@@ -63,10 +91,182 @@ function formatFollowupPreview(message: string): string {
   return `${message.slice(0, MAX_FOLLOWUP_PREVIEW_CHARS)}… [truncated; ${message.length} chars total]`;
 }
 
+function formatArtifactProviderOutput(output: string | null): string {
+  if (output === null) return "";
+  const sanitized = sanitizeOutput(output);
+  const originalBytes = Buffer.byteLength(sanitized, "utf8");
+  let bounded = sanitized;
+  if (originalBytes > MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES) {
+    const marker = `\n[Output truncated from ${originalBytes} bytes.]`;
+    bounded = Buffer.from(sanitized, "utf8")
+      .subarray(
+        0,
+        Math.max(
+          0,
+          MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES -
+            Buffer.byteLength(marker, "utf8"),
+        ),
+      )
+      .toString("utf8");
+    while (
+      Buffer.byteLength(`${bounded}${marker}`, "utf8") >
+      MAX_ARTIFACT_PROVIDER_OUTPUT_BYTES
+    ) {
+      bounded = bounded.slice(0, -1);
+    }
+    bounded += marker;
+  }
+  return `\n<untrusted-subagent-output>\n${bounded || "(empty output)"}\n</untrusted-subagent-output>`;
+}
+
+type InitialRoutingMetadataResult =
+  | { status: "persisted"; entry: OrchestratorRoutingEntry }
+  | { status: "warning"; error: string };
+
+function parentBranchEntries(ctx: unknown): readonly unknown[] {
+  if (!ctx || typeof ctx !== "object") return [];
+  const sessionManager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (!sessionManager || typeof sessionManager !== "object") return [];
+  const getBranch = (sessionManager as { getBranch?: unknown }).getBranch;
+  if (typeof getBranch !== "function") return [];
+  try {
+    const branch = getBranch.call(sessionManager);
+    return Array.isArray(branch) ? branch : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistInitialRoutingMetadata(params: {
+  cwd: string;
+  childId: string;
+  description?: string;
+  aliases?: string[];
+  authorityEntries?: readonly unknown[];
+  pi?: ExtensionAPI;
+}): InitialRoutingMetadataResult | undefined {
+  if (params.description === undefined) return undefined;
+  if (!isValidSubagentId(params.childId)) {
+    return {
+      status: "warning",
+      error: `spawn returned invalid child id ${params.childId}`,
+    };
+  }
+  try {
+    const overlay = upsertOrchestratorRoutingEntry(
+      params.cwd,
+      {
+        childId: params.childId,
+        description: params.description!,
+        ...(params.aliases === undefined ? {} : { aliases: params.aliases }),
+        provenance: "orchestratorv2",
+      },
+      { authorityEntries: params.authorityEntries ?? [] },
+    );
+    const entry = overlay.records.find(
+      (record) => record.childId === params.childId,
+    );
+    if (!entry) throw new Error("routing metadata update was not persisted");
+    appendOrchestratorRoutingAuthorityEntry(params.pi ?? {}, params.cwd, entry);
+    return { status: "persisted", entry };
+  } catch (error) {
+    return {
+      status: "warning",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function validateInitialRoutingMetadata(
+  description: string | undefined,
+  aliases: string[] | undefined,
+): string | undefined {
+  if (aliases !== undefined && description === undefined) {
+    return "routingAliases requires routingDescription";
+  }
+  if (description === undefined) return undefined;
+  if (description.trim().length === 0) {
+    return "description must be a non-empty string";
+  }
+  const descriptionBytes = Buffer.byteLength(description, "utf8");
+  if (descriptionBytes > MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES) {
+    return `description exceeds ${MAX_ORCHESTRATOR_ROUTING_DESCRIPTION_BYTES} bytes`;
+  }
+  if (aliases === undefined) return undefined;
+  if (aliases.length > MAX_ORCHESTRATOR_ROUTING_ALIASES) {
+    return `aliases exceeds ${MAX_ORCHESTRATOR_ROUTING_ALIASES} entries`;
+  }
+  const seen = new Set<string>();
+  for (const alias of aliases) {
+    if (alias.trim().length === 0) return "alias must be a non-empty string";
+    if (
+      Buffer.byteLength(alias, "utf8") > MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES
+    ) {
+      return `alias exceeds ${MAX_ORCHESTRATOR_ROUTING_ALIAS_BYTES} bytes`;
+    }
+    if (seen.has(alias)) return `duplicate alias: ${alias}`;
+    seen.add(alias);
+  }
+  return undefined;
+}
+
+function validateRoutingMetadataMode(
+  topLevelOrchestratorV2: boolean,
+  description: string | undefined,
+  aliases: string[] | undefined,
+): string | undefined {
+  if (topLevelOrchestratorV2 && description === undefined) {
+    return "routingDescription is required for a top-level Orchestratorv2 child";
+  }
+  if (!topLevelOrchestratorV2 && (description !== undefined || aliases)) {
+    return "routingDescription and routingAliases are reserved for a top-level Orchestratorv2 session";
+  }
+  return undefined;
+}
+function persistInteractiveRollbackTombstone(
+  state: InteractiveSubagentState,
+): void {
+  const tombstoneAt = Date.now();
+  if (!state.parentSessionId) return;
+  try {
+    updateInteractiveState(state.cwd, state.id, (entry) => {
+      delete entry.completionPolicy;
+      delete entry.completionGroupId;
+      delete entry.notifyOnComplete;
+      delete entry.triggerTurnOnComplete;
+      entry.completionTombstone = "failed";
+      entry.completionTombstoneAt = tombstoneAt;
+    });
+  } catch (error) {
+    debugLog("warn", "interactive_spawn_tombstone_failed", {
+      id: state.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function rollbackInteractiveSpawn(state: InteractiveSubagentState): void {
+  state.completionPolicy = undefined;
+  state.completionGroupId = undefined;
+  try {
+    cancelInteractiveSubagent(state.id, "cancel_interactive_subagent", state);
+  } catch {
+    /* Registration failed; pane cleanup is best effort. */
+  }
+  removeInteractiveSubagentState(state);
+  if (state.parentSessionId) {
+    try {
+      removeInteractiveState(state.cwd, state.id);
+    } catch {
+      persistInteractiveRollbackTombstone(state);
+    }
+  }
+}
+
 export function findArtifactById(id: string): SubagentArtifact | null {
-  // Sub-agent ids are randomBytes(8).toString("hex") at spawn time, i.e. 16
-  // lowercase hex chars. Validate the id before joining it into a path so that an
-  // LLM-supplied id like "../../../etc" can't escape the artifact root
+  // Sub-agent ids are historically 4 random bytes (8 hex chars) and currently
+  // 8 random bytes (16 hex chars). Validate before joining into a path so that
+  // an LLM-supplied id like "../../../etc" cannot escape the artifact root.
   // (path.join normalises "..", so a malicious id would otherwise resolve
   // to a sibling directory and get exfiltrated to the parent LLM via
   // read_subagent_artifact).
@@ -120,6 +320,44 @@ function getArtifactForState(
   state: Pick<InteractiveSubagentState, "artifactDir">,
 ): SubagentArtifact {
   return artifactPath(dirname(state.artifactDir), basename(state.artifactDir));
+}
+
+interface SelectedCompletion {
+  turnId: string;
+  protocolV2: boolean;
+}
+
+function completionForRead(
+  art: SubagentArtifact,
+  selector: { turn?: number; turnId?: string },
+): SelectedCompletion | undefined {
+  const completions: ReturnType<typeof readEventBatch>["records"] = [];
+  const snapshotEndOffset = eventLogEndOffset(art);
+  let cursor = 0;
+  while (cursor < snapshotEndOffset) {
+    const batch = readEventBatch(art, cursor);
+    for (const record of batch.records) {
+      if (record.endOffset > snapshotEndOffset) break;
+      if (isCompletionEvent(record.event)) completions.push(record);
+    }
+    const nextOffset = batch.records.at(-1)?.endOffset ?? batch.endOffset;
+    if (nextOffset <= cursor) break;
+    cursor = Math.min(nextOffset, snapshotEndOffset);
+  }
+  const selected = selector.turnId
+    ? completions.find(
+        ({ event }) =>
+          event.type === "completion" && event.turnId === selector.turnId,
+      )
+    : selector.turn !== undefined
+      ? completions.filter(({ event }) => event.type === "done")[
+          selector.turn - 1
+        ]
+      : completions.at(-1);
+  if (!selected) return undefined;
+  return selected.event.type === "completion"
+    ? { turnId: selected.event.turnId, protocolV2: true }
+    : { turnId: `legacy-${selected.startOffset}`, protocolV2: false };
 }
 
 function resolveInteractiveToolStates(token: SessionToolToken | undefined):
@@ -188,10 +426,10 @@ export function registerInteractiveSubagentTools(
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
       "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
-      "Both completion modes show the user a notification.",
-      'Defaults: notifyOnComplete="notify" and triggerTurnOnComplete=true.',
-      "The default stores only an artifact pointer (output is not injected) and automatically starts the next parent turn after pointer delivery.",
-      "Explicit triggerTurnOnComplete=false disables the automatic turn for either mode.",
+      "Completion coordination defaults to each: every terminal turn creates one TUI-only notice, while safely-idle results are coalesced into a compact immutable-reference manifest that resumes the parent.",
+      "Use completionPolicy=group with a shared completionGroupId for related agents; the parent resumes once the spawning turn settles and every registered member is terminal.",
+      "Human input takes priority, and successful read_subagent_artifact collection consumes the matching pending delivery.",
+      "Deprecated notifyOnComplete and triggerTurnOnComplete inputs map to coordinated each delivery and cannot be combined with completionPolicy or completionGroupId.",
     ].join("\n"),
     parameters: InteractiveParams,
 
@@ -224,31 +462,140 @@ export function registerInteractiveSubagentTools(
           isError: true,
         };
       }
+      const routingMetadataError = validateInitialRoutingMetadata(
+        params.routingDescription,
+        params.routingAliases,
+      );
+      const topLevelOrchestratorV2 =
+        registration.scope !== undefined &&
+        process.env.PI_SUBAGENTURA_CHILD !== "1" &&
+        isOrchestratorV2Enabled(pi);
+      const routingModeError = validateRoutingMetadataMode(
+        topLevelOrchestratorV2,
+        params.routingDescription,
+        params.routingAliases,
+      );
+      if (routingMetadataError || routingModeError) {
+        const error = routingMetadataError ?? routingModeError!;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid initial routing metadata: ${error}`,
+            },
+          ],
+          details: {
+            status: "invalid_routing_metadata",
+            error,
+          },
+          isError: true,
+        };
+      }
+      const contextParams = params as typeof params & {
+        includeContext?: boolean;
+        context?: string;
+      };
+      if (
+        contextParams.context !== undefined &&
+        Buffer.byteLength(contextParams.context, "utf8") >
+          MAX_INTERACTIVE_CONTEXT_BYTES
+      ) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Explicit context exceeds ${MAX_INTERACTIVE_CONTEXT_BYTES} bytes.`,
+            },
+          ],
+          details: {
+            status: "invalid_context",
+            maxBytes: MAX_INTERACTIVE_CONTEXT_BYTES,
+          },
+          isError: true,
+        };
+      }
+      let completion: ResolvedCompletionPolicy;
+      try {
+        if (
+          !registration.scope &&
+          (params.completionPolicy !== undefined ||
+            params.completionGroupId !== undefined)
+        ) {
+          throw new Error(
+            "completionPolicy and completionGroupId require a live parent session scope for coordinated delivery",
+          );
+        }
+        completion = registration.scope
+          ? resolveCompletionPolicy(params)
+          : { legacy: true };
+        if (registration.scope) {
+          assertCompletionGroupOpen(
+            completion.policy,
+            completion.groupId,
+            sessionOwner(registration.scope),
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            { type: "text", text: `Sub-agent not started: ${message}` },
+          ],
+          details: { status: "error", error: message },
+          isError: true,
+        };
+      }
       const completionMode = params.notifyOnComplete ?? "notify";
       const triggerTurn = completionTriggersTurn(
         completionMode,
         params.triggerTurnOnComplete ?? true,
       );
+      let completionReservation: CompletionGroupReservation | undefined;
+      if (registration.scope) {
+        try {
+          completionReservation = reserveCompletionGroup(
+            completion.policy,
+            completion.groupId,
+            sessionOwner(registration.scope),
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `Sub-agent not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
+      }
       debugLog("info", "tool_call", {
         toolName: "subagent_interactive",
         toolCallId: _toolCallId,
         taskLength: params.task?.length ?? 0,
         model: params.model ?? null,
         cwd: params.cwd ?? ctx.cwd,
-        includeContext: params.includeContext ?? false,
-        notifyOnComplete: completionMode,
-        triggerTurnOnComplete: triggerTurn,
+        includeContext: contextParams.includeContext ?? false,
+        notifyOnComplete: completion.legacy ? completionMode : null,
+        triggerTurnOnComplete: completion.legacy ? triggerTurn : null,
+        completionPolicy: completion.policy ?? "legacy",
+        completionGroupId: completion.groupId ?? null,
       });
 
-      let contextText: string | null = null;
-      if (params.includeContext === true) {
+      let contextText: string | null =
+        contextParams.includeContext === false
+          ? (contextParams.context ?? null)
+          : null;
+      let authorityEntries: readonly unknown[] | undefined;
+      if (contextParams.includeContext === true) {
         const branch = ctx.sessionManager.getBranch();
+        authorityEntries = branch;
         const messages = branch
           .filter(
             (e): e is typeof e & { type: "message" } => e.type === "message",
           )
           .map((e) => e.message);
         contextText = serializeConversation(convertToLlm(messages));
+      } else if (topLevelOrchestratorV2) {
+        authorityEntries = parentBranchEntries(ctx);
       }
 
       const taskPreview = params.task.replace(/\s+/g, " ").slice(0, 48);
@@ -264,14 +611,49 @@ export function registerInteractiveSubagentTools(
           cwd: targetCwd,
           contextText,
           background: params.background, // defaults to true (hidden) inside the helper
-          notifyOnComplete: completionMode,
-          triggerTurnOnComplete: triggerTurn,
+          notifyOnComplete: completion.legacy ? completionMode : undefined,
+          triggerTurnOnComplete: completion.legacy ? triggerTurn : undefined,
+          completionPolicy: completion.policy,
+          completionGroupId: completion.groupId,
           muxPreference: params.mux, // pass through user's mux preference
           parentCwd: ctx.cwd,
           parentSessionId: ctx.sessionManager.getSessionId(),
           thinkingLevel: params.thinkingLevel,
           sessionScope: registration.scope,
           spawnTreeContext: registration.scope?.spawnTreeContext,
+        });
+        if (registration.scope && completion.policy) {
+          try {
+            registerCompletionMember(
+              "interactive",
+              state.id,
+              completion.policy,
+              completion.groupId,
+              sessionOwner(registration.scope),
+              completionReservation,
+            );
+          } catch (error) {
+            releaseCompletionGroup(completionReservation);
+            rollbackInteractiveSpawn(state);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to start interactive sub-agent: ${error instanceof Error ? error.message : String(error)}`,
+                },
+              ],
+              details: { status: "error", error: String(error) },
+              isError: true,
+            };
+          }
+        }
+        const routingMetadata = persistInitialRoutingMetadata({
+          cwd: ctx.cwd,
+          childId: state.id,
+          description: params.routingDescription,
+          aliases: params.routingAliases,
+          authorityEntries,
+          pi,
         });
         updateRunningSubagentFooter(
           ctx.ui,
@@ -287,13 +669,28 @@ export function registerInteractiveSubagentTools(
         }
         locationLines.push(`Focus: ${state.selectPaneCommand}`);
         locationLines.push(`Session: ${state.sessionFile}`);
+        if (routingMetadata?.status === "warning") {
+          locationLines.push(
+            `Warning: initial routing metadata was not persisted: ${routingMetadata.error}`,
+          );
+        }
         return {
           content: [
             {
               type: "text",
               text:
                 `Interactive sub-agent ${state.id} started (${displayMode}) in ${state.mux} pane ${state.paneId}.\n\n` +
-                `${formatCompletionDeliveryBehavior(completionMode, triggerTurn, "planned")}\n\n` +
+                `${
+                  completion.legacy
+                    ? formatCompletionDeliveryBehavior(
+                        completionMode,
+                        triggerTurn,
+                        "planned",
+                      )
+                    : completion.policy === "group"
+                      ? `Completion will notify the user immediately and resume the parent once group ${completion.groupId} is sealed at parent settlement and all registered members finish.`
+                      : "Completion will notify the user immediately and resume the parent with immutable result references when safely idle."
+                }\n\n` +
                 locationLines.join("\n"),
             },
           ],
@@ -301,9 +698,11 @@ export function registerInteractiveSubagentTools(
             ...state,
             status: "started",
             thinkingLevel: params.thinkingLevel,
+            ...(routingMetadata === undefined ? {} : { routingMetadata }),
           },
         };
       } catch (error) {
+        releaseCompletionGroup(completionReservation);
         const msg = error instanceof Error ? error.message : String(error);
         return {
           content: [
@@ -423,7 +822,7 @@ export function registerInteractiveSubagentTools(
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
     description:
-      "Kill an interactive sub-agent pane. The tool result acknowledges parent-initiated cancellation, so artifacts are retained without injecting a duplicate cancellation completion into LLM context.",
+      "Kill an interactive sub-agent pane and retain its cancelled artifact. Coordinated delivery still emits one TUI-only terminal notice and may later add a compact cancellation selector; the tool result does not inject a duplicate full-output cancellation message.",
     parameters: Type.Object({
       jobId: Type.String({
         description:
@@ -464,7 +863,7 @@ export function registerInteractiveSubagentTools(
           ? ` Snapshot error: ${state.cancellationSnapshot.error}`
           : "";
       userNotification =
-        `Interactive sub-agent ${params.jobId} cancelled; no separate cancellation completion was injected into the parent LLM. ` +
+        `Interactive sub-agent ${params.jobId} cancelled; coordinated delivery will use one TUI notice and, when eligible, one compact cancellation selector. ` +
         `Artifacts retained at ${state.artifactDir}.${snapshotText}`;
       try {
         ctx.ui.notify(userNotification, "warning");
@@ -477,7 +876,7 @@ export function registerInteractiveSubagentTools(
             type: "text",
             text:
               `Interactive sub-agent ${params.jobId} cancelled. ` +
-              `No separate cancellation completion will be injected into the parent LLM. ` +
+              `Coordinated delivery will use one TUI notice and, when eligible, one compact cancellation selector. ` +
               `Artifacts retained at ${state.artifactDir}.` +
               (state.cancellationSnapshot?.path
                 ? ` Snapshot ${state.cancellationSnapshot.status}: ${state.cancellationSnapshot.path}.`
@@ -509,8 +908,10 @@ export function registerInteractiveSubagentTools(
       "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
       "is a true follow-up turn, not a fresh spawn. A workflow-owned child can accept a follow-up",
       "only after its completed turn is idle and its workflow runner has consumed the result. It is",
-      "promoted to standalone only after that follow-up is sent successfully. The child will run the",
-      "new turn and (per its system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
+      "promoted to standalone only after that follow-up is sent successfully. An idle follow-up resets",
+      "future completion delivery to independent each; a source can satisfy a group only once, so later",
+      "turns from that source/group are also independent. The child will run the new turn and (per its",
+      "system prompt) call '$ARTIFACT_DIR/cli.mjs done 0' again when it finishes. Use",
       "get_interactive_subagent_status to check the pane state first if you're not sure it's still alive.",
     ].join("\n"),
     parameters: Type.Object({
@@ -531,7 +932,7 @@ export function registerInteractiveSubagentTools(
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 or 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },
@@ -618,18 +1019,9 @@ export function registerInteractiveSubagentTools(
       // sendCommandToPane uses send-keys + Enter; it throws synchronously if the
       // pane is gone (e.g. the child exited between the status check and now).
       // Wrap so the parent gets a structured error instead of an exception trace.
+      const startsNewTurn = state.status === "idle";
       try {
         sendCommandToPane(state, params.message + FOLLOWUP_COMPLETION_REMINDER);
-        // Reaching the send proves both workflow release conditions held at the guard above.
-        // Release ownership only after sendCommandToPane succeeds so a failed send remains owned.
-        if (
-          state.completionOwner === "workflow" &&
-          state.workflowResultConsumed &&
-          state.status === "idle"
-        ) {
-          state.completionOwner = "standalone";
-          state.workflowId = undefined;
-        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -648,6 +1040,39 @@ export function registerInteractiveSubagentTools(
           isError: true,
         };
       }
+      // Reaching the send proves both workflow release conditions held at the guard above.
+      if (
+        state.completionOwner === "workflow" &&
+        state.workflowResultConsumed &&
+        state.status === "idle"
+      ) {
+        state.completionOwner = "standalone";
+        state.workflowId = undefined;
+      }
+      let persistenceWarning: string | undefined;
+      if (startsNewTurn) {
+        state.completionPolicy = "each";
+        state.completionGroupId = undefined;
+        state.notifyOnComplete = undefined;
+        state.triggerTurnOnComplete = undefined;
+        if (state.parentSessionId) {
+          try {
+            updateInteractiveState(state.cwd, state.id, (entry) => {
+              entry.completionPolicy = "each";
+              delete entry.completionGroupId;
+              delete entry.notifyOnComplete;
+              delete entry.triggerTurnOnComplete;
+            });
+          } catch (error) {
+            persistenceWarning =
+              "The message was sent, but the new completion policy could not be persisted; reload may require manual recovery.";
+            debugLog("warn", "interactive_followup_policy_persist_failed", {
+              id: state.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
       const messagePreview = formatFollowupPreview(params.message);
       const messageTruncated =
         params.message.length > MAX_FOLLOWUP_PREVIEW_CHARS;
@@ -657,11 +1082,13 @@ export function registerInteractiveSubagentTools(
             type: "text",
             text:
               `Sent follow-up to interactive sub-agent ${params.id} (${params.message.length} chars) in pane ${state.paneId}.` +
-              `\n\nMessage sent:\n${messagePreview}`,
+              `\n\nMessage sent:\n${messagePreview}` +
+              (persistenceWarning ? `\n\nWarning: ${persistenceWarning}` : ""),
           },
         ],
         details: {
           id: params.id,
+          ...(persistenceWarning ? { persistenceWarning } : {}),
           paneId: state.paneId,
           messageLength: params.message.length,
           messagePreview,
@@ -673,18 +1100,18 @@ export function registerInteractiveSubagentTools(
   });
 
   // ── Tool: read an interactive sub-agent's artifact ───────────────
-  // The artifact (events.ndjson + output.md) is the source of truth for what the
-  // sub-agent did. The main agent calls this when it wants to know more than the pointer.
-  // The artifact (events.ndjson + output.md + output-N.md snapshots) is the source of truth for what
-  // the sub-agent did. The main agent calls this when it wants to know more than the pointer.
+  // Events and immutable terminal snapshots are authoritative. output.md remains
+  // mutable staging for legacy or still-running artifacts only.
   registerToolWithDefaultGuidance(pi, {
     name: "read_subagent_artifact",
     label: "Read Subagent Artifact",
     description: [
-      "Read an interactive sub-agent's artifact on disk. Returns the lifecycle events and,",
-      "if present, the sub-agent's output.md (the latest turn's content) or a specific turn's snapshot.",
+      "Read an interactive sub-agent's artifact on disk. Returns lifecycle events and, by default,",
+      "the latest terminal immutable protocol-v2 snapshot. Mutable output.md is used only when",
+      "no protocol-v2 terminal snapshot applies, including legacy or still-running artifacts.",
       "Use `since` (unix ms) to fetch only events newer than your last read. Use `turnId` for a",
       "protocol-v2 Pi turn, or legacy numeric `turn` for an output-N.md snapshot.",
+      "Returning a terminal output consumes its matching pending coordinated delivery so it is not sent again automatically; events-only reads do not consume it.",
     ].join("\n"),
     parameters: Type.Object({
       id: Type.String({
@@ -710,8 +1137,9 @@ export function registerInteractiveSubagentTools(
       ),
       turnId: Type.Optional(
         Type.String({
+          maxLength: MAX_TURN_ID_LENGTH,
           description:
-            "Read a protocol-v2 immutable output by its Pi-derived turnId.",
+            "Read a protocol-v2 immutable output by its Pi-derived turnId (max 256 characters).",
         }),
       ),
     }),
@@ -724,7 +1152,7 @@ export function registerInteractiveSubagentTools(
           content: [
             {
               type: "text",
-              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 16 lowercase hex chars.`,
+              text: `Invalid sub-agent id ${JSON.stringify(params.id)}; expected 8 or 16 lowercase hex chars.`,
             },
           ],
           details: { id: params.id, status: "invalid_id" },
@@ -771,12 +1199,17 @@ export function registerInteractiveSubagentTools(
         params.includeOutput !== false ||
         params.turn !== undefined ||
         params.turnId !== undefined;
+      const selectedCompletion = wantsOutput
+        ? completionForRead(art, params)
+        : undefined;
       const output = wantsOutput
         ? params.turnId !== undefined
           ? readOutputForTurnId(art, params.turnId)
           : params.turn !== undefined
             ? readOutputForTurn(art, params.turn)
-            : readOutput(art)
+            : selectedCompletion?.protocolV2
+              ? readOutputForTurnId(art, selectedCompletion.turnId)
+              : readOutput(art)
         : null;
       const lastEventValue =
         events.length > 0 ? events[events.length - 1] : null;
@@ -784,7 +1217,9 @@ export function registerInteractiveSubagentTools(
       // doesn't see a misleading "not written yet" after the sub-agent has
       // already exited (the common case: model finished without writing).
       let outputText: string;
-      if (output === null) {
+      if (!wantsOutput) {
+        outputText = "(not requested)";
+      } else if (output === null) {
         if (params.turnId !== undefined) {
           outputText = `(no immutable snapshot for turnId ${params.turnId})`;
         } else if (params.turn !== undefined) {
@@ -814,6 +1249,15 @@ export function registerInteractiveSubagentTools(
               .map(({ turnId, eventId }) => `${turnId} → ${eventId}`)
               .join(", ")}\n`
           : "";
+      if (wantsOutput && output !== null && selectedCompletion) {
+        consumeCompletionSource(
+          pi,
+          "interactive",
+          params.id,
+          registration?.scope ? sessionOwner(registration.scope) : undefined,
+          selectedCompletion.turnId,
+        );
+      }
       return {
         content: [
           {
@@ -829,7 +1273,8 @@ export function registerInteractiveSubagentTools(
                 : "") +
               turnsLine +
               historyLine +
-              `Output: ${outputText}`,
+              `Output: ${outputText}` +
+              (wantsOutput ? formatArtifactProviderOutput(output) : ""),
           },
         ],
         details: {

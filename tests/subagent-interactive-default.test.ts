@@ -18,10 +18,12 @@ const {
   mockCancelInteractiveSubagent,
   mockLaunchInteractiveSubagent,
   mockPruneDeadInteractiveSubagents,
+  mockUpsertOrchestratorRoutingEntry,
 } = vi.hoisted(() => ({
   mockCancelInteractiveSubagent: vi.fn(),
   mockLaunchInteractiveSubagent: vi.fn(),
   mockPruneDeadInteractiveSubagents: vi.fn(),
+  mockUpsertOrchestratorRoutingEntry: vi.fn(),
 }));
 
 vi.mock("../src/interactive-tmux", async (importOriginal) => {
@@ -35,16 +37,29 @@ vi.mock("../src/interactive-tmux", async (importOriginal) => {
   };
 });
 
+vi.mock("../src/orchestrator-routing", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/orchestrator-routing")>();
+  return {
+    ...actual,
+    upsertOrchestratorRoutingEntry: mockUpsertOrchestratorRoutingEntry,
+  };
+});
+
 import registerExtension from "../src/subagent";
 import {
   formatInteractiveState,
   interactiveSubagentRegistry,
+  type InteractiveSubagentState,
 } from "../src/interactive-tmux";
+import { enqueueDelivery, flushDeliveries } from "../src/delivery";
+import { registerCompletionMember } from "../src/completion-coordinator";
 import {
   clearSessionScopes,
   getStartedSessionScopes,
   registerSessionScope,
 } from "../src/session-scope";
+import { InteractiveParams } from "../src/schemas";
 import { registerInteractiveSubagentTools } from "../src/tools/interactive";
 
 const savedTmux = process.env.TMUX;
@@ -116,6 +131,23 @@ describe("subagent_interactive tool lifecycle", () => {
     registerExtension(_api as any);
     return _api;
   }
+  function setupScopeLessExtension() {
+    const _api = {
+      registerTool: vi.fn(),
+      registerMessageRenderer: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      appendEntry: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn().mockReturnValue(false),
+      sendMessage: vi.fn(),
+      sendUserMessage: vi.fn(),
+      on: vi.fn(),
+    };
+    registerInteractiveSubagentTools(
+      _api as unknown as Parameters<typeof registerInteractiveSubagentTools>[0],
+    );
+    return _api;
+  }
 
   /** Bind ui + sessionManager onto the registered session context. */
   function startSession(ctx: ReturnType<typeof mockCtx>): void {
@@ -135,6 +167,7 @@ describe("subagent_interactive tool lifecycle", () => {
     mockLaunchInteractiveSubagent.mockReset();
     mockCancelInteractiveSubagent.mockReset();
     mockPruneDeadInteractiveSubagents.mockReset();
+    mockUpsertOrchestratorRoutingEntry.mockReset();
     mockCancelInteractiveSubagent.mockReturnValue(
       mockInteractiveState("cancelled"),
     );
@@ -207,7 +240,91 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
-  it("defaults to notify + automatic triggering when both params are omitted", async () => {
+  it.each(["notify", "inject"] as const)(
+    "keeps legacy %s delivery for a scope-less registration",
+    async (mode) => {
+      clearSessionScopes();
+      const scopeLessApi = setupScopeLessExtension();
+      const toolDef = getInteractiveToolDef(scopeLessApi);
+      const state =
+        mockInteractiveState() as unknown as InteractiveSubagentState;
+      mockLaunchInteractiveSubagent.mockReturnValueOnce(state);
+      const ctx = mockCtx();
+
+      const result = await toolDef.execute(
+        `call-scope-less-${mode}`,
+        { task: "legacy delivery", notifyOnComplete: mode },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+      expect(result.details.status).toBe("started");
+      expect(mockLaunchInteractiveSubagent).toHaveBeenCalledOnce();
+      const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+      expect(launch.notifyOnComplete).toBe(mode);
+      expect(launch.triggerTurnOnComplete).toBe(true);
+      expect(launch.completionPolicy).toBeUndefined();
+      expect(launch.completionGroupId).toBeUndefined();
+
+      interactiveSubagentRegistry.set(state.id, state);
+      enqueueDelivery(
+        state,
+        {
+          deliveryId: `scope-less-${mode}`,
+          subagentId: state.id,
+          turnId: "legacy-turn",
+          eventId: "legacy-event",
+          mode,
+          triggerTurn: true,
+          status: "done",
+          artifactDir: state.artifactDir,
+          state: "queued",
+        },
+        { persist: false },
+      );
+      flushDeliveries(
+        scopeLessApi as unknown as Parameters<typeof flushDeliveries>[0],
+        ctx.ui as unknown as Parameters<typeof flushDeliveries>[1],
+      );
+
+      expect(scopeLessApi.sendMessage).toHaveBeenCalledOnce();
+      expect(scopeLessApi.sendMessage.mock.calls[0][1]).toMatchObject({
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      expect(scopeLessApi.sendUserMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["each", { completionPolicy: "each" }],
+    ["group", { completionPolicy: "group", completionGroupId: "legacy-group" }],
+  ] as const)(
+    "rejects scope-less explicit %s completion controls before launch",
+    async (_label, controls) => {
+      clearSessionScopes();
+      const scopeLessApi = setupScopeLessExtension();
+      const toolDef = getInteractiveToolDef(scopeLessApi);
+
+      const result = await toolDef.execute(
+        "call-scope-less-coordination",
+        { task: "must not launch", ...controls },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      expect(result).toMatchObject({
+        isError: true,
+        details: { status: "error" },
+      });
+      expect(result.content[0].text).toContain("live parent session scope");
+      expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+    },
+  );
+
+  it("defaults to coordinated independent reference delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
 
@@ -221,23 +338,326 @@ describe("subagent_interactive tool lifecycle", () => {
 
     expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
     const callArgs = mockLaunchInteractiveSubagent.mock.calls[0][0];
-    expect(callArgs.notifyOnComplete).toBe("notify");
-    expect(callArgs.triggerTurnOnComplete).toBe(true);
+    expect(callArgs.notifyOnComplete).toBeUndefined();
+    expect(callArgs.triggerTurnOnComplete).toBeUndefined();
+    expect(callArgs.completionPolicy).toBe("each");
     expect(callArgs.spawnTreeContext).toMatchObject({
       role: "root",
       rootId: "test-session-id",
     });
+    expect(callArgs.contextText).toBeNull();
+    expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+    expect(result.content[0].text).toContain("notify the user immediately");
     expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
+      "immutable result references when safely idle",
     );
   });
 
-  it("defaults explicit notify mode to automatic triggering", async () => {
+  it("passes explicit context directly without reading the parent branch", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const ctx = mockCtx();
+
+    await toolDef.execute(
+      "call-explicit-context",
+      {
+        task: "research X",
+        includeContext: false,
+        context: "EXPLICIT-CONTEXT-MARKER",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(ctx.sessionManager.getBranch).not.toHaveBeenCalled();
+    expect(mockLaunchInteractiveSubagent.mock.calls[0][0].contextText).toBe(
+      "EXPLICIT-CONTEXT-MARKER",
+    );
+  });
+
+  it("uses only the serialized parent branch when includeContext is true", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const ctx = mockCtx();
+    ctx.sessionManager.getBranch.mockReturnValue([
+      {
+        type: "message",
+        message: { role: "user", content: "PARENT-BRANCH-MARKER" },
+      },
+    ]);
+
+    await toolDef.execute(
+      "call-parent-context",
+      {
+        task: "research X",
+        includeContext: true,
+        context: "EXPLICIT-CONTEXT-MUST-NOT-BE-CONCATENATED",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(ctx.sessionManager.getBranch).toHaveBeenCalledOnce();
+    const contextText = mockLaunchInteractiveSubagent.mock.calls[0][0]
+      .contextText as string;
+    expect(contextText).toContain("PARENT-BRANCH-MARKER");
+    expect(contextText).not.toContain(
+      "EXPLICIT-CONTEXT-MUST-NOT-BE-CONCATENATED",
+    );
+  });
+
+  it("persists initial routing metadata only after a successful spawn", async () => {
+    api.getFlag.mockImplementation((name: string) => name === "orchestratorv2");
+    const toolDef = getInteractiveToolDef(api);
+    const state = {
+      ...mockInteractiveState(),
+      id: "0123456789abcdef",
+      artifactDir: "/tmp/artifacts/0123456789abcdef",
+    };
+    const entry = {
+      childId: state.id,
+      description: "Own the API migration",
+      aliases: ["api", "migration"],
+      provenance: "orchestratorv2" as const,
+    };
+    mockLaunchInteractiveSubagent.mockReturnValueOnce(state);
+    mockUpsertOrchestratorRoutingEntry.mockReturnValueOnce({
+      records: [entry],
+    });
+
+    const result = await toolDef.execute(
+      "call-routing-metadata",
+      {
+        task: "research X",
+        routingDescription: entry.description,
+        routingAliases: entry.aliases,
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledOnce();
+    expect(mockUpsertOrchestratorRoutingEntry).toHaveBeenCalledWith(
+      "/tmp",
+      entry,
+      { authorityEntries: [] },
+    );
+    expect(
+      mockLaunchInteractiveSubagent.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      mockUpsertOrchestratorRoutingEntry.mock.invocationCallOrder[0],
+    );
+    expect(result.details).toMatchObject({
+      status: "started",
+      routingMetadata: { status: "persisted", entry },
+    });
+
+    mockLaunchInteractiveSubagent.mockReset();
+    mockUpsertOrchestratorRoutingEntry.mockClear();
+    mockLaunchInteractiveSubagent.mockImplementationOnce(() => {
+      throw new Error("mux unavailable");
+    });
+    const failed = await toolDef.execute(
+      "call-routing-spawn-failure",
+      {
+        task: "research X",
+        routingDescription: entry.description,
+        routingAliases: entry.aliases,
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(failed.details.status).toBe("error");
+    expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+  });
+  it("rejects a v2 spawn without routingDescription before reserving a group", async () => {
+    api.getFlag.mockImplementation((name: string) => name === "orchestratorv2");
+    const scope = getStartedSessionScopes()[0]!;
+    const owner = { id: scope.id, generation: scope.generation };
+    for (let index = 0; index < 512; index++) {
+      registerCompletionMember(
+        "interactive",
+        `filled-${index}`,
+        "group",
+        `filled-group-${index}`,
+        owner,
+      );
+    }
+
+    const result = await getInteractiveToolDef(api).execute(
+      "call-v2-routing-required",
+      {
+        task: "review shard",
+        completionPolicy: "group",
+        completionGroupId: "routing-required",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result).toMatchObject({
+      isError: true,
+      details: { status: "invalid_routing_metadata" },
+    });
+    expect(result.content[0].text).toContain(
+      "routingDescription is required for a top-level Orchestratorv2 child",
+    );
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+    expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+  });
+
+  it("rejects routing metadata that cannot persist before spawning", async () => {
     const toolDef = getInteractiveToolDef(api);
 
+    const aliasesOnly = await toolDef.execute(
+      "call-routing-aliases-only",
+      { task: "research X", routingAliases: ["api"] },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(aliasesOnly.isError).toBe(true);
+    expect(aliasesOnly.details).toMatchObject({
+      status: "invalid_routing_metadata",
+    });
+
+    const oversizedDescription = "😀".repeat(2048);
+    const oversized = await toolDef.execute(
+      "call-routing-oversized",
+      { task: "research X", routingDescription: oversizedDescription },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(oversized.isError).toBe(true);
+    expect(oversized.details).toMatchObject({
+      status: "invalid_routing_metadata",
+      error: expect.stringContaining("description exceeds 4096 bytes"),
+    });
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+    expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+  });
+
+  it("reports routing persistence failure without pretending the child failed", async () => {
+    api.getFlag.mockImplementation((name: string) => name === "orchestratorv2");
+    const toolDef = getInteractiveToolDef(api);
+    const state = {
+      ...mockInteractiveState(),
+      id: "0123456789abcdef",
+      artifactDir: "/tmp/artifacts/0123456789abcdef",
+    };
+    mockLaunchInteractiveSubagent.mockReturnValueOnce(state);
+    mockUpsertOrchestratorRoutingEntry.mockImplementationOnce(() => {
+      throw new Error("routing record count exceeds 128");
+    });
+
+    const result = await toolDef.execute(
+      "call-routing-warning",
+      {
+        task: "research X",
+        routingDescription: "Own the API migration",
+        routingAliases: ["api"],
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.details).toMatchObject({
+      id: state.id,
+      status: "started",
+      routingMetadata: {
+        status: "warning",
+        error: "routing record count exceeds 128",
+      },
+    });
+    expect(result.content[0].text).toContain(
+      `Interactive sub-agent ${state.id} started`,
+    );
+    expect(result.content[0].text).toContain(
+      "Warning: initial routing metadata was not persisted: routing record count exceeds 128",
+    );
+    expect(result.content[0].text).not.toContain(
+      "Failed to start interactive sub-agent",
+    );
+  });
+
+  it("forwards an explicit related completion group", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const result = await toolDef.execute(
+      "call-group",
+      {
+        task: "review shard",
+        completionPolicy: "group",
+        completionGroupId: "review",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        completionPolicy: "group",
+        completionGroupId: "review",
+      }),
+    );
+    expect(result.content[0].text).toContain("group review");
+  });
+
+  it("rejects a new group before launching at the group cap", async () => {
+    const scope = getStartedSessionScopes()[0]!;
+    const owner = { id: scope.id, generation: scope.generation };
+    for (let index = 0; index < 512; index++) {
+      registerCompletionMember(
+        "interactive",
+        `filled-${index}`,
+        "group",
+        `filled-group-${index}`,
+        owner,
+      );
+    }
+    const result = await getInteractiveToolDef(api).execute(
+      "call-group-overflow",
+      {
+        task: "review shard",
+        completionPolicy: "group",
+        completionGroupId: "overflow",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+    expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+  });
+
+  it("rejects conflicting coordinated and legacy delivery options", async () => {
+    const toolDef = getInteractiveToolDef(api);
+    const result = await toolDef.execute(
+      "call-conflict",
+      {
+        task: "review shard",
+        completionPolicy: "each",
+        notifyOnComplete: "notify",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("cannot be combined");
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+  });
+
+  it("maps explicit legacy notify mode to coordinated each delivery", async () => {
+    const toolDef = getInteractiveToolDef(api);
     const result = await toolDef.execute(
       "call-2",
       { task: "research X", notifyOnComplete: "notify" },
@@ -246,24 +666,16 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].notifyOnComplete,
-    ).toBe("notify");
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(true);
-    expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.notifyOnComplete).toBeUndefined();
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("notify the user immediately");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
-  it("explains explicit inject mode with automatic turn triggering disabled", async () => {
+  it("maps explicit legacy inject controls to coordinated each delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-3",
       {
@@ -276,24 +688,18 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].notifyOnComplete,
-    ).toBe("inject");
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(false);
-    expect(result.content[0].text).toContain(
-      "Completion output will be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "No new parent turn will start automatically",
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.notifyOnComplete).toBeUndefined();
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
+    expect(result.content[0].text).not.toContain(
+      "Completion output will be injected",
     );
   });
 
-  it("forwards triggerTurnOnComplete when explicitly passed", async () => {
+  it("accepts legacy triggerTurnOnComplete through coordinated delivery", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-trigger-turn",
       {
@@ -306,16 +712,10 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(mockLaunchInteractiveSubagent).toHaveBeenCalledTimes(1);
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(true);
-    expect(result.content[0].text).toContain(
-      "Completion output will not be injected into the parent LLM",
-    );
-    expect(result.content[0].text).toContain(
-      "A new parent turn will start automatically after the pointer delivery",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
   it("updates the running footer immediately after launch", async () => {
@@ -456,9 +856,8 @@ describe("subagent_interactive tool lifecycle", () => {
       undefined,
     );
   });
-  it("preserves explicit false triggering for notify mode", async () => {
+  it("maps legacy false triggering to coordinated timing", async () => {
     const toolDef = getInteractiveToolDef(api);
-
     const result = await toolDef.execute(
       "call-notify-no-trigger",
       {
@@ -471,12 +870,10 @@ describe("subagent_interactive tool lifecycle", () => {
       mockCtx(),
     );
 
-    expect(
-      mockLaunchInteractiveSubagent.mock.calls[0][0].triggerTurnOnComplete,
-    ).toBe(false);
-    expect(result.content[0].text).toContain(
-      "No new parent turn will start automatically",
-    );
+    const launch = mockLaunchInteractiveSubagent.mock.calls[0][0];
+    expect(launch.triggerTurnOnComplete).toBeUndefined();
+    expect(launch.completionPolicy).toBe("each");
+    expect(result.content[0].text).toContain("immutable result references");
   });
 
   it("notifies the user without scheduling another LLM completion when cancelled", async () => {
@@ -504,11 +901,11 @@ describe("subagent_interactive tool lifecycle", () => {
       expect.objectContaining({ id: "abc12345" }),
     );
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("no separate cancellation completion"),
+      expect.stringContaining("one compact cancellation selector"),
       "warning",
     );
     expect(result.content[0].text).toContain(
-      "No separate cancellation completion will be injected",
+      "one compact cancellation selector",
     );
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "subagentura-running",
@@ -516,20 +913,28 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
-  it("exposes notifyOnComplete in the schema with the new default documented", () => {
+  it("registers the intersected InteractiveParams schema and documents defaults", () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
     const params = toolDef.parameters;
-    // TypeBox runtime shape: properties.notifyOnComplete exists
-    const properties = (params as any).properties;
+    expect(params).toBe(InteractiveParams);
+    const [commonFields, contextModes] = (params as any).allOf;
+    const properties = commonFields.properties;
     expect(properties).toBeDefined();
     expect(properties.notifyOnComplete).toBeDefined();
     expect(properties.triggerTurnOnComplete).toBeDefined();
-    // Description must document 'notify' as the default and 'inject' as a valid
-    // alternative.
+    expect(properties.routingDescription).toBeDefined();
+    expect(properties.routingAliases).toBeDefined();
+    expect(properties.completionPolicy).toBeDefined();
+    expect(properties.completionGroupId).toBeDefined();
+    expect(contextModes.anyOf).toHaveLength(3);
     const desc = properties.notifyOnComplete.description ?? "";
-    expect(desc).toMatch(/notify.*default|default.*notify/i);
-    expect(desc).toContain('"inject"');
+    expect(desc).toMatch(/deprecated compatibility/i);
+    expect(desc).toContain("coordinated each");
+    expect(properties.completionPolicy.description).toMatch(
+      /defaults to "each"/i,
+    );
+    expect(properties.completionGroupId.description).toMatch(/required/i);
   });
 
   it("isolates peer status, cancel, send, list, and read tools", async () => {

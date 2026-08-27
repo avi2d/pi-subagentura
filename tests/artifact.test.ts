@@ -1033,7 +1033,14 @@ describe("persisted interactive state helpers", () => {
             ...SAMPLE,
             eventByteCursor: "not-a-number",
             sessionByteCursor: -10,
-            pendingDeliveries: [null, { nope: true }, validIntent],
+            pendingDeliveries: [
+              null,
+              { nope: true },
+              { ...validIntent, deliveryId: "x".repeat(129) },
+              { ...validIntent, turnId: "" },
+              { ...validIntent, eventId: "../escape" },
+              validIntent,
+            ],
             deliveryReceipts: ["one", "one", 42, "two"],
           },
         },
@@ -1048,6 +1055,50 @@ describe("persisted interactive state helpers", () => {
     expect(loaded.states[SAMPLE.id].sessionByteCursor).toBe(0);
     expect(loaded.states[SAMPLE.id].pendingDeliveries).toEqual([validIntent]);
     expect(loaded.states[SAMPLE.id].deliveryReceipts).toEqual(["one", "two"]);
+  });
+
+  it("normalizes malformed persisted group authority to coordinated each", () => {
+    const file = stateFilePath(root);
+    mkdirSync(join(root, ".pi"), { recursive: true, mode: 0o700 });
+    const groupedIntent = {
+      deliveryId: "delivery",
+      subagentId: SAMPLE.id,
+      turnId: "turn",
+      eventId: "event",
+      mode: "notify",
+      triggerTurn: false,
+      status: "done",
+      artifactDir: SAMPLE.artifactDir,
+      completionPolicy: "group",
+      completionGroupId: "bad\ngroup",
+      state: "queued",
+    };
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        parent: "pi",
+        states: {
+          [SAMPLE.id]: {
+            ...SAMPLE,
+            completionPolicy: "group",
+            completionGroupId: "bad\ngroup",
+            pendingDeliveries: [groupedIntent],
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    const loaded = loadInteractiveStates(root)!;
+    expect(loaded.states[SAMPLE.id].completionPolicy).toBe("each");
+    expect(loaded.states[SAMPLE.id].completionGroupId).toBeUndefined();
+    expect(loaded.states[SAMPLE.id].pendingDeliveries[0]).toMatchObject({
+      completionPolicy: "each",
+    });
+    expect(loaded.states[SAMPLE.id].pendingDeliveries[0]).not.toHaveProperty(
+      "completionGroupId",
+    );
   });
 
   it("skips malformed v2 state and intent shapes without throwing", () => {

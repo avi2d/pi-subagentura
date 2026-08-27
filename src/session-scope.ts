@@ -19,6 +19,7 @@ export type SessionScopeLifecycle = "registered" | "started" | "shutdown";
 export interface SessionScopeManager {
   getEntries?: () => unknown[];
   getSessionId?: () => string;
+  getSessionDir?: () => string;
 }
 
 /** Mutable state owned by one extension registration and lifecycle generation. */
@@ -27,10 +28,12 @@ export interface SessionScope {
   generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
+  cwd?: string;
   lifecycle: SessionScopeLifecycle;
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
   lineageMode?: "root" | "child";
+  isParentIdle?: () => boolean;
   parentStreaming: boolean;
   inProcessJobs: Map<string, JobState>;
   pendingInProcessDeliveries: PendingJobDelivery[];
@@ -43,10 +46,12 @@ export interface SessionScopeRegistration {
   generation: number;
   pi: ExtensionAPI;
   ui?: ExtensionUIContext;
+  cwd?: string;
   lifecycle?: SessionScopeLifecycle;
   sessionManager?: SessionScopeManager;
   spawnTreeContext?: ParsedSpawnTreeContext;
   lineageMode?: "root" | "child";
+  isParentIdle?: () => boolean;
   parentStreaming?: boolean;
   inProcessJobs?: Map<string, JobState>;
   pendingInProcessDeliveries?: PendingJobDelivery[];
@@ -152,6 +157,7 @@ export function registerSessionScope(
     existing.parentStreaming =
       registration.parentStreaming ?? existing.parentStreaming;
     if (registration.ui !== undefined) existing.ui = registration.ui;
+    if (registration.cwd !== undefined) existing.cwd = registration.cwd;
     if (registration.sessionManager !== undefined) {
       existing.sessionManager = registration.sessionManager;
     }
@@ -160,6 +166,9 @@ export function registerSessionScope(
     }
     if (registration.lineageMode !== undefined) {
       existing.lineageMode = registration.lineageMode;
+    }
+    if (registration.isParentIdle !== undefined) {
+      existing.isParentIdle = registration.isParentIdle;
     }
     if (registration.inProcessJobs !== undefined) {
       existing.inProcessJobs = registration.inProcessJobs;
@@ -181,10 +190,12 @@ export function registerSessionScope(
         generation: registration.generation,
         pi: registration.pi,
         ui: registration.ui,
+        cwd: registration.cwd,
         lifecycle: registration.lifecycle ?? "started",
         sessionManager: registration.sessionManager,
         spawnTreeContext: registration.spawnTreeContext,
         lineageMode: registration.lineageMode ?? "root",
+        isParentIdle: registration.isParentIdle,
         parentStreaming: registration.parentStreaming ?? false,
         inProcessJobs: registration.inProcessJobs ?? new Map(),
         pendingInProcessDeliveries:
@@ -320,6 +331,18 @@ export function getActiveSessionScopeId(): number | undefined {
 export function resolveStreamingFlag(owner?: SessionOwnerToken): boolean {
   if (owner) return resolveLiveSessionScope(owner)?.parentStreaming ?? false;
   return Boolean(getGlobalState().__piSubagenturaParentStreaming);
+}
+
+export function resolveActualStreamingFlag(owner?: SessionOwnerToken): boolean {
+  const scope = owner ? resolveLiveSessionScope(owner) : undefined;
+  if (scope?.isParentIdle) {
+    try {
+      return !scope.isParentIdle();
+    } catch {
+      // A stale context falls back to the event-maintained compatibility flag.
+    }
+  }
+  return resolveStreamingFlag(owner);
 }
 
 export interface InteractiveSessionOwnerState {

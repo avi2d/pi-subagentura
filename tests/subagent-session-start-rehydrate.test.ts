@@ -5,12 +5,47 @@
  * resume) and filters by parentSessionId.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { appendInteractiveState } from "../src/artifact";
+import type * as InteractiveTmuxModule from "../src/interactive-tmux";
 import { interactiveSubagentRegistry } from "../src/interactive-tmux";
+import { appendInteractiveState } from "../src/artifact";
+import {
+  ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+  createOrchestratorRoutingAuthorityEntry,
+  upsertOrchestratorRoutingEntry,
+  type OrchestratorRoutingEntry,
+} from "../src/orchestrator-routing";
 import { importFresh } from "./test-utils";
 import { makeTmp } from "./subagent-rehydrate-helpers";
+
+const { mockDebugLog } = vi.hoisted(() => ({ mockDebugLog: vi.fn() }));
+
+vi.mock("../src/helpers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/helpers")>();
+  return { ...actual, debugLog: mockDebugLog };
+});
+
+const ROUTED_CHILD = "0123456789abcdef";
+function parentContext(
+  cwd: string,
+  records: readonly OrchestratorRoutingEntry[],
+) {
+  const branch = records.map((record) => ({
+    type: "custom",
+    customType: ORCHESTRATOR_ROUTING_AUTHORITY_ENTRY_TYPE,
+    data: createOrchestratorRoutingAuthorityEntry(cwd, record),
+  }));
+  return {
+    cwd,
+    sessionManager: {
+      getBranch: () => branch,
+      getEntries: () => [],
+      getSessionId: () => "rehydrate-parent",
+    },
+  };
+}
+const LEGACY_ROUTED_CHILD = "abc12345";
 
 describe("session_start rehydrate integration", () => {
   let cwd: string;
@@ -24,7 +59,10 @@ describe("session_start rehydrate integration", () => {
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
+    mockDebugLog.mockClear();
+    vi.restoreAllMocks();
     vi.doUnmock("node:child_process");
+    vi.doUnmock("../src/interactive-tmux");
   });
 
   async function setupExtension() {
@@ -41,11 +79,18 @@ describe("session_start rehydrate integration", () => {
       await importFresh<typeof import("../src/subagent")>("../src/subagent")
     ).default;
     mod(api as any);
-    let startHandler: ((event: any, ctx: any) => void) | undefined;
+    let startHandler:
+      ((event: any, ctx: any) => void | Promise<void>) | undefined;
     for (const [event, handler] of (api.on as any).mock.calls) {
       if (event === "session_start") startHandler = handler;
     }
     return { api, startHandler };
+  }
+
+  function registeredTool(api: any, name: string): any {
+    return api.registerTool.mock.calls.find(([definition]: any[]) => {
+      return definition.name === name;
+    })?.[0];
   }
 
   it("session_start handler repopulates the registry from the on-disk state file", async () => {
@@ -83,6 +128,129 @@ describe("session_start rehydrate integration", () => {
       ),
     ).not.toThrow();
     expect(interactiveSubagentRegistry.size).toBe(0);
+  });
+
+  it.each(["startup", "reload", "resume"])(
+    "keeps routing metadata visible as stale/unknown after a fresh %s lifecycle",
+    async (reason) => {
+      const saved = upsertOrchestratorRoutingEntry(cwd, {
+        childId: ROUTED_CHILD,
+        description: "Own the restart-sensitive API work",
+        aliases: ["restart-api"],
+        provenance: "user",
+      }).records[0]!;
+      const ctx = parentContext(cwd, [saved]);
+
+      const { api, startHandler } = await setupExtension();
+      await startHandler!({ type: "session_start", reason }, ctx);
+      const result = await registeredTool(
+        api,
+        "list_orchestrator_agents",
+      ).execute("list-after-lifecycle", {}, undefined, undefined, ctx);
+
+      expect(interactiveSubagentRegistry.size).toBe(0);
+      expect(result.details).toMatchObject({
+        status: "ok",
+        routingMetadataStatus: "loaded",
+        agents: [
+          {
+            childId: ROUTED_CHILD,
+            description: "Own the restart-sensitive API work",
+            aliases: ["restart-api"],
+            status: "unknown",
+            liveness: "unknown",
+            stale: true,
+            actionable: false,
+            reason: "runtime_missing",
+          },
+        ],
+      });
+    },
+  );
+
+  it("rehydrates an 8-hex child for routing list and follow-up send", async () => {
+    const saved = upsertOrchestratorRoutingEntry(cwd, {
+      childId: LEGACY_ROUTED_CHILD,
+      description: "Own legacy interactive follow-ups",
+      provenance: "user",
+    }).records[0]!;
+    const ctx = parentContext(cwd, [saved]);
+    appendInteractiveState(cwd, {
+      id: LEGACY_ROUTED_CHILD,
+      paneId: "%42",
+      mux: "tmux",
+      artifactDir: join(cwd, LEGACY_ROUTED_CHILD),
+      sessionFile: "/tmp/sess.jsonl",
+      parentSessionId: "rehydrate-parent",
+    });
+
+    const mockSendCommandToPane = vi.fn();
+    vi.doMock("../src/interactive-tmux", async (importOriginal) => {
+      const actual = await importOriginal<typeof InteractiveTmuxModule>();
+      return {
+        ...actual,
+        isPaneAlive: vi.fn().mockReturnValue(true),
+        getInteractivePaneLivenessAsync: vi.fn().mockResolvedValue("alive"),
+        sendCommandToPane: mockSendCommandToPane,
+      };
+    });
+    const { api, startHandler } = await setupExtension();
+    await startHandler!({ type: "session_start", reason: "reload" }, ctx);
+
+    const listed = await registeredTool(
+      api,
+      "list_orchestrator_agents",
+    ).execute("list-legacy-child", {}, undefined, undefined, ctx);
+    expect(listed.details).toMatchObject({
+      routingMetadataStatus: "loaded",
+      agents: [
+        {
+          childId: LEGACY_ROUTED_CHILD,
+          description: "Own legacy interactive follow-ups",
+          provenance: "user",
+          status: "running",
+          liveness: "alive",
+          actionable: true,
+        },
+      ],
+    });
+
+    const sent = await registeredTool(
+      api,
+      "send_interactive_subagent_message",
+    ).execute(
+      "send-legacy-child",
+      { id: LEGACY_ROUTED_CHILD, message: "Continue the legacy task" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(sent.details).toMatchObject({
+      id: LEGACY_ROUTED_CHILD,
+      status: "sent",
+    });
+    expect(mockSendCommandToPane).toHaveBeenCalledOnce();
+  });
+
+  it("fails routing metadata closed without blocking runtime rehydration", async () => {
+    appendInteractiveState(cwd, {
+      id: "runtime-survives",
+      paneId: "%42",
+      mux: "tmux",
+      artifactDir: join(cwd, "runtime-survives"),
+      sessionFile: "/tmp/sess.jsonl",
+    });
+    writeFileSync(join(cwd, ".pi", "subagentura-routing.json"), "{");
+
+    const { startHandler } = await setupExtension();
+    await startHandler!({ type: "session_start", reason: "reload" }, { cwd });
+
+    expect(interactiveSubagentRegistry.has("runtime-survives")).toBe(true);
+    expect(mockDebugLog).toHaveBeenCalledWith(
+      "error",
+      "orchestrator_routing_recovery_failed",
+      expect.objectContaining({ error: expect.any(String) }),
+    );
   });
 
   it("session_start does NOT rehydrate on startup when session ID doesn't match", async () => {

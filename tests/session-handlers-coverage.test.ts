@@ -14,6 +14,11 @@ import {
 } from "../src/interactive-tmux";
 import { registerSessionHandlers } from "../src/session-handlers";
 import {
+  ORCHESTRATOR_V2_WAKE_DETAIL_KEY,
+  ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
+  sendCompletionTurn,
+} from "../src/completion-turn";
+import {
   LINEAGE_BOOTSTRAP_ENV,
   acquireRuntimeSpawnTreeContext,
   createDescendantSpawnTreeContext,
@@ -33,6 +38,7 @@ import {
   sessionOwner,
   type SessionScope,
 } from "../src/session-scope";
+import { publishCompletion } from "../src/completion-coordinator";
 
 interface HandlerRegistration {
   handlers: Map<string, Function[]>;
@@ -51,7 +57,10 @@ function registerHandlers(
       registered.push(handler);
       handlers.set(name, registered);
     }),
+    appendEntry: vi.fn(),
+    getFlag: vi.fn((name: string) => name === "orchestratorv2"),
     sendMessage: vi.fn(),
+    sendUserMessage: vi.fn(),
   };
   const sessionScope = registerSessionHandlers(
     pi as any,
@@ -70,6 +79,7 @@ function startSession(
   const sessionManager = {
     getSessionId: () => sessionId,
     getEntries: () => [],
+    getBranch: () => [],
   };
   const ctx = { cwd: root, ui, sessionManager };
   registration.handlers.get("session_start")![0]({ reason: "startup" }, ctx);
@@ -257,6 +267,87 @@ describe("session handler lifecycle callbacks", () => {
     expect(acquireRuntimeSpawnTreeContext(artifactDir)).toBeUndefined();
   });
 
+  it("acknowledges only the marked wake run after it settles", () => {
+    const registration = registerHandlers();
+    startSession(registration, root, "session-a");
+    const { handlers, pi } = registration;
+
+    sendCompletionTurn(
+      pi,
+      {
+        customType: "subagent-notify",
+        content: "completion",
+        display: true,
+      },
+      { deliverAs: "followUp", triggerTurn: true, parentStreaming: false },
+    );
+    const wakePrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    handlers.get("agent_start")![0]();
+    handlers.get("agent_settled")![0]();
+    expect(pi.appendEntry).toHaveBeenCalledOnce();
+
+    handlers.get("before_agent_start")![0]({ prompt: `${wakePrompt} extra` });
+    handlers.get("agent_start")![0]();
+    handlers.get("agent_settled")![0]();
+    expect(pi.appendEntry).toHaveBeenCalledOnce();
+
+    handlers.get("before_agent_start")![0]({ prompt: wakePrompt });
+    handlers.get("agent_start")![0]();
+    handlers.get("agent_settled")![0]();
+    expect(pi.appendEntry).toHaveBeenLastCalledWith(
+      ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
+      expect.objectContaining({ state: "acknowledged" }),
+    );
+  });
+
+  it("clears a stale wake before reload recovery starts a fresh watchdog", () => {
+    const registration = registerHandlers();
+    const ui = { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() };
+    const branch: unknown[] = [];
+    const sessionManager = {
+      getSessionId: () => "session-a",
+      getEntries: () => [],
+      getBranch: () => branch,
+    };
+    const ctx = { cwd: root, ui, sessionManager };
+    registration.handlers.get("session_start")![0]({ reason: "startup" }, ctx);
+    const timersBeforeWake = vi.getTimerCount();
+
+    sendCompletionTurn(
+      registration.pi,
+      {
+        customType: "subagent-notify",
+        content: "completion",
+        display: true,
+      },
+      { deliverAs: "followUp", triggerTurn: true, parentStreaming: false },
+    );
+    const wakeId =
+      registration.pi.sendMessage.mock.calls[0][0].details[
+        ORCHESTRATOR_V2_WAKE_DETAIL_KEY
+      ];
+    branch.push(
+      {
+        type: "custom",
+        customType: ORCHESTRATOR_V2_WAKE_ENTRY_TYPE,
+        data: { schemaVersion: 1, state: "requested", wakeId },
+      },
+      {
+        type: "custom_message",
+        details: { [ORCHESTRATOR_V2_WAKE_DETAIL_KEY]: wakeId },
+      },
+    );
+    expect(vi.getTimerCount()).toBe(timersBeforeWake + 1);
+
+    registration.handlers.get("session_start")![0]({ reason: "reload" }, ctx);
+
+    expect(registration.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(timersBeforeWake + 1);
+    registration.handlers.get("session_shutdown")![0]({ reason: "quit" }, ctx);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("tracks streaming and flush lifecycle state on the exact scope", () => {
     const registration = registerHandlers();
     const ctx = startSession(registration, root, "session-a");
@@ -284,6 +375,33 @@ describe("session handler lifecycle callbacks", () => {
     expect((globalThis as any).__piSubagenturaPiRef).toBeUndefined();
   });
 
+  it("continues shutdown when lifecycle completion receipt persistence fails", () => {
+    const registration = registerHandlers();
+    const ctx = startSession(registration, root, "session-a");
+    registration.pi.appendEntry.mockImplementation(() => {
+      throw new Error("session storage unavailable");
+    });
+    publishCompletion(
+      {
+        schemaVersion: 1,
+        completionId: "shutdown-receipt",
+        source: "in-process",
+        sourceId: "shutdown-job",
+        label: "shutdown job",
+        status: "done",
+        policy: "each",
+        references: [{ label: "result", value: "job" }],
+        completedAt: 1,
+      },
+      sessionOwner(registration.sessionScope),
+    );
+    registration.handlers.get("session_shutdown")![0]({ reason: "quit" }, ctx);
+    expect(registration.sessionScope.lifecycle).toBe("shutdown");
+    expect(getSessionScopes()).toEqual([]);
+    expect(
+      (globalThis as any).__piSubagenturaInteractivePollerHandle,
+    ).toBeUndefined();
+  });
   it.each([
     ["A-first", "a"],
     ["B-first", "b"],

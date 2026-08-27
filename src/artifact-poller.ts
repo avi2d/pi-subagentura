@@ -36,7 +36,12 @@ import {
   type InteractiveSubagentState,
 } from "./interactive-tmux";
 import { shouldNotify } from "./notifications";
-import { deliveryIdFor, enqueueDelivery, flushDeliveries } from "./delivery";
+import {
+  deliveryIdFor,
+  enqueueDelivery,
+  flushDeliveries,
+  MAX_DELIVERY_RECORDS,
+} from "./delivery";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import {
@@ -500,17 +505,33 @@ async function runPollArtifactChanges(
       const records = batch.records;
       const lifecycle = (state.lifecycle ??= {});
       let nextCursor = cursor;
+      let queueBlocked = false;
       for (const record of records) {
         const ev = record.event;
+        const queuesCompletion =
+          state.completionOwner !== "workflow" &&
+          shouldNotify(ev) &&
+          isCompletionEvent(ev);
+        if (
+          queuesCompletion &&
+          (state.pendingDeliveries?.length ?? 0) >= MAX_DELIVERY_RECORDS
+        ) {
+          flushDeliveries(interactivePi, ui, owner);
+          if ((state.pendingDeliveries?.length ?? 0) >= MAX_DELIVERY_RECORDS) {
+            queueBlocked = true;
+            break;
+          }
+        }
         nextCursor = record.endOffset;
         foldInteractiveLifecycle(lifecycle, ev);
         if ("version" in ev && ev.version === 2 && ev.type === "turn_started") {
           state.activeTurnId = ev.turnId;
         }
-        if (state.completionOwner === "workflow") continue;
-        if (!shouldNotify(ev) || !isCompletionEvent(ev)) continue;
+        if (!queuesCompletion) continue;
         const v2 = ev.type === "completion" ? ev : undefined;
-        const mode = state.notifyOnComplete ?? "inject";
+        const mode = state.completionPolicy
+          ? "notify"
+          : (state.notifyOnComplete ?? "inject");
         const triggerTurn =
           mode === "inject"
             ? state.triggerTurnOnComplete !== false
@@ -539,42 +560,59 @@ async function runPollArtifactChanges(
             artifactDir: state.artifactDir,
             output: v2?.output,
             message: deliveryMessageFromEvent(ev),
+            completionPolicy: state.completionPolicy,
+            completionGroupId: state.completionGroupId,
             state: "queued",
           },
           { persist: false },
         );
       }
-      for (const issue of batch.issues) {
-        if (state.completionOwner === "workflow") continue;
-        const mode = state.notifyOnComplete ?? "inject";
-        const triggerTurn =
-          mode === "inject"
-            ? state.triggerTurnOnComplete !== false
-            : state.triggerTurnOnComplete === true;
-        const identity = `record-overflow-${issue.startOffset}`;
-        enqueueDelivery(
-          state,
-          {
-            deliveryId: deliveryIdFor({
-              parentSessionId: state.parentSessionId ?? "pi",
+      if (!queueBlocked) {
+        for (const issue of batch.issues) {
+          if (state.completionOwner === "workflow") continue;
+          const mode = state.completionPolicy
+            ? "notify"
+            : (state.notifyOnComplete ?? "inject");
+          const triggerTurn =
+            mode === "inject"
+              ? state.triggerTurnOnComplete !== false
+              : state.triggerTurnOnComplete === true;
+          const identity = `record-overflow-${issue.startOffset}`;
+          if ((state.pendingDeliveries?.length ?? 0) >= MAX_DELIVERY_RECORDS) {
+            flushDeliveries(interactivePi, ui, owner);
+            if (
+              (state.pendingDeliveries?.length ?? 0) >= MAX_DELIVERY_RECORDS
+            ) {
+              queueBlocked = true;
+              break;
+            }
+          }
+          enqueueDelivery(
+            state,
+            {
+              deliveryId: deliveryIdFor({
+                parentSessionId: state.parentSessionId ?? "pi",
+                subagentId: state.id,
+                turnId: identity,
+                mode,
+              }),
               subagentId: state.id,
               turnId: identity,
+              eventId: identity,
               mode,
-            }),
-            subagentId: state.id,
-            turnId: identity,
-            eventId: identity,
-            mode,
-            triggerTurn,
-            status: "error",
-            artifactDir: state.artifactDir,
-            message: `Artifact record at byte ${issue.startOffset} exceeded the ${issue.maxBytes}-byte limit and was skipped.`,
-            state: "queued",
-          },
-          { persist: false },
-        );
+              triggerTurn,
+              status: "error",
+              artifactDir: state.artifactDir,
+              message: `Artifact record at byte ${issue.startOffset} exceeded the ${issue.maxBytes}-byte limit and was skipped.`,
+              completionPolicy: state.completionPolicy,
+              completionGroupId: state.completionGroupId,
+              state: "queued",
+            },
+            { persist: false },
+          );
+        }
       }
-      nextCursor = batch.endOffset;
+      if (!queueBlocked) nextCursor = batch.endOffset;
       state.eventByteCursor = nextCursor;
       const next = deriveInteractiveSubagentStatusFromLifecycle(
         lifecycle,

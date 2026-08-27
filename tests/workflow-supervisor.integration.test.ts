@@ -600,7 +600,9 @@ describe("workflow supervisor integration", () => {
       { cwd: "/tmp", modelRegistry: {} },
     );
     expect(refused.isError).toBe(true);
-    expect(refused.content[0]?.text).toContain("workflow jobs already running");
+    expect(refused.content[0]?.text).toContain(
+      "workflow jobs are retained or running",
+    );
 
     // The blocking sync path must not acquire a new failure mode from being
     // tracked: it always ran before, so it still runs now.

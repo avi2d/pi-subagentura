@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { abortableWait } from "./abortable-wait";
 import {
   debugLog,
+  MAX_REGISTRY_SIZE,
   registerInProcessJob,
   removeInProcessJob,
   startSubagentJob,
@@ -31,8 +32,10 @@ import {
   workflowUsageFromUsage,
 } from "./workflow-core";
 import {
+  discardWorkflowJob,
   getWorkflowCompletionPresentation,
   getWorkflowJobForOwner,
+  invokeWorkflowCompletionHook,
   normalizeCancelledWorkflowState,
   startWorkflowJob,
   workflowJobsForOwner,
@@ -56,12 +59,27 @@ import { getOrchestrationContext } from "./orchestration-context";
 import {
   getActiveSessionOwner,
   isSessionOwnerLive,
+  resolveActualStreamingFlag,
   resolveLiveSessionScope,
+  sessionOwner,
   type SessionOwnerToken,
   type SessionScope,
 } from "./session-scope";
+import { isOrchestratorV2Enabled, sendCompletionTurn } from "./completion-turn";
 import { attachAsyncJobSettlement } from "./tools/in-process";
 import { registerToolWithDefaultGuidance } from "./tool-guidance";
+import {
+  assertCompletionGroupOpen,
+  reserveCompletionGroup,
+  releaseCompletionGroup,
+  consumeCompletionSource,
+  MAX_COMPLETION_LABEL_LENGTH,
+  publishCompletion,
+  registerCompletionMember,
+  resolveCompletionPolicy,
+  type ResolvedCompletionPolicy,
+  type CompletionGroupReservation,
+} from "./completion-coordinator";
 
 const WORKFLOW_SESSION_SCOPE_MESSAGE =
   "Workflow jobs are scoped to the current parent session and do not survive reload/resume/new/quit.";
@@ -210,6 +228,7 @@ export function registerWorkflowTool(
             spawnTreeContext: childScope?.spawnTreeContext,
             workflowId: ownedWorkflowId,
             completionOwner: "workflow",
+            completionPolicy: "each",
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -317,7 +336,7 @@ export function registerWorkflowTool(
           signal?.removeEventListener("abort", forwardAbort);
           discardWorkflowChildSpawn(abort, prepared);
           throw new Error(
-            "Workflow agent cancelled: parent session shut down before the child was registered.",
+            `Workflow agent could not start: ${MAX_REGISTRY_SIZE} in-process sub-agent jobs are retained or running.`,
           );
         }
         // Without settlement the row would stay "running" forever: cancellable in
@@ -351,6 +370,42 @@ export function registerWorkflowTool(
     return text.slice(0, Math.max(0, end)) + WORKFLOW_TRUNCATION_MARKER;
   }
 
+  function configureWorkflowCompletion(
+    job: WorkflowJobState,
+    completion: ResolvedCompletionPolicy,
+    workflowOwner: SessionOwnerToken | undefined,
+    reservation?: CompletionGroupReservation,
+  ): void {
+    job.completionPolicy = completion.policy;
+    job.completionGroupId = completion.groupId;
+    if (completion.policy) {
+      registerCompletionMember(
+        "workflow",
+        job.id,
+        completion.policy,
+        completion.groupId,
+        workflowOwner,
+        reservation,
+      );
+    }
+  }
+
+  function workflowCompletionLabel(job: WorkflowJobState): string {
+    const prefix = "Workflow ";
+    const suffix = ` (${job.id})`;
+    const nameLimit = Math.max(
+      0,
+      MAX_COMPLETION_LABEL_LENGTH - prefix.length - suffix.length,
+    );
+    const displayName =
+      job.name.length <= nameLimit
+        ? job.name
+        : nameLimit <= 1
+          ? job.name.slice(0, nameLimit)
+          : `${job.name.slice(0, nameLimit - 1)}…`;
+    return `${prefix}${displayName}${suffix}`;
+  }
+
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
     const run = job.result;
     const errorCount = run?.errorCount ?? job.snapshot.errorCount;
@@ -358,15 +413,53 @@ export function registerWorkflowTool(
       job.status,
       errorCount,
     );
+    if (job.completionPolicy) {
+      publishCompletion(
+        {
+          schemaVersion: 1,
+          completionId: `workflow:${job.id}`,
+          source: "workflow",
+          sourceId: job.id,
+          label: workflowCompletionLabel(job),
+          status:
+            job.status === "cancelled"
+              ? "cancelled"
+              : job.status === "error" ||
+                  presentation.label === "completed with errors"
+                ? "error"
+                : "done",
+          policy: job.completionPolicy,
+          ...(job.completionGroupId ? { groupId: job.completionGroupId } : {}),
+          references:
+            job.status === "cancelled"
+              ? [{ label: "status", value: "cancelled; no result retained" }]
+              : [
+                  {
+                    label: "result",
+                    value: `call get_workflow_result with workflowId ${JSON.stringify(job.id)}`,
+                  },
+                ],
+          completedAt: Date.now(),
+        },
+        job.parentSessionOwner,
+      );
+      return true;
+    }
     const icon = presentation.icon || (job.status === "done" ? "✅" : "❌");
     const rawSummary = formatWorkflowNotificationSummary(job);
     const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
     let content = `${icon} Workflow "${job.name}" (${job.id}) ${presentation.label} — ${summary}`;
     if (run) {
-      content += `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
+      content += isOrchestratorV2Enabled(pi)
+        ? "\n\nThis completion came from the separate workflow compatibility mode. Surface its status without calling workflow tools in Orchestratorv2 mode."
+        : `\n\nCall get_workflow_result with workflowId "${job.id}" to retrieve the result.`;
     }
     try {
-      pi.sendMessage!(
+      const owner =
+        job.parentSessionOwner ??
+        (sessionScope ? sessionOwner(sessionScope) : undefined);
+      sendCompletionTurn(
+        pi,
         {
           customType: "workflow-notify",
           content,
@@ -379,7 +472,11 @@ export function registerWorkflowTool(
             budgetTotal: job.snapshot.budgetTotal,
           },
         },
-        { deliverAs: "followUp", triggerTurn: true },
+        {
+          deliverAs: "followUp",
+          triggerTurn: true,
+          parentStreaming: resolveActualStreamingFlag(owner),
+        },
       );
       return true;
     } catch (err) {
@@ -426,6 +523,8 @@ export function registerWorkflowTool(
       "",
       "Default: run in the background and return a workflowId immediately (async). Use async: false for synchronous execution.",
       "Poll with get_workflow_status / get_workflow_result. Up to 100 jobs; cancel with cancel_workflow.",
+      "Background completionPolicy defaults to each: the user gets one TUI-only notice and the parent resumes with a compact get_workflow_result reference.",
+      "Use completionPolicy=group with a shared safe 1–128 character completionGroupId when related background workflows must reach one all-terminal barrier before the parent resumes (max 32 members per group, 512 groups per parent session).",
       "Constraints: Date.now()/Math.random()/argless new Date() throw; concurrency capped automatically;",
       `>${MAX_TOTAL_AGENTS} agents or >${MAX_ITEMS_PER_CALL} items per call throws. meta MUST be a pure literal.`,
     ].join("\n"),
@@ -472,6 +571,20 @@ export function registerWorkflowTool(
             "Run in the background and return a workflowId immediately.",
         }),
       ),
+      completionPolicy: Type.Optional(
+        Type.Union([Type.Literal("each"), Type.Literal("group")], {
+          description:
+            'Completion coordination policy for this background workflow. Defaults to "each"; "group" waits with other workflows/jobs sharing completionGroupId until parent settlement seals the group and every member is terminal.',
+        }),
+      ),
+      completionGroupId: Type.Optional(
+        Type.String({
+          maxLength: 128,
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          description:
+            'Required with completionPolicy="group". Safe 1–128 character identifier shared by related background work; at most 32 members per group and 512 groups per parent session.',
+        }),
+      ),
     }),
 
     async execute(
@@ -507,6 +620,46 @@ export function registerWorkflowTool(
         };
       }
 
+      let completion: ResolvedCompletionPolicy;
+      try {
+        completion =
+          params.async === false
+            ? { legacy: false }
+            : sessionScope
+              ? resolveCompletionPolicy(params)
+              : (() => {
+                  if (
+                    params.completionPolicy !== undefined ||
+                    params.completionGroupId !== undefined
+                  ) {
+                    throw new Error(
+                      "completionPolicy or completionGroupId requires an active parent session",
+                    );
+                  }
+                  return { legacy: true };
+                })();
+        if (
+          params.async === false &&
+          (params.completionPolicy !== undefined ||
+            params.completionGroupId !== undefined)
+        ) {
+          throw new Error(
+            "completionPolicy is available only for background workflows",
+          );
+        }
+        assertCompletionGroupOpen(
+          completion.policy,
+          completion.groupId,
+          workflowOwner,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Workflow not run: ${message}` }],
+          details: { status: "error", error: message },
+          isError: true,
+        };
+      }
       const script: string | null =
         typeof params.script === "string" && params.script.trim()
           ? params.script
@@ -545,6 +698,21 @@ export function registerWorkflowTool(
             isError: true,
           };
         }
+        let completionReservation: CompletionGroupReservation | undefined;
+        try {
+          completionReservation = reserveCompletionGroup(
+            completion.policy,
+            completion.groupId,
+            workflowOwner,
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `Workflow not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
         const jobStartedAt = Date.now();
         let job: WorkflowJobState;
         try {
@@ -558,7 +726,25 @@ export function registerWorkflowTool(
             "async",
           );
         } catch (err) {
+          releaseCompletionGroup(completionReservation);
           const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `Workflow not started: ${msg}` }],
+            details: { status: "error", error: msg },
+            isError: true,
+          };
+        }
+        try {
+          configureWorkflowCompletion(
+            job,
+            completion,
+            workflowOwner,
+            completionReservation,
+          );
+        } catch (error) {
+          discardWorkflowJob(job);
+          releaseCompletionGroup(completionReservation);
+          const msg = error instanceof Error ? error.message : String(error);
           return {
             content: [{ type: "text", text: `Workflow not started: ${msg}` }],
             details: { status: "error", error: msg },
@@ -571,7 +757,7 @@ export function registerWorkflowTool(
               type: "text",
               text:
                 `Workflow "${meta.name}" started in background as ${job.id}. ` +
-                `Poll get_workflow_status / get_workflow_result. ${WORKFLOW_SESSION_SCOPE_MESSAGE}`,
+                `Completion coordination will notify the user and resume the parent with a compact result reference; use get_workflow_status / get_workflow_result only for explicit inspection. ${WORKFLOW_SESSION_SCOPE_MESSAGE}`,
             },
           ],
           details: { status: "started", workflowId: job.id, name: meta.name },
@@ -746,7 +932,7 @@ export function registerWorkflowTool(
     name: "get_workflow_result",
     label: "Workflow Result",
     description:
-      "Block until a background workflow finishes and return its final result.",
+      "Block until a background workflow finishes and return its final result. Successful terminal collection consumes the matching pending coordinated delivery so it is not sent again automatically.",
     parameters: Type.Object({
       workflowId: Type.String({
         description: "Workflow ID returned by an async `workflow` spawn.",
@@ -757,7 +943,8 @@ export function registerWorkflowTool(
       params: any,
       signal?: AbortSignal,
     ): Promise<any> {
-      const st = getWorkflowJobForOwner(params.workflowId, owner());
+      const workflowOwner = owner();
+      const st = getWorkflowJobForOwner(params.workflowId, workflowOwner);
       if (!st) {
         return {
           content: [
@@ -805,6 +992,8 @@ export function registerWorkflowTool(
         const usage = presentWorkflowUsage(st.snapshot?.usage);
         const outputBudget = st.snapshot?.budgetTotal;
         const usageDetails = usage ? { usage } : {};
+        st.resultRetrieved = true;
+        consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
         return {
           content: [
             {
@@ -836,6 +1025,8 @@ export function registerWorkflowTool(
         run.errorCount,
       );
       const usage = presentWorkflowUsage(run.usage);
+      st.resultRetrieved = true;
+      consumeCompletionSource(pi, "workflow", st.id, workflowOwner);
       return {
         content: [
           {
@@ -929,6 +1120,7 @@ export function registerWorkflowTool(
       st.abort.abort();
       st.status = "cancelled";
       normalizeCancelledWorkflowState(st);
+      invokeWorkflowCompletionHook(st);
       if (cancellationSnapshotsEnabled()) {
         await waitForCancellationReceipts(st);
         normalizeCancelledWorkflowState(st);
@@ -1101,6 +1293,11 @@ export function registerWorkflowTool(
         }),
         Date.now(),
         notifyWorkflowCompletion,
+        workflowOwner,
+      );
+      configureWorkflowCompletion(
+        job,
+        sessionScope ? { policy: "each", legacy: false } : { legacy: true },
         workflowOwner,
       );
       return { job, meta };

@@ -19,6 +19,8 @@ const {
   mockBuildLiveUpdate,
   mockScheduleJobCleanup,
   mockDeliverNotification,
+  mockPublishCompletion,
+  mockRegisterCompletionMember,
 } = vi.hoisted(() => ({
   mockStartSubagentJob: vi.fn(),
   mockDebugLog: vi.fn(),
@@ -26,6 +28,8 @@ const {
   mockBuildLiveUpdate: vi.fn(),
   mockScheduleJobCleanup: vi.fn(),
   mockDeliverNotification: vi.fn(),
+  mockPublishCompletion: vi.fn(),
+  mockRegisterCompletionMember: vi.fn(),
 }));
 
 // We need a separate hoisted mock for `convertToLlm` / `serializeConversation`
@@ -57,6 +61,16 @@ vi.mock("../src/notifications", async (importOriginal) => {
   };
 });
 
+vi.mock("../src/completion-coordinator", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/completion-coordinator")>();
+  return {
+    ...actual,
+    publishCompletion: mockPublishCompletion,
+    registerCompletionMember: mockRegisterCompletionMember,
+  };
+});
+
 // interactive-tmux.ts has a TypeScript syntax that esbuild (vitest's transformer)
 // cannot parse (line 613). We mock it so vitest never loads the source.
 vi.mock("../src/interactive-tmux", () => {
@@ -82,6 +96,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 // ── Imports (after mocks, vitest resolves to mocked modules) ─────────
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type * as HelpersModule from "../src/helpers";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
@@ -89,6 +104,7 @@ import {
   type SubagentResult,
   inProcessJobsForOwner,
   jobRegistry,
+  MAX_REGISTRY_SIZE,
   pruneCompletedJobs,
   registerInProcessJob,
 } from "../src/helpers";
@@ -250,6 +266,7 @@ beforeEach(() => {
   mockStartSubagentJob.mockReset();
   mockStartSubagentJob.mockResolvedValue(defaultStartSubagentJobResult);
   mockFormatUsage.mockReturnValue("mock usage 1 turn");
+  mockRegisterCompletionMember.mockReset();
   mockBuildLiveUpdate.mockReturnValue({
     content: [{ type: "text", text: "running..." }],
     details: { status: "running", subagentStatus: {} },
@@ -501,6 +518,24 @@ describe("subagent_isolated tool", () => {
     expect(result.details.status).toBe("done");
   });
 
+  it("rejects completion coordination controls on the sync path", async () => {
+    const result = await toolDef.execute(
+      "sync-group",
+      {
+        task: "analyze code",
+        async: false,
+        completionPolicy: "group",
+        completionGroupId: "sync-group",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("only for background");
+    expect(mockStartSubagentJob).not.toHaveBeenCalled();
+  });
+
   it("defaults to async (background) when the flag is omitted", async () => {
     const ctx = mockCtx();
     const result = await toolDef.execute(
@@ -518,6 +553,31 @@ describe("subagent_isolated tool", () => {
     expect(mockStartSubagentJob).toHaveBeenCalledWith(
       expect.objectContaining({ signal: expect.any(AbortSignal), depth: 1 }),
     );
+  });
+
+  it("reports retained-job capacity instead of session shutdown", async () => {
+    for (let index = 0; index < MAX_REGISTRY_SIZE; index++) {
+      jobRegistry.set(
+        `running-capacity-${index}`,
+        createJobState({
+          id: `running-capacity-${index}`,
+          status: "running",
+        }),
+      );
+    }
+
+    const result = await toolDef.execute(
+      "call-at-capacity",
+      { task: "analyze code" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("retained or running");
+    expect(result.content[0].text).not.toContain("session shutdown");
+    expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
   });
 
   it("refuses to spawn once the orchestration depth cap is reached", async () => {
@@ -893,6 +953,79 @@ describe("get_subagent_result tool", () => {
     // resultRetrieved should have been set
     expect(job.resultRetrieved).toBe(true);
   });
+  it("keeps a grouped result through TTL, prune, and cap pressure until collection", async () => {
+    vi.useFakeTimers();
+    try {
+      const resultA: SubagentResult = {
+        ...defaultSuccessResult,
+        output: "grouped result A",
+      };
+      const groupedA = createJobState({
+        id: "grouped-a",
+        status: "done",
+        result: resultA,
+        promise: Promise.resolve(resultA),
+        completionPolicy: "group",
+        completionGroupId: "grouped-retention",
+        maxAge: 10,
+      });
+      const groupedB = createJobState({
+        id: "grouped-b",
+        status: "running",
+        promise: new Promise<SubagentResult>(() => {}),
+        completionPolicy: "group",
+        completionGroupId: "grouped-retention",
+      });
+      expect(registerInProcessJob(groupedA)).toBe(true);
+      expect(registerInProcessJob(groupedB)).toBe(true);
+
+      const actualHelpers =
+        await vi.importActual<typeof HelpersModule>("../src/helpers");
+      actualHelpers.scheduleJobCleanup(groupedA.id, false, groupedA.maxAge);
+      vi.advanceTimersByTime(20);
+      expect(jobRegistry.get(groupedA.id)).toBe(groupedA);
+      expect(pruneCompletedJobs()).toBe(0);
+
+      for (let index = 0; jobRegistry.size < MAX_REGISTRY_SIZE; index++) {
+        jobRegistry.set(
+          `running-filler-${index}`,
+          createJobState({
+            id: `running-filler-${index}`,
+            status: "running",
+          }),
+        );
+      }
+      expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+      expect(
+        registerInProcessJob(
+          createJobState({ id: "over-cap", status: "running" }),
+        ),
+      ).toBe(false);
+      expect(jobRegistry.size).toBe(MAX_REGISTRY_SIZE);
+      expect(jobRegistry.get(groupedA.id)).toBe(groupedA);
+      expect(jobRegistry.get(groupedB.id)).toBe(groupedB);
+
+      const collected = await toolDef.execute(
+        "collect-grouped-a",
+        { jobId: groupedA.id },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      expect(collected.content[0].text).toBe("grouped result A");
+      expect(groupedA.resultRetrieved).toBe(true);
+      expect(mockScheduleJobCleanup).toHaveBeenCalledWith(
+        groupedA.id,
+        true,
+        undefined,
+        undefined,
+      );
+      expect(pruneCompletedJobs()).toBe(1);
+      expect(jobRegistry.has(groupedA.id)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("handles cancellation race (status changes to cancelled after await)", async () => {
     const jobId = "race-job";
@@ -1055,6 +1188,7 @@ describe("cancel_subagent tool", () => {
         id: jobId,
         status: "running",
         session: { abort: abortFn } as any,
+        completionPolicy: "each",
       }),
     );
 
@@ -1080,6 +1214,18 @@ describe("cancel_subagent tool", () => {
     );
     // Footer was updated
     expect(ctx.ui.setStatus).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "cancelled",
+        references: [
+          {
+            label: "status",
+            value: "cancelled; no result retained",
+          },
+        ],
+      }),
+      undefined,
+    );
   });
 
   it("handles abort rejection gracefully", async () => {
@@ -1794,10 +1940,13 @@ describe("subagent_with_context async path", () => {
     );
 
     expect(jobRegistry.has("default-job")).toBe(true);
-    expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("inject");
+    expect(jobRegistry.get("default-job")).toMatchObject({
+      completionPolicy: undefined,
+      notifyOnComplete: "inject",
+    });
   });
 
-  it("uses notify mode when notifyOnComplete is 'notify'", async () => {
+  it("keeps legacy notifyOnComplete on the direct fallback without a session scope", async () => {
     mockConvertToLlm.mockReturnValue([{ role: "user", content: "Hi" }]);
     mockSerializeConversation.mockReturnValue("Hi");
 
@@ -1821,6 +1970,9 @@ describe("subagent_with_context async path", () => {
     );
 
     expect(jobRegistry.get("default-job")!.notifyOnComplete).toBe("notify");
+    expect(jobRegistry.get("default-job")!.completionPolicy).toBeUndefined();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(mockDeliverNotification).toHaveBeenCalledOnce();
   });
 
   it("includes modelWarning in async response when present", async () => {
@@ -1854,7 +2006,10 @@ describe("subagent_with_context async path", () => {
     expect(result.content[0].text).toContain("Model not found");
   });
 
-  it("delivers notification when async job completes successfully", async () => {
+  it("publishes a coordinated completion when an async job succeeds", async () => {
+    const scoped = setupScopedExtension(805);
+    api = scoped.api;
+    toolDef = getToolDef(api, "subagent_with_context");
     let resolveJob!: (v: SubagentResult) => void;
     const deferred = new Promise<SubagentResult>((r) => {
       resolveJob = r;
@@ -1893,7 +2048,44 @@ describe("subagent_with_context async path", () => {
 
     const job = jobRegistry.get("default-job")!;
     expect(job.status).toBe("done");
-    expect(mockDeliverNotification).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "in-process",
+        sourceId: "default-job",
+        status: "done",
+        policy: "each",
+      }),
+      sessionOwner(scoped.scope),
+    );
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
+  });
+
+  it("rolls back a prepared isolated job when completion registration fails", async () => {
+    const setup = setupScopedExtension(804);
+    const abort = vi.fn().mockResolvedValue(undefined);
+    mockStartSubagentJob.mockResolvedValue({
+      ...defaultStartSubagentJobResult,
+      jobId: "rollback-job",
+      session: { abort },
+    });
+    mockRegisterCompletionMember.mockImplementationOnce(() => {
+      throw new Error("group registration failed");
+    });
+    const result = await getToolDef(setup.api, "subagent_isolated").execute(
+      "rollback-call",
+      {
+        task: "test",
+        async: true,
+        completionPolicy: "group",
+        completionGroupId: "rollback-group",
+      },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(jobRegistry.has("rollback-job")).toBe(false);
   });
 
   it("does not deliver notification when job is cancelled before completion", async () => {
@@ -1937,9 +2129,13 @@ describe("subagent_with_context async path", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     expect(mockDeliverNotification).not.toHaveBeenCalled();
+    expect(mockPublishCompletion).not.toHaveBeenCalled();
   });
 
-  it("delivers notification on job promise rejection", async () => {
+  it("publishes a coordinated completion on job promise rejection", async () => {
+    const scoped = setupScopedExtension(806);
+    api = scoped.api;
+    toolDef = getToolDef(api, "subagent_with_context");
     let rejectJob!: (err: Error) => void;
     const deferred = new Promise<SubagentResult>((_, reject) => {
       rejectJob = reject;
@@ -1977,7 +2173,16 @@ describe("subagent_with_context async path", () => {
     rejectJob(new Error("LLM crash"));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(mockDeliverNotification).toHaveBeenCalled();
+    expect(mockPublishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "in-process",
+        sourceId: "default-job",
+        status: "error",
+        policy: "each",
+      }),
+      sessionOwner(scoped.scope),
+    );
+    expect(mockDeliverNotification).not.toHaveBeenCalled();
   });
 });
 
@@ -2037,7 +2242,11 @@ describe("async rejection settlement", () => {
       undefined,
       undefined,
     );
-    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+    expect(mockDeliverNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "default-job", status: "error" }),
+      expect.objectContaining({ isError: true, errorMessage: "context crash" }),
+    );
+    expect(mockPublishCompletion).not.toHaveBeenCalled();
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
       undefined,
@@ -2104,7 +2313,14 @@ describe("async rejection settlement", () => {
       undefined,
       undefined,
     );
-    expect(mockDeliverNotification).toHaveBeenCalledTimes(1);
+    expect(mockDeliverNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "default-job", status: "error" }),
+      expect.objectContaining({
+        isError: true,
+        errorMessage: "isolated crash",
+      }),
+    );
+    expect(mockPublishCompletion).not.toHaveBeenCalled();
 
     const result = await getToolDef(api, "get_subagent_result").execute(
       "result-call",

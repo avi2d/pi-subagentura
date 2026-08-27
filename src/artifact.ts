@@ -913,15 +913,19 @@ export function readEvents(
   since?: number,
 ): SubagentEvent[] {
   const events: SubagentEvent[] = [];
+  const snapshotEndOffset = eventLogEndOffset(art);
   let cursor = 0;
-  for (;;) {
+  while (cursor < snapshotEndOffset) {
     const batch = readEventBatch(art, cursor);
-    for (const { event } of batch.records) {
-      if (since === undefined || event.ts >= since) events.push(event);
+    for (const record of batch.records) {
+      if (record.endOffset > snapshotEndOffset) break;
+      if (since === undefined || record.event.ts >= since) {
+        events.push(record.event);
+      }
     }
-    if (batch.endOffset <= cursor) break;
-    cursor = batch.endOffset;
-    if (cursor >= eventLogEndOffset(art)) break;
+    const nextOffset = batch.records.at(-1)?.endOffset ?? batch.endOffset;
+    if (nextOffset <= cursor) break;
+    cursor = Math.min(nextOffset, snapshotEndOffset);
   }
   return events;
 }
@@ -1365,6 +1369,10 @@ export interface InteractiveSubagentPersistedStateV1 {
 
   notifyOnComplete?: "notify" | "inject";
   triggerTurnOnComplete?: boolean;
+  completionPolicy?: "each" | "group";
+  completionTombstone?: "failed";
+  completionTombstoneAt?: number;
+  completionGroupId?: string;
 
   /** Parent pi session id; only rehydrated when the current session matches. */
   parentSessionId?: string;
@@ -1382,6 +1390,8 @@ export interface PersistedDeliveryIntent {
   output?: OutputSnapshot;
   message?: string;
   state: "queued" | "dispatchAttempted";
+  completionPolicy?: "each" | "group";
+  completionGroupId?: string;
 }
 
 export const MAX_DELIVERY_RECEIPTS = 256;
@@ -1519,6 +1529,19 @@ function migrateStatePayload(
         basename(entry.artifactDir),
       );
       const cutoverOffset = legacy ? eventLogEndOffset(art) : 0;
+      const completionGroupId =
+        typeof entry.completionGroupId === "string" &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(entry.completionGroupId)
+          ? entry.completionGroupId
+          : undefined;
+      const completionPolicy =
+        entry.completionPolicy === "each"
+          ? "each"
+          : entry.completionPolicy === "group"
+            ? completionGroupId
+              ? "group"
+              : "each"
+            : undefined;
       const cursor = (candidate: unknown, fallback: number): number =>
         typeof candidate === "number" &&
         Number.isSafeInteger(candidate) &&
@@ -1532,10 +1555,19 @@ function migrateStatePayload(
               const rawIntent = intent as unknown as Record<string, unknown>;
               if (
                 typeof rawIntent.deliveryId !== "string" ||
+                rawIntent.deliveryId.length === 0 ||
+                rawIntent.deliveryId.length > MAX_EVENT_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.deliveryId) ||
                 typeof rawIntent.subagentId !== "string" ||
                 rawIntent.subagentId !== id ||
                 typeof rawIntent.turnId !== "string" ||
+                rawIntent.turnId.length === 0 ||
+                rawIntent.turnId.length > MAX_TURN_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.turnId) ||
                 typeof rawIntent.eventId !== "string" ||
+                rawIntent.eventId.length === 0 ||
+                rawIntent.eventId.length > MAX_EVENT_ID_LENGTH ||
+                !/^[A-Za-z0-9._:-]+$/.test(rawIntent.eventId) ||
                 (rawIntent.mode !== "notify" && rawIntent.mode !== "inject") ||
                 typeof rawIntent.triggerTurn !== "boolean" ||
                 (rawIntent.status !== "done" &&
@@ -1547,6 +1579,21 @@ function migrateStatePayload(
               ) {
                 return [];
               }
+              const intentGroupId =
+                typeof rawIntent.completionGroupId === "string" &&
+                /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(
+                  rawIntent.completionGroupId,
+                )
+                  ? rawIntent.completionGroupId
+                  : undefined;
+              const intentPolicy =
+                rawIntent.completionPolicy === "each"
+                  ? "each"
+                  : rawIntent.completionPolicy === "group"
+                    ? intentGroupId
+                      ? "group"
+                      : "each"
+                    : undefined;
               const output =
                 rawIntent.output &&
                 typeof rawIntent.output === "object" &&
@@ -1580,6 +1627,10 @@ function migrateStatePayload(
                   ...(output ? { output } : {}),
                   ...(typeof rawIntent.message === "string"
                     ? { message: rawIntent.message.slice(0, 500) }
+                    : {}),
+                  ...(intentPolicy ? { completionPolicy: intentPolicy } : {}),
+                  ...(intentPolicy === "group"
+                    ? { completionGroupId: intentGroupId }
                     : {}),
                   state: rawIntent.state,
                 },
@@ -1670,6 +1721,16 @@ function migrateStatePayload(
           : {}),
         ...(typeof entry.triggerTurnOnComplete === "boolean"
           ? { triggerTurnOnComplete: entry.triggerTurnOnComplete }
+          : {}),
+        ...(completionPolicy ? { completionPolicy } : {}),
+        ...(completionPolicy === "group" ? { completionGroupId } : {}),
+        ...(entry.completionTombstone === "failed"
+          ? { completionTombstone: "failed" as const }
+          : {}),
+        ...(typeof entry.completionTombstoneAt === "number" &&
+        Number.isFinite(entry.completionTombstoneAt) &&
+        entry.completionTombstoneAt >= 0
+          ? { completionTombstoneAt: entry.completionTombstoneAt }
           : {}),
         ...(typeof entry.parentSessionId === "string"
           ? { parentSessionId: entry.parentSessionId }
