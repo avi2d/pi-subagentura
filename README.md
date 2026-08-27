@@ -10,9 +10,16 @@ Give the parent Pi agent one task and let it build the team. pi-subagentura adds
 reusable multi-agent workflows, lightweight background delegation, and real
 child Pi sessions you can watch, attach to, and continue in tmux or Zellij.
 
-Start Pi with the bundled orchestrator guidance and describe the outcome you
-want. The parent can turn that request into a saved workflow, run its agents in
-the background, and keep their intermediate results out of the parent context.
+For routing-first delegation, start Pi with `--orchestratorv2`. The prompt
+guides the parent to route clear work to attachable interactive subagents, ask
+for clarification when a request is ambiguous or a narrow request has no matching
+child, and leave specialist repository work to those children. Compatibility
+workflow and in-process tools remain registered.
+
+For reusable workflows, start Pi with the bundled orchestration guidance and
+describe the outcome you want. The parent can turn that request into a saved
+workflow, run its agents in the background, and keep their intermediate results
+out of the parent context.
 
 ## Installation
 
@@ -43,6 +50,17 @@ pi install git:github.com/lmn451/pi-subagentura
 ```
 
 ## Quick start
+
+For routing-first interactive delegation:
+
+```text
+pi --orchestratorv2
+Review the authentication layer across the API and database boundaries.
+```
+
+The parent routes work to attachable interactive subagents and asks for
+clarification when a request is ambiguous or a narrow request has no matching
+child. For reusable workflows, use the workflow-oriented `--orchestrator` mode:
 
 ```text
 pi --orchestrator
@@ -89,6 +107,10 @@ See the [workflow guide](./docs/workflows.md) and
 
 ## Why use it?
 
+- Route work to attachable interactive specialists with `--orchestratorv2`
+- Resume interactive artifacts, routing state, pending deliveries, and receipts
+  within the matching parent session; delivery is bounded and at-least-once,
+  while in-process jobs and background workflows remain session-scoped
 - Watch a real child Pi session and its tool activity live in tmux or zellij
 - Supervise a bounded recursive tree of interactive children and grandchildren
 - Focus or capture a descendant pane locally, or attach from another terminal
@@ -224,6 +246,17 @@ tools remain registered for compatibility, while the Orchestratorv2 prompt
 directs the parent to delegate only through attachable interactive children and
 use the parent session's authoritative routing ledger together with the
 project-local routing cache.
+
+The v2 prompt gives the parent a lightweight routing role: it routes clear work
+to attachable interactive subagents, can split broad requests across specialists,
+and asks for clarification when a request is ambiguous or a narrow request has no
+matching child. The parent is instructed to leave specialist repository work to
+those children; this is prompt guidance, not an enforced routing boundary.
+
+For interactive children in the matching parent session, artifacts, routing state,
+pending deliveries, and receipts persist and rehydrate across same-session
+restart, reload, and resume paths. Delivery is bounded and at-least-once; in-process
+jobs and background workflows remain session-scoped.
 
 Orchestratorv2 adds exactly two routing-metadata tools:
 `list_orchestrator_agents` and `update_orchestrator_agent_description`.
