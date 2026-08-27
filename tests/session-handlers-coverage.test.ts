@@ -409,7 +409,7 @@ describe("session handler lifecycle callbacks", () => {
     updateRunningSubagentFooter(sharedUi, sessionOwner(a.sessionScope));
     expect(sharedUi.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent active",
+      "⚡ 1 sub-agent alive",
     );
 
     a.handlers.get("session_shutdown")![0]({ reason: "quit" }, aCtx);
@@ -437,7 +437,7 @@ describe("session handler lifecycle callbacks", () => {
 
     expect(ui.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent active",
+      "⚡ 1 sub-agent alive",
     );
   });
 

@@ -367,7 +367,7 @@ describe("workflow supervisor integration", () => {
     // workflow agent label passed through to launchInteractiveSubagent).
     expect((rows as string[]).join("\n")).toContain("reviewer");
     expect((rows as string[]).join("\n")).not.toContain("sibling-agent");
-    expect(lastFooter(a.ui)).toBe("⚡ 1 sub-agent active");
+    expect(lastFooter(a.ui)).toBe("⚡ 1 sub-agent alive");
     // B's surfaces are untouched by A's tick.
     expect(lastWidgetRows(b.ui)).toBe("never-painted");
 
