@@ -38,7 +38,10 @@ import {
   type ParsedSpawnTreeContext,
 } from "./spawn-tree-context";
 import { rehydrateInteractiveSubagents } from "./rehydrate";
-import { loadOrchestratorRoutingMetadata } from "./orchestrator-routing";
+import {
+  deleteOrchestratorRoutingFile,
+  loadOrchestratorRoutingMetadata,
+} from "./orchestrator-routing";
 import {
   cancelInteractiveSubagentByState,
   removeInteractiveSubagentState,
@@ -384,6 +387,7 @@ export function registerSessionHandlers(
       if (event?.reason === "new" && ctx?.cwd) {
         try {
           deleteInteractiveStatesFile(ctx.cwd);
+          deleteOrchestratorRoutingFile(ctx.cwd);
         } catch {
           /* best effort */
         }
