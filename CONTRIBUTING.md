@@ -40,44 +40,114 @@ npm run format:check
 npm run pack:check
 ```
 
-### Normal release
+### Release PR and merge gate
+
+Prepare the version and changelog on a branch so the release change reaches
+`master` through a reviewed pull request:
 
 ```bash
-# 1. Bump version and create the git tag
-npm version patch          # or minor, or major
-
-# 2. Push the commit and tag to trigger publish.yml
-git push origin master --follow-tags
+VERSION=3.4.5
+git fetch origin master --tags
+git switch -c "release/v$VERSION" origin/master
+npm version "$VERSION" --no-git-tag-version
+# Update CHANGELOG.md and move the Unreleased entries to the new version.
+npm run typecheck
+npm test
+npm run format:check
+npm run pack:check
+git add package.json package-lock.json CHANGELOG.md
+git commit -m "chore(release): prepare v$VERSION"
+git push --set-upstream origin "release/v$VERSION"
+gh pr create --base master --head "release/v$VERSION" \
+  --title "chore(release): prepare v$VERSION"
 ```
 
-GitHub Actions runs typecheck, tests, published-tarball smoke, and pack:check
-before publishing. If any step fails, the package is not published — fix the
-issue and retry.
+The normal merge gate is required: confirm the PR has an approved review and
+all required checks pass on the latest commit before merging. These commands
+make that gate explicit; inspect the `reviewDecision` output for `APPROVED`:
 
-### Version / tag collision recovery
+```bash
+PR=123
+gh pr view "$PR" --json baseRefName,headRefName,reviewDecision,mergeStateStatus
+gh pr checks "$PR" --required --watch
+gh pr merge "$PR" --squash --delete-branch
+```
 
-If `npm version patch` fails because the target version or tag already exists:
+If GitHub cannot complete a merge despite that gate, an authorized repository
+administrator may deliberately use the documented administrative fallback:
 
-1. **Check remote tags** — `git fetch --tags origin` then `git tag -l 'v*'`
-   to see what has already been tagged and published. `npm view
-pi-subagentura versions` shows versions on the registry.
+```bash
+# Re-check the PR above, then record the operational reason for this exception.
+gh pr merge "$PR" --admin --squash --delete-branch
+```
 
-2. **Choose the next available version** — if `v2.3.4` exists, bump to
-   `v2.3.5` (or whatever the appropriate next version is). You can also use
-   `npm version <exact-version>` to set a specific version, e.g.
-   `npm version 2.3.5`.
+`--admin` is an exceptional bypass of branch-protection enforcement, not a
+replacement for approval or checks. Never use it for convenience, combine it
+with `--auto`, or change repository rulesets, branch protection, workflow
+permissions, or secrets. If the required review or checks are not satisfied,
+stop and fix the PR instead of using the fallback.
 
-3. **Never force-push or delete a published tag.** The publish workflow uses
-   OIDC trusted publishing and the tag—version match as its release gate.
-   Force-pushing moves a tag that npm already published, creating a confusing
-   mismatch between the Git ref and the published package. If the tag exists
-   locally but the release was aborted before the git push, delete just the
-   local tag (`git tag -d v2.3.4`) and re-run `npm version patch`.
+### Tag and publish
 
-4. **If a patch is needed on an already-released version**, you must bump to
-   a new version — npm does not allow re-publishing the same version number.
-   Release a patch-level increment: `npm version patch` produces `v2.3.5` if
-   `v2.3.4` is current.
+After the PR is merged, tag the exact current `master` commit. The tag is the
+publish trigger; do not tag the release branch before the PR is merged:
+
+```bash
+VERSION=3.4.5
+git fetch origin master --tags
+git switch master
+git pull --ff-only origin master
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+test "$(node -p \"require('./package.json').version\")" = "$VERSION"
+test -z "$(git tag --list "v$VERSION")"
+git tag -a "v$VERSION" -m "Release v$VERSION"
+git push origin "v$VERSION"
+```
+
+The tag must be `v$VERSION`, must match `package.json`, and must point at the
+merged `master` commit. The tag starts `publish.yml`, which reruns typecheck,
+tests, the published-tarball smoke test, and `pack:check` before publishing to
+npm and GitHub Packages. Monitor the run and verify the resulting artifacts:
+
+```bash
+gh run list --workflow publish.yml --limit 10 --json databaseId,headBranch,status,conclusion
+RUN_ID=123456789 # use the databaseId for v$VERSION from the output above
+gh run watch "$RUN_ID" --exit-status
+test "$(npm view "pi-subagentura@$VERSION" version)" = "$VERSION"
+gh release view "v$VERSION"
+```
+
+Confirm the workflow completed successfully before announcing the release. The
+workflow uses OIDC for npm; do not add an `NPM_TOKEN` or other publish secret.
+
+### Failure and recovery
+
+- If a required check fails or the approval is missing, do not use `--admin`.
+  Fix the PR and wait for the required gate to pass.
+- If the tag/version check fails, do not move the tag. Inspect the workflow and
+  local/remote versions, then prepare a corrective PR and a new version when
+  the release commit must change.
+- If a tag-triggered run fails before either registry has the version, rerun it
+  only after confirming the tag still points to the intended commit and the
+  version is absent from the registries. Otherwise, use a new version.
+- If any registry already contains the version, do not rerun publishing blindly,
+  force-push, or delete the tag. Package versions are immutable; inspect the
+  completed workflow steps and have an authorized maintainer recover only the
+  missing later-stage artifact.
+- For a collision, fetch tags and registry versions before choosing the next
+  available version:
+
+  ```bash
+  git fetch --tags origin
+  git tag -l 'v*'
+  npm view pi-subagentura versions
+  ```
+
+Never force-push or delete a published tag. If a tag exists only locally and
+the release was aborted before it was pushed, delete that local tag and choose
+the intended version again. If a patch is needed for an already-published
+version, increment the patch version; npm does not allow re-publishing the same
+version number.
 
 ## Reporting issues
 
