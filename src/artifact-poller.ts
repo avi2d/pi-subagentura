@@ -35,6 +35,7 @@ import {
   getInteractivePaneLivenessAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import { isOrchestratorMode } from "./completion-turn";
 import { shouldNotify } from "./notifications";
 import {
   deliveryIdFor,
@@ -42,6 +43,7 @@ import {
   flushDeliveries,
   MAX_DELIVERY_RECORDS,
 } from "./delivery";
+import { completionDisplayLabel } from "./completion-presentation";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import {
@@ -76,6 +78,7 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+const MAX_WORKFLOW_FOOTER_TAGS = 4;
 type StatusUi = Pick<ExtensionUIContext, "setStatus">;
 interface WidgetSurfaceState {
   contributions: Map<string, string[]>;
@@ -85,10 +88,12 @@ interface WidgetSurfaceState {
 interface SubagentFooterContribution {
   kind: "subagent";
   count: number;
+  footerLabel?: string;
 }
 interface WorkflowFooterContribution {
   kind: "workflow";
   count: number;
+  footerLabel?: string;
   usage?: WorkflowUsage;
 }
 type FooterContribution =
@@ -174,25 +179,32 @@ function mergeFooterContributions(
 ): string | undefined {
   if (key === FOOTER_KEY) {
     let total = 0;
+    let footerLabel: string | undefined;
     for (const contribution of contributions) {
-      if (contribution.kind === "subagent") total += contribution.count;
+      if (contribution.kind !== "subagent") continue;
+      total += contribution.count;
+      footerLabel ??= contribution.footerLabel;
     }
     if (total === 0) return undefined;
-    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive`;
+    const label = footerLabel ? ` · ${footerLabel}` : "";
+    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive${label}`;
   }
   if (key === WORKFLOW_FOOTER_KEY) {
     let total = 0;
+    let footerLabel: string | undefined;
     let usage = zeroWorkflowUsage();
     for (const contribution of contributions) {
       if (contribution.kind !== "workflow") continue;
       total += contribution.count;
+      footerLabel ??= contribution.footerLabel;
       usage = addAggregateWorkflowUsage(usage, contribution.usage);
     }
     if (total === 0) return undefined;
     const presentedUsage = hasWorkflowUsage(usage)
       ? ` · ${formatWorkflowUsage(usage)}`
       : "";
-    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}`;
+    const label = footerLabel ? ` · ${footerLabel}` : "";
+    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}${label}`;
   }
   return undefined;
 }
@@ -240,6 +252,55 @@ function updateFooterStatus(
   }
 }
 
+function orchestratorLabelForOwner(
+  owner: SessionOwnerToken | undefined,
+): string | undefined {
+  const scope = resolveLiveSessionScope(owner);
+  const context = scope?.spawnTreeContext;
+  if (context?.role === "descendant") {
+    if (context.orchestratorMode !== true) return undefined;
+    const ownerId = context.parentAgentId ?? context.rootId;
+    return `subagent of orchestrator ${ownerId}`;
+  }
+  return scope && isOrchestratorMode(scope.pi) ? "orchestrator" : undefined;
+}
+function workflowTagForId(workflowId: string): string {
+  const name = workflowJobRegistry.get(workflowId)?.name;
+  return `workflow ${completionDisplayLabel(name, workflowId)}`;
+}
+function workflowTagsForOwner(owner: SessionOwnerToken | undefined): string[] {
+  const workflowIds = new Set<string>();
+  for (const job of inProcessJobsForOwners([owner])) {
+    if (job.status === "running" && job.workflowId) {
+      workflowIds.add(job.workflowId);
+    }
+  }
+  for (const state of interactiveStatesForOwners([owner])) {
+    if (
+      (state.status === "running" ||
+        state.status === "idle" ||
+        state.status === "unknown") &&
+      state.workflowId
+    ) {
+      workflowIds.add(state.workflowId);
+    }
+  }
+  const tags = [...workflowIds].sort().map(workflowTagForId);
+  if (tags.length <= MAX_WORKFLOW_FOOTER_TAGS) return tags;
+  const omitted = tags.length - MAX_WORKFLOW_FOOTER_TAGS;
+  return [
+    ...tags.slice(0, MAX_WORKFLOW_FOOTER_TAGS),
+    `… and ${omitted} more workflows`,
+  ];
+}
+function footerLabelsForOwner(
+  owner: SessionOwnerToken | undefined,
+): string | undefined {
+  const labels = workflowTagsForOwner(owner);
+  const orchestratorLabel = orchestratorLabelForOwner(owner);
+  if (orchestratorLabel) labels.unshift(orchestratorLabel);
+  return labels.length > 0 ? labels.join(" · ") : undefined;
+}
 /**
  * Repaint the "N sub-agents alive" footer, scoped to `owner` when supplied.
  *
@@ -256,7 +317,13 @@ export function updateRunningSubagentFooter(
   const runningCount =
     owner !== undefined && !ownerContext ? 0 : getRunningSubagentCount([owner]);
   const contribution: SubagentFooterContribution | undefined =
-    runningCount > 0 ? { kind: "subagent", count: runningCount } : undefined;
+    runningCount > 0
+      ? {
+          kind: "subagent",
+          count: runningCount,
+          footerLabel: footerLabelsForOwner(owner),
+        }
+      : undefined;
   updateFooterStatus(ui, FOOTER_KEY, contribution, owner);
 }
 
@@ -673,6 +740,7 @@ async function runPollArtifactChanges(
             ? {
                 kind: "workflow",
                 count: wfCount,
+                footerLabel: orchestratorLabelForOwner(owner),
                 usage: aggregateWorkflowFooterUsage(owner),
               }
             : undefined;

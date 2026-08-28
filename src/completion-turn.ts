@@ -221,6 +221,20 @@ export function isOrchestratorV2Enabled(pi: ExtensionAPI): boolean {
   );
 }
 
+export function isOrchestratorMode(pi: ExtensionAPI): boolean {
+  const getFlag = (pi as Partial<ExtensionAPI>).getFlag;
+  if (typeof getFlag !== "function") return false;
+  try {
+    return (
+      getFlag.call(pi, "orchestrator") === true ||
+      getFlag.call(pi, "orchestratorv2") === true
+    );
+  } catch {
+    /* Flag access is unavailable in lightweight host contexts. */
+    return false;
+  }
+}
+
 /**
  * Restore an unacknowledged wake only after its custom completion message is
  * durable. This closes the crash window between pointer delivery and the

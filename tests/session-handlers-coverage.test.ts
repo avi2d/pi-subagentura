@@ -527,7 +527,7 @@ describe("session handler lifecycle callbacks", () => {
     updateRunningSubagentFooter(sharedUi, sessionOwner(a.sessionScope));
     expect(sharedUi.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent alive",
+      "⚡ 1 sub-agent alive · orchestrator",
     );
 
     a.handlers.get("session_shutdown")![0]({ reason: "quit" }, aCtx);
@@ -555,8 +555,125 @@ describe("session handler lifecycle callbacks", () => {
 
     expect(ui.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent alive",
+      "⚡ 1 sub-agent alive · orchestrator",
     );
+  });
+
+  it("labels a child with its owner and workflow name", () => {
+    const rootContext = createRootSpawnTreeContext(
+      "orchestrator-root",
+      root,
+      true,
+    );
+    const orchestratorContext = createDescendantSpawnTreeContext(
+      rootContext,
+      "orchestrator-agent",
+      join(root, "orchestrator-agent"),
+    );
+    const childContext = createDescendantSpawnTreeContext(
+      orchestratorContext,
+      "child-agent",
+      join(root, "child-agent"),
+    );
+    const registration = registerHandlers(childContext, false);
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-child", ui);
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    workflow.name = "review-auth";
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+    child.completionOwner = "workflow";
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    expect(ui.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent alive · subagent of orchestrator orchestrator-agent · workflow review-auth",
+    );
+  });
+
+  it("falls back to the workflow ID when its name is unavailable", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    delete workflow.name;
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+    child.completionOwner = "workflow";
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    expect(ui.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent alive · orchestrator · workflow workflow-id",
+    );
+  });
+
+  it("bounds and sanitizes workflow names in the footer", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    workflow.name = `review\u001b[31m\n${"x".repeat(10_000)}`;
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    const footer = ui.setStatus.mock.calls.at(-1)?.[1] as string;
+    expect(footer).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    expect(footer.length).toBeLessThan(230);
+  });
+
+  it("caps aggregate workflow footer tags", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    for (let index = 0; index < 6; index++) {
+      const workflow = ownedWorkflow(
+        registration.sessionScope,
+        `wf-${index}`,
+      ).workflow;
+      workflow.name = `workflow-name-${index}`;
+      const child = ownedJob(registration.sessionScope, `child-job-${index}`)
+        .job as JobState;
+      child.workflowId = workflow.id;
+    }
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    const footer = ui.setStatus.mock.calls.at(-1)?.[1] as string;
+    expect(footer).toContain("… and 2 more workflows");
+    expect(footer).not.toContain("workflow workflow-name-5");
   });
 
   it("polls every started scope from one shared interval", async () => {

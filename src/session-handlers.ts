@@ -62,6 +62,7 @@ import {
 import { closeActiveInteractiveSupervisor } from "./interactive-supervisor-ui";
 import {
   clearCompletionTurnWake,
+  isOrchestratorMode,
   markCompletionTurnWakeStarted,
   recoverCompletionTurnWakes,
   settleCompletionTurnWake,
@@ -303,7 +304,11 @@ export function registerSessionHandlers(
       sessionId &&
       scope.spawnTreeContext?.role !== "descendant"
     ) {
-      scope.spawnTreeContext = createRootSpawnTreeContext(sessionId);
+      scope.spawnTreeContext = createRootSpawnTreeContext(
+        sessionId,
+        undefined,
+        isOrchestratorMode(pi),
+      );
     }
     scope.isParentIdle =
       typeof ctx.isIdle === "function" ? ctx.isIdle.bind(ctx) : undefined;

@@ -538,7 +538,7 @@ describe("pollArtifactChanges", () => {
     expect(rows).toHaveLength(1);
     expect(uiA.setStatus).toHaveBeenCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent alive",
+      "⚡ 1 sub-agent alive · workflow wf-1",
     );
   });
 
