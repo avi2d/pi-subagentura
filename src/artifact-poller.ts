@@ -43,6 +43,7 @@ import {
   flushDeliveries,
   MAX_DELIVERY_RECORDS,
 } from "./delivery";
+import { sanitizeDisplayLabel } from "./display-label";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import {
@@ -77,6 +78,7 @@ const WORKFLOW_WIDGET_KEY = "subagentura-workflow-activity";
 /** Maximum widget rows before truncation with "… and N more". */
 const MAX_WIDGET_ROWS = 10;
 const MAX_WORKFLOW_WIDGET_ROWS = 5;
+const MAX_WORKFLOW_FOOTER_TAGS = 4;
 type StatusUi = Pick<ExtensionUIContext, "setStatus">;
 interface WidgetSurfaceState {
   contributions: Map<string, string[]>;
@@ -264,8 +266,7 @@ function orchestratorLabelForOwner(
 }
 function workflowTagForId(workflowId: string): string {
   const name = workflowJobRegistry.get(workflowId)?.name;
-  const trimmedName = typeof name === "string" ? name.trim() : "";
-  return `workflow ${trimmedName || workflowId}`;
+  return `workflow ${sanitizeDisplayLabel(name, workflowId)}`;
 }
 function workflowTagsForOwner(owner: SessionOwnerToken | undefined): string[] {
   const workflowIds = new Set<string>();
@@ -284,7 +285,13 @@ function workflowTagsForOwner(owner: SessionOwnerToken | undefined): string[] {
       workflowIds.add(state.workflowId);
     }
   }
-  return [...workflowIds].sort().map(workflowTagForId);
+  const tags = [...workflowIds].sort().map(workflowTagForId);
+  if (tags.length <= MAX_WORKFLOW_FOOTER_TAGS) return tags;
+  const omitted = tags.length - MAX_WORKFLOW_FOOTER_TAGS;
+  return [
+    ...tags.slice(0, MAX_WORKFLOW_FOOTER_TAGS),
+    `… and ${omitted} more workflows`,
+  ];
 }
 function footerLabelsForOwner(
   owner: SessionOwnerToken | undefined,

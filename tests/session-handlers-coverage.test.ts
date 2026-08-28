@@ -626,6 +626,56 @@ describe("session handler lifecycle callbacks", () => {
     );
   });
 
+  it("bounds and sanitizes workflow names in the footer", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    workflow.name = `review\u001b[31m\n${"x".repeat(10_000)}`;
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    const footer = ui.setStatus.mock.calls.at(-1)?.[1] as string;
+    expect(footer).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    expect(footer.length).toBeLessThan(230);
+  });
+
+  it("caps aggregate workflow footer tags", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    for (let index = 0; index < 6; index++) {
+      const workflow = ownedWorkflow(
+        registration.sessionScope,
+        `wf-${index}`,
+      ).workflow;
+      workflow.name = `workflow-name-${index}`;
+      const child = ownedJob(registration.sessionScope, `child-job-${index}`)
+        .job as JobState;
+      child.workflowId = workflow.id;
+    }
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    const footer = ui.setStatus.mock.calls.at(-1)?.[1] as string;
+    expect(footer).toContain("… and 2 more workflows");
+    expect(footer).not.toContain("workflow workflow-name-5");
+  });
+
   it("polls every started scope from one shared interval", async () => {
     const a = registerHandlers();
     const b = registerHandlers();
