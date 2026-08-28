@@ -749,6 +749,44 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
+  it.each(["orchestrator", "orchestratorv2"] as const)(
+    "labels the running footer for --%s mode",
+    async (flag) => {
+      api.getFlag.mockImplementation((name: string) => name === flag);
+      const ctx = mockCtx();
+      const state = {
+        ...mockInteractiveState(),
+        parentSessionId: "test-session-id",
+      };
+      mockLaunchInteractiveSubagent.mockImplementationOnce(() => {
+        interactiveSubagentRegistry.set(state.id, state as any);
+        getStartedSessionScopes()[0]?.interactiveStates.set(
+          state.id,
+          state as any,
+        );
+        return state;
+      });
+
+      await getInteractiveToolDef(api).execute(
+        `call-footer-${flag}`,
+        {
+          task: "research X",
+          ...(flag === "orchestratorv2"
+            ? { routingDescription: "research specialist" }
+            : {}),
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+        "subagentura-running",
+        "⚡ 1 sub-agent alive · orchestrator",
+      );
+    },
+  );
+
   it("counts only this session's agents once the session context is bound", async () => {
     // The reachable production path: the tool passes the raw active token and
     // updateRunningSubagentFooter owns the scoping decision.

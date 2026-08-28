@@ -85,10 +85,12 @@ interface WidgetSurfaceState {
 interface SubagentFooterContribution {
   kind: "subagent";
   count: number;
+  orchestrator: boolean;
 }
 interface WorkflowFooterContribution {
   kind: "workflow";
   count: number;
+  orchestrator: boolean;
   usage?: WorkflowUsage;
 }
 type FooterContribution =
@@ -174,25 +176,32 @@ function mergeFooterContributions(
 ): string | undefined {
   if (key === FOOTER_KEY) {
     let total = 0;
+    let orchestrator = false;
     for (const contribution of contributions) {
-      if (contribution.kind === "subagent") total += contribution.count;
+      if (contribution.kind !== "subagent") continue;
+      total += contribution.count;
+      orchestrator ||= contribution.orchestrator;
     }
     if (total === 0) return undefined;
-    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive`;
+    const label = orchestrator ? " · orchestrator" : "";
+    return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive${label}`;
   }
   if (key === WORKFLOW_FOOTER_KEY) {
     let total = 0;
+    let orchestrator = false;
     let usage = zeroWorkflowUsage();
     for (const contribution of contributions) {
       if (contribution.kind !== "workflow") continue;
       total += contribution.count;
+      orchestrator ||= contribution.orchestrator;
       usage = addAggregateWorkflowUsage(usage, contribution.usage);
     }
     if (total === 0) return undefined;
     const presentedUsage = hasWorkflowUsage(usage)
       ? ` · ${formatWorkflowUsage(usage)}`
       : "";
-    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}`;
+    const label = orchestrator ? " · orchestrator" : "";
+    return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}${label}`;
   }
   return undefined;
 }
@@ -240,6 +249,19 @@ function updateFooterStatus(
   }
 }
 
+function isOrchestratorSession(owner: SessionOwnerToken | undefined): boolean {
+  const scope = resolveLiveSessionScope(owner);
+  if (!scope) return false;
+  try {
+    return (
+      scope.pi.getFlag("orchestrator") === true ||
+      scope.pi.getFlag("orchestratorv2") === true
+    );
+  } catch {
+    /* Flags may be unavailable in lightweight test or host contexts. */
+    return false;
+  }
+}
 /**
  * Repaint the "N sub-agents alive" footer, scoped to `owner` when supplied.
  *
@@ -256,7 +278,13 @@ export function updateRunningSubagentFooter(
   const runningCount =
     owner !== undefined && !ownerContext ? 0 : getRunningSubagentCount([owner]);
   const contribution: SubagentFooterContribution | undefined =
-    runningCount > 0 ? { kind: "subagent", count: runningCount } : undefined;
+    runningCount > 0
+      ? {
+          kind: "subagent",
+          count: runningCount,
+          orchestrator: isOrchestratorSession(owner),
+        }
+      : undefined;
   updateFooterStatus(ui, FOOTER_KEY, contribution, owner);
 }
 
@@ -673,6 +701,7 @@ async function runPollArtifactChanges(
             ? {
                 kind: "workflow",
                 count: wfCount,
+                orchestrator: isOrchestratorSession(owner),
                 usage: aggregateWorkflowFooterUsage(owner),
               }
             : undefined;
