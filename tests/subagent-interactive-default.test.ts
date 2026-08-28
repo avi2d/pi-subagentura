@@ -385,13 +385,13 @@ describe("subagent_interactive tool lifecycle", () => {
       },
     ]);
 
+    // This used to pass `context` here too, to prove it was not concatenated.
+    // The tool refuses that pair outright now (see "refuses an explicit context
+    // alongside includeContext true"), because silently dropping a handoff the
+    // caller supplied is worse than saying no.
     await toolDef.execute(
       "call-parent-context",
-      {
-        task: "research X",
-        includeContext: true,
-        context: "EXPLICIT-CONTEXT-MUST-NOT-BE-CONCATENATED",
-      },
+      { task: "research X", includeContext: true },
       undefined,
       undefined,
       ctx,
@@ -401,9 +401,6 @@ describe("subagent_interactive tool lifecycle", () => {
     const contextText = mockLaunchInteractiveSubagent.mock.calls[0][0]
       .contextText as string;
     expect(contextText).toContain("PARENT-BRANCH-MARKER");
-    expect(contextText).not.toContain(
-      "EXPLICIT-CONTEXT-MUST-NOT-BE-CONCATENATED",
-    );
   });
 
   it("persists initial routing metadata only after a successful spawn", async () => {
@@ -539,6 +536,66 @@ describe("subagent_interactive tool lifecycle", () => {
     });
     expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
     expect(mockUpsertOrchestratorRoutingEntry).not.toHaveBeenCalled();
+  });
+
+  // These two rules used to be a union of three context variants inside
+  // InteractiveParams, which put an `allOf` at the root of the registered
+  // schema and made Anthropic answer 400 to every tool list containing it. They
+  // are enforced by the tool now, so they are asserted on the rejection a
+  // caller receives rather than on the schema's shape.
+  it("refuses an explicit context alongside includeContext true", async () => {
+    const toolDef = getInteractiveToolDef(api);
+
+    const result = await toolDef.execute(
+      "call-context-both",
+      { task: "research X", includeContext: true, context: "handoff" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ status: "invalid_context_mode" });
+    expect(result.content[0].text).toContain(
+      "context is not allowed when includeContext is true",
+    );
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+  });
+
+  it("refuses an explicit context that would be silently dropped", async () => {
+    const toolDef = getInteractiveToolDef(api);
+
+    const result = await toolDef.execute(
+      "call-context-orphan",
+      { task: "research X", context: "handoff" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ status: "invalid_context_mode" });
+    expect(result.content[0].text).toContain(
+      "context requires includeContext: false",
+    );
+    expect(mockLaunchInteractiveSubagent).not.toHaveBeenCalled();
+  });
+
+  it("accepts an explicit context alongside includeContext false", async () => {
+    const toolDef = getInteractiveToolDef(api);
+
+    const result = await toolDef.execute(
+      "call-context-explicit",
+      { task: "research X", includeContext: false, context: "handoff" },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+
+    expect(result.details).not.toMatchObject({
+      status: "invalid_context_mode",
+    });
+    expect(mockLaunchInteractiveSubagent).toHaveBeenCalled();
   });
 
   it("reports routing persistence failure without pretending the child failed", async () => {
@@ -951,13 +1008,12 @@ describe("subagent_interactive tool lifecycle", () => {
     );
   });
 
-  it("registers the intersected InteractiveParams schema and documents defaults", () => {
+  it("registers the plain InteractiveParams schema and documents defaults", () => {
     const toolDef = getInteractiveToolDef(api);
     expect(toolDef).toBeDefined();
     const params = toolDef.parameters;
     expect(params).toBe(InteractiveParams);
-    const [commonFields, contextModes] = (params as any).allOf;
-    const properties = commonFields.properties;
+    const properties = (params as any).properties;
     expect(properties).toBeDefined();
     expect(properties.notifyOnComplete).toBeDefined();
     expect(properties.triggerTurnOnComplete).toBeDefined();
@@ -965,7 +1021,8 @@ describe("subagent_interactive tool lifecycle", () => {
     expect(properties.routingAliases).toBeDefined();
     expect(properties.completionPolicy).toBeDefined();
     expect(properties.completionGroupId).toBeDefined();
-    expect(contextModes.anyOf).toHaveLength(3);
+    expect(properties.includeContext).toBeDefined();
+    expect(properties.context).toBeDefined();
     const desc = properties.notifyOnComplete.description ?? "";
     expect(desc).toMatch(/deprecated compatibility/i);
     expect(desc).toContain("coordinated each");

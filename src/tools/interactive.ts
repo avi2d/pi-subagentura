@@ -177,6 +177,32 @@ function persistInitialRoutingMetadata(params: {
   }
 }
 
+/**
+ * An explicit `context` handoff is only meaningful when the parent branch is
+ * not being serialized, so it is permitted only alongside
+ * `includeContext: false`. Silently dropping it would send a child a prompt the
+ * caller believed it had supplied.
+ *
+ * This used to live in `InteractiveParams` as a union of three variants, which
+ * put an `allOf` at the root of the registered schema. Anthropic answers 400 to
+ * a root composition keyword, and an adapter that forwards the schema unchanged
+ * took down every turn on that provider. The rule is enforced here instead,
+ * next to the routing rules, and no adapter can lose it.
+ */
+function validateContextMode(
+  includeContext: boolean | undefined,
+  context: string | undefined,
+): string | undefined {
+  if (context === undefined) return undefined;
+  if (includeContext === true) {
+    return "context is not allowed when includeContext is true, because the parent branch is serialized instead";
+  }
+  if (includeContext === undefined) {
+    return "context requires includeContext: false";
+  }
+  return undefined;
+}
+
 function validateInitialRoutingMetadata(
   description: string | undefined,
   aliases: string[] | undefined,
@@ -495,6 +521,22 @@ export function registerInteractiveSubagentTools(
         includeContext?: boolean;
         context?: string;
       };
+      const contextModeError = validateContextMode(
+        contextParams.includeContext,
+        contextParams.context,
+      );
+      if (contextModeError) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Invalid context mode: ${contextModeError}`,
+            },
+          ],
+          details: { status: "invalid_context_mode", error: contextModeError },
+          isError: true,
+        };
+      }
       if (
         contextParams.context !== undefined &&
         Buffer.byteLength(contextParams.context, "utf8") >

@@ -42,14 +42,13 @@ function collectErrorMessages(schema: XSchema, value: unknown): string[] {
   return errs.map((e: { message: string }) => e.message);
 }
 
-/** Reproduce Pi 0.80.6's Anthropic convertTools top-level schema projection. */
-function piAnthropicInputSchema(schema: any) {
-  return {
-    type: "object",
-    properties: schema.properties ?? {},
-    required: schema.required ?? [],
-  };
-}
+// There was a `piAnthropicInputSchema` helper here that reproduced Pi 0.80.6's
+// Anthropic `convertTools` projection, and the assertions ran against that copy
+// rather than against the schema. It reported green through the whole of
+// v3.4.x while `subagent_interactive` carried a root `allOf` that Anthropic
+// answers 400 to, because the copy projected the `allOf` away exactly as the
+// adapter it modelled would have, and an adapter that forwards the schema
+// unchanged was never represented. Assert on the schema itself.
 
 // ---------------------------------------------------------------------------
 // BaseParams
@@ -538,20 +537,22 @@ describe("InteractiveParams", () => {
     ).toBe(true);
   });
 
-  it("rejects explicit context without includeContext false", () => {
+  // The two context-exclusivity rules moved out of this schema and into
+  // `subagent_interactive` itself, because stating them here needed an `allOf`
+  // at the schema root that Anthropic rejects. They are asserted against the
+  // tool in tests/subagent-interactive-default.test.ts, on the rejection a
+  // caller actually receives.
+  it("accepts both context shapes, and leaves the exclusivity to the tool", () => {
     expect(check(InteractiveParams)({ task: "t", context: "handoff" })).toBe(
-      false,
+      true,
     );
-  });
-
-  it("rejects explicit context with includeContext true", () => {
     expect(
       check(InteractiveParams)({
         task: "t",
-        includeContext: true,
+        includeContext: false,
         context: "handoff",
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("rejects explicit context with a non-string value", () => {
@@ -576,34 +577,17 @@ describe("InteractiveParams", () => {
     );
   });
 
-  it("declares common fields intersected with three strict context variants", () => {
+  it("declares a plain object schema a provider can be handed unchanged", () => {
     const schema = InteractiveParams as any;
-    expect(schema.unevaluatedProperties).toBe(false);
-    expect(schema.allOf).toHaveLength(2);
-
-    const commonProperties = schema.allOf[0].properties;
-    expect(commonProperties).toHaveProperty("task");
-    expect(commonProperties).toHaveProperty("routingDescription");
-    expect(commonProperties).toHaveProperty("routingAliases");
-    expect(commonProperties).toHaveProperty("completionPolicy");
-    expect(commonProperties).toHaveProperty("completionGroupId");
-    expect(schema.allOf[0].dependentRequired).toEqual({
-      routingAliases: ["routingDescription"],
-    });
-    expect(commonProperties).not.toHaveProperty("includeContext");
-    expect(commonProperties).not.toHaveProperty("context");
-
-    const variants = schema.allOf[1].anyOf;
-    expect(variants).toHaveLength(3);
-    expect(variants[0].properties.includeContext.const).toBe(true);
-    expect(variants[0].properties).not.toHaveProperty("context");
-    expect(variants[1].properties.includeContext.const).toBe(false);
-    expect(variants[1].properties.context.type).toBe("string");
-    expect(variants[2].properties).toEqual({});
+    expect(schema.type).toBe("object");
+    expect(schema.additionalProperties).toBe(false);
+    for (const keyword of ["allOf", "anyOf", "oneOf"]) {
+      expect(Object.keys(schema)).not.toContain(keyword);
+    }
   });
 
-  it("exposes the full model-visible shape through Pi's Anthropic conversion", () => {
-    const providerSchema = piAnthropicInputSchema(InteractiveParams);
+  it("exposes the full model-visible shape", () => {
+    const providerSchema = InteractiveParams as any;
 
     expect(providerSchema.required).toEqual(["task"]);
     expect(Object.keys(providerSchema.properties).sort()).toEqual(
@@ -667,11 +651,11 @@ describe("InteractiveParams", () => {
     ).toBe(true);
   });
 
-  it("rejects routing aliases without a routing description", () => {
-    expect(
-      check(InteractiveParams)({ task: "t", routingAliases: ["api"] }),
-    ).toBe(false);
-  });
+  // `routingAliases` without `routingDescription` is rejected by
+  // `validateInitialRoutingMetadata`, asserted through the tool in
+  // tests/subagent-interactive-default.test.ts ("rejects routing metadata that
+  // cannot persist before spawning"). Stating it here as well needed the
+  // `dependentRequired` that only the intersection carried.
 
   it("rejects empty routing descriptions and aliases", () => {
     expect(

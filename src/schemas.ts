@@ -229,75 +229,44 @@ Object.assign(InteractiveSpawnFields, {
   dependentRequired: { routingAliases: ["routingDescription"] },
 });
 
-const InteractiveContextMode = Type.Union([
-  Type.Object(
-    {
-      includeContext: Type.Literal(true, {
+const InteractiveProviderFields = Type.Object(
+  {
+    ...InteractiveSpawnFields.properties,
+    includeContext: Type.Optional(
+      Type.Boolean({
         description:
-          "Serialize the full parent conversation branch into the initial child prompt.",
+          "Whether to serialize the parent branch. False permits an explicit context handoff; true forbids one.",
       }),
-    },
-    { not: { required: ["context"] } },
-  ),
-  Type.Object({
-    includeContext: Type.Literal(false, {
-      description:
-        "Keep the child independent unless an explicit context handoff is supplied.",
-    }),
+    ),
     context: Type.Optional(
       Type.String({
         maxLength: MAX_INTERACTIVE_CONTEXT_BYTES,
         description:
-          "Explicit handoff/context passed directly to the initial child prompt.",
+          "Explicit handoff/context, permitted only when includeContext is false.",
       }),
     ),
-  }),
-  Type.Object(
-    {},
-    {
-      description:
-        "Legacy default with neither parent-branch nor explicit context fields.",
-      not: {
-        anyOf: [{ required: ["includeContext"] }, { required: ["context"] }],
-      },
-    },
-  ),
-]);
-
-const InteractiveProviderFields = Type.Object({
-  ...InteractiveSpawnFields.properties,
-  includeContext: Type.Optional(
-    Type.Boolean({
-      description:
-        "Whether to serialize the parent branch. False permits an explicit context handoff; true forbids one.",
-    }),
-  ),
-  context: Type.Optional(
-    Type.String({
-      maxLength: MAX_INTERACTIVE_CONTEXT_BYTES,
-      description:
-        "Explicit handoff/context, permitted only when includeContext is false.",
-    }),
-  ),
-});
-
-function exposeProviderObjectShape<T extends object>(
-  validationSchema: T,
-  providerShape: typeof InteractiveProviderFields,
-): T {
-  // Pi 0.80.6's Anthropic adapter projects only these top-level keywords.
-  // Keep allOf/anyOf on the returned schema so TypeBox validation stays strict.
-  return {
-    ...validationSchema,
-    type: providerShape.type,
-    properties: providerShape.properties,
-    required: providerShape.required,
-  };
-}
-
-export const InteractiveParams = exposeProviderObjectShape(
-  Type.Intersect([InteractiveSpawnFields, InteractiveContextMode], {
-    unevaluatedProperties: false,
-  }),
-  InteractiveProviderFields,
+  },
+  // Replaces the `unevaluatedProperties: false` the intersection carried. Both
+  // reject a misspelled argument rather than dropping it, and this one is
+  // plain JSON Schema that a provider is far more likely to understand.
+  { additionalProperties: false },
 );
+
+/**
+ * The schema `subagent_interactive` registers, and the one an adapter may hand
+ * a provider unchanged.
+ *
+ * A plain object schema, deliberately. The Anthropic Messages API answers 400
+ * to `oneOf`, `allOf` or `anyOf` at the root of a tool's `input_schema`. Pi's
+ * own Anthropic adapter projects the schema down to `{type, properties,
+ * required}` first, which hides a root composition keyword; `pi-claude-bridge`
+ * forwards what it is given, which does not. A schema is only safe here if it
+ * is safe for an adapter that does nothing.
+ */
+export const InteractiveParams = InteractiveProviderFields;
+
+// The rule the three context variants used to state, `includeContext: true`
+// forbidding `context`, is enforced by `validateContextMode` in
+// `tools/interactive.ts`, next to the routing rules it sits with. It was never
+// visible to a model: every adapter projected the composition away before the
+// schema was sent.
