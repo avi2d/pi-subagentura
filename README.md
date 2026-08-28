@@ -247,6 +247,16 @@ directs the parent to delegate only through attachable interactive children and
 use the parent session's authoritative routing ledger together with the
 project-local routing cache.
 
+#### See the thin-router flow
+
+> **A small real-session story:** [open the parent replay](https://htmlpreview.github.io/?https://gist.githubusercontent.com/lmn451/7da0271b7e863c1a215e2b7aec822c18/raw/index.html) to see one user talking with a lightweight Orchestratorv2 parent while it fans work out to many attachable child sessions. The highlighted spawn point shows the thin router creating a second Pi session for the reusable workflow-child work.
+
+> [Open the child-session replay](https://htmlpreview.github.io/?https://gist.githubusercontent.com/lmn451/e4570ecfd640872efeeed72630d08f37/raw/index.html) to see that child session create two interactive specialists—a recovery-safety reviewer and a package/API reviewer—and supervise their work in its own conversation.
+
+This is the core v2 model in miniature: **you can keep talking with the orchestrator, or attach and talk directly with a child.** Children can create and supervise their own descendants, while important outcomes flow back through the child and the parent’s existing artifact and notification paths. The replay annotations mark the parent-to-child handoff and the two specialist launches.
+
+> Replays generated with [vibe-replay](https://github.com/tuo-lei/vibe-replay), an interactive replay and sharing tool for AI coding sessions.
+
 The v2 prompt gives the parent a lightweight routing role: it routes clear work
 to attachable interactive subagents, can split broad requests across specialists,
 and asks for clarification when a request is ambiguous or a narrow request has no
