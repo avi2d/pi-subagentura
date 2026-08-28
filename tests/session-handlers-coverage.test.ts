@@ -559,7 +559,7 @@ describe("session handler lifecycle callbacks", () => {
     );
   });
 
-  it("labels a child with its stable orchestrator parent ID", () => {
+  it("labels a child with its owner and workflow name", () => {
     const rootContext = createRootSpawnTreeContext(
       "orchestrator-root",
       root,
@@ -582,13 +582,47 @@ describe("session handler lifecycle callbacks", () => {
       notify: vi.fn(),
     };
     startSession(registration, root, "session-child", ui);
-    ownedJob(registration.sessionScope, "child-job");
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    workflow.name = "review-auth";
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+    child.completionOwner = "workflow";
 
     updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
 
     expect(ui.setStatus).toHaveBeenLastCalledWith(
       "subagentura-running",
-      "⚡ 1 sub-agent alive · subagent of orchestrator orchestrator-agent",
+      "⚡ 1 sub-agent alive · subagent of orchestrator orchestrator-agent · workflow review-auth",
+    );
+  });
+
+  it("falls back to the workflow ID when its name is unavailable", () => {
+    const registration = registerHandlers();
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-orchestrator", ui);
+    const workflow = ownedWorkflow(
+      registration.sessionScope,
+      "workflow-id",
+    ).workflow;
+    delete workflow.name;
+    const child = ownedJob(registration.sessionScope, "child-job")
+      .job as JobState;
+    child.workflowId = workflow.id;
+    child.completionOwner = "workflow";
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    expect(ui.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent alive · orchestrator · workflow workflow-id",
     );
   });
 

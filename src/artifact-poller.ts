@@ -250,7 +250,7 @@ function updateFooterStatus(
   }
 }
 
-function footerLabelForOwner(
+function orchestratorLabelForOwner(
   owner: SessionOwnerToken | undefined,
 ): string | undefined {
   const scope = resolveLiveSessionScope(owner);
@@ -261,6 +261,38 @@ function footerLabelForOwner(
     return `subagent of orchestrator ${ownerId}`;
   }
   return scope && isOrchestratorMode(scope.pi) ? "orchestrator" : undefined;
+}
+function workflowTagForId(workflowId: string): string {
+  const name = workflowJobRegistry.get(workflowId)?.name;
+  const trimmedName = typeof name === "string" ? name.trim() : "";
+  return `workflow ${trimmedName || workflowId}`;
+}
+function workflowTagsForOwner(owner: SessionOwnerToken | undefined): string[] {
+  const workflowIds = new Set<string>();
+  for (const job of inProcessJobsForOwners([owner])) {
+    if (job.status === "running" && job.workflowId) {
+      workflowIds.add(job.workflowId);
+    }
+  }
+  for (const state of interactiveStatesForOwners([owner])) {
+    if (
+      (state.status === "running" ||
+        state.status === "idle" ||
+        state.status === "unknown") &&
+      state.workflowId
+    ) {
+      workflowIds.add(state.workflowId);
+    }
+  }
+  return [...workflowIds].sort().map(workflowTagForId);
+}
+function footerLabelsForOwner(
+  owner: SessionOwnerToken | undefined,
+): string | undefined {
+  const labels = workflowTagsForOwner(owner);
+  const orchestratorLabel = orchestratorLabelForOwner(owner);
+  if (orchestratorLabel) labels.unshift(orchestratorLabel);
+  return labels.length > 0 ? labels.join(" · ") : undefined;
 }
 /**
  * Repaint the "N sub-agents alive" footer, scoped to `owner` when supplied.
@@ -282,7 +314,7 @@ export function updateRunningSubagentFooter(
       ? {
           kind: "subagent",
           count: runningCount,
-          footerLabel: footerLabelForOwner(owner),
+          footerLabel: footerLabelsForOwner(owner),
         }
       : undefined;
   updateFooterStatus(ui, FOOTER_KEY, contribution, owner);
@@ -701,7 +733,7 @@ async function runPollArtifactChanges(
             ? {
                 kind: "workflow",
                 count: wfCount,
-                footerLabel: footerLabelForOwner(owner),
+                footerLabel: orchestratorLabelForOwner(owner),
                 usage: aggregateWorkflowFooterUsage(owner),
               }
             : undefined;
