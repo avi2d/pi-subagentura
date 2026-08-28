@@ -534,7 +534,7 @@ export function notifyInProcessCompletionWithoutDelivery(
   const mode = jobState.notifyOnComplete ?? "inject";
   notifyCompletionDelivery(target.ui, [
     {
-      label: "in-process sub-agent",
+      label: `Job ${jobState.id}`,
       mode,
       triggerTurn: completionTriggersTurn(mode, jobState.triggerTurnOnComplete),
       status: result.isError ? "error" : "done",
@@ -637,6 +637,7 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
       jobState.triggerTurnOnComplete,
     );
     const summary = buildNotifySummary(result);
+    const displayLabel = `Job ${jobState.id}`;
     let content =
       mode === "inject"
         ? `${summary}\n[Untrusted sub-agent output]\n${sanitizeOutput(result.output) || "(sub-agent produced no output)"}`
@@ -644,7 +645,7 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
           ? `${summary}\nResult remains in compatibility job ${jobState.id}. Surface its status without calling in-process tools in Orchestratorv2 mode.`
           : `${summary}\nResult retained in job ${jobState.id}; use get_subagent_result for details.`;
     content = formatCompletionMessage(
-      undefined,
+      displayLabel,
       content,
       "in-process sub-agent",
     );
@@ -700,7 +701,7 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
     llm.map(({ pending, mode, trigger, status }) => ({
       label:
         pending.kind === "completion"
-          ? "in-process sub-agent"
+          ? `Job ${pending.jobState.id}`
           : "In-process completion overflow",
       mode,
       triggerTurn: trigger,

@@ -98,13 +98,28 @@ describe("in-process completion delivery queue", () => {
 
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage.mock.calls[0][0].content).toMatch(
-      /^from: in-process sub-agent, /,
+      /^from: Job test-job-1, /,
     );
     expect(sendMessage.mock.calls[0][0].content).not.toContain(
       SUCCESS_RESULT.output,
     );
     expect(sendMessage.mock.calls[0][0].details.mode).toBe("notify");
     expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("keeps job IDs in distinct in-process completion labels", () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    const first = makeJobState({ id: "job-a" });
+    const second = makeJobState({ id: "job-b" });
+
+    deliverNotification(first, SUCCESS_RESULT);
+    deliverNotification(second, SUCCESS_RESULT);
+
+    expect(sendMessage.mock.calls.map(([message]) => message.content)).toEqual([
+      expect.stringMatching(/^from: Job job-a, /),
+      expect.stringMatching(/^from: Job job-b, /),
+    ]);
   });
 
   it("reports other running in-process jobs in completion messages", () => {
