@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-08-28
+
+### Added
+
+- Added an annotated Orchestratorv2 thin-router walkthrough showing a parent session creating a child session and that child coordinating two interactive specialists.
+- Added credit and replay links for [vibe-replay](https://github.com/tuo-lei/vibe-replay).
+
 ## [3.4.0] - 2026-08-27
 
 ### Added
