@@ -97,11 +97,29 @@ describe("in-process completion delivery queue", () => {
     deliverNotification(job, SUCCESS_RESULT);
 
     expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0][0].content).toMatch(
+      /^from: Job test-job-1, /,
+    );
     expect(sendMessage.mock.calls[0][0].content).not.toContain(
       SUCCESS_RESULT.output,
     );
     expect(sendMessage.mock.calls[0][0].details.mode).toBe("notify");
     expect(job.notificationDelivered).toBe(true);
+  });
+
+  it("keeps job IDs in distinct in-process completion labels", () => {
+    const sendMessage = vi.fn();
+    (globalThis as any).__piSubagenturaPiRef = { sendMessage };
+    const first = makeJobState({ id: "job-a" });
+    const second = makeJobState({ id: "job-b" });
+
+    deliverNotification(first, SUCCESS_RESULT);
+    deliverNotification(second, SUCCESS_RESULT);
+
+    expect(sendMessage.mock.calls.map(([message]) => message.content)).toEqual([
+      expect.stringMatching(/^from: Job job-a, /),
+      expect.stringMatching(/^from: Job job-b, /),
+    ]);
   });
 
   it("reports other running in-process jobs in completion messages", () => {
@@ -406,7 +424,7 @@ describe("artifact notification compatibility", () => {
       }),
     ).toBe(true);
     expect(sendMessage.mock.calls[0][0].content).toContain(
-      "✅ Reviewer (child-1) — done (exit 0)",
+      "from: Reviewer, ✅ done (exit 0)",
     );
     expect(sendMessage.mock.calls[0][1]).toMatchObject({
       deliverAs: "followUp",
@@ -490,15 +508,34 @@ describe("artifact notification compatibility", () => {
     }
 
     expect(sendMessage.mock.calls.map((call) => call[0].content)).toEqual([
-      expect.stringContaining("▶ Reviewer (child-1) — started"),
-      expect.stringContaining("🚫 Reviewer (child-1) — cancelled"),
-      expect.stringContaining("❌ Reviewer (child-1) — process exited (1)"),
-      expect.stringContaining("▶ Reviewer (child-1) — started"),
-      expect.stringContaining("▶ Reviewer (child-1) — activity"),
-      expect.stringContaining("❌ Reviewer (child-1) — done (exit 1)"),
-      expect.stringContaining("❌ Reviewer (child-1) — error"),
-      expect.stringContaining("✅ Reviewer (child-1) — process exited (0)"),
-      expect.stringContaining("❌ Reviewer (child-1) — error"),
+      "from: Reviewer, ▶ started\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, 🚫 cancelled\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ❌ process exited (1)\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ▶ started\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ▶ activity\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ❌ done (exit 1)\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ❌ error\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ✅ process exited (0)\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
+      "from: Reviewer, ❌ error\n" +
+        "unknown error\n" +
+        "Output: /tmp/artifacts/child-1/output.md\n" +
+        "Activity log: /tmp/artifacts/child-1/events.ndjson",
     ]);
   });
 

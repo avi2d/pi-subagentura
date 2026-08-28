@@ -144,6 +144,28 @@ describe("completion coordinator", () => {
     }
   });
 
+  it("hides technical IDs in collapsed completion entries", () => {
+    const setupResult = setup();
+    scope = setupResult.scope;
+    const renderer = setupResult.pi.registerEntryRenderer.mock.calls.find(
+      ([type]) => type === "subagentura-completion",
+    )?.[1];
+    expect(renderer).toBeTypeOf("function");
+    const theme = { fg: (_color: string, text: string) => text };
+    const entry = { data: record("worker", { label: "Reviewer" }) };
+    const collapsed = renderer(entry, { expanded: false }, theme)
+      .render(200)
+      .join("\n")
+      .trimEnd();
+    expect(collapsed).toBe("from: Reviewer, ✓ done");
+    expect(collapsed).not.toContain("worker");
+    expect(collapsed).not.toContain("turn-worker");
+    const expanded = renderer(entry, { expanded: true }, theme)
+      .render(200)
+      .join("\n");
+    expect(expanded).toContain('("worker", turn "turn-worker")');
+  });
+
   it("notifies the user once and sends one independent reference manifest", () => {
     const setupResult = setup();
     scope = setupResult.scope;

@@ -211,7 +211,9 @@ describe("coordinated completion delivery", () => {
     expect(providerContext).toContain("Completed background work");
     expect(providerContext).toContain("outputs/event-a.md");
     expect(providerContext).toContain("events.ndjson");
-    expect(providerContext).not.toContain("subagentura-completion");
+    expect(JSON.stringify(harness.contexts[0].messages)).not.toContain(
+      "subagentura-completion",
+    );
     expect(providerContext).not.toContain("untrusted-subagent-output");
     harness.completeNext();
     await harness.session.waitForIdle();

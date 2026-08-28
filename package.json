@@ -55,6 +55,7 @@
     "src/artifact-poller.ts",
     "src/child-protocol.ts",
     "src/completion-turn.ts",
+    "src/completion-presentation.ts",
     "src/delivery.ts",
     "src/completion-coordinator.ts",
     "src/completion-ledger.ts",
