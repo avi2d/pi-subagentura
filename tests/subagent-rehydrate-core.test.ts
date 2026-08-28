@@ -24,7 +24,11 @@ describe("rehydrateInteractiveSubagents", () => {
   beforeEach(() => {
     cwd = makeTmp();
     vi.resetModules();
-    vi.doMock("../src/multiplexer", () => ({
+    // Spread the actual module so helpers like isMuxName keep their real
+    // behavior — a hand-written stub of the full surface silently drops every
+    // persisted state the moment artifact.ts grows a new import from here.
+    vi.doMock("../src/multiplexer", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../src/multiplexer")>()),
       getMux: () => ({
         name: "tmux",
         getPaneLiveness: () => "dead",

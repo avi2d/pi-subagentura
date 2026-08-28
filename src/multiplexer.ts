@@ -15,21 +15,24 @@
  *     per backend so `isAvailable()` can be probed during resolution).
  *
  * Resolution order (`getMux`):
- *   1. Explicit `preference` arg from the tool (forces tmux or zellij).
- *   2. Auto-detect: prefer the mux already attached to the parent process
- *      (env var heuristic: ZELLIJ_SESSION_NAME, then TMUX).
+ *   1. Explicit `preference` arg from the tool (forces a named backend).
+ *   2. Auto-detect: prefer the mux already hosting the parent process
+ *      (env var heuristic: HERDR_ENV, then ZELLIJ_SESSION_NAME, then TMUX).
  *   3. Fall back to whichever backend has a binary + active server, tmux first
- *      for backward compatibility.
- *   4. Throw with a setup hint pointing at both backends.
+ *      for backward compatibility. herdr never participates here: it has no
+ *      relaxed path, because every operation needs the workspace and caller
+ *      pane context herdr only injects into its own panes.
+ *   4. Throw with a setup hint naming the backends.
  */
 
 import { execFileSync, spawn, type ExecSyncOptions } from "node:child_process";
 import { TmuxMultiplexer } from "./multiplexer-tmux";
 import { ZellijMultiplexer } from "./multiplexer-zellij";
+import { HerdrMultiplexer } from "./multiplexer-herdr";
 import { assertNever } from "./artifact";
 
 /** Names of the supported multiplexer backends. Kept narrow on purpose. */
-export type MuxName = "tmux" | "zellij";
+export type MuxName = "tmux" | "zellij" | "herdr";
 /** Result of a backend pane-listing liveness probe. */
 export type PaneLiveness = "alive" | "dead" | "unknown";
 
@@ -66,8 +69,9 @@ export interface MultiplexerCapabilities {
  * entry directly from a `MuxName` (e.g. `InteractiveSubagentState.mux`) without
  * resolving a backend instance or paying an availability probe.
  *
- * Every flag below is asserted against the real `tmux` / `zellij` binaries in
- * `tests/tmux.integration.test.ts` and `tests/zellij.integration.test.ts` —
+ * Every flag below is asserted against the real `tmux` / `zellij` / `herdr`
+ * binaries in `tests/tmux.integration.test.ts`,
+ * `tests/zellij.integration.test.ts` and `tests/herdr.integration.test.ts` —
  * flipping one to `true` without a passing real-binary assertion is how the
  * broken zellij `dump-screen` argv shipped green.
  */
@@ -90,6 +94,20 @@ export const MUX_CAPABILITIES: Readonly<
     boundedCapture: true,
     // `action new-pane --floating`.
     nativeOverlay: true,
+  },
+  herdr: {
+    // `tab focus <tab_id>`; a split pane's tab id is recovered from
+    // `pane get <pane_id>`, so a PaneRef alone reaches the pane's tab.
+    structuredFocus: true,
+    // `pane read --source visible --lines N`. Verified against herdr 0.8.2 —
+    // bounded by the pane's viewport (48 rows in the pane tested): a pi child
+    // runs on the alternate screen, and rows leaving it never reach host
+    // scrollback, so capture cannot exceed what the viewport still shows.
+    boundedCapture: true,
+    // herdr has no popup or floating surface. The first backend where this is
+    // never true — the supervisor's native-view action must degrade to the
+    // portable overlay instead of assuming an overlay exists.
+    nativeOverlay: false,
   },
 } as const;
 
@@ -292,7 +310,7 @@ export interface GetMuxOptions {
 export class NoMultiplexerAvailableError extends Error {
   constructor() {
     super(
-      "No multiplexer available. Start pi inside tmux or zellij, " +
+      "No multiplexer available. Start pi inside herdr, tmux or zellij, " +
         "for example: tmux new -A -s pi 'pi'  —  or install one of them and ensure a server is running.",
     );
     this.name = "NoMultiplexerAvailableError";
@@ -310,6 +328,7 @@ export class NoMultiplexerAvailableError extends Error {
 export function getMux(opts: GetMuxOptions = {}): Multiplexer {
   const tmux = getOrCreate("tmux", () => new TmuxMultiplexer());
   const zellij = getOrCreate("zellij", () => new ZellijMultiplexer());
+  const herdr = getOrCreate("herdr", () => new HerdrMultiplexer());
 
   const preference = opts.preference ?? "auto";
   switch (preference) {
@@ -317,12 +336,19 @@ export function getMux(opts: GetMuxOptions = {}): Multiplexer {
       return tmux;
     case "zellij":
       return zellij;
+    case "herdr":
+      return herdr;
     case "auto": {
-      // Prefer the mux already attached to this process. We check env vars
-      // (cheap) before probing availability (one exec call each). If both env
-      // vars are set (e.g., nested sessions — exotic but possible), zellij wins
-      // (it's the more specific signal — ZELLIJ_SESSION_NAME is a single session
-      // name, TMUX can be inherited through nested tmux-in-tmux shells).
+      // Prefer the mux already hosting this process. We check env vars
+      // (cheap) before probing availability (one exec call each). HERDR_ENV
+      // wins over both others: herdr injects it only into its own panes,
+      // while a herdr pane can host a nested tmux/zellij client whose env
+      // vars then also leak into children.
+      if (process.env.HERDR_ENV && herdr.isAvailable()) return herdr;
+      // If both remaining env vars are set (e.g., nested sessions — exotic
+      // but possible), zellij wins (it's the more specific signal —
+      // ZELLIJ_SESSION_NAME is a single session name, TMUX can be inherited
+      // through nested tmux-in-tmux shells).
       if (process.env.ZELLIJ_SESSION_NAME && zellij.isAvailable())
         return zellij;
       if (process.env.TMUX && tmux.isAvailable()) return tmux;
@@ -364,6 +390,12 @@ export function __setTmuxMultiplexer(impl: Multiplexer | undefined): void {
 export function __setZellijMultiplexer(impl: Multiplexer | undefined): void {
   if (impl) instances.set("zellij", impl);
   else instances.delete("zellij");
+}
+
+/** Test seam: replace the cached herdr backend. Pass `undefined` to restore. */
+export function __setHerdrMultiplexer(impl: Multiplexer | undefined): void {
+  if (impl) instances.set("herdr", impl);
+  else instances.delete("herdr");
 }
 
 /** Test seam: clear all cached backend instances (forces re-instantiation). */

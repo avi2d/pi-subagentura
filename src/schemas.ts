@@ -217,10 +217,15 @@ const InteractiveSpawnFields = Type.Object({
   ),
   mux: Type.Optional(
     Type.Union(
-      [Type.Literal("auto"), Type.Literal("tmux"), Type.Literal("zellij")],
+      [
+        Type.Literal("auto"),
+        Type.Literal("herdr"),
+        Type.Literal("tmux"),
+        Type.Literal("zellij"),
+      ],
       {
         description:
-          'Which multiplexer backend to use. "auto" (default) picks based on environment: zellij if ZELLIJ_SESSION_NAME is set, tmux if TMUX is set, then whichever backend binary is available. "tmux" forces tmux. "zellij" forces zellij.',
+          'Which multiplexer backend to use. "auto" (default) picks based on environment: herdr if HERDR_ENV is set, then zellij if ZELLIJ_SESSION_NAME is set, then tmux if TMUX is set, then whichever of tmux/zellij has a binary available. "herdr" forces herdr, "tmux" forces tmux, "zellij" forces zellij.',
       },
     ),
   ),

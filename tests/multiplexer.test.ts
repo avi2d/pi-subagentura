@@ -29,6 +29,9 @@ describe("getMux relaxed-spawn resolution", () => {
     delete process.env.TMUX;
     delete process.env.ZELLIJ;
     delete process.env.ZELLIJ_SESSION_NAME;
+    // The suite itself may run inside a herdr pane; auto-resolution would
+    // then legitimately pick herdr and every fallback assertion below lies.
+    delete process.env.HERDR_ENV;
   });
 
   afterEach(() => {
@@ -91,6 +94,61 @@ describe("getMux relaxed-spawn resolution", () => {
 
     const mux = getMux({ preference: "auto" });
     expect(mux.name).toBe("zellij");
+  });
+
+  it("getMux auto prefers herdr when HERDR_ENV is set and the probe succeeds", async () => {
+    // herdr is checked before the tmux/zellij env vars: a herdr pane can host
+    // a nested tmux client, but HERDR_ENV is only ever injected by herdr
+    // itself, so it is the most specific signal about where pi actually runs.
+    process.env.HERDR_ENV = "1";
+    vi.doMock(
+      "node:child_process",
+      () =>
+        ({
+          execFileSync: (file: string, args: string[]) => {
+            if (file === "herdr" && args[0] === "pane" && args[1] === "current")
+              return "";
+            const joined = args.join(" ");
+            if (joined.includes("command -v 'herdr'")) return "";
+            throw new Error("unexpected exec: " + file + " " + joined);
+          },
+        }) as unknown as typeof import("node:child_process"),
+    );
+
+    const { getMux, __resetMuxInstances } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    __resetMuxInstances();
+
+    const mux = getMux({ preference: "auto" });
+    expect(mux.name).toBe("herdr");
+  });
+
+  it("getMux auto falls past herdr to tmux when the herdr probe fails", async () => {
+    process.env.HERDR_ENV = "1";
+    vi.doMock(
+      "node:child_process",
+      () =>
+        ({
+          execFileSync: (file: string, args: string[]) => {
+            if (file === "herdr") throw new Error("socket gone");
+            const joined = args.join(" ");
+            if (joined.includes("command -v 'herdr'")) return "";
+            if (joined.includes("command -v 'tmux'")) return "";
+            throw new Error("unexpected exec: " + file + " " + joined);
+          },
+        }) as unknown as typeof import("node:child_process"),
+    );
+
+    const { getMux, __resetMuxInstances } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    __resetMuxInstances();
+
+    const mux = getMux({ preference: "auto" });
+    expect(mux.name).toBe("tmux");
   });
 
   it("getMux throws NoMultiplexerAvailableError when neither binary exists", async () => {
@@ -331,12 +389,17 @@ describe("MUX_CAPABILITIES", () => {
       await importFresh<typeof import("../src/multiplexer")>(
         "../src/multiplexer",
       );
-    expect(Object.keys(MUX_CAPABILITIES).sort()).toEqual(["tmux", "zellij"]);
+    expect(Object.keys(MUX_CAPABILITIES).sort()).toEqual([
+      "herdr",
+      "tmux",
+      "zellij",
+    ]);
     expect(muxCapabilities("tmux")).toBe(MUX_CAPABILITIES.tmux);
     expect(muxCapabilities("zellij")).toBe(MUX_CAPABILITIES.zellij);
+    expect(muxCapabilities("herdr")).toBe(MUX_CAPABILITIES.herdr);
   });
 
-  it("is the single source of truth both backends expose", async () => {
+  it("is the single source of truth every backend exposes", async () => {
     const { MUX_CAPABILITIES } =
       await importFresh<typeof import("../src/multiplexer")>(
         "../src/multiplexer",
@@ -347,11 +410,15 @@ describe("MUX_CAPABILITIES", () => {
     const { ZellijMultiplexer } = await importFresh<
       typeof import("../src/multiplexer-zellij")
     >("../src/multiplexer-zellij");
+    const { HerdrMultiplexer } = await importFresh<
+      typeof import("../src/multiplexer-herdr")
+    >("../src/multiplexer-herdr");
 
     expect(new TmuxMultiplexer().capabilities).toEqual(MUX_CAPABILITIES.tmux);
     expect(new ZellijMultiplexer().capabilities).toEqual(
       MUX_CAPABILITIES.zellij,
     );
+    expect(new HerdrMultiplexer().capabilities).toEqual(MUX_CAPABILITIES.herdr);
   });
 });
 

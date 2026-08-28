@@ -503,7 +503,7 @@ export function launchInteractiveSubagent(params: {
   /** Required for coordinated grouped completion. */
   completionGroupId?: string;
   /** Mux preference — passed to getMux(). "auto" (default) = env-var heuristic. */
-  muxPreference?: "auto" | "tmux" | "zellij";
+  muxPreference?: MuxName | "auto";
   /**
    * Parent pi session id. Used as the per-session key for the on-disk state file
    * so a parent reload can rehydrate the sub-agent. If omitted, persistence is
