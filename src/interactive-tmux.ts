@@ -62,6 +62,7 @@ import {
   type CapturePaneOptions,
   type CapturePaneResult,
   getMux,
+  isMuxName,
   NoMultiplexerAvailableError,
   type MuxName,
   type Multiplexer,
@@ -900,7 +901,7 @@ export function getLineagePaneLiveness(
   manifest: LineageManifest,
 ): PaneLiveness {
   const backend = manifest.pane.backend;
-  if (backend !== "tmux" && backend !== "zellij") return "unknown";
+  if (!isMuxName(backend)) return "unknown";
   try {
     return getMux({ preference: backend }).getPaneLiveness(
       manifest.pane.paneId,

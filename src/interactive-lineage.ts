@@ -12,6 +12,7 @@ import {
   promises as fs,
 } from "node:fs";
 import path from "node:path";
+import { isMuxName } from "./multiplexer";
 
 export const LINEAGE_SCHEMA_VERSION = 1;
 export const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024;
@@ -755,10 +756,7 @@ export async function projectManifests(
       addReason(manifest.agentId, "malformed");
       continue;
     }
-    if (
-      manifest.pane.backend !== "tmux" &&
-      manifest.pane.backend !== "zellij"
-    ) {
+    if (!isMuxName(manifest.pane.backend)) {
       issues.push({
         kind: "malformed",
         agentId: manifest.agentId,

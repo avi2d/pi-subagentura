@@ -36,7 +36,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import isPathInside from "is-path-inside";
 import { debugLog } from "./helpers";
-import type { MuxName } from "./multiplexer";
+import { isMuxName, type MuxName } from "./multiplexer";
 
 /** Current schema version for the interactive state file. */
 export const CURRENT_STATE_SCHEMA_VERSION = 2;
@@ -1518,7 +1518,7 @@ function migrateStatePayload(
         basename(raw.artifactDir) !== id ||
         typeof raw.paneId !== "string" ||
         typeof raw.sessionFile !== "string" ||
-        (raw.mux !== "tmux" && raw.mux !== "zellij")
+        !isMuxName(raw.mux)
       ) {
         continue;
       }

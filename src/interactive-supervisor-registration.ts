@@ -31,7 +31,12 @@ import {
   type ProjectionIssue,
 } from "./interactive-lineage";
 import type { ParsedSpawnTreeContext } from "./spawn-tree-context";
-import { getMux, type MuxName, type PaneLiveness } from "./multiplexer";
+import {
+  getMux,
+  isMuxName,
+  type MuxName,
+  type PaneLiveness,
+} from "./multiplexer";
 import {
   abortJobTree,
   inProcessJobOwner,
@@ -244,9 +249,7 @@ function inProcessSupervisorDepth(
 }
 
 function muxNameForManifest(manifest: LineageManifest): MuxName | undefined {
-  if (manifest.pane.backend === "tmux") return "tmux";
-  if (manifest.pane.backend === "zellij") return "zellij";
-  return undefined;
+  return isMuxName(manifest.pane.backend) ? manifest.pane.backend : undefined;
 }
 
 function stateForNode(
@@ -337,10 +340,7 @@ async function loadSupervisorProjection(
   const isNodeStale = async (manifest: LineageManifest): Promise<boolean> => {
     const cached = paneLivenessById.get(manifest.agentId);
     if (cached !== undefined) return cached === "dead";
-    if (
-      manifest.pane.backend !== "tmux" &&
-      manifest.pane.backend !== "zellij"
-    ) {
+    if (!isMuxName(manifest.pane.backend)) {
       paneLivenessById.set(manifest.agentId, "unknown");
       return false;
     }

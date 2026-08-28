@@ -98,6 +98,19 @@ export function muxCapabilities(name: MuxName): MultiplexerCapabilities {
   return MUX_CAPABILITIES[name];
 }
 
+/**
+ * Whether an untrusted value names a supported multiplexer backend.
+ *
+ * Derived from the `MUX_CAPABILITIES` keys rather than a second literal list,
+ * so widening `MuxName` cannot leave a call site silently filtering the new
+ * backend out. Every place that decides "is this a backend name" — persisted
+ * interactive state, lineage manifests, the supervisor's liveness probe — must
+ * use this guard instead of comparing against literals.
+ */
+export function isMuxName(value: unknown): value is MuxName {
+  return typeof value === "string" && Object.hasOwn(MUX_CAPABILITIES, value);
+}
+
 /** Bounds applied by backend-neutral pane capture. */
 export interface CapturePaneOptions {
   readonly maxBytes: number;

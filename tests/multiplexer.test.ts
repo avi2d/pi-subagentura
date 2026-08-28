@@ -355,6 +355,32 @@ describe("MUX_CAPABILITIES", () => {
   });
 });
 
+describe("isMuxName", () => {
+  it("accepts exactly the MUX_CAPABILITIES keys, so a new backend needs no second edit", async () => {
+    const { isMuxName, MUX_CAPABILITIES } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    for (const name of Object.keys(MUX_CAPABILITIES)) {
+      expect(isMuxName(name)).toBe(true);
+    }
+  });
+
+  it("rejects non-members, non-strings, and inherited object keys", async () => {
+    const { isMuxName } =
+      await importFresh<typeof import("../src/multiplexer")>(
+        "../src/multiplexer",
+      );
+    expect(isMuxName("screen")).toBe(false);
+    expect(isMuxName("")).toBe(false);
+    expect(isMuxName(undefined)).toBe(false);
+    expect(isMuxName(3)).toBe(false);
+    // A naive `value in MUX_CAPABILITIES` walks the prototype chain, so every
+    // Object.prototype key would pass the filter and reach the backends.
+    expect(isMuxName("toString")).toBe(false);
+  });
+});
+
 describe("commandExists", () => {
   it("probes with a non-login shell", async () => {
     // `-lc` sources the user's profile on every availability probe: slow, has
