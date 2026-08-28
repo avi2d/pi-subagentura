@@ -8,6 +8,7 @@ import {
   sessionLedgerPath,
 } from "./completion-ledger";
 import { Text } from "@earendil-works/pi-tui";
+import { formatCompletionMessage } from "./completion-presentation";
 import { MAX_TURN_ID_LENGTH } from "./artifact";
 import {
   getActiveSessionOwner,
@@ -1610,8 +1611,8 @@ export function registerCompletionCoordinator(
           const identity = record.turnId
             ? `${JSON.stringify(record.sourceId)}, turn ${JSON.stringify(record.turnId)}`
             : JSON.stringify(record.sourceId);
-          const references = options.expanded
-            ? `\n${record.references
+          const details = options.expanded
+            ? ` (${identity})\n${record.references
                 .map(
                   (reference) =>
                     `  ${JSON.stringify(reference.label)}: ${JSON.stringify(reference.value)}`,
@@ -1621,7 +1622,7 @@ export function registerCompletionCoordinator(
           return new Text(
             theme.fg(
               record.status === "error" ? "error" : "dim",
-              `${icon} ${JSON.stringify(record.label)} ${record.status} (${identity})${references}`,
+              `${formatCompletionMessage(record.label, `${icon} ${record.status}`)}${details}`,
             ),
             0,
             0,

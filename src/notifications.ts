@@ -1,3 +1,4 @@
+import { formatCompletionMessage } from "./completion-presentation";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -375,14 +376,12 @@ export function notifyCompletionDelivery(
       notice.triggerTurn,
       "delivered",
     );
-    return `${notice.label} (${notice.status}). ${behavior}`;
+    return formatCompletionMessage(
+      notice.label,
+      `(${notice.status}). ${behavior}`,
+    );
   });
-  const message =
-    lines.length === 1
-      ? lines[0]
-      : `${lines.length} sub-agent completions delivered:\n${lines
-          .map((line) => `- ${line}`)
-          .join("\n")}`;
+  const message = lines.join("\n");
   const level = notices.some(({ status }) => status === "error")
     ? "error"
     : notices.some(({ status }) => status === "cancelled")
@@ -395,7 +394,7 @@ export function notifyCompletionDelivery(
   }
 }
 
-function buildNotifySummary(jobId: string, result: SubagentResult): string {
+function buildNotifySummary(result: SubagentResult): string {
   const status = result.isError ? "❌" : "✅";
   const msg = result.isError
     ? result.errorMessage || result.output.slice(0, 200).replace(/\s+/g, " ")
@@ -404,7 +403,7 @@ function buildNotifySummary(jobId: string, result: SubagentResult): string {
   const sanitized = sanitizeOutput(msg);
 
   const usageStr = formatUsage(result.usage);
-  const summary = `${status} Job ${jobId} ${sanitized.slice(0, 300)}`;
+  const summary = `${status} ${sanitized.slice(0, 300)}`;
   if (usageStr) {
     return `${summary} (${usageStr})`;
   }
@@ -535,7 +534,7 @@ export function notifyInProcessCompletionWithoutDelivery(
   const mode = jobState.notifyOnComplete ?? "inject";
   notifyCompletionDelivery(target.ui, [
     {
-      label: `Job ${jobState.id}`,
+      label: "in-process sub-agent",
       mode,
       triggerTurn: completionTriggersTurn(mode, jobState.triggerTurnOnComplete),
       status: result.isError ? "error" : "done",
@@ -610,9 +609,12 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
   for (const pending of queue) {
     if (!sameDeliveryOwner(pending, deliveryOwner)) continue;
     if (pending.kind === "overflow") {
-      let content =
+      let content = formatCompletionMessage(
+        undefined,
         "⚠️ In-process completion delivery overflowed its bounded queue." +
-        `\nCompletion identity ledger: ${pending.overflowPath}`;
+          `\nCompletion identity ledger: ${pending.overflowPath}`,
+        "in-process sub-agent",
+      );
       content = appendRunningJobsNote(content, effectiveOwner);
       const itemBytes = Buffer.byteLength(content, "utf8");
       if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES)
@@ -634,13 +636,18 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
       mode,
       jobState.triggerTurnOnComplete,
     );
-    const summary = buildNotifySummary(jobState.id, result);
+    const summary = buildNotifySummary(result);
     let content =
       mode === "inject"
         ? `${summary}\n[Untrusted sub-agent output]\n${sanitizeOutput(result.output) || "(sub-agent produced no output)"}`
         : isOrchestratorV2Enabled(target.pi)
           ? `${summary}\nResult remains in compatibility job ${jobState.id}. Surface its status without calling in-process tools in Orchestratorv2 mode.`
           : `${summary}\nResult retained in job ${jobState.id}; use get_subagent_result for details.`;
+    content = formatCompletionMessage(
+      undefined,
+      content,
+      "in-process sub-agent",
+    );
     content = appendRunningJobsNote(content, effectiveOwner);
     const itemBytes = Buffer.byteLength(content, "utf8");
     if (llm.length > 0 && bytes + itemBytes > MAX_IN_PROCESS_FLUSH_BYTES) break;
@@ -693,7 +700,7 @@ export function flushInProcessDeliveries(owner?: SessionOwnerToken): void {
     llm.map(({ pending, mode, trigger, status }) => ({
       label:
         pending.kind === "completion"
-          ? `Job ${pending.jobState.id}`
+          ? "in-process sub-agent"
           : "In-process completion overflow",
       mode,
       triggerTurn: trigger,
@@ -816,7 +823,11 @@ function buildArtifactMessage(
   state: InteractiveSubagentState,
   event: SubagentEvent,
 ): string {
-  const header = `${iconFor(event)} ${state.name} (${state.id}) — ${labelFor(event)}`;
+  const header = formatCompletionMessage(
+    state.name,
+    `${iconFor(event)} ${labelFor(event)}`,
+    "interactive sub-agent",
+  );
   const outputPath = join(state.artifactDir, "output.md");
   const logPath = join(state.artifactDir, "events.ndjson");
   const pointer = `\nOutput: ${outputPath}\nActivity log: ${logPath}`;

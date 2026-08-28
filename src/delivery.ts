@@ -1,3 +1,7 @@
+import {
+  completionDisplayLabel,
+  formatCompletionMessage,
+} from "./completion-presentation";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -47,7 +51,6 @@ export const MAX_OUTPUT_BYTES = 32 * 1024;
 export const MAX_FLUSH_BYTES = 64 * 1024;
 /** Maximum immutable output snapshot accepted from the artifact protocol. */
 export const MAX_ARTIFACT_OUTPUT_BYTES = 1024 * 1024;
-const MAX_FORMATTED_IDENTIFIER = 96;
 interface DeliveryGlobalState {
   __piSubagenturaInteractiveRegistry?: Map<string, InteractiveSubagentState>;
   __piSubagenturaSessionManager?: { getEntries?: () => unknown[] };
@@ -97,12 +100,6 @@ function appendRunningJobsNote(
 ): string {
   const note = runningInProcessJobsNote(owner);
   return note ? `${content}\n${note}` : content;
-}
-
-function boundedIdentifier(value: unknown, fallback: string): string {
-  if (typeof value !== "string" || value.length === 0) return fallback;
-  const sanitized = sanitizeOutput(value.slice(0, MAX_FORMATTED_IDENTIFIER));
-  return sanitized.replace(/[\r\n]/g, " ");
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -363,9 +360,9 @@ function pointer(intent: PersistedDeliveryIntent): string {
 
 function formatIntent(
   intent: PersistedDeliveryIntent,
+  displayLabel: string,
   owner?: SessionOwnerToken,
 ): string {
-  const header = `[Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}, turn ${boundedIdentifier(intent.turnId, "unknown")}, ${intent.status}]`;
   const output = intent.mode === "inject" ? readBoundedOutput(intent) : null;
   const message =
     typeof intent.message === "string" ? sanitizeOutput(intent.message) : "";
@@ -380,13 +377,16 @@ function formatIntent(
           ? `\n${message}`
           : "\n(no immutable output available)"
         : `\n<untrusted-subagent-output>\n${output || "(empty output)"}\n</untrusted-subagent-output>`;
-  return appendRunningJobsNote(
-    truncateUtf8(`${header}${body}\n${pointer(intent)}`, MAX_FLUSH_BYTES),
-    owner,
+  const content = formatCompletionMessage(
+    displayLabel,
+    `[${intent.status}]${body}\n${pointer(intent)}`,
+    "interactive sub-agent",
   );
+  return appendRunningJobsNote(truncateUtf8(content, MAX_FLUSH_BYTES), owner);
 }
 
 function publishCoordinatedInteractiveCompletion(
+  state: InteractiveSubagentState,
   intent: PersistedDeliveryIntent,
   owner?: SessionOwnerToken,
 ): void {
@@ -416,7 +416,7 @@ function publishCoordinatedInteractiveCompletion(
       source: "interactive",
       sourceId: intent.subagentId,
       turnId: intent.turnId,
-      label: `Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}`,
+      label: completionDisplayLabel(state.name, "interactive sub-agent"),
       status: intent.status,
       policy: intent.completionPolicy,
       ...(intent.completionGroupId
@@ -446,10 +446,14 @@ export function flushDeliveries(
     for (const intent of state.pendingDeliveries ?? []) {
       if (intent.state === "dispatchAttempted") continue;
       if (intent.completionPolicy) {
-        publishCoordinatedInteractiveCompletion(intent, owner);
+        publishCoordinatedInteractiveCompletion(state, intent, owner);
         continue;
       }
-      llm.push({ state, intent, content: formatIntent(intent, owner) });
+      llm.push({
+        state,
+        intent,
+        content: formatIntent(intent, state.name, owner),
+      });
     }
   }
   reconcileAllDeliveryReceipts(owner);
@@ -502,8 +506,8 @@ export function flushDeliveries(
   }
   notifyCompletionDelivery(
     ui,
-    selected.map(({ intent }) => ({
-      label: `Sub-agent ${boundedIdentifier(intent.subagentId, "unknown")}`,
+    selected.map(({ state, intent }) => ({
+      label: completionDisplayLabel(state.name, "interactive sub-agent"),
       mode: intent.mode,
       triggerTurn: intent.triggerTurn,
       status: intent.status,

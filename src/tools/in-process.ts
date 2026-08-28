@@ -340,7 +340,7 @@ function publishInProcessCompletion(
       completionId: `job:${jobState.id}`,
       source: "in-process",
       sourceId: jobState.id,
-      label: `Job ${jobState.id}`,
+      label: "in-process sub-agent",
       status: result.cancelled
         ? "cancelled"
         : result.isError

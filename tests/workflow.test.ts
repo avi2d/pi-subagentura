@@ -3211,6 +3211,9 @@ describe("registerWorkflowTool", () => {
         }),
         { deliverAs: "followUp", triggerTurn: true },
       );
+      expect(staleSendMessage.mock.calls[0][0].content).toContain(
+        "from: notify, ",
+      );
       expect(sendMessage).not.toHaveBeenCalled();
       expect(staleSendMessage.mock.calls[0][0].content).not.toContain(
         "final result",

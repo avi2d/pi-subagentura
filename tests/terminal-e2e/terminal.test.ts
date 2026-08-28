@@ -232,7 +232,7 @@ describe("real Pi terminal E2E", () => {
         "async completion",
       );
       await harness.waitForScreen(
-        (screen) => /✓ "Job [a-f0-9]{16}" done/.test(screen),
+        (screen) => /from: in-process sub-agent, ✓ done/.test(screen),
         "async completion TUI notice",
       );
       await harness.waitForScreen(

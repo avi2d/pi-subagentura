@@ -44,6 +44,10 @@ import {
 import { renderProgress } from "./workflow-ui";
 import { awaitInteractiveResult, stringify } from "./workflow-worker";
 import { sanitizeOutput } from "./notifications";
+import {
+  completionDisplayLabel,
+  formatCompletionMessage,
+} from "./completion-presentation";
 import { showWorkflowTree } from "./workflow-tree-ui";
 import {
   WorkflowPickerComponent,
@@ -73,7 +77,6 @@ import {
   reserveCompletionGroup,
   releaseCompletionGroup,
   consumeCompletionSource,
-  MAX_COMPLETION_LABEL_LENGTH,
   publishCompletion,
   registerCompletionMember,
   resolveCompletionPolicy,
@@ -391,19 +394,7 @@ export function registerWorkflowTool(
   }
 
   function workflowCompletionLabel(job: WorkflowJobState): string {
-    const prefix = "Workflow ";
-    const suffix = ` (${job.id})`;
-    const nameLimit = Math.max(
-      0,
-      MAX_COMPLETION_LABEL_LENGTH - prefix.length - suffix.length,
-    );
-    const displayName =
-      job.name.length <= nameLimit
-        ? job.name
-        : nameLimit <= 1
-          ? job.name.slice(0, nameLimit)
-          : `${job.name.slice(0, nameLimit - 1)}…`;
-    return `${prefix}${displayName}${suffix}`;
+    return completionDisplayLabel(job.name, "workflow");
   }
 
   function notifyWorkflowCompletion(job: WorkflowJobState): boolean {
@@ -448,7 +439,11 @@ export function registerWorkflowTool(
     const icon = presentation.icon || (job.status === "done" ? "✅" : "❌");
     const rawSummary = formatWorkflowNotificationSummary(job);
     const summary = truncateWorkflowNotification(sanitizeOutput(rawSummary));
-    let content = `${icon} Workflow "${job.name}" (${job.id}) ${presentation.label} — ${summary}`;
+    let content = formatCompletionMessage(
+      completionDisplayLabel(job.name, "workflow"),
+      `${icon} ${presentation.label} — ${summary}`,
+      "workflow",
+    );
     if (run) {
       content += isOrchestratorV2Enabled(pi)
         ? "\n\nThis completion came from the separate workflow compatibility mode. Surface its status without calling workflow tools in Orchestratorv2 mode."
