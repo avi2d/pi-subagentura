@@ -255,6 +255,8 @@ project-local routing cache.
 
 This is the core v2 model in miniature: **you can keep talking with the orchestrator, or attach and talk directly with a child.** Children can create and supervise their own descendants, while important outcomes flow back through the child and the parent’s existing artifact and notification paths. The replay annotations mark the parent-to-child handoff and the two specialist launches.
 
+> Replays generated with [vibe-replay](https://github.com/tuo-lei/vibe-replay), an interactive replay and sharing tool for AI coding sessions.
+
 The v2 prompt gives the parent a lightweight routing role: it routes clear work
 to attachable interactive subagents, can split broad requests across specialists,
 and asks for clarification when a request is ambiguous or a narrow request has no
