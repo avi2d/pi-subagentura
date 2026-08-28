@@ -43,7 +43,7 @@ import {
   flushDeliveries,
   MAX_DELIVERY_RECORDS,
 } from "./delivery";
-import { sanitizeDisplayLabel } from "./display-label";
+import { completionDisplayLabel } from "./completion-presentation";
 import { debugLog, jobRegistry, type JobState } from "./helpers";
 import { coarseElapsedMs, formatActivityRow } from "./rendering";
 import {
@@ -266,7 +266,7 @@ function orchestratorLabelForOwner(
 }
 function workflowTagForId(workflowId: string): string {
   const name = workflowJobRegistry.get(workflowId)?.name;
-  return `workflow ${sanitizeDisplayLabel(name, workflowId)}`;
+  return `workflow ${completionDisplayLabel(name, workflowId)}`;
 }
 function workflowTagsForOwner(owner: SessionOwnerToken | undefined): string[] {
   const workflowIds = new Set<string>();
