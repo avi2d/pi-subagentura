@@ -791,6 +791,13 @@ function focusReturnHint(state: InteractiveSubagentState): string {
       ? "tmux prefix + l (last window)"
       : "tmux prefix + ; (last pane)";
   }
+  if (state.mux === "herdr") {
+    // herdr's default bindings (herdr --default-config): previous_tab is
+    // prefix+p; panes are reached directionally with prefix+h/j/k/l.
+    return state.windowName
+      ? "herdr prefix + p (previous tab)"
+      : "herdr prefix + h/l (adjacent pane)";
+  }
   return state.windowName
     ? "Ctrl+t, then Tab (last tab)"
     : "Ctrl+p, then p (previous pane)";

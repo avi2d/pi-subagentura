@@ -1145,6 +1145,25 @@ describe("interactive supervisor", () => {
       }),
     );
     expect(zellijTab).toContain("Return: Ctrl+t, then Tab (last tab)");
+
+    // The herdr hints must be herdr's own defaults — the zellij fallback
+    // told herdr users to press keybindings their multiplexer does not have.
+    const herdrSplit = renderDetails(
+      state("herdr-split", {
+        mux: "herdr",
+        attachCommand: "herdr",
+        selectPaneCommand: "herdr tab focus 'w1:t9'",
+      }),
+    );
+    expect(herdrSplit).toContain("Return: herdr prefix + h/l (adjacent pane)");
+
+    const herdrTab = renderDetails(
+      state("herdr-tab", {
+        mux: "herdr",
+        windowName: "w1:t9",
+      }),
+    );
+    expect(herdrTab).toContain("Return: herdr prefix + p (previous tab)");
   });
 
   it("shows why and from where an interactive agent is projected", () => {

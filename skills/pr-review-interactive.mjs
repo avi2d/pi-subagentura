@@ -1,6 +1,6 @@
 // Workflow: code-review a PR with 3 parallel interactive sub-agents
 //
-// Spawns three tmux/zellij-backed sub-agents (isolation: "process" — real
+// Spawns three mux-backed sub-agents (isolation: "process" — real
 // process isolation, attachable panes), each with a focused review persona
 // and a JSON-Schema-validated structured output. The aggregator phase
 // merges the three reports into a single markdown review.
@@ -20,7 +20,7 @@
 export const meta = {
   name: "pr-review-interactive",
   description:
-    "Code-review a PR with 3 parallel interactive (tmux/zellij) sub-agents: correctness, tests, design",
+    "Code-review a PR with 3 parallel interactive mux-backed sub-agents: correctness, tests, design",
   phases: [
     { title: "Gather context" },
     { title: "Review in parallel" },
@@ -88,8 +88,8 @@ const contextBlock = [
 
 phase("Review in parallel");
 
-// Each sub-agent runs in its own tmux/zellij pane (real isolation, attachable).
-// The user can `tmux attach` to watch any of them live. If the multiplexer is
+// Each sub-agent runs in its own multiplexer pane (real isolation, attachable).
+// The user can attach to watch any of them live. If the multiplexer is
 // unavailable, the workflow falls back to in-process sub-agents.
 const personas = {
   correctness:
@@ -194,7 +194,7 @@ lines.push(
 );
 lines.push("");
 lines.push(
-  "**Reviewers:** 3 parallel interactive sub-agents (tmux/zellij panes). Use `tmux attach -t <session>` to watch any of them live.",
+  "**Reviewers:** 3 parallel interactive sub-agents in multiplexer panes. Use the attach command from each spawn result to watch any of them live.",
 );
 lines.push("");
 

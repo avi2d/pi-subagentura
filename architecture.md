@@ -5,7 +5,7 @@
 `pi-subagentura` is a Pi extension that runs delegated agents in three execution shapes:
 
 1. an in-process Pi `AgentSession`;
-2. an interactive `pi` process in a tmux or Zellij pane;
+2. an interactive `pi` process in a multiplexer pane (herdr, tmux, or Zellij);
 3. a workflow `Worker` plus `node:vm` program whose `agent()` calls use either of the first two runners.
 
 These shapes share UI and cancellation surfaces, but they do not share an execution protocol.
@@ -48,7 +48,7 @@ flowchart TB
 
   IntTools[tools/interactive.ts]
   IntKernel[interactive-tmux.ts]
-  Mux[tmux or Zellij]
+  Mux[herdr, tmux, or Zellij]
   Child[separate child pi process]
   Artifacts[(events.ndjson + output snapshots)]
   IntJobs[(interactive registry + persisted state)]
@@ -108,7 +108,7 @@ flowchart TB
 | ------------------------ | ------------------------------------------ | ------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | In-process, synchronous  | Pi extension process, child `AgentSession` | Child Pi session and execute callback                         | Returned `SubagentResult`                                                     | Direct final `AgentToolResult`                                                   |
 | In-process, asynchronous | Pi extension process, child `AgentSession` | Per-session scope registry (with a legacy process-wide index) | Settled job promise and stored result                                         | Coordinated manifest references `get_subagent_result`                            |
-| Interactive              | Separate `pi` process in tmux/Zellij       | Live interactive registry plus artifact files                 | Physical completion event in `events.ndjson`; immutable v2 snapshot for bytes | Coordinated manifest references the immutable snapshot and activity log          |
+| Interactive              | Separate `pi` process in a mux pane        | Live interactive registry plus artifact files                 | Physical completion event in `events.ndjson`; immutable v2 snapshot for bytes | Coordinated manifest references the immutable snapshot and activity log          |
 | Workflow, foreground     | Worker thread and VM in extension process  | `Engine`, worker RPC state, selected runner                   | Worker terminal result after outstanding agent calls settle                   | Direct final `workflow` tool result                                              |
 | Workflow, background     | Same Worker/VM arrangement                 | Global `workflowJobRegistry`                                  | Settled workflow job promise                                                  | Coordinated manifest references `get_workflow_result`; owned children suppressed |
 

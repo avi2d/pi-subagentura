@@ -8,7 +8,7 @@
 
 Give the parent Pi agent one task and let it build the team. pi-subagentura adds
 reusable multi-agent workflows, lightweight background delegation, and real
-child Pi sessions you can watch, attach to, and continue in tmux or Zellij.
+child Pi sessions you can watch, attach to, and continue in herdr, tmux, or Zellij.
 
 For routing-first delegation, start Pi with `--orchestratorv2`. The prompt
 guides the parent to route clear work to attachable interactive subagents, ask
