@@ -35,6 +35,8 @@ export interface SpawnTreeContext {
   rootId: string;
   sessionRoot: string;
   artifactDir?: string;
+  /** Whether this lineage belongs to an orchestrator-mode parent. */
+  orchestratorMode?: boolean;
   currentAgentId?: string;
   parentAgentId?: string;
   depth: number;
@@ -145,6 +147,11 @@ export function parseSpawnTreeContext(value: unknown): ParsedSpawnTreeContext {
     raw.artifactDir === undefined
       ? undefined
       : resolve(boundedString(raw.artifactDir, "artifactDir"));
+  const orchestratorMode =
+    raw.orchestratorMode === undefined ? undefined : raw.orchestratorMode;
+  if (orchestratorMode !== undefined && typeof orchestratorMode !== "boolean") {
+    throw new Error("Invalid lineage bootstrap orchestratorMode");
+  }
   const depth = boundedInteger(raw.depth, "depth", 0, MAX_CONTEXT_DEPTH);
   const maxDepth = boundedInteger(
     raw.maxDepth,
@@ -162,6 +169,7 @@ export function parseSpawnTreeContext(value: unknown): ParsedSpawnTreeContext {
     rootId,
     sessionRoot,
     ...(artifactDir ? { artifactDir } : {}),
+    ...(orchestratorMode ? { orchestratorMode } : {}),
     ...(currentAgentId ? { currentAgentId } : {}),
     ...(parentAgentId ? { parentAgentId } : {}),
     depth,
@@ -180,12 +188,14 @@ export function defaultSpawnTreeSessionRoot(): string {
 export function createRootSpawnTreeContext(
   rootId: string,
   sessionRoot = defaultSpawnTreeSessionRoot(),
+  orchestratorMode = false,
 ): ParsedSpawnTreeContext {
   return parseSpawnTreeContext({
     schemaVersion: LINEAGE_BOOTSTRAP_SCHEMA_VERSION,
     role: "root",
     rootId,
     sessionRoot,
+    ...(orchestratorMode ? { orchestratorMode: true } : {}),
     depth: 0,
     maxDepth: DEFAULT_MAX_DEPTH,
     maxNodes: DEFAULT_MAX_NODES,

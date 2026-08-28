@@ -559,6 +559,39 @@ describe("session handler lifecycle callbacks", () => {
     );
   });
 
+  it("labels a child with its stable orchestrator parent ID", () => {
+    const rootContext = createRootSpawnTreeContext(
+      "orchestrator-root",
+      root,
+      true,
+    );
+    const orchestratorContext = createDescendantSpawnTreeContext(
+      rootContext,
+      "orchestrator-agent",
+      join(root, "orchestrator-agent"),
+    );
+    const childContext = createDescendantSpawnTreeContext(
+      orchestratorContext,
+      "child-agent",
+      join(root, "child-agent"),
+    );
+    const registration = registerHandlers(childContext, false);
+    const ui = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      notify: vi.fn(),
+    };
+    startSession(registration, root, "session-child", ui);
+    ownedJob(registration.sessionScope, "child-job");
+
+    updateRunningSubagentFooter(ui, sessionOwner(registration.sessionScope));
+
+    expect(ui.setStatus).toHaveBeenLastCalledWith(
+      "subagentura-running",
+      "⚡ 1 sub-agent alive · subagent of orchestrator orchestrator-agent",
+    );
+  });
+
   it("polls every started scope from one shared interval", async () => {
     const a = registerHandlers();
     const b = registerHandlers();

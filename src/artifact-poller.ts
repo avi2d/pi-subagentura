@@ -35,6 +35,7 @@ import {
   getInteractivePaneLivenessAsync,
   type InteractiveSubagentState,
 } from "./interactive-tmux";
+import { isOrchestratorMode } from "./completion-turn";
 import { shouldNotify } from "./notifications";
 import {
   deliveryIdFor,
@@ -85,12 +86,12 @@ interface WidgetSurfaceState {
 interface SubagentFooterContribution {
   kind: "subagent";
   count: number;
-  orchestrator: boolean;
+  footerLabel?: string;
 }
 interface WorkflowFooterContribution {
   kind: "workflow";
   count: number;
-  orchestrator: boolean;
+  footerLabel?: string;
   usage?: WorkflowUsage;
 }
 type FooterContribution =
@@ -176,31 +177,31 @@ function mergeFooterContributions(
 ): string | undefined {
   if (key === FOOTER_KEY) {
     let total = 0;
-    let orchestrator = false;
+    let footerLabel: string | undefined;
     for (const contribution of contributions) {
       if (contribution.kind !== "subagent") continue;
       total += contribution.count;
-      orchestrator ||= contribution.orchestrator;
+      footerLabel ??= contribution.footerLabel;
     }
     if (total === 0) return undefined;
-    const label = orchestrator ? " · orchestrator" : "";
+    const label = footerLabel ? ` · ${footerLabel}` : "";
     return `⚡ ${total} sub-agent${total > 1 ? "s" : ""} alive${label}`;
   }
   if (key === WORKFLOW_FOOTER_KEY) {
     let total = 0;
-    let orchestrator = false;
+    let footerLabel: string | undefined;
     let usage = zeroWorkflowUsage();
     for (const contribution of contributions) {
       if (contribution.kind !== "workflow") continue;
       total += contribution.count;
-      orchestrator ||= contribution.orchestrator;
+      footerLabel ??= contribution.footerLabel;
       usage = addAggregateWorkflowUsage(usage, contribution.usage);
     }
     if (total === 0) return undefined;
     const presentedUsage = hasWorkflowUsage(usage)
       ? ` · ${formatWorkflowUsage(usage)}`
       : "";
-    const label = orchestrator ? " · orchestrator" : "";
+    const label = footerLabel ? ` · ${footerLabel}` : "";
     return `⚡ ${total} workflow${total > 1 ? "s" : ""} running${presentedUsage}${label}`;
   }
   return undefined;
@@ -249,18 +250,17 @@ function updateFooterStatus(
   }
 }
 
-function isOrchestratorSession(owner: SessionOwnerToken | undefined): boolean {
+function footerLabelForOwner(
+  owner: SessionOwnerToken | undefined,
+): string | undefined {
   const scope = resolveLiveSessionScope(owner);
-  if (!scope) return false;
-  try {
-    return (
-      scope.pi.getFlag("orchestrator") === true ||
-      scope.pi.getFlag("orchestratorv2") === true
-    );
-  } catch {
-    /* Flags may be unavailable in lightweight test or host contexts. */
-    return false;
+  const context = scope?.spawnTreeContext;
+  if (context?.role === "descendant") {
+    if (context.orchestratorMode !== true) return undefined;
+    const ownerId = context.parentAgentId ?? context.rootId;
+    return `subagent of orchestrator ${ownerId}`;
   }
+  return scope && isOrchestratorMode(scope.pi) ? "orchestrator" : undefined;
 }
 /**
  * Repaint the "N sub-agents alive" footer, scoped to `owner` when supplied.
@@ -282,7 +282,7 @@ export function updateRunningSubagentFooter(
       ? {
           kind: "subagent",
           count: runningCount,
-          orchestrator: isOrchestratorSession(owner),
+          footerLabel: footerLabelForOwner(owner),
         }
       : undefined;
   updateFooterStatus(ui, FOOTER_KEY, contribution, owner);
@@ -701,7 +701,7 @@ async function runPollArtifactChanges(
             ? {
                 kind: "workflow",
                 count: wfCount,
-                orchestrator: isOrchestratorSession(owner),
+                footerLabel: footerLabelForOwner(owner),
                 usage: aggregateWorkflowFooterUsage(owner),
               }
             : undefined;
