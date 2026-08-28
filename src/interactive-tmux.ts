@@ -646,7 +646,6 @@ export function launchInteractiveSubagent(params: {
     name: params.name,
     cwd,
     background,
-    parentPane: process.env.TMUX_PANE,
     windowName: safeSegment(params.name),
     id,
   });

@@ -198,7 +198,6 @@ export class ZellijMultiplexer implements Multiplexer {
     name: string;
     cwd: string;
     background: boolean;
-    parentPane?: string;
     windowName?: string;
     id?: string;
   }): { paneId: string; windowName?: string; session?: string } {
@@ -291,10 +290,10 @@ export class ZellijMultiplexer implements Multiplexer {
     } else {
       // Visible split — side-by-side with the focused pane. zellij splits
       // relative to the currently-focused pane; there is no flag to split
-      // from a specific pane id (`new-pane` has no `--in-pane-id`), so
-      // `opts.parentPane` is intentionally ignored. No `--close-on-exit`:
-      // that flag makes a trailing `<COMMAND>` mandatory, and we want a
-      // plain shell pane that outlives the launch script (like tmux's split).
+      // from a specific pane id (`new-pane` has no `--in-pane-id`). No
+      // `--close-on-exit`: that flag makes a trailing `<COMMAND>` mandatory,
+      // and we want a plain shell pane that outlives the launch script (like
+      // tmux's split).
       execMuxOrThrow(
         "zellij",
         "new-pane",

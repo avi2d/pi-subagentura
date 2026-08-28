@@ -156,9 +156,10 @@ export interface Multiplexer {
    *                           parent pane (parent must be attached to a mux
    *                           session for the split mode to work — callers
    *                           should fall back to background when the parent
-   *                           is not in a session).
-   * @param opts.parentPane    Parent pane id for split mode. Required when
-   *                           `background === false`. Ignored otherwise.
+   *                           is not in a session). A backend resolves its
+   *                           own parent pane for split mode from its own
+   *                           environment (e.g. tmux reads `TMUX_PANE`);
+   *                           that knowledge never crosses this interface.
    * @param opts.windowName    Optional explicit name for the detached
    *                           window/tab. Backends are free to ignore this
    *                           and generate their own (zellij requires unique
@@ -180,7 +181,6 @@ export interface Multiplexer {
     name: string;
     cwd: string;
     background: boolean;
-    parentPane?: string;
     windowName?: string;
     /** Unique id (8 hex) for naming the new session when parent is not in a mux. */
     id?: string;

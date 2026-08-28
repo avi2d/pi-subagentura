@@ -224,10 +224,10 @@ describe("multiplexer-zellij", () => {
   });
 
   it("createPane new-pane passes neither --in-pane-id nor --close-on-exit", async () => {
-    // `new-pane` has no `--in-pane-id` flag (parentPane has no mapping in
-    // zellij — it splits the focused pane). And `--close-on-exit` makes a
-    // trailing <COMMAND> mandatory, so passing it without a command makes
-    // zellij exit non-zero. Both must be absent.
+    // `new-pane` has no `--in-pane-id` flag (zellij always splits the focused
+    // pane — there is no way to split from a specific pane id). And
+    // `--close-on-exit` makes a trailing <COMMAND> mandatory, so passing it
+    // without a command makes zellij exit non-zero. Both must be absent.
     process.env.ZELLIJ = "0";
     process.env.ZELLIJ_SESSION_NAME = "main";
     const calls: string[][] = [];
@@ -251,7 +251,6 @@ describe("multiplexer-zellij", () => {
       name: "Demo",
       cwd: "/tmp",
       background: false,
-      parentPane: "1",
     });
 
     const newPaneCall = calls.find((a) => a.includes("new-pane"));

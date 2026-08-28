@@ -170,7 +170,6 @@ export class TmuxMultiplexer implements Multiplexer {
     name: string;
     cwd: string;
     background: boolean;
-    parentPane?: string;
     windowName?: string;
     id?: string; // sub-agent id (8 hex); used for the relaxed-path unique session name
   }): { paneId: string; windowName?: string; session: string } {
@@ -299,7 +298,9 @@ export class TmuxMultiplexer implements Multiplexer {
         "-c",
         opts.cwd,
       ];
-      const parent = opts.parentPane ?? process.env.TMUX_PANE;
+      // The parent pane is tmux knowledge: this backend reads its own env
+      // rather than having the call site thread it through `createPane`.
+      const parent = process.env.TMUX_PANE;
       if (parent) {
         args.splice(4, 0, "-t", parent);
       }

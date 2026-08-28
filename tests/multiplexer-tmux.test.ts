@@ -170,9 +170,9 @@ describe("multiplexer-tmux", () => {
   /*  createPane — visible split mode (split-window)                     */
   /* ------------------------------------------------------------------ */
 
-  it("createPane visible split mode uses split-window -h -d and returns paneId with parentPane", async () => {
+  it("createPane visible split mode uses split-window -h -d and targets the pane in TMUX_PANE", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
-    process.env.TMUX_PANE = "%1";
+    process.env.TMUX_PANE = "%5";
     const calls: string[][] = [];
     installMockExec((args) => {
       calls.push(args);
@@ -188,7 +188,6 @@ describe("multiplexer-tmux", () => {
       name: "Demo",
       cwd: "/tmp",
       background: false,
-      parentPane: "%5",
     });
 
     expect(result.paneId).toBe(MOCK_PANE_ID);
@@ -205,7 +204,8 @@ describe("multiplexer-tmux", () => {
     expect(sw).toContain("#{pane_id}");
     expect(sw).toContain("-c");
     expect(sw).toContain("/tmp");
-    // -t targets the parent pane
+    // -t targets the parent pane, resolved by the backend from TMUX_PANE —
+    // the env var is tmux knowledge and must not leak to the call site.
     expect(sw).toContain("-t");
     expect(sw).toContain("%5");
 
@@ -216,9 +216,9 @@ describe("multiplexer-tmux", () => {
     expect(sp).toContain("Demo");
   });
 
-  it("createPane visible split falls back to TMUX_PANE when parentPane is omitted", async () => {
+  it("createPane visible split omits -t when TMUX_PANE is unset (splits the focused pane)", async () => {
     process.env.TMUX = "/tmp/tmux-1000/default,12345,0";
-    process.env.TMUX_PANE = "%9";
+    delete process.env.TMUX_PANE;
     const calls: string[][] = [];
     installMockExec((args) => {
       calls.push(args);
@@ -234,12 +234,10 @@ describe("multiplexer-tmux", () => {
       name: "T",
       cwd: "/tmp",
       background: false,
-      // parentPane omitted — should use TMUX_PANE
     });
 
     const sw = calls.find((a) => a[0] === "split-window");
-    expect(sw).toContain("-t");
-    expect(sw).toContain("%9");
+    expect(sw).not.toContain("-t");
   });
 
   it("cleans up a created pane when its session cannot be derived", async () => {
