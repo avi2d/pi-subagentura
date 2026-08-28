@@ -448,9 +448,9 @@ export function registerInteractiveSubagentTools(
     name: "subagent_interactive",
     label: "Interactive Subagent",
     description: [
-      "Spawn a separate Pi process in a tmux/zellij pane and return immediately.",
+      "Spawn a separate Pi process in a multiplexer pane (herdr, tmux, or zellij) and return immediately.",
       "Use this when the user wants to attach to the sub-agent session and continue follow-ups there.",
-      "Works inside tmux or zellij. The tool returns attach/focus commands and the child session file.",
+      "Works inside herdr, tmux, or zellij. The tool returns attach/focus commands and the child session file.",
       "This is intentionally separate from SDK subagents: it favors observability and attachability over in-process execution.",
       "Completion coordination defaults to each: every terminal turn creates one TUI-only notice, while safely-idle results are coalesced into a compact immutable-reference manifest that resumes the parent.",
       "Use completionPolicy=group with a shared completionGroupId for related agents; the parent resumes once the spawning turn settles and every registered member is terminal.",
@@ -797,12 +797,12 @@ export function registerInteractiveSubagentTools(
     },
   });
 
-  // ── Tool 7: inspect attachable tmux-backed sessions ────────────────
+  // ── Tool 7: inspect attachable mux-backed sessions ─────────────────
   registerToolWithDefaultGuidance(pi, {
     name: "get_interactive_subagent_status",
     label: "Get Interactive Subagent Status",
     description:
-      "Inspect tmux-backed interactive subagents. Omit jobId to list all tracked sessions. Returns attach/select commands and session paths without capturing pane output.",
+      "Inspect mux-backed interactive subagents. Omit jobId to list all tracked sessions. Returns attach/select commands and session paths without capturing pane output.",
     parameters: Type.Object({
       jobId: Type.Optional(
         Type.String({
@@ -859,7 +859,7 @@ export function registerInteractiveSubagentTools(
     },
   });
 
-  // ── Tool 8: cancel an attachable tmux-backed session ───────────────
+  // ── Tool 8: cancel an attachable mux-backed session ────────────────
   registerToolWithDefaultGuidance(pi, {
     name: "cancel_interactive_subagent",
     label: "Cancel Interactive Subagent",
@@ -935,8 +935,8 @@ export function registerInteractiveSubagentTools(
   // ── Tool: send a follow-up message to a live interactive sub-agent ──────
   // The child REPL stays open after `done` (see buildChildSubagentProtocol in
   // interactive-tmux.ts), so the parent can push a new prompt into the same
-  // session via tmux send-keys. Model context is preserved across messages —
-  // this is a true follow-up turn, not a fresh spawn.
+  // session via the mux's key injection. Model context is preserved across
+  // messages — this is a true follow-up turn, not a fresh spawn.
   //
   // Caps: the message must be non-empty (an empty Enter in the REPL would submit a
   // blank prompt) and at most MAX_FOLLOWUP_BYTES UTF-8 bytes (symmetric with
@@ -947,7 +947,7 @@ export function registerInteractiveSubagentTools(
     label: "Send Interactive Subagent Message",
     description: [
       "Send a follow-up prompt to a live interactive sub-agent. The message is delivered into the",
-      "child's existing REPL via tmux send-keys, so the child's model context is preserved — this",
+      "child's existing REPL via the multiplexer's key injection, so the child's model context is preserved — this",
       "is a true follow-up turn, not a fresh spawn. A workflow-owned child can accept a follow-up",
       "only after its completed turn is idle and its workflow runner has consumed the result. It is",
       "promoted to standalone only after that follow-up is sent successfully. An idle follow-up resets",

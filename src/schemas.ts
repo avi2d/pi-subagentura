@@ -225,7 +225,7 @@ const InteractiveSpawnFields = Type.Object({
       ],
       {
         description:
-          'Which multiplexer backend to use. "auto" (default) picks based on environment: herdr if HERDR_ENV is set, then zellij if ZELLIJ_SESSION_NAME is set, then tmux if TMUX is set, then whichever of tmux/zellij has a binary available. "herdr" forces herdr, "tmux" forces tmux, "zellij" forces zellij.',
+          'Which multiplexer backend to use. "auto" (default) picks based on environment: herdr if HERDR_ENV is set, then zellij if ZELLIJ_SESSION_NAME is set, then tmux if TMUX is set, then tmux or zellij by binary availability (herdr never joins that fallback: it only works inside a herdr-managed pane). "herdr" forces herdr, "tmux" forces tmux, "zellij" forces zellij.',
       },
     ),
   ),

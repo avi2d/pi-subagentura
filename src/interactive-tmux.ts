@@ -1,5 +1,5 @@
 /**
- * Interactive sub-agent orchestrator (tmux/zellij).
+ * Interactive sub-agent orchestrator (mux-backed: herdr, tmux, or zellij).
  *
  * PR #1 refactor: this file used to do all tmux exec calls inline. Those
  * moved to `multiplexer-tmux.ts` behind the `Multiplexer` interface in
@@ -16,7 +16,8 @@
  * the new home for them is `multiplexer-tmux.ts`. The PR also relaxes the
  * spawn check: a child can be created even when the parent is not in a
  * tmux/zellij session (a new detached session is created on the fly; the
- * user attaches via the returned `attachCommand`).
+ * user attaches via the returned `attachCommand`). herdr has no detached
+ * path: it requires pi to already run inside a herdr-managed pane.
  *
  * The exports kept here are the public surface consumed by `subagent.ts`
  * and the test suite. Their signatures are preserved verbatim so the rest
@@ -334,9 +335,10 @@ export function isTmuxAvailable(): boolean {
 /** Setup hint shown to the user when no mux is available. Mux-agnostic. */
 export function tmuxSetupHint(): string {
   return (
-    "Start pi inside tmux or zellij, for example:\n" +
+    "Start pi inside herdr, tmux or zellij, for example:\n" +
     "  tmux new -A -s pi 'pi'\n" +
-    "  zellij --session pi  (or just start pi inside an existing zellij session)"
+    "  zellij --session pi  (or just start pi inside an existing zellij session)\n" +
+    "  herdr  (then start pi in a pane)"
   );
 }
 

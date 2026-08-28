@@ -699,7 +699,7 @@ function buildInProcessSchemaPrompt(
   );
 }
 
-// ── tmux/zellij process-backed agents ────────────────────────────────
+// ── mux process-backed agents ────────────────────────────────────────
 
 /** Build a SubagentArtifact view over an interactive sub-agent's on-disk artifact dir. */
 function artifactFor(state: InteractiveSubagentState) {

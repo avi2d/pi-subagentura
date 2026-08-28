@@ -5,8 +5,8 @@
 The workflow tool orchestrates sub-agents at scale via a JavaScript script that runs
 in a Worker thread. It ports Claude Code's dynamic workflow model into
 pi-subagentura: workflows are reusable, async by default, and each `agent()`
-call defaults to an attachable tmux/zellij-backed sub-agent when a multiplexer
-is available.
+call defaults to an attachable mux-backed sub-agent (herdr, tmux, or zellij)
+when a multiplexer is available.
 
 **Phase 2 scope:** async-by-default execution, process isolation as the default
 for workflow sub-agents, and slash commands for creating/running workflows.
@@ -32,7 +32,7 @@ creation flexible while the actual execution still goes through the deterministi
 | Decision                | Choice                                 | Rationale                                                                                       |
 | ----------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | Sync vs Async           | Async by default; sync explicit opt-in | Workflows are long-running; blocking the agent makes no sense. Claude Code is always async.     |
-| Default agent isolation | Process (tmux/zellij)                  | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux exists.         |
+| Default agent isolation | Process (mux-backed)                   | Attachable, debuggable, same UX as Claude Code. In-process fallback when no mux exists.         |
 | Saved workflow UX       | `/workflows` + `/list-workflows`       | These names should mean saved reusable workflows, not job status.                               |
 | Job status UX           | `/workflow-status`                     | Avoids overloading `/workflows`; status remains available without breaking tools.               |
 | TUI scope               | Footer/widget plus interactive overlay | Full clickable mouse UI is deferred, but keyboard drill-down and cancel controls are available. |
@@ -54,7 +54,7 @@ graph TD
     D --> L[agent() inside workflow]
     L --> M{isolation param?}
     M -- unset/default process --> N[launchInteractiveSubagent]
-    N -- tmux/zellij ok --> O[awaitInteractiveResult]
+    N -- mux ok --> O[awaitInteractiveResult]
     N -- NoMultiplexerAvailable --> P[in-process startSubagentJob]
     M -- in-process opt-out --> P
     P --> Q[SubagentResult]
@@ -69,7 +69,7 @@ graph TD
 
 2. **`agent()` defaults to process isolation**
    - If `isolation` is omitted, the workflow runtime passes `"process"`.
-   - `makeRunAgent` tries tmux/zellij via `launchInteractiveSubagent()`.
+   - `makeRunAgent` tries the resolved multiplexer via `launchInteractiveSubagent()`.
    - If no multiplexer is available, it logs a warning and falls back to the
      in-process sub-agent path.
    - `isolation: "in-process"` remains the explicit opt-out.
@@ -90,7 +90,7 @@ graph TD
 | `src/artifact-poller.ts`  | Paint workflow footer/status widget and cap workflow rows.                                                                                |
 | `src/workflow-tree-ui.ts` | Interactive workflow tree overlay with expand/collapse and cancel controls.                                                               |
 | `src/subagent.ts`         | No changes; it already calls `registerWorkflowTool`.                                                                                      |
-| `src/multiplexer.ts`      | No changes; tmux/zellij detection and fallback already exist.                                                                             |
+| `src/multiplexer.ts`      | No changes; multiplexer detection and fallback already exist.                                                                             |
 
 ## UI Polish Status
 
